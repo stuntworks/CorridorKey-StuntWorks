@@ -41,38 +41,81 @@ def _save_output_path(p):
     try: _config_path.write_text(p)
     except: pass
 
-win = disp.AddWindow({"ID": "CK", "WindowTitle": "CorridorKey Pro", "Geometry": [100, 100, 450, 750]}, [
-    ui.VGroup({"Spacing": 6, "Margin": 10}, [
-        ui.Label({"Text": "CorridorKey Pro", "Alignment": {"AlignHCenter": True}, "Font": ui.Font({"PixelSize": 18, "Bold": True}), "StyleSheet": "color: #4CAF50;"}),
-        ui.HGroup({"Spacing": 10}, [ui.Label({"Text": "Alpha Method:", "MinimumSize": [90, 0]}), ui.ComboBox({"ID": "AlphaMethod"})]),
-        ui.HGroup({"Spacing": 10}, [ui.Label({"Text": "Screen Type:", "MinimumSize": [90, 0]}), ui.ComboBox({"ID": "ScreenType"})]),
-        ui.HGroup({"Spacing": 10}, [ui.Label({"Text": "Despill:", "MinimumSize": [90, 0]}), ui.Slider({"ID": "DespillSlider", "Minimum": 0, "Maximum": 100, "Value": 50, "Orientation": "Horizontal"}), ui.Label({"ID": "DespillValue", "Text": "0.50", "MinimumSize": [35, 0]})]),
-        ui.HGroup({"Spacing": 10}, [ui.Label({"Text": "Refiner:", "MinimumSize": [90, 0]}), ui.Slider({"ID": "RefinerSlider", "Minimum": 0, "Maximum": 100, "Value": 100, "Orientation": "Horizontal"}), ui.Label({"ID": "RefinerValue", "Text": "1.00", "MinimumSize": [35, 0]})]),
-        ui.HGroup({"Spacing": 10}, [ui.CheckBox({"ID": "DespeckleCheck", "Text": "Auto Despeckle", "Checked": True}), ui.SpinBox({"ID": "DespeckleSize", "Minimum": 50, "Maximum": 1000, "Value": 400, "SingleStep": 50}), ui.Label({"Text": "px"})]),
-        ui.HGroup({"Spacing": 10}, [ui.Label({"Text": "Export:", "MinimumSize": [90, 0]}), ui.ComboBox({"ID": "ExportFormat"})]),
-        ui.HGroup({"Spacing": 10}, [ui.Label({"Text": "Output:", "MinimumSize": [90, 0]}), ui.ComboBox({"ID": "OutputMode"})]),
-        ui.HGroup({"Spacing": 5}, [ui.Label({"Text": "Save To:", "MinimumSize": [90, 0]}), ui.LineEdit({"ID": "OutputPath", "Text": _load_output_path(), "ReadOnly": True}), ui.Button({"ID": "BrowseOutput", "Text": "...", "MinimumSize": [30, 0], "MaximumSize": [30, 26]})]),
-        ui.Label({"Text": "Frame Range:", "StyleSheet": "color: #FF9800; font-weight: bold;"}),
-        ui.HGroup({"Spacing": 8}, [
-            ui.Button({"ID": "SetInPoint", "Text": "IN", "MinimumSize": [0, 26], "StyleSheet": "background: #2196F3; color: white;"}),
-            ui.Label({"ID": "InPointLabel", "Text": "---", "MinimumSize": [50, 0], "StyleSheet": "color: #2196F3;"}),
-            ui.Button({"ID": "SetOutPoint", "Text": "OUT", "MinimumSize": [0, 26], "StyleSheet": "background: #2196F3; color: white;"}),
-            ui.Label({"ID": "OutPointLabel", "Text": "---", "MinimumSize": [50, 0], "StyleSheet": "color: #2196F3;"}),
-            ui.Button({"ID": "ClearRange", "Text": "Clear", "MinimumSize": [0, 26], "StyleSheet": "background: #607D8B; color: white;"})]),
-        ui.HGroup({"Spacing": 10}, [ui.CheckBox({"ID": "DisableTrack1", "Text": "Disable Track 1 after processing", "Checked": True})]),
-        ui.HGroup({"Spacing": 10}, [ui.CheckBox({"ID": "LivePreview", "Text": "Live Preview on slider change", "Checked": False, "StyleSheet": "color: #FF9800;"})]),
-        ui.Label({"ID": "Status", "Text": "Ready", "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #0FF; font-size: 14px; font-weight: bold;", "MinimumSize": [0, 28]}),
-        ui.Button({"ID": "SAMClickMask", "Text": "SAM CLICK-TO-MASK", "MinimumSize": [0, 38], "StyleSheet": "background: #E91E63; color: white; font-size: 13px; font-weight: bold;"}),
-        ui.Button({"ID": "ShowPreview", "Text": "SHOW PREVIEW", "MinimumSize": [0, 45], "StyleSheet": "background: #9C27B0; color: white; font-size: 14px; font-weight: bold;"}),
-        ui.Button({"ID": "ProcessFrame", "Text": "PROCESS FRAME", "MinimumSize": [0, 35], "StyleSheet": "background: #2196F3; color: white; font-size: 12px; font-weight: bold;"}),
-        ui.HGroup({"Spacing": 10}, [
-            ui.Button({"ID": "ProcessRange", "Text": "PROCESS RANGE", "MinimumSize": [0, 35], "StyleSheet": "background: #4CAF50; color: white; font-weight: bold;"}),
-            ui.Button({"ID": "Cancel", "Text": "CANCEL", "MinimumSize": [0, 35], "StyleSheet": "background: #f44336; color: white; font-weight: bold;"})]),
-        ui.HGroup({"Spacing": 10}, [
-            ui.Button({"ID": "ToggleTrack1", "Text": "TOGGLE TRACK 1", "MinimumSize": [0, 26], "StyleSheet": "background: #607D8B; color: white;"}),
-            ui.Button({"ID": "OpenFusion", "Text": "OPEN FUSION", "MinimumSize": [0, 26], "StyleSheet": "background: #FF9800; color: white;"})]),
-        ui.TextEdit({"ID": "Log", "ReadOnly": True, "MinimumSize": [0, 70], "StyleSheet": "background: #111; color: #0f0; font-family: monospace; font-size: 10px;"})])
+winLayout = ui.VGroup({"Spacing": 14}, [
+    ui.Label({"Text": "CorridorKey Pro", "Weight": 0, "Alignment": {"AlignHCenter": True}, "Font": ui.Font({"PixelSize": 16, "Bold": True}), "StyleSheet": "color: #4CAF50;"}),
+    ui.HGroup({"Weight": 0, "Spacing": 5}, [
+        ui.Label({"Text": "Alpha Method:", "Weight": 0}),
+        ui.ComboBox({"ID": "AlphaMethod", "Weight": 2}),
+    ]),
+    ui.HGroup({"Weight": 0, "Spacing": 5}, [
+        ui.Label({"Text": "Screen Type:", "Weight": 0}),
+        ui.ComboBox({"ID": "ScreenType", "Weight": 2}),
+    ]),
+    ui.HGroup({"Weight": 0, "Spacing": 5}, [
+        ui.Label({"Text": "Despill:", "Weight": 0}),
+        ui.Slider({"ID": "DespillSlider", "Minimum": 0, "Maximum": 100, "Value": 50, "Orientation": "Horizontal", "Weight": 2}),
+        ui.Label({"ID": "DespillValue", "Text": "0.50", "Weight": 0}),
+    ]),
+    ui.HGroup({"Weight": 0, "Spacing": 5}, [
+        ui.Label({"Text": "Refiner:", "Weight": 0}),
+        ui.Slider({"ID": "RefinerSlider", "Minimum": 0, "Maximum": 100, "Value": 100, "Orientation": "Horizontal", "Weight": 2}),
+        ui.Label({"ID": "RefinerValue", "Text": "1.00", "Weight": 0}),
+    ]),
+    ui.HGroup({"Weight": 0, "Spacing": 5}, [
+        ui.CheckBox({"ID": "DespeckleCheck", "Text": "Auto Despeckle", "Checked": True, "Weight": 0}),
+        ui.SpinBox({"ID": "DespeckleSize", "Minimum": 50, "Maximum": 1000, "Value": 400, "SingleStep": 50, "Weight": 0}),
+        ui.Label({"Text": "px", "Weight": 0}),
+    ]),
+    ui.HGroup({"Weight": 0, "Spacing": 5}, [
+        ui.Label({"Text": "Export:", "Weight": 0}),
+        ui.ComboBox({"ID": "ExportFormat", "Weight": 2}),
+    ]),
+    ui.HGroup({"Weight": 0, "Spacing": 5}, [
+        ui.Label({"Text": "Output:", "Weight": 0}),
+        ui.ComboBox({"ID": "OutputMode", "Weight": 2}),
+    ]),
+    ui.HGroup({"Weight": 0, "Spacing": 5}, [
+        ui.Label({"Text": "Save To:", "Weight": 0}),
+        ui.LineEdit({"ID": "OutputPath", "Text": _load_output_path(), "ReadOnly": True, "Weight": 2}),
+        ui.Button({"ID": "BrowseOutput", "Text": "...", "Weight": 0}),
+    ]),
+    ui.VGap(2),
+    ui.Label({"Text": "Frame Range:", "Weight": 0, "StyleSheet": "color: #FF9800; font-weight: bold;"}),
+    ui.HGroup({"Weight": 0, "Spacing": 5}, [
+        ui.Button({"ID": "SetInPoint", "Text": "IN", "Weight": 1, "StyleSheet": "QPushButton { background-color: #2196F3; color: white; border-radius: 4px; padding: 4px; }"}),
+        ui.Label({"ID": "InPointLabel", "Text": "---", "Weight": 0, "StyleSheet": "color: #2196F3;"}),
+        ui.Button({"ID": "SetOutPoint", "Text": "OUT", "Weight": 1, "StyleSheet": "QPushButton { background-color: #2196F3; color: white; border-radius: 4px; padding: 4px; }"}),
+        ui.Label({"ID": "OutPointLabel", "Text": "---", "Weight": 0, "StyleSheet": "color: #2196F3;"}),
+        ui.Button({"ID": "ClearRange", "Text": "Clear", "Weight": 1, "StyleSheet": "QPushButton { background-color: #607D8B; color: white; border-radius: 4px; padding: 4px; }"}),
+    ]),
+    ui.HGroup({"Weight": 0}, [
+        ui.CheckBox({"ID": "DisableTrack1", "Text": "Disable source clip after processing", "Checked": True}),
+    ]),
+    ui.HGroup({"Weight": 0}, [
+        ui.CheckBox({"ID": "LivePreview", "Text": "Live Preview on slider change", "Checked": False, "StyleSheet": "color: #FF9800;"}),
+    ]),
+    ui.VGap(2),
+    ui.Label({"ID": "Status", "Text": "Ready", "Weight": 0, "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #0FF; font-size: 14px; font-weight: bold;"}),
+    ui.VGap(2),
+    ui.HGroup({"Weight": 0, "Spacing": 5}, [
+        ui.Button({"ID": "SAMClickMask", "Text": "SAM MASK", "Weight": 1, "StyleSheet": "QPushButton { background-color: #E91E63; color: white; font-weight: bold; border-radius: 5px; padding: 6px; }"}),
+        ui.Button({"ID": "ShowPreview", "Text": "PREVIEW", "Weight": 1, "StyleSheet": "QPushButton { background-color: #9C27B0; color: white; font-weight: bold; border-radius: 5px; padding: 6px; }"}),
+        ui.Button({"ID": "ProcessFrame", "Text": "SINGLE FRAME", "Weight": 1, "StyleSheet": "QPushButton { background-color: #2196F3; color: white; font-weight: bold; border-radius: 5px; padding: 6px; }"}),
+    ]),
+    ui.VGap(2),
+    ui.Button({"ID": "ProcessRange", "Text": "PROCESS RANGE", "Weight": 0, "StyleSheet": "QPushButton { background-color: #4CAF50; color: white; font-size: 15px; font-weight: bold; border-radius: 6px; padding: 10px; }"}),
+    ui.Button({"ID": "Cancel", "Text": "CANCEL", "Weight": 0, "StyleSheet": "QPushButton { background-color: #f44336; color: white; font-weight: bold; border-radius: 5px; padding: 4px; }"}),
+    ui.VGap(2),
+    ui.HGroup({"Weight": 0, "Spacing": 5}, [
+        ui.Button({"ID": "ToggleTrack1", "Text": "TOGGLE TRACK 1", "Weight": 1, "StyleSheet": "QPushButton { background-color: #607D8B; color: white; border-radius: 4px; padding: 3px; }"}),
+        ui.Button({"ID": "OpenFusion", "Text": "OPEN FUSION", "Weight": 1, "StyleSheet": "QPushButton { background-color: #FF9800; color: white; border-radius: 4px; padding: 3px; }"}),
+    ]),
+    ui.VGap(2),
+    ui.TextEdit({"ID": "Log", "ReadOnly": True, "Weight": 3, "StyleSheet": "background: #111; color: #0f0; font-family: monospace; font-size: 10px; border-radius: 4px;"}),
+    ui.Button({"ID": "AboutBtn", "Text": "About", "Weight": 0, "StyleSheet": "QPushButton { background-color: #333; color: #999; font-size: 11px; border-radius: 4px; padding: 2px; }"}),
 ])
+
+win = disp.AddWindow({"ID": "CK", "WindowTitle": "CorridorKey Pro", "Geometry": [100, 50, 500, 750]}, winLayout)
 
 items = win.GetItems()
 items["AlphaMethod"].AddItem("Simple Chroma Key")
@@ -250,25 +293,78 @@ def composite_over_checker(fg, alpha, sz=20):
     a3 = np.stack([a, a, a], axis=2)
     return (fg * a3 + chk * (1 - a3)).astype(np.uint8)
 
+def grab_background_frame():
+    """Try to grab a frame from the track below the green screen for composite background."""
+    import cv2
+    try:
+        cf, fps = get_current_frame_info()
+        # Check tracks below the source (V1 has green screen, check V2+ for bg plates
+        # OR if green screen is on V2+, check V1)
+        track_count = timeline.GetTrackCount("video")
+        for track_idx in range(1, track_count + 1):
+            clips = timeline.GetItemListInTrack("video", track_idx) or []
+            for c in clips:
+                if c.GetStart() <= cf < c.GetEnd():
+                    mpi = c.GetMediaPoolItem()
+                    if not mpi: continue
+                    props = mpi.GetClipProperty() if mpi else {}
+                    fp = props.get("File Path", "")
+                    if not fp: continue
+                    fn = c.GetLeftOffset() + (cf - c.GetStart())
+                    cap = cv2.VideoCapture(fp)
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, fn))
+                    ret, bg_frame = cap.read()
+                    cap.release()
+                    if ret:
+                        log(f"BG plate from V{track_idx}: {os.path.basename(fp)}")
+                        return bg_frame
+        log("No background plate found on other tracks")
+    except Exception as e:
+        log(f"BG grab failed: {e}")
+    return None
+
 def show_preview_window(orig_bgr, keyed_rgb, alpha):
-    import cv2, numpy as np, base64
+    import cv2, numpy as np, subprocess, json
     a2d = alpha[:, :, 0] if len(alpha.shape) == 3 else alpha
-    orig_rgb = cv2.cvtColor(orig_bgr, cv2.COLOR_BGR2RGB)
-    comp = composite_over_checker(keyed_rgb, a2d)
-    matte_vis = (a2d * 255).astype(np.uint8) if a2d.max() <= 1 else a2d
-    # Save preview images to output folder
+    log(f"Matte debug — dtype:{a2d.dtype} min:{a2d.min():.4f} max:{a2d.max():.4f} mean:{a2d.mean():.4f}")
+    # Normalize matte to full 0-255 range (white=subject, black=background)
+    if a2d.dtype in (np.float32, np.float64):
+        matte_vis = (np.clip(a2d / max(a2d.max(), 1e-6), 0, 1) * 255).astype(np.uint8)
+    else:
+        if a2d.max() > 0 and a2d.max() < 255:
+            matte_vis = (a2d.astype(np.float32) / a2d.max() * 255).astype(np.uint8)
+        else:
+            matte_vis = a2d.astype(np.uint8)
+    log(f"Matte after norm — min:{matte_vis.min()} max:{matte_vis.max()} mean:{matte_vis.mean():.1f}")
+    # Try to grab background plate from another track
+    bg_frame = grab_background_frame()
+    # Save preview images to temp folder
     preview_dir = Path(items["OutputPath"].Text) / "_preview"
     preview_dir.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(preview_dir / "original.png"), orig_bgr)
-    cv2.imwrite(str(preview_dir / "keyed.png"), cv2.cvtColor(comp, cv2.COLOR_RGB2BGR))
-    matte_out = cv2.cvtColor(matte_vis, cv2.COLOR_GRAY2BGR) if len(matte_vis.shape) == 2 else matte_vis
-    cv2.imwrite(str(preview_dir / "matte.png"), matte_out)
-    fg_out = cv2.cvtColor(keyed_rgb, cv2.COLOR_RGB2BGR)
-    cv2.imwrite(str(preview_dir / "foreground.png"), fg_out)
-    # Open folder so user can inspect
-    os.startfile(str(preview_dir))
-    log(f"Preview saved to: {preview_dir}")
-    log("  original.png | keyed.png | matte.png | foreground.png")
+    paths = {
+        "original": str(preview_dir / "original.png"),
+        "foreground": str(preview_dir / "foreground.png"),
+        "matte": str(preview_dir / "matte.png"),
+    }
+    cv2.imwrite(paths["original"], orig_bgr)
+    cv2.imwrite(paths["foreground"], cv2.cvtColor(keyed_rgb, cv2.COLOR_RGB2BGR))
+    cv2.imwrite(paths["matte"], matte_vis)
+    # Save background plate if found
+    if bg_frame is not None:
+        h, w = orig_bgr.shape[:2]
+        if bg_frame.shape[:2] != (h, w):
+            bg_frame = cv2.resize(bg_frame, (w, h))
+        paths["background"] = str(preview_dir / "background.png")
+        cv2.imwrite(paths["background"], bg_frame)
+        log("Background plate saved for composite")
+    # Launch preview as separate process — no event loop conflicts
+    viewer_script = str(Path(r"D:\New AI Projects\CorridorKey\resolve_plugin") / "preview_viewer.py")
+    python_exe = str(Path(r"D:\New AI Projects\CorridorKey") / ".venv" / "Scripts" / "python.exe")
+    subprocess.Popen(
+        [python_exe, viewer_script, json.dumps(paths)],
+        creationflags=subprocess.CREATE_NO_WINDOW
+    )
+    log("Preview launched")
 
 def save_output(fg, matte, path, fmt):
     import cv2, numpy as np
@@ -374,7 +470,9 @@ def process_current_frame(preview_only=False):
         if settings["output_mode"] in [0, 2]:
             ci = {"mediaPoolItem": imp[0], "startFrame": 0, "endFrame": 1, "trackIndex": 2, "recordFrame": cs, "mediaType": 1}
             if media_pool.AppendToTimeline([ci]):
-                if items["DisableTrack1"].Checked: timeline.SetTrackEnable("video", 1, False)
+                if items["DisableTrack1"].Checked and clip:
+                    clip.SetClipEnabled(False)
+                    log(f"Disabled source clip: {os.path.basename(fp)}")
                 status("DONE! Track 2")
             else: status("MediaPool only")
         else: status("Done - MediaPool")
@@ -508,6 +606,49 @@ win.On.ProcessRange.Clicked = on_process_range
 win.On.Cancel.Clicked = on_cancel
 win.On.ToggleTrack1.Clicked = on_toggle_track1
 win.On.OpenFusion.Clicked = on_open_fusion
+
+def on_about(ev):
+    about_win = disp.AddWindow({"ID": "About", "WindowTitle": "About CorridorKey Pro", "Geometry": [200, 150, 460, 620]}, [
+        ui.VGroup({"Spacing": 8, "Margin": 16}, [
+            ui.Label({"Text": "CorridorKey Pro", "Alignment": {"AlignHCenter": True}, "Font": ui.Font({"PixelSize": 22, "Bold": True}), "StyleSheet": "color: #4CAF50;"}),
+            ui.Label({"Text": "AI-Powered Green Screen Keyer for DaVinci Resolve", "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #aaa; font-size: 12px;"}),
+            ui.Label({"Text": "─────────────────────────────", "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #333;"}),
+            ui.Label({"Text": "CorridorKey Engine", "Alignment": {"AlignHCenter": True}, "Font": ui.Font({"PixelSize": 14, "Bold": True}), "StyleSheet": "color: #FF9800;"}),
+            ui.Label({"Text": "Created by Niko Pueringer / Corridor Digital", "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #ddd;"}),
+            ui.Label({"Text": "github.com/nikopueringer/CorridorKey", "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #2196F3; font-size: 11px;"}),
+            ui.Label({"Text": "─────────────────────────────", "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #333;"}),
+            ui.Label({"Text": "DaVinci Resolve Plugin", "Alignment": {"AlignHCenter": True}, "Font": ui.Font({"PixelSize": 14, "Bold": True}), "StyleSheet": "color: #FF9800;"}),
+            ui.Label({"Text": "by Roberto Lopez & Elvis Lopez", "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #ddd;"}),
+            ui.Label({"Text": "StuntWorks Action Cinema", "Alignment": {"AlignHCenter": True}, "Font": ui.Font({"PixelSize": 13, "Bold": True}), "StyleSheet": "color: #E91E63;"}),
+            ui.Label({"Text": "github.com/stuntworks/CorridorKey-Plugin", "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #2196F3; font-size: 11px;"}),
+            ui.Label({"Text": "─────────────────────────────", "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #333;"}),
+            ui.Label({"Text": "StuntWorks is a professional stunt rigging company.\nIn our spare time we build the tools we wish existed —\nfree plugins, automation, and workflow helpers.\nIf you find this useful, a coffee helps us keep building.",
+                      "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #ccc; font-size: 11px; font-style: italic;", "WordWrap": True}),
+            ui.Label({"Text": "☕  ko-fi.com/stuntworks", "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #FF5E5B; font-size: 13px; font-weight: bold;"}),
+            ui.Label({"Text": "─────────────────────────────", "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #333;"}),
+            ui.Label({"Text": "How To Use", "Alignment": {"AlignHCenter": True}, "Font": ui.Font({"PixelSize": 14, "Bold": True}), "StyleSheet": "color: #FF9800;"}),
+            ui.Label({"Text": "1. Place green screen footage on your timeline\n"
+                              "2. Set Alpha Method (Simple or SAM2 Click-to-Mask)\n"
+                              "3. Choose Green or Blue screen type\n"
+                              "4. Click SHOW PREVIEW to check the key\n"
+                              "5. Adjust Despill and Refiner sliders as needed\n"
+                              "6. Set IN/OUT points for your range\n"
+                              "7. Click PROCESS RANGE to render\n"
+                              "8. Keyed output goes to Track 2 automatically\n\n"
+                              "Tip: Place a background plate on the track below\n"
+                              "your green screen clip to see the real composite\n"
+                              "in the preview window.",
+                      "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #ccc; font-size: 11px;", "WordWrap": True}),
+            ui.Button({"ID": "CloseAbout", "Text": "Close", "MinimumSize": [0, 30], "StyleSheet": "background: #607D8B; color: white;"})])
+    ])
+    def close_about(ev): disp.ExitLoop()
+    about_win.On.CloseAbout.Clicked = close_about
+    about_win.On.About.Close = close_about
+    about_win.Show()
+    disp.RunLoop()
+    about_win.Hide()
+
+win.On.AboutBtn.Clicked = on_about
 win.On.CK.Close = on_close
 
 log("CorridorKey Pro Ready")
