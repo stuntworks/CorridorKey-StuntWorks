@@ -214,7 +214,15 @@
             });
         }
 
-        log('CorridorKey Panel Ready');
+        // Detect host app and update UI
+        cs.evalScript('getHostApp()', function(host) {
+            if (host === 'ppro') {
+                log('CorridorKey Panel Ready (Premiere Pro)');
+                document.querySelector('.btn-batch').textContent = 'PROCESS IN/OUT RANGE';
+            } else {
+                log('CorridorKey Panel Ready (After Effects)');
+            }
+        });
     </script>
 </body>
 </html>
