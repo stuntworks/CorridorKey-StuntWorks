@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.trt
+*.aex
+*.zip
+*.dll
+*.pdb
+*.pyd
+_backup_working/
+.env
