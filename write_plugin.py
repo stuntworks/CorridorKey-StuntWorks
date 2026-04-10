@@ -16,18 +16,32 @@ def _find_corridorkey_root():
     env_root = os.environ.get("CORRIDORKEY_ROOT")
     if env_root and os.path.isdir(env_root):
         return env_root
-    # 2. Config file next to this script
-    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "corridorkey_path.txt")
-    if os.path.exists(config_path):
-        with open(config_path) as f:
-            root = f.read().strip()
-            if os.path.isdir(root):
-                return root
+    # 2. Config file next to this script (Resolve may not define __file__)
+    script_dirs = []
+    try:
+        script_dirs.append(os.path.dirname(os.path.abspath(__file__)))
+    except NameError:
+        pass
+    # Also check known Resolve script locations
+    if sys.platform == "win32":
+        script_dirs.append(os.path.join(os.environ.get("PROGRAMDATA", "C:/ProgramData"),
+            "Blackmagic Design", "DaVinci Resolve", "Fusion", "Scripts", "Utility"))
+    elif sys.platform == "darwin":
+        script_dirs.append("/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility")
+    else:
+        script_dirs.append("/opt/resolve/Fusion/Scripts/Utility")
+    for sd in script_dirs:
+        config_path = os.path.join(sd, "corridorkey_path.txt")
+        if os.path.exists(config_path):
+            with open(config_path) as f:
+                root = f.read().strip()
+                if os.path.isdir(root):
+                    return root
     # 3. Check if we're running from within the repo
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    for candidate in [script_dir, os.path.dirname(script_dir)]:
-        if os.path.exists(os.path.join(candidate, "resolve_plugin", "core")):
-            return candidate
+    for sd in script_dirs:
+        for candidate in [sd, os.path.dirname(sd)]:
+            if os.path.exists(os.path.join(candidate, "resolve_plugin", "core")):
+                return candidate
     raise RuntimeError("CorridorKey not found. Set CORRIDORKEY_ROOT env var or create corridorkey_path.txt")
 
 CORRIDORKEY_ROOT = _find_corridorkey_root()
@@ -46,11 +60,11 @@ sys.path.insert(0, _resolve_modules)
 sys.path.insert(0, CORRIDORKEY_ROOT)
 sys.path.insert(0, os.path.join(CORRIDORKEY_ROOT, "resolve_plugin"))
 
-import DaVinciResolveScript as dvr
 import fusionscript
 
-resolve = dvr.scriptapp("Resolve")
-ui = resolve.Fusion().UIManager
+# Use fu provided by Resolve's script runner (dvr.scriptapp hangs in newer Resolve)
+resolve = fu.GetResolve()
+ui = fu.UIManager
 disp = fusionscript.UIDispatcher(ui)
 
 pm = resolve.GetProjectManager()
