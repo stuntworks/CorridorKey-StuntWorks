@@ -16,8 +16,8 @@ This plugin wraps the CorridorKey neural keyer into a native script panel for Da
 
 ## Requirements
 
-- [CorridorKey](https://github.com/nikopueringer/CorridorKey) installed with Python venv
-- NVIDIA GPU with CUDA support (4GB+ VRAM)
+- [CorridorKey](https://github.com/nikopueringer/CorridorKey) installed with Python venv (use the latest version for float16 and GPU-batched processing — runs on 8GB+ VRAM now)
+- NVIDIA GPU with CUDA support (8GB+ VRAM recommended)
 - DaVinci Resolve Studio 18+ (free version lacks scripting API)
 
 ## DaVinci Resolve Installation
