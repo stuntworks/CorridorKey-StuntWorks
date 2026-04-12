@@ -1,10 +1,10 @@
 # CorridorKey Plugin
 
-One-click AI green screen keying inside DaVinci Resolve and After Effects.
+One-click AI green screen keying inside DaVinci Resolve.
 
 **Powered by [CorridorKey](https://github.com/nikopueringer/CorridorKey) by Niko Pueringer / Corridor Digital.**
 
-This plugin wraps the CorridorKey neural keyer into native panels for DaVinci Resolve Studio and Adobe After Effects, so editors can use AI-powered green screen removal without touching the command line.
+This plugin wraps the CorridorKey neural keyer into a native script panel for DaVinci Resolve Studio, so editors can use AI-powered green screen removal without touching the command line.
 
 ## What It Does
 
@@ -18,7 +18,7 @@ This plugin wraps the CorridorKey neural keyer into native panels for DaVinci Re
 
 - [CorridorKey](https://github.com/nikopueringer/CorridorKey) installed with Python venv
 - NVIDIA GPU with CUDA support (4GB+ VRAM)
-- DaVinci Resolve Studio 18+ (free version lacks scripting API) and/or Adobe After Effects 2020+
+- DaVinci Resolve Studio 18+ (free version lacks scripting API)
 
 ## DaVinci Resolve Installation
 
@@ -42,9 +42,9 @@ This plugin wraps the CorridorKey neural keyer into native panels for DaVinci Re
 5. Click **PROCESS FRAME** for single frame or **PROCESS ALL** for the full clip
 6. Keyed result appears on Track 2 with transparency
 
-## After Effects (Coming Soon)
+## After Effects / Premiere (Experimental)
 
-Two integration methods are in development:
+Early code exists in `ae_plugin/` but is **untested**. Contributions welcome.
 - **CEP Panel** - HTML extension panel
 - **Golobulus Effect** - Native AE effect plugin
 
