@@ -48,6 +48,12 @@ Two integration methods are in development:
 - **CEP Panel** - HTML extension panel
 - **Golobulus Effect** - Native AE effect plugin
 
+## Support
+
+If this plugin saves you time, consider buying me a coffee:
+
+[![Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/stuntworks)
+
 ## Credits
 
 - **CorridorKey AI Engine** - [Niko Pueringer / Corridor Digital](https://github.com/nikopueringer/CorridorKey)

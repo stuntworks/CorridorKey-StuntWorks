@@ -69,11 +69,13 @@ The SHOW PREVIEW button opens a Tkinter popup showing:
 
 ### Path Setup
 ```python
-venv_packages = r"D:\New AI Projects\CorridorKey\.venv\Lib\site-packages"
-site.addsitedir(venv_packages)
-sys.path.insert(0, venv_packages)
-sys.path.insert(0, r"D:\New AI Projects\CorridorKey")
-sys.path.insert(0, r"D:\New AI Projects\CorridorKey\resolve_plugin")
+# Auto-detect CorridorKey root, or set CORRIDORKEY_ROOT env var
+CORRIDORKEY_ROOT = Path(os.environ.get("CORRIDORKEY_ROOT", Path(__file__).resolve().parent.parent))
+_venv_packages = CORRIDORKEY_ROOT / ".venv" / "Lib" / "site-packages"
+if _venv_packages.exists():
+    site.addsitedir(str(_venv_packages))
+sys.path.insert(0, str(CORRIDORKEY_ROOT))
+sys.path.insert(0, str(CORRIDORKEY_ROOT / "resolve_plugin"))
 ```
 
 ### Frame Extraction
