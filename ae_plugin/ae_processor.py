@@ -176,10 +176,12 @@ def process_batch(source_video, output_folder, start_frame, end_frame, fps,
     failed_frames = []
 
     for frame_idx in range(start_frame, end_frame):
-        seq_num = frame_idx - start_frame
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+
+        # Real frames at 00001+, dummy at 00000 (Premiere drops first frame of sequence)
+        seq_num = (frame_idx - start_frame) + 1
         output_path = output_folder / f"output_{seq_num:05d}.png"
 
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
         ret, frame = cap.read()
         if not ret:
             log.warning(f"Failed to read frame {frame_idx}")
@@ -211,9 +213,14 @@ def process_batch(source_video, output_folder, start_frame, end_frame, fps,
             output = cv2.merge([fg_bgr[:, :, 0], fg_bgr[:, :, 1], fg_bgr[:, :, 2], alpha_uint8])
 
             # Also save matte
-            matte_path = output_folder / f"output_{seq_num:05d}_matte.png"
+            matte_path = output_folder / f"matte_{seq_num:05d}.png"
             cv2.imwrite(str(output_path), output)
             cv2.imwrite(str(matte_path), alpha_uint8)
+
+            # Write dummy pre-roll as output_00000 (Premiere skips first frame of sequence)
+            if seq_num == 1:
+                dummy_path = output_folder / "output_00000.png"
+                cv2.imwrite(str(dummy_path), output)
 
             processed += 1
             if processed % 10 == 0:

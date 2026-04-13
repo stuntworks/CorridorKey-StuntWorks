@@ -188,6 +188,10 @@
         <input type="checkbox" id="addToTimeline" checked>
         <label for="addToTimeline" style="margin:0">Add keyed clip to timeline</label>
     </div>
+    <div class="checkbox-row">
+        <input type="checkbox" id="disableSource" checked>
+        <label for="disableSource" style="margin:0">Disable source clip after processing</label>
+    </div>
 
     <button class="btn-preview" onclick="processFrame(true)">PREVIEW FRAME</button>
     <button class="btn-process" onclick="processFrame(false)">PROCESS FRAME</button>
@@ -490,7 +494,8 @@
 
                     // Import sequence into Premiere
                     var escapedFolder = outputFolder.replace(/\\/g, '\\\\');
-                    cs.evalScript("ppro_importSequence('" + escapedFolder + "')", function(importResult) {
+                    var disableSrc = document.getElementById('disableSource').checked;
+                    cs.evalScript("ppro_importSequence('" + escapedFolder + "', " + info.fps + ", " + (info.clipStartSec || 0) + ", " + disableSrc + ")", function(importResult) {
                         if (importResult === 'success') {
                             status('Done!');
                             log('Batch complete: ' + processed + '/' + totalFrames + ' frames');

@@ -440,33 +440,62 @@ function ppro_getWorkAreaInfo() {
         var seq = app.project.activeSequence;
         if (!seq) return JSON.stringify({error: "No active sequence"});
 
-        var inPoint = seq.getInPointAsTime();
-        var outPoint = seq.getOutPointAsTime();
-
-        if (!inPoint || !outPoint || inPoint.seconds >= outPoint.seconds) {
-            return JSON.stringify({error: "Set in/out points on timeline first"});
-        }
-
         var fpsRaw = seq.getSettings().videoFrameRate;
         var fps = parseFloat(fpsRaw);
         if (isNaN(fps) || fps <= 0) fps = 24;
-        var startFrame = Math.floor(inPoint.seconds * fps);
-        var endFrame = Math.floor(outPoint.seconds * fps);
 
-        if (endFrame <= startFrame) return JSON.stringify({error: "Invalid in/out range"});
+        var inPoint = seq.getInPointAsTime();
+        var outPoint = seq.getOutPointAsTime();
+        var hasIOMarks = inPoint && outPoint && outPoint.seconds > inPoint.seconds;
 
-        var track = seq.videoTracks[0];
-        var clips = track.clips;
-        if (clips.numItems < 1) return JSON.stringify({error: "No clips on Track 1"});
+        var startFrame, endFrame, filePath, clipStartSec;
 
-        var filePath = clips[0].projectItem.getMediaPath();
+        if (hasIOMarks) {
+            // Use sequence I/O marks
+            clipStartSec = inPoint.seconds;
+            startFrame = Math.floor(inPoint.seconds * fps);
+            endFrame = Math.floor(outPoint.seconds * fps);
+
+            var track = seq.videoTracks[0];
+            var clips = track.clips;
+            if (clips.numItems < 1) return JSON.stringify({error: "No clips on Track 1"});
+            filePath = clips[0].projectItem.getMediaPath();
+        } else {
+            // No I/O marks — fall back to clip at playhead
+            var playerPos = seq.getPlayerPosition();
+            var track = seq.videoTracks[0];
+            var clips = track.clips;
+            var targetClip = null;
+
+            for (var i = 0; i < clips.numItems; i++) {
+                var clip = clips[i];
+                if (playerPos.seconds >= clip.start.seconds && playerPos.seconds < clip.end.seconds) {
+                    targetClip = clip;
+                    break;
+                }
+            }
+
+            if (!targetClip) {
+                if (clips.numItems < 1) return JSON.stringify({error: "No clips on Track 1"});
+                targetClip = clips[0];
+            }
+
+            // Timeline position of the source clip
+            clipStartSec = targetClip.start.seconds;
+            filePath = targetClip.projectItem.getMediaPath();
+            startFrame = Math.floor(targetClip.inPoint.seconds * fps);
+            endFrame = Math.floor((targetClip.inPoint.seconds + (targetClip.end.seconds - targetClip.start.seconds)) * fps);
+        }
+
         if (!filePath) return JSON.stringify({error: "Cannot get source file path"});
+        if (endFrame <= startFrame) return JSON.stringify({error: "Invalid frame range"});
 
         return JSON.stringify({
             sourcePath: filePath,
             startFrame: startFrame,
             endFrame: endFrame,
-            fps: fps
+            fps: fps,
+            clipStartSec: clipStartSec
         });
     } catch (e) {
         return JSON.stringify({error: e.toString()});
@@ -530,14 +559,71 @@ function ppro_importFile(filePath) {
     }
 }
 
-function ppro_importSequence(folderPath) {
+function ppro_importSequence(folderPath, fps, clipStartSec, disableSource) {
     try {
         var firstOut = folderPath + "\\output_00000.png";
-        if (new File(firstOut).exists) {
-            app.project.importFiles([firstOut], true, app.project.rootItem, true);
-            return "success";
+        if (!new File(firstOut).exists) {
+            return "Error: No output files found";
         }
-        return "Error: No output files found";
+
+        // Find or create CorridorKey bin
+        var rootItem = app.project.rootItem;
+        var ckBin = null;
+        for (var i = 0; i < rootItem.children.numItems; i++) {
+            if (rootItem.children[i].name === "CorridorKey" && rootItem.children[i].type === 2) {
+                ckBin = rootItem.children[i];
+                break;
+            }
+        }
+        if (!ckBin) {
+            ckBin = rootItem.createBin("CorridorKey");
+        }
+
+        // Import sequence to CorridorKey bin
+        app.project.importFiles([firstOut], true, ckBin, true);
+
+        // Find the imported item (last in the bin)
+        var importedItem = null;
+        for (var j = 0; j < ckBin.children.numItems; j++) {
+            importedItem = ckBin.children[j];
+        }
+
+        if (!importedItem) return "success:bin_only";
+
+        // Match frame rate to source
+        if (fps && fps > 0) {
+            try {
+                importedItem.setOverrideFrameRate(fps);
+            } catch (fpsErr) {}
+        }
+
+        // Place on V2 at the source clip's exact timecode
+        var seq = app.project.activeSequence;
+        if (seq) {
+            var seqFps = parseFloat(seq.getSettings().videoFrameRate) || fps || 24;
+            var vTracks = seq.videoTracks;
+            if (vTracks.numTracks >= 2) {
+                var placeSec = (clipStartSec !== undefined && clipStartSec >= 0) ? clipStartSec : seq.getPlayerPosition().seconds;
+                vTracks[1].overwriteClip(importedItem, placeSec);
+
+                // Disable source clip on V1 if requested
+                if (disableSource) {
+                    var v1clips = vTracks[0].clips;
+                    for (var ci = 0; ci < v1clips.numItems; ci++) {
+                        var c = v1clips[ci];
+                        if (c.start.seconds <= placeSec && c.end.seconds > placeSec) {
+                            try { c.disabled = true; } catch(de) {
+                                try { c.setClipEnabled(false); } catch(de2) {}
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                return "success";
+            }
+        }
+        return "success:bin_only";
     } catch (e) {
         return "Error: " + e.toString();
     }
