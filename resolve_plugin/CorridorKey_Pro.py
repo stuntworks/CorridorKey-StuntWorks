@@ -4,21 +4,12 @@ Enhanced with SAM2 Click-to-Mask, Frame Range, Export Modes
 import sys, os, site, tempfile
 from pathlib import Path
 
-# ── CorridorKey root: set CORRIDORKEY_ROOT env var, or auto-detect relative to this plugin
-CORRIDORKEY_ROOT = Path(os.environ.get("CORRIDORKEY_ROOT", Path(__file__).resolve().parent.parent))
-_venv_packages = CORRIDORKEY_ROOT / ".venv" / "Lib" / "site-packages"
-if _venv_packages.exists():
-    site.addsitedir(str(_venv_packages))
-    sys.path.insert(0, str(_venv_packages))
-
-# Resolve scripting modules
-if sys.platform == "win32":
-    _resolve_modules = Path(os.environ.get("PROGRAMDATA", "C:/ProgramData")) / "Blackmagic Design/DaVinci Resolve/Support/Developer/Scripting/Modules"
-else:
-    _resolve_modules = Path("/opt/resolve/Developer/Scripting/Modules")
-sys.path.insert(0, str(_resolve_modules))
-sys.path.insert(0, str(CORRIDORKEY_ROOT))
-sys.path.insert(0, str(CORRIDORKEY_ROOT / "resolve_plugin"))
+venv_packages = r"D:\New AI Projects\CorridorKey\.venv\Lib\site-packages"
+site.addsitedir(venv_packages)
+sys.path.insert(0, venv_packages)
+sys.path.insert(0, r"C:\ProgramData\Blackmagic Design\DaVinci Resolve\Support\Developer\Scripting\Modules")
+sys.path.insert(0, r"D:\New AI Projects\CorridorKey")
+sys.path.insert(0, r"D:\New AI Projects\CorridorKey\resolve_plugin")
 
 import fusionscript
 
@@ -211,7 +202,7 @@ def generate_sam2_mask(frame, pos_pts, neg_pts):
         from sam2.sam2_image_predictor import SAM2ImagePredictor
         log("Loading SAM2...")
         status("Loading SAM2...")
-        ckpt = str(CORRIDORKEY_ROOT / "sam2_weights" / "sam2.1_hiera_small.pt")
+        ckpt = r"D:\New AI Projects\CorridorKey\sam2_weights\sam2.1_hiera_small.pt"
         cfg = "configs/sam2.1/sam2.1_hiera_s.yaml"
         device = "cuda" if torch.cuda.is_available() else "cpu"
         model = build_sam2(cfg, ckpt, device=device)
@@ -367,8 +358,8 @@ def show_preview_window(orig_bgr, keyed_rgb, alpha):
         cv2.imwrite(paths["background"], bg_frame)
         log("Background plate saved for composite")
     # Launch preview as separate process — no event loop conflicts
-    viewer_script = str(CORRIDORKEY_ROOT / "resolve_plugin" / "preview_viewer.py")
-    python_exe = str(CORRIDORKEY_ROOT / ".venv" / ("Scripts" if sys.platform == "win32" else "bin") / ("python.exe" if sys.platform == "win32" else "python"))
+    viewer_script = str(Path(r"D:\New AI Projects\CorridorKey\resolve_plugin") / "preview_viewer.py")
+    python_exe = str(Path(r"D:\New AI Projects\CorridorKey") / ".venv" / "Scripts" / "python.exe")
     subprocess.Popen(
         [python_exe, viewer_script, json.dumps(paths)],
         creationflags=subprocess.CREATE_NO_WINDOW
@@ -477,19 +468,29 @@ def process_current_frame(preview_only=False):
         imp = media_pool.ImportMedia([str(op)])
         if not imp: status("Import failed"); return
         if settings["output_mode"] in [0, 2]:
-            ci = {"mediaPoolItem": imp[0], "startFrame": 0, "endFrame": 1, "trackIndex": 2, "recordFrame": cs, "mediaType": 1}
-            if media_pool.AppendToTimeline([ci]):
+            tc = timeline.GetTrackCount("video")
+            log(f"[v0.3] Video tracks: {tc}")
+            if tc < 2:
+                added = timeline.AddTrack("video")
+                log(f"AddTrack result: {added}")
+                tc = timeline.GetTrackCount("video")
+                log(f"Tracks after add: {tc}")
+            ci = {"mediaPoolItem": imp[0], "startFrame": 0, "endFrame": 0, "trackIndex": 2, "recordFrame": cs, "mediaType": 1}
+            log(f"Inserting on track 2 at frame {cs}")
+            result = media_pool.AppendToTimeline([ci])
                 if items["DisableTrack1"].Checked and clip:
                     clip.SetClipEnabled(False)
                     log(f"Disabled source clip: {os.path.basename(fp)}")
                 status("DONE! Track 2")
-            else: status("MediaPool only")
+            else:
+                log(f"AppendToTimeline FAILED")
+                status("MediaPool only — drag from CorridorKey bin")
         else: status("Done - MediaPool")
     except Exception as e:
         status("ERROR!")
         log(f"ERROR: {e}")
         import traceback; log(traceback.format_exc())
-        with open(str(Path(tempfile.gettempdir()) / "ck_error.txt"), "w") as ef: ef.write(traceback.format_exc())
+        with open(r"D:\ck_error.txt", "w") as ef: ef.write(traceback.format_exc())
 
 def on_show_preview(ev): process_current_frame(preview_only=True)
 def on_process_frame(ev): process_current_frame(preview_only=False)
