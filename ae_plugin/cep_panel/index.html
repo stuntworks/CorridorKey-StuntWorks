@@ -137,8 +137,8 @@
 <body>
     <h1>CorridorKey StuntWorks</h1>
     <div class="credit">
-        AI Keyer by <a href="https://github.com/nikopueringer/CorridorKey">Niko Pueringer / Corridor Digital</a><br>
-        Plugin by Roberto Lopez / <a href="https://www.youtube.com/@stuntworksactioncinema">StuntWorks Action Cinema</a>
+        AI Keyer by <a href="#" onclick="openURL('https://github.com/nikopueringer/CorridorKey')">Niko Pueringer / Corridor Digital</a><br>
+        Plugin by Roberto Lopez / <a href="#" onclick="openURL('https://www.youtube.com/@stuntworksactioncinema')">StuntWorks Action Cinema</a>
     </div>
 
     <div id="preview-container">
@@ -195,6 +195,10 @@
     <script>
         const cs = new CSInterface();
         var lastOutputPath = null;
+        function openURL(url) {
+            cs.openURLInDefaultBrowser(url);
+        }
+
         const OUTPUT_KEY = 'ck_output_path';
 
         // Load saved output path or default
