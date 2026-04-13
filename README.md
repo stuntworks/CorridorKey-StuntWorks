@@ -19,7 +19,17 @@
 
 *Plugin by Roberto Lopez / [StuntWorks](https://www.youtube.com/@stuntworkscinema)*
 
+![CorridorKey in DaVinci Resolve](docs/resolve_screenshot.png)
+
 </div>
+
+---
+
+## Before / After
+
+| Before | Keyed | Composite |
+|:---:|:---:|:---:|
+| ![Before](docs/ae_before.png) | ![Keyed](docs/ae_keyed.png) | ![Composite](docs/ae_composite.png) |
 
 ---
 

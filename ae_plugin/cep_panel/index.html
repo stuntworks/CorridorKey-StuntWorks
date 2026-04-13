@@ -263,9 +263,17 @@
             const container = document.getElementById('preview-container');
             const ts = Date.now();
             const fileUri = 'file:///' + filePath.replace(/\\/g, '/');
-            const matteUri = 'file:///' + filePath.replace(/\\/g, '/').replace('.png', '_matte.png');
-            container.innerHTML = '<img src="' + fileUri + '?' + ts + '" alt="Keyed" title="Keyed Result">' +
-                                  '<img src="' + matteUri + '?' + ts + '" alt="Matte" title="Alpha Matte">';
+            const mattePath = filePath.replace('.png', '_matte.png');
+            // Only show matte if the file exists (batch mode creates it, single doesn't)
+            var hasMatteFile = false;
+            try { hasMatteFile = fs.existsSync(mattePath); } catch(e) {}
+            if (hasMatteFile) {
+                const matteUri = 'file:///' + mattePath.replace(/\\/g, '/');
+                container.innerHTML = '<img src="' + fileUri + '?' + ts + '" alt="Keyed" title="Keyed Result">' +
+                                      '<img src="' + matteUri + '?' + ts + '" alt="Matte" title="Alpha Matte">';
+            } else {
+                container.innerHTML = '<img src="' + fileUri + '?' + ts + '" alt="Keyed Result" style="width:96%;margin:2%">';
+            }
         }
 
         function getSettings() {

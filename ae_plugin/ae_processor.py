@@ -265,9 +265,25 @@ def main():
     batch.add_argument("--despeckle-size", type=int, default=400)
     batch.add_argument("--refiner", type=float, default=1.0)
 
-    args = parser.parse_args()
+    # Try parsing — if it fails (legacy call without single/batch), use fallback
+    try:
+        args = parser.parse_args()
+    except SystemExit:
+        # Legacy call: ae_processor.py <input> <output> [options]
+        if len(sys.argv) >= 3 and not sys.argv[1].startswith('-'):
+            legacy = argparse.ArgumentParser()
+            legacy.add_argument("input")
+            legacy.add_argument("output")
+            legacy.add_argument("--screen", default="green", choices=["green", "blue"])
+            legacy.add_argument("--despill", type=float, default=0.5)
+            legacy.add_argument("--despeckle", type=int, default=1)
+            legacy.add_argument("--despeckle-size", type=int, default=400)
+            legacy.add_argument("--refiner", type=float, default=1.0)
+            args = legacy.parse_args()
+            args.mode = "single"
+        else:
+            sys.exit(1)
 
-    # Backwards compatibility: if no subcommand, treat positional args as single mode
     if args.mode is None:
         # Legacy call: ae_processor.py <input> <output> [options]
         if len(sys.argv) >= 3 and not sys.argv[1].startswith('-'):
