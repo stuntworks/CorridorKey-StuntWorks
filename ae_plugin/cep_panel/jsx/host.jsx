@@ -217,12 +217,24 @@ function ae_processWorkArea(settingsJson) {
         var outputFolder = new Folder(TEMP_DIR + "\\ck_seq_" + pid);
         if (!outputFolder.exists) outputFolder.create();
 
+        // Get source file for Python/OpenCV extraction
+        var sourceFile = null;
+        try { sourceFile = layer.source.file.fsName; } catch (e) {}
+        if (!sourceFile) return "Error: Cannot get source file";
+        var srcFps = comp.frameRate;
+
         for (var t = startTime; t < endTime; t += frameDuration) {
             var frameNum = Math.floor((t - startTime) / frameDuration);
             var inputPath = outputFolder.fsName + "\\input_" + padNumber(frameNum, 5) + ".png";
             var outputPath = outputFolder.fsName + "\\output_" + padNumber(frameNum, 5) + ".png";
 
-            saveFrameToFile(comp, t, inputPath);
+            // Extract frame via Python/OpenCV
+            var srcFrame = Math.floor((t - layer.startTime + layer.inPoint) * srcFps + 0.5) - 1;
+            var extractCmd = '"' + PYTHON_EXE + '" -c "' +
+                "import cv2; cap = cv2.VideoCapture(r'" + sourceFile.replace(/\\/g, "\\\\") + "'); " +
+                "cap.set(cv2.CAP_PROP_POS_FRAMES, " + srcFrame + "); ret, frame = cap.read(); cap.release(); " +
+                "cv2.imwrite(r'" + inputPath.replace(/\\/g, "\\\\") + "', frame) if ret else None" + '"';
+            system.callSystem(extractCmd);
 
             var cmd = buildCommand(inputPath, outputPath, settings);
             system.callSystem(cmd);
@@ -254,113 +266,7 @@ function ae_processWorkArea(settingsJson) {
     }
 }
 
-function saveFrameToFile(comp, time, filePath) {
-    var targetFile = new File(filePath);
-    if (targetFile.exists) targetFile.remove();
-
-    // Method 1: saveFrameToPng (may exist in some AE builds)
-    try {
-        comp.saveFrameToPng(time, targetFile);
-        if (targetFile.exists) return true;
-        // Check sequence-numbered variant
-        var seqFile1 = new File(filePath.replace(".png", "_00000.png"));
-        if (seqFile1.exists) { seqFile1.rename(targetFile.name); return true; }
-    } catch (e) { /* not available in this build */ }
-
-    // Method 2: Render queue with FourCC format (bypasses locale/template issues)
-    try {
-        var originalTime = comp.time;
-
-        // Flush stale render queue items
-        var rq = app.project.renderQueue;
-        while (rq.numItems > 0) { rq.item(1).remove(); }
-
-        // Add comp and set single-frame range
-        var rqItem = rq.items.add(comp);
-        rqItem.timeSpanStart = time;
-        rqItem.timeSpanDuration = comp.frameDuration;
-
-        // Configure output module — NO applyTemplate, use FourCC directly
-        var om = rqItem.outputModules[1];
-        try { om["format"] = 1797552720; } catch (e2) { /* FourCC not supported, try template */ }
-        // Set file AFTER format (critical ordering)
-        om.file = new File(filePath);
-
-        // Render
-        rq.render();
-
-        // Hunt for the actual written file — AE appends sequence numbers
-        var found = findWrittenFile(filePath);
-
-        // Clean up
-        try { rqItem.remove(); } catch (e3) {}
-        comp.time = originalTime;
-
-        if (found) return true;
-    } catch (e) { /* render queue failed */ }
-
-    // Method 3: Render queue with template search
-    try {
-        var rq2 = app.project.renderQueue;
-        while (rq2.numItems > 0) { rq2.item(1).remove(); }
-
-        var rqItem2 = rq2.items.add(comp);
-        rqItem2.timeSpanStart = time;
-        rqItem2.timeSpanDuration = comp.frameDuration;
-
-        var om2 = rqItem2.outputModules[1];
-        // Find any PNG-related template
-        var templates = om2.templates;
-        for (var i = 1; i <= templates.length; i++) {
-            if (templates[i].match(/PNG/i)) {
-                om2.applyTemplate(templates[i]);
-                break;
-            }
-        }
-        om2.file = new File(filePath);
-        rq2.render();
-
-        var found2 = findWrittenFile(filePath);
-        try { rqItem2.remove(); } catch (e4) {}
-
-        if (found2) return true;
-    } catch (e) {}
-
-    return false;
-}
-
-function findWrittenFile(filePath) {
-    // Check exact path first
-    if (new File(filePath).exists) return true;
-
-    // AE sequence numbering variants
-    var targetFile = new File(filePath);
-    var dir = targetFile.parent;
-    var baseName = targetFile.displayName.replace(/\.png$/i, "");
-    var candidates = [
-        baseName + "_00000.png",
-        baseName + "00000.png",
-        baseName + "[00000].png",
-        baseName + "_00001.png",
-        baseName + "00001.png"
-    ];
-    for (var i = 0; i < candidates.length; i++) {
-        var f = new File(dir.fsName + "/" + candidates[i]);
-        if (f.exists) {
-            f.rename(targetFile.name);
-            return true;
-        }
-    }
-
-    // Glob: any file starting with baseName in the temp dir
-    var matches = dir.getFiles(baseName + "*");
-    if (matches.length > 0) {
-        matches[0].rename(targetFile.name);
-        return true;
-    }
-
-    return false;
-}
+// saveFrameToFile and findWrittenFile removed — using Python/OpenCV direct extraction instead
 
 // ============================================================
 // PREMIERE PRO
