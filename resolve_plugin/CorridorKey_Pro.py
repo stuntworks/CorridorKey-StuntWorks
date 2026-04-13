@@ -478,6 +478,7 @@ def process_current_frame(preview_only=False):
             ci = {"mediaPoolItem": imp[0], "startFrame": 0, "endFrame": 0, "trackIndex": 2, "recordFrame": cs, "mediaType": 1}
             log(f"Inserting on track 2 at frame {cs}")
             result = media_pool.AppendToTimeline([ci])
+            if result:
                 if items["DisableTrack1"].Checked and clip:
                     clip.SetClipEnabled(False)
                     log(f"Disabled source clip: {os.path.basename(fp)}")
