@@ -3,55 +3,41 @@
  * Handles communication between CEP panel and host app.
  */
 
-// ── JSON polyfill for ExtendScript (no native JSON) ──
+// JSON polyfill for ExtendScript (no native JSON object)
 if (typeof JSON === "undefined") {
     JSON = {
-        parse: function(s) {
-            return eval("(" + s + ")");
-        },
+        parse: function(s) { return eval("(" + s + ")"); },
         stringify: function(obj) {
             if (obj === null) return "null";
             if (typeof obj === "undefined") return undefined;
             if (typeof obj === "number" || typeof obj === "boolean") return String(obj);
-            if (typeof obj === "string") return '"' + obj.replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
+            if (typeof obj === "string") {
+                return '"' + obj.replace(/\\/g, "\\\\").replace(/"/g, '\\"')
+                    .replace(/\n/g, "\\n").replace(/\r/g, "\\r").replace(/\t/g, "\\t") + '"';
+            }
             if (obj instanceof Array) {
-                var items = [];
-                for (var i = 0; i < obj.length; i++) items.push(JSON.stringify(obj[i]));
-                return "[" + items.join(",") + "]";
+                var arr = [];
+                for (var i = 0; i < obj.length; i++) arr.push(JSON.stringify(obj[i]));
+                return "[" + arr.join(",") + "]";
             }
             if (typeof obj === "object") {
                 var pairs = [];
                 for (var k in obj) {
-                    if (obj.hasOwnProperty(k)) pairs.push('"' + k + '":' + JSON.stringify(obj[k]));
+                    if (obj.hasOwnProperty(k)) {
+                        var v = JSON.stringify(obj[k]);
+                        if (v !== undefined) pairs.push('"' + k + '":' + v);
+                    }
                 }
                 return "{" + pairs.join(",") + "}";
             }
-            return String(obj);
+            return undefined;
         }
     };
 }
 
-// Locate CorridorKey root: check config file in known CEP locations
-var CORRIDORKEY_ROOT = null;
-var _cepPaths = [
-    Folder(Folder.userData.fsName + "/Adobe/CEP/extensions/com.corridorkey.panel"),
-    Folder(Folder.appData.fsName + "/Adobe/CEP/extensions/com.corridorkey.panel"),
-    (new File($.fileName)).parent.parent
-];
-for (var _ci = 0; _ci < _cepPaths.length; _ci++) {
-    var _cf = new File(_cepPaths[_ci].fsName + "/corridorkey_path.txt");
-    if (_cf.exists) {
-        _cf.open("r");
-        CORRIDORKEY_ROOT = _cf.read().replace(/[\r\n]/g, "");
-        _cf.close();
-        break;
-    }
-}
-if (!CORRIDORKEY_ROOT) {
-    // Last resort fallback
-    CORRIDORKEY_ROOT = "D:\\New AI Projects\\CorridorKey";
-}
-var PYTHON_EXE = CORRIDORKEY_ROOT + "\\.venv\\Scripts\\pythonw.exe";
+// Auto-detect CorridorKey root: this script is in ae_plugin/cep_panel/jsx/
+var CORRIDORKEY_ROOT = (new File($.fileName)).parent.parent.parent.parent.fsName;
+var PYTHON_EXE = CORRIDORKEY_ROOT + "\\.venv\\Scripts\\python.exe";
 var PROCESSOR_SCRIPT = CORRIDORKEY_ROOT + "\\ae_plugin\\ae_processor.py";
 var TEMP_DIR = Folder.temp.fsName;
 
@@ -61,21 +47,6 @@ if (typeof CompItem !== "undefined") {
     HOST_APP = "ae";
 } else if (typeof ProjectItem !== "undefined" || (app && app.project && app.project.activeSequence !== undefined)) {
     HOST_APP = "ppro";
-}
-
-function getProjectOutputDir() {
-    // Returns a CorridorKey subfolder next to the AE project file
-    try {
-        var projFile = app.project.file;
-        if (projFile) {
-            var projDir = projFile.parent.fsName;
-            var ckDir = new Folder(projDir + "/CorridorKey");
-            if (!ckDir.exists) ckDir.create();
-            return ckDir.fsName;
-        }
-    } catch (e) {}
-    // Fallback to Documents
-    return Folder.myDocuments.fsName + "/CorridorKey";
 }
 
 function getHostApp() {
@@ -100,92 +71,69 @@ function ae_processCurrentFrame(settingsJson, previewOnly) {
             return "Error: No layer selected";
         }
 
+        // Get source video file path directly from layer
+        if (!layer.source || !layer.source.file) {
+            return "Error: Selected layer has no source file";
+        }
+        var sourceFile = layer.source.file.fsName;
+
+        var currentTime = comp.time;
+        var fps = 1.0 / comp.frameDuration;
+
+        // Convert comp time to source media frame number
+        // sourceTime = compTime - layer.startTime + layer.inPoint
+        var sourceTime = currentTime - layer.startTime + layer.inPoint;
+        var sourceFrame = Math.round(sourceTime * fps);
+        if (sourceFrame < 0) sourceFrame = 0;
+
         var pid = Math.floor(Math.random() * 100000);
         var inputPath = TEMP_DIR + "\\ck_ae_in_" + pid + ".png";
         var outputPath = TEMP_DIR + "\\ck_ae_out_" + pid + ".png";
 
-        // Extract frame directly from source file via Python/OpenCV — bypasses render queue entirely
-        var sourceFile = null;
-        try {
-            sourceFile = layer.source.file.fsName;
-        } catch (e) {}
-
-        if (!sourceFile) {
-            return "Error: Cannot get source file from selected layer";
-        }
-
-        // Calculate source frame number — account for layer in-point and start time
-        var fps = comp.frameRate;
-        var layerTimeInComp = comp.time - layer.startTime;
-        var sourceTime = layerTimeInComp + layer.inPoint;
-        var frameNum = Math.floor(sourceTime * fps + 0.5) - 1;
-
-        // Use Python to extract frame
+        // Extract frame from source video via Python/OpenCV (not AE render)
         var extractCmd = '"' + PYTHON_EXE + '" -c "' +
             "import cv2; " +
             "cap = cv2.VideoCapture(r'" + sourceFile.replace(/\\/g, "\\\\") + "'); " +
-            "cap.set(cv2.CAP_PROP_POS_FRAMES, " + frameNum + "); " +
+            "cap.set(cv2.CAP_PROP_POS_FRAMES, " + sourceFrame + "); " +
             "ret, frame = cap.read(); " +
             "cap.release(); " +
             "cv2.imwrite(r'" + inputPath.replace(/\\/g, "\\\\") + "', frame) if ret else None" +
             '"';
+
         system.callSystem(extractCmd);
 
-        var inputCheck = new File(inputPath);
-        if (!inputCheck.exists) {
-            return "Error: Could not extract frame " + frameNum + " from: " + sourceFile;
+        var inputFile = new File(inputPath);
+        if (!inputFile.exists) {
+            return "Error: Could not extract frame from source";
         }
 
         var cmd = buildCommand(inputPath, outputPath, settings);
-
-        // Debug: check Python exists
-        var pyFile = new File(PYTHON_EXE);
-        if (!pyFile.exists) {
-            return "Error: Python not found at: " + PYTHON_EXE;
-        }
-        var procFile = new File(PROCESSOR_SCRIPT);
-        if (!procFile.exists) {
-            return "Error: Processor script not found at: " + PROCESSOR_SCRIPT;
-        }
-
-        var result = system.callSystem(cmd);
+        system.callSystem(cmd);
 
         var outputFile = new File(outputPath);
         if (!outputFile.exists) {
-            return "Error: Processing failed - no output. CMD: " + cmd + " | Result: " + result;
+            if (inputFile.exists) inputFile.remove();
+            return "Error: Processing failed - no output";
         }
 
-        // Import keyed frame to comp above selected layer
-        app.beginUndoGroup("CorridorKey Process");
-        try {
-            var normalizedOutput = outputPath.replace(/\\/g, "/");
-            var importFile = new File(normalizedOutput);
-            var io = new ImportOptions(importFile);
-            io.importAs = ImportAsType.FOOTAGE;
-            io.sequence = false;  // CRITICAL: filename ends in digits, AE thinks it's a sequence
-
-            var importedItem = app.project.importFile(io);
-            if (importedItem) {
-                var playheadTime = comp.time;
-                var newLayer = comp.layers.add(importedItem);
-                newLayer.enabled = true;
+        if (!previewOnly) {
+            app.beginUndoGroup("CorridorKey Frame");
+            var importedFile = app.project.importFile(new ImportOptions(outputFile));
+            if (importedFile) {
+                var newLayer = comp.layers.add(importedFile);
                 newLayer.moveBefore(layer);
-                // Position at playhead — set startTime AFTER moveBefore
-                newLayer.startTime = playheadTime;
-                newLayer.outPoint = playheadTime + comp.frameDuration;
-                comp.time = comp.time;  // Force UI refresh
+                newLayer.startTime = currentTime;
+                newLayer.outPoint = currentTime + comp.frameDuration;
             }
-        } catch (importErr) {
-            return "Error importing: " + importErr.toString();
-        } finally {
             app.endUndoGroup();
+            comp.time = comp.time; // force UI refresh
         }
 
-        // Cleanup input
-        var inputFile = new File(inputPath);
+        // Cleanup
         if (inputFile.exists) inputFile.remove();
+        if (!previewOnly && outputFile.exists) outputFile.remove();
 
-        return "success:" + outputPath;
+        return "success";
 
     } catch (e) {
         return "Error: " + e.toString();
@@ -206,46 +154,68 @@ function ae_processWorkArea(settingsJson) {
             return "Error: No layer selected";
         }
 
+        // Get source video file path directly from layer
+        if (!layer.source || !layer.source.file) {
+            return "Error: Selected layer has no source file";
+        }
+        var sourceFile = layer.source.file.fsName;
+
+        var fps = 1.0 / comp.frameDuration;
         var startTime = comp.workAreaStart;
         var duration = comp.workAreaDuration;
         var endTime = startTime + duration;
-        var frameDuration = comp.frameDuration;
-        var frameCount = Math.floor(duration / frameDuration);
-        var processedCount = 0;
+
+        // Convert comp work area times to source media frame numbers
+        // sourceTime = compTime - layer.startTime + layer.inPoint
+        var sourceStartTime = startTime - layer.startTime + layer.inPoint;
+        var sourceEndTime = endTime - layer.startTime + layer.inPoint;
+        var startFrame = Math.round(sourceStartTime * fps);
+        var endFrame = Math.round(sourceEndTime * fps);
+
+        if (startFrame < 0) startFrame = 0;
+        if (endFrame <= startFrame) {
+            return "Error: Invalid frame range";
+        }
+
+        var frameCount = endFrame - startFrame;
 
         var pid = Math.floor(Math.random() * 100000);
         var outputFolder = new Folder(TEMP_DIR + "\\ck_seq_" + pid);
         if (!outputFolder.exists) outputFolder.create();
 
-        // Get source file for Python/OpenCV extraction
-        var sourceFile = null;
-        try { sourceFile = layer.source.file.fsName; } catch (e) {}
-        if (!sourceFile) return "Error: Cannot get source file";
-        var srcFps = comp.frameRate;
+        // ONE Python call for entire batch — Python reads video directly
+        var cmd = '"' + PYTHON_EXE + '" "' + PROCESSOR_SCRIPT + '" batch ';
+        cmd += '"' + sourceFile + '" ';
+        cmd += '"' + outputFolder.fsName + '" ';
+        cmd += '--start-frame ' + startFrame + ' ';
+        cmd += '--end-frame ' + endFrame + ' ';
+        cmd += '--fps ' + fps + ' ';
+        cmd += '--screen ' + ((settings.screenType === "blue") ? "blue" : "green") + ' ';
+        cmd += '--despill ' + (parseFloat(settings.despill) || 0.5) + ' ';
+        cmd += '--despeckle ' + (settings.despeckle ? '1' : '0') + ' ';
+        cmd += '--despeckle-size ' + (parseInt(settings.despeckleSize, 10) || 400) + ' ';
+        cmd += '--refiner ' + (parseFloat(settings.refiner) || 1.0);
 
-        for (var t = startTime; t < endTime; t += frameDuration) {
-            var frameNum = Math.floor((t - startTime) / frameDuration);
-            var inputPath = outputFolder.fsName + "\\input_" + padNumber(frameNum, 5) + ".png";
-            var outputPath = outputFolder.fsName + "\\output_" + padNumber(frameNum, 5) + ".png";
+        system.callSystem(cmd);
 
-            // Extract frame via Python/OpenCV
-            var srcFrame = Math.floor((t - layer.startTime + layer.inPoint) * srcFps + 0.5) - 1;
-            var extractCmd = '"' + PYTHON_EXE + '" -c "' +
-                "import cv2; cap = cv2.VideoCapture(r'" + sourceFile.replace(/\\/g, "\\\\") + "'); " +
-                "cap.set(cv2.CAP_PROP_POS_FRAMES, " + srcFrame + "); ret, frame = cap.read(); cap.release(); " +
-                "cv2.imwrite(r'" + inputPath.replace(/\\/g, "\\\\") + "', frame) if ret else None" + '"';
-            system.callSystem(extractCmd);
-
-            var cmd = buildCommand(inputPath, outputPath, settings);
-            system.callSystem(cmd);
-
-            var inputFile = new File(inputPath);
-            if (inputFile.exists) inputFile.remove();
-
-            processedCount++;
+        // Read result summary
+        var resultFile = new File(outputFolder.fsName + "\\batch_result.txt");
+        var processedCount = 0;
+        if (resultFile.exists) {
+            resultFile.open("r");
+            var resultText = resultFile.read();
+            resultFile.close();
+            var parts = resultText.split(",");
+            processedCount = parseInt(parts[0], 10);
         }
 
-        // Import sequence
+        if (processedCount === 0) {
+            return "Error: Batch processing failed - no frames produced";
+        }
+
+        // Import output sequence
+        app.beginUndoGroup("CorridorKey Batch");
+
         var firstFrame = new File(outputFolder.fsName + "\\output_00000.png");
         if (firstFrame.exists) {
             var importOptions = new ImportOptions(firstFrame);
@@ -253,20 +223,24 @@ function ae_processWorkArea(settingsJson) {
             var importedSeq = app.project.importFile(importOptions);
 
             if (importedSeq) {
+                importedSeq.mainSource.conformFrameRate = fps;
                 var newLayer = comp.layers.add(importedSeq);
                 newLayer.moveBefore(layer);
                 newLayer.startTime = startTime;
             }
         }
 
-        return "success: " + processedCount + " frames processed";
+        app.endUndoGroup();
+
+        // Force UI refresh
+        comp.time = comp.time;
+
+        return "success: " + processedCount + "/" + frameCount + " frames processed";
 
     } catch (e) {
         return "Error: " + e.toString();
     }
 }
-
-// saveFrameToFile and findWrittenFile removed — using Python/OpenCV direct extraction instead
 
 // ============================================================
 // PREMIERE PRO
@@ -396,7 +370,6 @@ function ppro_processWorkArea(settingsJson) {
             return "Error: No active sequence";
         }
 
-        // Get in/out points for work area
         var inPoint = seq.getInPointAsTime();
         var outPoint = seq.getOutPointAsTime();
 
@@ -405,15 +378,15 @@ function ppro_processWorkArea(settingsJson) {
         }
 
         var fps = seq.getSettings().videoFrameRate;
-        var startFrame = Math.floor(inPoint.seconds * fps);
-        var endFrame = Math.floor(outPoint.seconds * fps);
+        var startFrame = Math.round(inPoint.seconds * fps);
+        var endFrame = Math.round(outPoint.seconds * fps);
         var totalFrames = endFrame - startFrame;
 
         if (totalFrames <= 0) {
             return "Error: Invalid in/out range";
         }
 
-        // Find source clip on track 1
+        // Find source clip at in-point on track 1
         var track = seq.videoTracks[0];
         var clips = track.clips;
         if (clips.numItems < 1) {
@@ -423,38 +396,43 @@ function ppro_processWorkArea(settingsJson) {
         var sourceClip = clips[0];
         var filePath = sourceClip.projectItem.getMediaPath();
 
+        if (!filePath) {
+            return "Error: Cannot get source file path";
+        }
+
         var pid = Math.floor(Math.random() * 100000);
         var outputFolder = new Folder(TEMP_DIR + "\\ck_ppro_seq_" + pid);
         if (!outputFolder.exists) outputFolder.create();
 
+        // ONE Python call for entire batch
+        var screenType = (settings.screenType === "blue") ? "blue" : "green";
+        var cmd = '"' + PYTHON_EXE + '" "' + PROCESSOR_SCRIPT + '" batch ';
+        cmd += '"' + filePath + '" ';
+        cmd += '"' + outputFolder.fsName + '" ';
+        cmd += '--start-frame ' + startFrame + ' ';
+        cmd += '--end-frame ' + endFrame + ' ';
+        cmd += '--fps ' + fps + ' ';
+        cmd += '--screen ' + screenType + ' ';
+        cmd += '--despill ' + (parseFloat(settings.despill) || 0.5) + ' ';
+        cmd += '--despeckle ' + (settings.despeckle ? '1' : '0') + ' ';
+        cmd += '--despeckle-size ' + (parseInt(settings.despeckleSize, 10) || 400) + ' ';
+        cmd += '--refiner ' + (parseFloat(settings.refiner) || 1.0);
+
+        system.callSystem(cmd);
+
+        // Read result summary
+        var resultFile = new File(outputFolder.fsName + "\\batch_result.txt");
         var processedCount = 0;
+        if (resultFile.exists) {
+            resultFile.open("r");
+            var resultText = resultFile.read();
+            resultFile.close();
+            var parts = resultText.split(",");
+            processedCount = parseInt(parts[0], 10);
+        }
 
-        for (var f = startFrame; f < endFrame; f++) {
-            var frameNum = f - startFrame;
-            var inputPath = outputFolder.fsName + "\\input_" + padNumber(frameNum, 5) + ".png";
-            var outputPath = outputFolder.fsName + "\\output_" + padNumber(frameNum, 5) + ".png";
-
-            // Extract frame
-            var extractCmd = '"' + PYTHON_EXE + '" -c "' +
-                "import cv2; " +
-                "cap = cv2.VideoCapture(r'" + filePath.replace(/\\/g, "\\\\") + "'); " +
-                "cap.set(cv2.CAP_PROP_POS_FRAMES, " + f + "); " +
-                "ret, frame = cap.read(); " +
-                "cap.release(); " +
-                "cv2.imwrite(r'" + inputPath.replace(/\\/g, "\\\\") + "', frame) if ret else None" +
-                '"';
-
-            system.callSystem(extractCmd);
-
-            // Process
-            var cmd = buildCommand(inputPath, outputPath, settings);
-            system.callSystem(cmd);
-
-            // Cleanup input
-            var inputFile = new File(inputPath);
-            if (inputFile.exists) inputFile.remove();
-
-            processedCount++;
+        if (processedCount === 0) {
+            return "Error: Batch processing failed - no frames produced";
         }
 
         // Import the output sequence
@@ -463,7 +441,7 @@ function ppro_processWorkArea(settingsJson) {
             app.project.importFiles([firstOut], true, app.project.rootItem, true);
         }
 
-        return "success: " + processedCount + " frames processed";
+        return "success: " + processedCount + "/" + totalFrames + " frames processed";
 
     } catch (e) {
         return "Error: " + e.toString();
