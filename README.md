@@ -81,7 +81,7 @@ If this plugin saves you time, consider buying me a coffee:
 ## Credits
 
 - **CorridorKey AI Engine** - [Niko Pueringer / Corridor Digital](https://github.com/nikopueringer/CorridorKey)
-- **Plugin Integration** - [Berto Labs / StuntWorks](https://github.com/stuntworks)
+- **Plugin Integration** - Roberto Lopez / [StuntWorks Action Cinema](https://www.youtube.com/@stuntworksactioncinema)
 
 ## License
 
