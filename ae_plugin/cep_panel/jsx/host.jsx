@@ -303,7 +303,10 @@ function ppro_getClipInfo() {
 
         for (var i = 0; i < clips.numItems; i++) {
             var clip = clips[i];
-            if (playerPos.ticks >= clip.start.ticks && playerPos.ticks < clip.end.ticks) {
+            var pSec = playerPos.seconds;
+            var cStart = clip.start.seconds;
+            var cEnd = clip.end.seconds;
+            if (pSec >= cStart && pSec < cEnd) {
                 targetClip = clip;
                 break;
             }
