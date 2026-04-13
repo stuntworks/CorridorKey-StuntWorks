@@ -166,7 +166,7 @@ Output saves to a `CorridorKey` folder next to your project.
 
 ## Support
 
-If this saves you time, consider buying me a coffee:
+If this saves you time, consider buying me a coffee: https://ko-fi.com/stuntworks
 
 [![Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/stuntworks)
 
