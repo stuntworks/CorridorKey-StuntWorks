@@ -3,8 +3,54 @@
  * Handles communication between CEP panel and host app.
  */
 
-// Auto-detect CorridorKey root: this script is in ae_plugin/cep_panel/jsx/
-var CORRIDORKEY_ROOT = (new File($.fileName)).parent.parent.parent.parent.fsName;
+// ── JSON polyfill for ExtendScript (no native JSON) ──
+if (typeof JSON === "undefined") {
+    JSON = {
+        parse: function(s) {
+            return eval("(" + s + ")");
+        },
+        stringify: function(obj) {
+            if (obj === null) return "null";
+            if (typeof obj === "undefined") return undefined;
+            if (typeof obj === "number" || typeof obj === "boolean") return String(obj);
+            if (typeof obj === "string") return '"' + obj.replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
+            if (obj instanceof Array) {
+                var items = [];
+                for (var i = 0; i < obj.length; i++) items.push(JSON.stringify(obj[i]));
+                return "[" + items.join(",") + "]";
+            }
+            if (typeof obj === "object") {
+                var pairs = [];
+                for (var k in obj) {
+                    if (obj.hasOwnProperty(k)) pairs.push('"' + k + '":' + JSON.stringify(obj[k]));
+                }
+                return "{" + pairs.join(",") + "}";
+            }
+            return String(obj);
+        }
+    };
+}
+
+// Locate CorridorKey root: check config file in known CEP locations
+var CORRIDORKEY_ROOT = null;
+var _cepPaths = [
+    Folder(Folder.userData.fsName + "/Adobe/CEP/extensions/com.corridorkey.panel"),
+    Folder(Folder.appData.fsName + "/Adobe/CEP/extensions/com.corridorkey.panel"),
+    (new File($.fileName)).parent.parent
+];
+for (var _ci = 0; _ci < _cepPaths.length; _ci++) {
+    var _cf = new File(_cepPaths[_ci].fsName + "/corridorkey_path.txt");
+    if (_cf.exists) {
+        _cf.open("r");
+        CORRIDORKEY_ROOT = _cf.read().replace(/[\r\n]/g, "");
+        _cf.close();
+        break;
+    }
+}
+if (!CORRIDORKEY_ROOT) {
+    // Last resort fallback
+    CORRIDORKEY_ROOT = "D:\\New AI Projects\\CorridorKey";
+}
 var PYTHON_EXE = CORRIDORKEY_ROOT + "\\.venv\\Scripts\\python.exe";
 var PROCESSOR_SCRIPT = CORRIDORKEY_ROOT + "\\ae_plugin\\ae_processor.py";
 var TEMP_DIR = Folder.temp.fsName;
@@ -46,15 +92,31 @@ function ae_processCurrentFrame(settingsJson, previewOnly) {
 
         var savedFrame = saveFrameToFile(comp, currentTime, inputPath);
         if (!savedFrame) {
-            return "Error: Could not export frame";
+            return "Error: Could not export frame. Tried saveFrameToPng and render queue.";
+        }
+
+        var inputCheck = new File(inputPath);
+        if (!inputCheck.exists) {
+            return "Error: Frame export said OK but file missing at: " + inputPath;
         }
 
         var cmd = buildCommand(inputPath, outputPath, settings);
+
+        // Debug: check Python exists
+        var pyFile = new File(PYTHON_EXE);
+        if (!pyFile.exists) {
+            return "Error: Python not found at: " + PYTHON_EXE;
+        }
+        var procFile = new File(PROCESSOR_SCRIPT);
+        if (!procFile.exists) {
+            return "Error: Processor script not found at: " + PROCESSOR_SCRIPT;
+        }
+
         var result = system.callSystem(cmd);
 
         var outputFile = new File(outputPath);
         if (!outputFile.exists) {
-            return "Error: Processing failed - no output";
+            return "Error: Processing failed - no output. CMD: " + cmd + " | Result: " + result;
         }
 
         if (!previewOnly) {
@@ -142,36 +204,111 @@ function ae_processWorkArea(settingsJson) {
 }
 
 function saveFrameToFile(comp, time, filePath) {
-    try {
-        comp.saveFrameToPng(time, new File(filePath));
-        return true;
-    } catch (e) {
-        return renderFrameViaQueue(comp, time, filePath);
-    }
-}
+    var targetFile = new File(filePath);
+    if (targetFile.exists) targetFile.remove();
 
-function renderFrameViaQueue(comp, time, filePath) {
+    // Method 1: saveFrameToPng (may exist in some AE builds)
+    try {
+        comp.saveFrameToPng(time, targetFile);
+        if (targetFile.exists) return true;
+        // Check sequence-numbered variant
+        var seqFile1 = new File(filePath.replace(".png", "_00000.png"));
+        if (seqFile1.exists) { seqFile1.rename(targetFile.name); return true; }
+    } catch (e) { /* not available in this build */ }
+
+    // Method 2: Render queue with FourCC format (bypasses locale/template issues)
     try {
         var originalTime = comp.time;
-        comp.time = time;
 
-        var rqItem = app.project.renderQueue.items.add(comp);
-        var om = rqItem.outputModules[1];
+        // Flush stale render queue items
+        var rq = app.project.renderQueue;
+        while (rq.numItems > 0) { rq.item(1).remove(); }
 
-        om.file = new File(filePath);
-        om.applyTemplate("PNG Sequence");
-
+        // Add comp and set single-frame range
+        var rqItem = rq.items.add(comp);
         rqItem.timeSpanStart = time;
         rqItem.timeSpanDuration = comp.frameDuration;
 
-        app.project.renderQueue.render();
-        rqItem.remove();
+        // Configure output module — NO applyTemplate, use FourCC directly
+        var om = rqItem.outputModules[1];
+        try { om["format"] = 1797552720; } catch (e2) { /* FourCC not supported, try template */ }
+        // Set file AFTER format (critical ordering)
+        om.file = new File(filePath);
+
+        // Render
+        rq.render();
+
+        // Hunt for the actual written file — AE appends sequence numbers
+        var found = findWrittenFile(filePath);
+
+        // Clean up
+        try { rqItem.remove(); } catch (e3) {}
         comp.time = originalTime;
 
-        return true;
-    } catch (e) {
-        return false;
+        if (found) return true;
+    } catch (e) { /* render queue failed */ }
+
+    // Method 3: Render queue with template search
+    try {
+        var rq2 = app.project.renderQueue;
+        while (rq2.numItems > 0) { rq2.item(1).remove(); }
+
+        var rqItem2 = rq2.items.add(comp);
+        rqItem2.timeSpanStart = time;
+        rqItem2.timeSpanDuration = comp.frameDuration;
+
+        var om2 = rqItem2.outputModules[1];
+        // Find any PNG-related template
+        var templates = om2.templates;
+        for (var i = 1; i <= templates.length; i++) {
+            if (templates[i].match(/PNG/i)) {
+                om2.applyTemplate(templates[i]);
+                break;
+            }
+        }
+        om2.file = new File(filePath);
+        rq2.render();
+
+        var found2 = findWrittenFile(filePath);
+        try { rqItem2.remove(); } catch (e4) {}
+
+        if (found2) return true;
+    } catch (e) {}
+
+    return false;
+}
+
+function findWrittenFile(filePath) {
+    // Check exact path first
+    if (new File(filePath).exists) return true;
+
+    // AE sequence numbering variants
+    var targetFile = new File(filePath);
+    var dir = targetFile.parent;
+    var baseName = targetFile.displayName.replace(/\.png$/i, "");
+    var candidates = [
+        baseName + "_00000.png",
+        baseName + "00000.png",
+        baseName + "[00000].png",
+        baseName + "_00001.png",
+        baseName + "00001.png"
+    ];
+    for (var i = 0; i < candidates.length; i++) {
+        var f = new File(dir.fsName + "/" + candidates[i]);
+        if (f.exists) {
+            f.rename(targetFile.name);
+            return true;
+        }
     }
+
+    // Glob: any file starting with baseName in the temp dir
+    var matches = dir.getFiles(baseName + "*");
+    if (matches.length > 0) {
+        matches[0].rename(targetFile.name);
+        return true;
+    }
+
+    return false;
 }
 
 // ============================================================
