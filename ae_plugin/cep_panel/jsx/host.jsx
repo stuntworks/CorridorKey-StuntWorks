@@ -85,19 +85,40 @@ function ae_processCurrentFrame(settingsJson, previewOnly) {
             return "Error: No layer selected";
         }
 
-        var currentTime = comp.time;
         var pid = Math.floor(Math.random() * 100000);
         var inputPath = TEMP_DIR + "\\ck_ae_in_" + pid + ".png";
         var outputPath = TEMP_DIR + "\\ck_ae_out_" + pid + ".png";
 
-        var savedFrame = saveFrameToFile(comp, currentTime, inputPath);
-        if (!savedFrame) {
-            return "Error: Could not export frame. Tried saveFrameToPng and render queue.";
+        // Extract frame directly from source file via Python/OpenCV — bypasses render queue entirely
+        var sourceFile = null;
+        try {
+            sourceFile = layer.source.file.fsName;
+        } catch (e) {}
+
+        if (!sourceFile) {
+            return "Error: Cannot get source file from selected layer";
         }
+
+        // Calculate source frame number — account for layer in-point and start time
+        var fps = comp.frameRate;
+        var layerTimeInComp = comp.time - layer.startTime;
+        var sourceTime = layerTimeInComp + layer.inPoint;
+        var frameNum = Math.floor(sourceTime * fps);
+
+        // Use Python to extract frame
+        var extractCmd = '"' + PYTHON_EXE + '" -c "' +
+            "import cv2; " +
+            "cap = cv2.VideoCapture(r'" + sourceFile.replace(/\\/g, "\\\\") + "'); " +
+            "cap.set(cv2.CAP_PROP_POS_FRAMES, " + frameNum + "); " +
+            "ret, frame = cap.read(); " +
+            "cap.release(); " +
+            "cv2.imwrite(r'" + inputPath.replace(/\\/g, "\\\\") + "', frame) if ret else None" +
+            '"';
+        system.callSystem(extractCmd);
 
         var inputCheck = new File(inputPath);
         if (!inputCheck.exists) {
-            return "Error: Frame export said OK but file missing at: " + inputPath;
+            return "Error: Could not extract frame " + frameNum + " from: " + sourceFile;
         }
 
         var cmd = buildCommand(inputPath, outputPath, settings);
@@ -119,20 +140,18 @@ function ae_processCurrentFrame(settingsJson, previewOnly) {
             return "Error: Processing failed - no output. CMD: " + cmd + " | Result: " + result;
         }
 
-        if (!previewOnly) {
-            var importedFile = app.project.importFile(new ImportOptions(outputFile));
-            if (importedFile) {
-                var newLayer = comp.layers.add(importedFile);
-                newLayer.moveBefore(layer);
-                newLayer.startTime = currentTime;
-                newLayer.outPoint = currentTime + comp.frameDuration;
-            }
+        // Import keyed frame to comp above selected layer (both preview and process)
+        var importedFile = app.project.importFile(new ImportOptions(outputFile));
+        if (importedFile) {
+            var newLayer = comp.layers.add(importedFile);
+            newLayer.moveBefore(layer);
+            newLayer.startTime = comp.time;
+            newLayer.outPoint = comp.time + comp.frameDuration;
         }
 
-        // Cleanup
+        // Cleanup input
         var inputFile = new File(inputPath);
         if (inputFile.exists) inputFile.remove();
-        if (!previewOnly && outputFile.exists) outputFile.remove();
 
         return "success";
 
