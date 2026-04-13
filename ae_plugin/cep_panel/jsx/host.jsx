@@ -204,7 +204,7 @@ function ae_processCurrentFrame(settingsJson, previewOnly) {
         var fps = comp.frameRate;
         var layerTimeInComp = comp.time - layer.startTime;
         var sourceTime = layerTimeInComp + layer.inPoint;
-        var frameNum = Math.max(0, Math.floor(sourceTime * fps + 0.5) - 1);
+        var frameNum = Math.floor(sourceTime * fps + 0.5);
 
         var safeSource = sanitizePath(sourceFile);
         var safeInput = sanitizePath(inputPath);
@@ -293,8 +293,8 @@ function ae_processWorkArea(settingsJson) {
         // Convert comp work area to source media frame numbers
         var sourceStartTime = startTime - layer.startTime + layer.inPoint;
         var sourceEndTime = endTime - layer.startTime + layer.inPoint;
-        var startFrame = Math.max(0, Math.floor(sourceStartTime * fps + 0.5) - 1);
-        var endFrame = Math.max(0, Math.floor(sourceEndTime * fps + 0.5) - 1);
+        var startFrame = Math.floor(sourceStartTime * fps + 0.5);
+        var endFrame = Math.floor(sourceEndTime * fps + 0.5);
         if (endFrame <= startFrame) return "Error: Invalid frame range";
 
         var frameCount = endFrame - startFrame;
@@ -418,8 +418,7 @@ function ppro_getClipInfo() {
         var offsetInClip = playheadSec - clipStartSec;
         // Source media time = clip inPoint + offset
         var sourceTimeSec = clipInPointSec + offsetInClip;
-        var sourceFrame = Math.floor(sourceTimeSec * fps) - 1;
-        if (sourceFrame < 0) sourceFrame = 0;
+        var sourceFrame = Math.floor(sourceTimeSec * fps);
 
         var clipDurationSec = targetClip.end.seconds - targetClip.start.seconds;
         var totalFrames = Math.floor(clipDurationSec * fps);
