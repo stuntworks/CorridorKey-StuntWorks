@@ -3,86 +3,119 @@
 One-click AI green screen keying inside DaVinci Resolve, After Effects, and Premiere Pro.
 
 **Powered by [CorridorKey](https://github.com/nikopueringer/CorridorKey) by Niko Pueringer / Corridor Digital.**
-**Plugin by [Berto Labs / StuntWorks](https://github.com/stuntworks)**
+**Plugin by Roberto Lopez / [StuntWorks](https://www.youtube.com/@stuntworkscinema)**
 
-Multi-editor plugin that wraps the CorridorKey neural keyer into native panels for DaVinci Resolve, After Effects, and Premiere Pro. One installer, all your editors.
+---
 
 ## What It Does
 
-- AI-powered green/blue screen keying with one click
-- Preview before committing to timeline
+- AI-powered green/blue screen removal with one click
+- Works inside Resolve, After Effects, and Premiere Pro
+- Preview keyed result before committing
 - Batch process entire clips or work areas
-- Auto-import results to MediaPool / project
-- Adjustable despill, edge refinement, and despeckle controls
+- Adjustable despill, edge refinement, and despeckle
+- Keyed files save to your project folder automatically
 
 ## Requirements
 
-- [CorridorKey](https://github.com/nikopueringer/CorridorKey) installed with Python venv (use the latest version for float16 and GPU-batched processing — runs on 8GB+ VRAM now)
-- NVIDIA GPU with CUDA support (8GB+ VRAM recommended)
+- [CorridorKey](https://github.com/nikopueringer/CorridorKey) installed with Python venv
+- NVIDIA GPU with CUDA (8GB+ VRAM recommended)
 - One or more of:
-  - DaVinci Resolve Studio 18+ (free version lacks scripting API)
-  - Adobe After Effects 2020+
-  - Adobe Premiere Pro 2020+
+  - DaVinci Resolve Studio 18+
+  - After Effects 2020+
+  - Premiere Pro 2020+
 
-## Installation
+---
 
-The unified installer detects your apps and installs to all of them:
+## Install
 
 ```
 git clone https://github.com/stuntworks/CorridorKey-StuntWorks.git
 cd CorridorKey-StuntWorks
-python install.py          # Interactive — detects and asks
-python install.py --all    # Install to all detected apps
-python install.py --resolve  # Resolve only
-python install.py --adobe    # AE + Premiere only
-python install.py --uninstall
+python install.py
 ```
 
-The installer will:
-- Copy plugin files to the correct locations
-- Enable unsigned CEP extensions for Adobe apps (registry/defaults)
-- Point the plugin to your CorridorKey engine
+Options:
+- `python install.py --all` — install to all detected apps
+- `python install.py --resolve` — Resolve only
+- `python install.py --adobe` — AE + Premiere only
+- `python install.py --uninstall` — remove from all apps
 
-Set `CORRIDORKEY_ROOT` environment variable if your CorridorKey install isn't in a sibling directory.
+Set `CORRIDORKEY_ROOT` if your CorridorKey install isn't in a sibling directory.
+
+---
 
 ## DaVinci Resolve
 
-1. Enable scripting: Preferences > System > General > External scripting using: **Local**
+**Open:** Workspace > Scripts > CorridorKey
+
+### Setup
+1. Preferences > System > General > External scripting: **Local**
 2. Restart Resolve
-3. Access via: **Workspace > Scripts > CorridorKey**
 
-### Usage
-1. Place green screen footage on Track 1
+### How to Use
+1. Put green screen footage on Track 1
 2. Open CorridorKey panel
-3. Adjust settings (screen type, despill, refiner)
-4. Click **SHOW PREVIEW** to check quality
-5. Click **PROCESS FRAME** or **PROCESS ALL** for the full clip
-6. Keyed result appears on Track 2 with transparency
+3. Pick screen type (green/blue), adjust despill and refiner
+4. **SHOW PREVIEW** — see the key before committing
+5. **PROCESS FRAME** — key one frame, adds to Track 2
+6. **PROCESS ALL** — key entire clip, adds sequence to Track 2
+7. Output saves to a **CorridorKey** folder next to your project
 
-## After Effects / Premiere Pro (Experimental)
+---
 
-1. Restart AE or Premiere after running the installer
-2. Access via: **Window > Extensions > CorridorKey**
+## After Effects
 
-### Usage
-1. Select a layer (AE) or have footage on Track 1 (Premiere)
-2. Choose screen type, adjust despill and refiner
-3. Click **PREVIEW FRAME**, **PROCESS FRAME**, or **PROCESS WORK AREA**
-4. Keyed result imports to your project automatically
+**Open:** Window > Extensions > CorridorKey
 
-> **Note:** AE/Premiere support is experimental. The panel and processor are built but still being tested. Issues and PRs welcome.
+### How to Use
+1. Select the green screen layer in your comp
+2. Pick screen type, adjust despill and refiner
+3. **PREVIEW FRAME** — see the keyed result in the panel (no changes to comp)
+4. **PROCESS FRAME** — key current frame, imports above selected layer
+5. **PROCESS WORK AREA** — key all frames in the work area (B/N keys to set range)
+6. Output saves to a **CorridorKey** folder next to your project
+
+### Notes
+- Batch processing runs in one shot — AE will freeze until done, then come back
+- Results import as a layer above your selected green screen layer
+
+---
+
+## Premiere Pro
+
+**Open:** Window > Extensions > CorridorKey
+
+### How to Use
+1. Put green screen footage on V1
+2. Move playhead to the frame you want
+3. Pick screen type, adjust despill and refiner
+4. **PREVIEW FRAME** — see the keyed result in the panel
+5. **PROCESS FRAME** — key current frame, places on V2 at playhead
+6. **PROCESS IN/OUT RANGE** — set I and O points, then batch key (not yet tested)
+7. Output saves to a **CorridorKey** folder next to your project
+
+### Options
+- **Add keyed clip to timeline** — uncheck this if you have a complex timeline and want to drag clips from the bin manually
+- **Output Folder** — defaults to project folder, click Browse to change
+
+### Notes
+- Keyed files also appear in a "CorridorKey" bin in your project panel
+- You need at least 2 video tracks (V1 + V2) for auto-placement
+
+---
 
 ## Support
 
-If this plugin saves you time, consider buying me a coffee:
+If this saves you time:
 
 [![Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/stuntworks)
 
 ## Credits
 
-- **CorridorKey AI Engine** - [Niko Pueringer / Corridor Digital](https://github.com/nikopueringer/CorridorKey)
-- **Plugin Integration** - Roberto Lopez / [StuntWorks Action Cinema](https://www.youtube.com/@stuntworksactioncinema)
+- **CorridorKey AI Engine** — [Niko Pueringer / Corridor Digital](https://github.com/nikopueringer/CorridorKey)
+- **Plugin** — Roberto Lopez / [StuntWorks](https://www.youtube.com/@stuntworkscinema)
 
 ## License
 
-This plugin is free and open source. The CorridorKey engine is subject to its own license terms.
+This plugin is free and open source under the same terms as CorridorKey (CC-BY-NC-SA-4.0).
