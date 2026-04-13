@@ -129,6 +129,9 @@ class CorridorKeyProcessor:
         if not input_frames:
             raise RuntimeError(f"No input frames found in {input_dir}")
 
+        if not alpha_frames:
+            raise RuntimeError(f"No alpha hint frames found in {alpha_dir}")
+
         if len(alpha_frames) < len(input_frames):
             # Duplicate last alpha if needed
             while len(alpha_frames) < len(input_frames):

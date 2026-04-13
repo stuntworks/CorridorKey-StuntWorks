@@ -146,6 +146,7 @@ def uninstall():
     scripts_path = get_resolve_scripts_path()
     dest_dir = scripts_path / "Utility" / "CorridorKey"
     launcher_path = scripts_path / "Utility" / "CorridorKey.py"
+    config_path = scripts_path / "Utility" / "corridorkey_path.txt"
 
     print("Uninstalling CorridorKey...")
 
@@ -156,6 +157,10 @@ def uninstall():
     if launcher_path.exists():
         launcher_path.unlink()
         print(f"  Removed: {launcher_path}")
+
+    if config_path.exists():
+        config_path.unlink()
+        print(f"  Removed: {config_path}")
 
     print("Uninstall complete!")
     return True

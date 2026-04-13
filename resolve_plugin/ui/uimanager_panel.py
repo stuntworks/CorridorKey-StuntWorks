@@ -3,6 +3,7 @@ CorridorKey Fusion UIManager Panel
 Native DaVinci Resolve Studio UI panel.
 """
 import threading
+import queue
 from typing import Callable, Optional, Any
 
 
@@ -36,6 +37,24 @@ def create_corridorkey_panel(fusion, on_process_callback: Callable):
         "processing": False,
         "cancelled": False,
     }
+
+    # Thread-safe UI update queue -- background threads enqueue, main thread drains
+    _ui_queue = queue.Queue()
+
+    def _enqueue_ui(fn):
+        """Schedule a UI update to run on the main thread."""
+        _ui_queue.put(fn)
+
+    def _drain_ui_queue():
+        """Process all pending UI updates. Call from main thread only."""
+        while not _ui_queue.empty():
+            try:
+                fn = _ui_queue.get_nowait()
+                fn()
+            except queue.Empty:
+                break
+            except Exception as e:
+                print(f"UI update error: {e}")
 
     # Create window
     win = disp.AddWindow({
@@ -236,38 +255,53 @@ def create_corridorkey_panel(fusion, on_process_callback: Callable):
 
     # Helper functions
     def log(message: str):
-        """Add message to log output."""
+        """Add message to log output (thread-safe)."""
         print(f"LOG: {message}")  # Also print to console
-        try:
-            current = items["LogOutput"].PlainText or ""
-            items["LogOutput"].PlainText = current + message + "\n"
-        except Exception as e:
-            print(f"Log error: {e}")
+        def _do():
+            try:
+                current = items["LogOutput"].PlainText or ""
+                items["LogOutput"].PlainText = current + message + "\n"
+            except Exception as e:
+                print(f"Log error: {e}")
+        if threading.current_thread() is threading.main_thread():
+            _do()
+        else:
+            _enqueue_ui(_do)
 
     def update_progress(current: int, total: int, message: str):
-        """Update progress display and status."""
-        if total > 0:
-            percent = int((current / total) * 100)
-            items["ProgressLabel"].Text = f"{percent}%"
+        """Update progress display and status (thread-safe)."""
+        def _do():
+            if total > 0:
+                percent = int((current / total) * 100)
+                items["ProgressLabel"].Text = f"{percent}%"
+            else:
+                items["ProgressLabel"].Text = ""
+            items["StatusLabel"].Text = message
+        if threading.current_thread() is threading.main_thread():
+            _do()
         else:
-            items["ProgressLabel"].Text = ""
-        items["StatusLabel"].Text = message
+            _enqueue_ui(_do)
 
     def set_processing(processing: bool):
-        """Enable/disable UI during processing."""
+        """Enable/disable UI during processing (thread-safe)."""
         state["processing"] = processing
-        items["PreviewBtn"].Enabled = not processing
-        items["ProcessBtn"].Enabled = not processing
-        items["ProcessAllBtn"].Enabled = not processing
-        items["CancelBtn"].Enabled = processing
-        items["ScreenType"].Enabled = not processing
-        items["DespillSlider"].Enabled = not processing
-        items["RefinerSlider"].Enabled = not processing
-        items["DespeckleCheck"].Enabled = not processing
-        items["DespeckleSize"].Enabled = not processing
-        items["InputGamma"].Enabled = not processing
-        items["OutputMode"].Enabled = not processing
-        items["GenerateProxy"].Enabled = not processing
+        def _do():
+            items["PreviewBtn"].Enabled = not processing
+            items["ProcessBtn"].Enabled = not processing
+            items["ProcessAllBtn"].Enabled = not processing
+            items["CancelBtn"].Enabled = processing
+            items["ScreenType"].Enabled = not processing
+            items["DespillSlider"].Enabled = not processing
+            items["RefinerSlider"].Enabled = not processing
+            items["DespeckleCheck"].Enabled = not processing
+            items["DespeckleSize"].Enabled = not processing
+            items["InputGamma"].Enabled = not processing
+            items["OutputMode"].Enabled = not processing
+            items["GenerateProxy"].Enabled = not processing
+        if threading.current_thread() is threading.main_thread():
+            _do()
+        else:
+            _enqueue_ui(_do)
 
     def get_settings() -> dict:
         """Get current settings from UI."""
@@ -284,15 +318,18 @@ def create_corridorkey_panel(fusion, on_process_callback: Callable):
 
     # Event handlers
     def on_despill_changed(ev):
+        _drain_ui_queue()
         value = items["DespillSlider"].Value / 100.0
         items["DespillValue"].Text = f"{value:.2f}"
 
     def on_refiner_changed(ev):
+        _drain_ui_queue()
         value = items["RefinerSlider"].Value / 100.0
         items["RefinerValue"].Text = f"{value:.2f}"
 
     def on_preview_clicked(ev):
         """Preview single frame at playhead."""
+        _drain_ui_queue()
         # Immediate visual feedback
         items["StatusLabel"].Text = "CLICKED! Starting preview..."
         items["LogOutput"].PlainText = "Preview button clicked!\nPlease wait...\n"
@@ -331,6 +368,7 @@ def create_corridorkey_panel(fusion, on_process_callback: Callable):
         thread.start()
 
     def on_process_clicked(ev):
+        _drain_ui_queue()
         if state["processing"]:
             return
 
@@ -360,6 +398,7 @@ def create_corridorkey_panel(fusion, on_process_callback: Callable):
         thread.start()
 
     def on_process_all_clicked(ev):
+        _drain_ui_queue()
         if state["processing"]:
             return
 

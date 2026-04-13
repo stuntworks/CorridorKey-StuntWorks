@@ -88,8 +88,10 @@ def run(ctx):
     source_uint8 = (np.clip(source, 0, 1) * 255).astype(np.uint8)
 
     # Temp files — unique names to avoid collisions with parallel instances
+    # PID is always the same inside AE, so use random ID instead
+    import uuid
     temp_dir = tempfile.gettempdir()
-    unique_id = os.getpid()
+    unique_id = uuid.uuid4().hex[:12]
     input_path = os.path.join(temp_dir, f"ck_ae_input_{unique_id}.png")
     output_path = os.path.join(temp_dir, f"ck_ae_output_{unique_id}.png")
 
@@ -132,11 +134,16 @@ def run(ctx):
             # Copy to output
             np.copyto(output, result_array)
         else:
-            # On error, pass through original
+            # Pass through on error but log it
+            import sys
+            stderr_msg = result.stderr.decode("utf-8", errors="replace") if result.stderr else "unknown error"
+            print(f"[CorridorKey] ERROR: Processor failed (rc={result.returncode}): {stderr_msg}", file=sys.stderr)
             np.copyto(output, source)
 
     except Exception as e:
-        # On error, pass through original
+        # Pass through on error but log it
+        import sys
+        print(f"[CorridorKey] ERROR: {e}", file=sys.stderr)
         np.copyto(output, source)
 
     finally:

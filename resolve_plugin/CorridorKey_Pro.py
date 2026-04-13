@@ -4,12 +4,31 @@ Enhanced with SAM2 Click-to-Mask, Frame Range, Export Modes
 import sys, os, site, tempfile
 from pathlib import Path
 
-venv_packages = r"D:\New AI Projects\CorridorKey\.venv\Lib\site-packages"
-site.addsitedir(venv_packages)
-sys.path.insert(0, venv_packages)
-sys.path.insert(0, r"C:\ProgramData\Blackmagic Design\DaVinci Resolve\Support\Developer\Scripting\Modules")
-sys.path.insert(0, r"D:\New AI Projects\CorridorKey")
-sys.path.insert(0, r"D:\New AI Projects\CorridorKey\resolve_plugin")
+# Auto-detect paths from this script's location (resolve_plugin/CorridorKey_Pro.py)
+_PLUGIN_DIR = Path(__file__).parent.resolve()
+_CORRIDORKEY_ROOT = _PLUGIN_DIR.parent
+
+# Also check corridorkey_path.txt (written by installer) as override
+_config_candidates = [
+    _PLUGIN_DIR / "corridorkey_path.txt",
+    Path(os.environ.get("PROGRAMDATA", "C:/ProgramData")) / "Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility/CorridorKey/corridorkey_path.txt",
+]
+for _cfg in _config_candidates:
+    if _cfg.exists():
+        _override = _cfg.read_text().strip()
+        if Path(_override).exists():
+            _CORRIDORKEY_ROOT = Path(_override)
+            break
+
+_venv_packages = _CORRIDORKEY_ROOT / ".venv" / "Lib" / "site-packages"
+if _venv_packages.exists():
+    site.addsitedir(str(_venv_packages))
+    sys.path.insert(0, str(_venv_packages))
+
+_resolve_modules = Path(os.environ.get("PROGRAMDATA", "C:/ProgramData")) / "Blackmagic Design/DaVinci Resolve/Support/Developer/Scripting/Modules"
+sys.path.insert(0, str(_resolve_modules))
+sys.path.insert(0, str(_CORRIDORKEY_ROOT))
+sys.path.insert(0, str(_PLUGIN_DIR))
 
 import fusionscript
 
@@ -202,7 +221,7 @@ def generate_sam2_mask(frame, pos_pts, neg_pts):
         from sam2.sam2_image_predictor import SAM2ImagePredictor
         log("Loading SAM2...")
         status("Loading SAM2...")
-        ckpt = r"D:\New AI Projects\CorridorKey\sam2_weights\sam2.1_hiera_small.pt"
+        ckpt = str(_CORRIDORKEY_ROOT / "sam2_weights" / "sam2.1_hiera_small.pt")
         cfg = "configs/sam2.1/sam2.1_hiera_s.yaml"
         device = "cuda" if torch.cuda.is_available() else "cpu"
         model = build_sam2(cfg, ckpt, device=device)
@@ -358,8 +377,8 @@ def show_preview_window(orig_bgr, keyed_rgb, alpha):
         cv2.imwrite(paths["background"], bg_frame)
         log("Background plate saved for composite")
     # Launch preview as separate process — no event loop conflicts
-    viewer_script = str(Path(r"D:\New AI Projects\CorridorKey\resolve_plugin") / "preview_viewer.py")
-    python_exe = str(Path(r"D:\New AI Projects\CorridorKey") / ".venv" / "Scripts" / "python.exe")
+    viewer_script = str(_PLUGIN_DIR / "preview_viewer.py")
+    python_exe = str(_CORRIDORKEY_ROOT / ".venv" / "Scripts" / "python.exe")
     subprocess.Popen(
         [python_exe, viewer_script, json.dumps(paths)],
         creationflags=subprocess.CREATE_NO_WINDOW
@@ -519,7 +538,7 @@ def process_current_frame(preview_only=False):
         status("ERROR!")
         log(f"ERROR: {e}")
         import traceback; log(traceback.format_exc())
-        with open(r"D:\ck_error.txt", "w") as ef: ef.write(traceback.format_exc())
+        with open(str(Path(tempfile.gettempdir()) / "ck_error.txt"), "w") as ef: ef.write(traceback.format_exc())
 
 def on_show_preview(ev): process_current_frame(preview_only=True)
 def on_process_frame(ev): process_current_frame(preview_only=False)

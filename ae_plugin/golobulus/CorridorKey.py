@@ -83,8 +83,10 @@ def run(ctx):
     despeckle_size = ctx.get_param("despeckle_size")
 
     # Temp files — unique names to avoid collisions with parallel instances
+    # PID is always the same inside AE, so use random ID instead
+    import uuid
     temp_dir = tempfile.gettempdir()
-    unique_id = os.getpid()
+    unique_id = uuid.uuid4().hex[:12]
     input_path = os.path.join(temp_dir, f"ck_golobulus_in_{unique_id}.png")
     output_path = os.path.join(temp_dir, f"ck_golobulus_out_{unique_id}.png")
 
@@ -120,13 +122,20 @@ def run(ctx):
                 # Copy to output
                 np.copyto(output, keyed[:h, :w])
             else:
+                import sys
+                print("[CorridorKey] WARNING: Failed to load keyed output, passing through original", file=sys.stderr)
                 np.copyto(output, source)
         else:
-            # Pass through on error
+            # Pass through on error but log it
+            import sys
+            stderr_msg = result.stderr.decode("utf-8", errors="replace") if result.stderr else "unknown error"
+            print(f"[CorridorKey] ERROR: Processor failed (rc={result.returncode}): {stderr_msg}", file=sys.stderr)
             np.copyto(output, source)
 
     except Exception as e:
-        # Pass through on error
+        # Pass through on error but log it
+        import sys
+        print(f"[CorridorKey] ERROR: {e}", file=sys.stderr)
         np.copyto(output, source)
 
     finally:

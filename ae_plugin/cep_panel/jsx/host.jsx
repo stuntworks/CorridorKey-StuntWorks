@@ -7,7 +7,71 @@
 if (typeof JSON === "undefined") {
     JSON = {
         parse: function(s) {
-            return eval("(" + s + ")");
+            // Safe recursive-descent parser (no eval)
+            var _at = 0;
+            var _ch = " ";
+            function _error(m) { throw new Error("JSON parse error: " + m + " at position " + _at); }
+            function _next(c) {
+                if (c && c !== _ch) _error("Expected '" + c + "' got '" + _ch + "'");
+                _ch = s.charAt(_at); _at += 1; return _ch;
+            }
+            function _white() { while (_ch && _ch <= " ") _next(); }
+            function _string() {
+                var r = "";
+                if (_ch !== '"') _error("Expected string");
+                while (_next()) {
+                    if (_ch === '"') { _next(); return r; }
+                    if (_ch === "\\") {
+                        _next();
+                        if (_ch === "n") r += "\n";
+                        else if (_ch === "r") r += "\r";
+                        else if (_ch === "t") r += "\t";
+                        else if (_ch === "u") {
+                            var hex = ""; for (var i = 0; i < 4; i++) { hex += _next(); }
+                            r += String.fromCharCode(parseInt(hex, 16));
+                        } else r += _ch;
+                    } else r += _ch;
+                }
+                _error("Unterminated string");
+            }
+            function _number() {
+                var n = "";
+                if (_ch === "-") { n += _ch; _next(); }
+                while (_ch >= "0" && _ch <= "9") { n += _ch; _next(); }
+                if (_ch === ".") { n += _ch; _next(); while (_ch >= "0" && _ch <= "9") { n += _ch; _next(); } }
+                if (_ch === "e" || _ch === "E") { n += _ch; _next(); if (_ch === "+" || _ch === "-") { n += _ch; _next(); } while (_ch >= "0" && _ch <= "9") { n += _ch; _next(); } }
+                var v = +n; if (isNaN(v)) _error("Bad number"); return v;
+            }
+            function _word() {
+                if (_ch === "t") { _next("t"); _next("r"); _next("u"); _next("e"); return true; }
+                if (_ch === "f") { _next("f"); _next("a"); _next("l"); _next("s"); _next("e"); return false; }
+                if (_ch === "n") { _next("n"); _next("u"); _next("l"); _next("l"); return null; }
+                _error("Unexpected '" + _ch + "'");
+            }
+            function _array() {
+                var a = []; _next("["); _white();
+                if (_ch === "]") { _next(); return a; }
+                while (_ch) { a.push(_value()); _white(); if (_ch === "]") { _next(); return a; } _next(","); _white(); }
+                _error("Unterminated array");
+            }
+            function _object() {
+                var o = {}; _next("{"); _white();
+                if (_ch === "}") { _next(); return o; }
+                while (_ch) { var k = _string(); _white(); _next(":"); o[k] = _value(); _white(); if (_ch === "}") { _next(); return o; } _next(","); _white(); }
+                _error("Unterminated object");
+            }
+            function _value() {
+                _white();
+                if (_ch === "{") return _object();
+                if (_ch === "[") return _array();
+                if (_ch === '"') return _string();
+                if (_ch === "-" || (_ch >= "0" && _ch <= "9")) return _number();
+                return _word();
+            }
+            var result = _value();
+            _white();
+            if (_ch) _error("Unexpected trailing content");
+            return result;
         },
         stringify: function(obj) {
             if (obj === null) return "null";
@@ -31,6 +95,17 @@ if (typeof JSON === "undefined") {
     };
 }
 
+// ── Path sanitizer: reject dangerous characters before shell use ──
+function sanitizePath(p) {
+    // Block shell metacharacters that could break out of quoted strings
+    if (/[;&|`$!<>{}()\r\n]/.test(p)) {
+        throw new Error("Unsafe characters in file path: " + p);
+    }
+    // Escape single quotes for Python r-string and double quotes for cmd
+    p = p.replace(/'/g, "\\'").replace(/"/g, '\\"');
+    return p;
+}
+
 // Locate CorridorKey root: check config file in known CEP locations
 var CORRIDORKEY_ROOT = null;
 var _cepPaths = [
@@ -48,7 +123,9 @@ for (var _ci = 0; _ci < _cepPaths.length; _ci++) {
     }
 }
 if (!CORRIDORKEY_ROOT) {
-    CORRIDORKEY_ROOT = "D:\\New AI Projects\\CorridorKey";
+    // Last resort: assume plugin is inside CorridorKey repo (cep_panel/jsx/ -> repo root)
+    var _scriptDir = (new File($.fileName)).parent;
+    CORRIDORKEY_ROOT = _scriptDir.parent.parent.parent.fsName;
 }
 var PYTHON_EXE = CORRIDORKEY_ROOT + "\\.venv\\Scripts\\pythonw.exe";
 var PROCESSOR_SCRIPT = CORRIDORKEY_ROOT + "\\ae_plugin\\ae_processor.py";
@@ -127,15 +204,17 @@ function ae_processCurrentFrame(settingsJson, previewOnly) {
         var fps = comp.frameRate;
         var layerTimeInComp = comp.time - layer.startTime;
         var sourceTime = layerTimeInComp + layer.inPoint;
-        var frameNum = Math.floor(sourceTime * fps + 0.5) - 1;
+        var frameNum = Math.max(0, Math.floor(sourceTime * fps + 0.5) - 1);
 
+        var safeSource = sanitizePath(sourceFile);
+        var safeInput = sanitizePath(inputPath);
         var extractCmd = '"' + PYTHON_EXE + '" -c "' +
             "import cv2; " +
-            "cap = cv2.VideoCapture(r'" + sourceFile.replace(/\\/g, "\\\\") + "'); " +
+            "cap = cv2.VideoCapture(r'" + safeSource.replace(/\\/g, "\\\\") + "'); " +
             "cap.set(cv2.CAP_PROP_POS_FRAMES, " + frameNum + "); " +
             "ret, frame = cap.read(); " +
             "cap.release(); " +
-            "cv2.imwrite(r'" + inputPath.replace(/\\/g, "\\\\") + "', frame) if ret else None" +
+            "cv2.imwrite(r'" + safeInput.replace(/\\/g, "\\\\") + "', frame) if ret else None" +
             '"';
         system.callSystem(extractCmd);
 
@@ -214,9 +293,8 @@ function ae_processWorkArea(settingsJson) {
         // Convert comp work area to source media frame numbers
         var sourceStartTime = startTime - layer.startTime + layer.inPoint;
         var sourceEndTime = endTime - layer.startTime + layer.inPoint;
-        var startFrame = Math.floor(sourceStartTime * fps + 0.5) - 1;
-        var endFrame = Math.floor(sourceEndTime * fps + 0.5) - 1;
-        if (startFrame < 0) startFrame = 0;
+        var startFrame = Math.max(0, Math.floor(sourceStartTime * fps + 0.5) - 1);
+        var endFrame = Math.max(0, Math.floor(sourceEndTime * fps + 0.5) - 1);
         if (endFrame <= startFrame) return "Error: Invalid frame range";
 
         var frameCount = endFrame - startFrame;
@@ -226,9 +304,11 @@ function ae_processWorkArea(settingsJson) {
         if (!outputFolder.exists) outputFolder.create();
 
         // ONE Python call for entire batch — Python reads video directly
+        var safeBatchSource = sanitizePath(sourceFile);
+        var safeBatchOutput = sanitizePath(outputFolder.fsName);
         var cmd = '"' + PYTHON_EXE + '" "' + PROCESSOR_SCRIPT + '" batch ';
-        cmd += '"' + sourceFile + '" ';
-        cmd += '"' + outputFolder.fsName + '" ';
+        cmd += '"' + safeBatchSource + '" ';
+        cmd += '"' + safeBatchOutput + '" ';
         cmd += '--start-frame ' + startFrame + ' ';
         cmd += '--end-frame ' + endFrame + ' ';
         cmd += '--fps ' + fps + ' ';
@@ -504,8 +584,10 @@ function buildCommand(inputPath, outputPath, settings) {
     var despeckleSize = parseInt(settings.despeckleSize, 10);
     if (isNaN(despeckleSize) || despeckleSize < 50 || despeckleSize > 2000) despeckleSize = 400;
 
+    var safeIn = sanitizePath(inputPath);
+    var safeOut = sanitizePath(outputPath);
     var cmd = '"' + PYTHON_EXE + '" "' + PROCESSOR_SCRIPT + '" ';
-    cmd += '"' + inputPath + '" "' + outputPath + '" ';
+    cmd += '"' + safeIn + '" "' + safeOut + '" ';
     cmd += '--screen ' + screenType + ' ';
     cmd += '--despill ' + despill + ' ';
     cmd += '--refiner ' + refiner + ' ';
