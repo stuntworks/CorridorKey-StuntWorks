@@ -184,6 +184,11 @@
         </div>
     </div>
 
+    <div class="checkbox-row">
+        <input type="checkbox" id="addToTimeline" checked>
+        <label for="addToTimeline" style="margin:0">Add keyed clip to timeline</label>
+    </div>
+
     <button class="btn-preview" onclick="processFrame(true)">PREVIEW FRAME</button>
     <button class="btn-process" onclick="processFrame(false)">PROCESS FRAME</button>
     <button class="btn-batch" onclick="processWorkArea()">PROCESS WORK AREA</button>
@@ -273,6 +278,30 @@
             };
         }
 
+        // Get output directory — project folder by default, user can override via Browse
+        function getOutputDir() {
+            var outPath = document.getElementById('outputPath').value;
+            if (outPath) {
+                fs.mkdirSync(outPath, {recursive: true});
+                return outPath;
+            }
+            return path.join(os.homedir(), 'Documents', 'CorridorKey');
+        }
+
+        // Set default output to project folder if available
+        function updateDefaultOutput() {
+            cs.evalScript('getProjectOutputDir()', function(result) {
+                if (result && result !== 'undefined' && result !== 'null') {
+                    var current = document.getElementById('outputPath').value;
+                    // Only override if still on the generic default
+                    if (!current || current.indexOf('Documents/CorridorKey') !== -1 || current.indexOf('Documents\\CorridorKey') !== -1) {
+                        document.getElementById('outputPath').value = result.replace(/\\/g, '/');
+                        localStorage.setItem(OUTPUT_KEY, result);
+                    }
+                }
+            });
+        }
+
         // Build Python args for single frame processing
         function buildProcessArgs(inputPath, outputPath, settings) {
             return [processorScript, 'single', inputPath, outputPath,
@@ -306,22 +335,36 @@
                     var pid = Math.floor(Math.random() * 100000);
                     var tmpDir = os.tmpdir();
                     var inputPath = path.join(tmpDir, 'ck_ppro_in_' + pid + '.png');
-                    var outputPath = path.join(tmpDir, 'ck_ppro_out_' + pid + '.png');
 
-                    log('Extracting frame ' + info.sourceFrame + '...');
+                    // Save output to user's chosen folder (like Resolve does)
+                    var clipName = path.basename(info.sourcePath, path.extname(info.sourcePath));
+                    var outDir = getOutputDir();
+                    var clipDir = path.join(outDir, 'CK_' + clipName);
+                    fs.mkdirSync(clipDir, {recursive: true});
+                    var outputPath = path.join(clipDir, 'CK_' + clipName + '_' + String(info.sourceFrame).padStart(6, '0') + '.png');
 
-                    // Extract frame via Python/OpenCV
-                    var extractCode = "import cv2; " +
+                    log('Frame ' + info.sourceFrame + '/' + (info.totalFrames || '?') + ' | ' + (info.debug || ''));
+                    log('Extracting...');
+
+                    // Extract frame via Python/OpenCV with error reporting
+                    var extractCode = "import cv2, sys; " +
                         "cap = cv2.VideoCapture(r'" + info.sourcePath.replace(/'/g, "\\'") + "'); " +
-                        "cap.set(cv2.CAP_PROP_POS_FRAMES, " + info.sourceFrame + "); " +
-                        "ret, frame = cap.read(); cap.release(); " +
-                        "cv2.imwrite(r'" + inputPath.replace(/'/g, "\\'") + "', frame) if ret else exit(1)";
+                        "total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)); " +
+                        "fps = cap.get(cv2.CAP_PROP_FPS); " +
+                        "print(f'Video: {total} frames, {fps} fps', file=sys.stderr); " +
+                        "frame_num = min(" + info.sourceFrame + ", total - 1); " +
+                        "cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num); " +
+                        "ret, frame = cap.read(); " +
+                        "print(f'Seek to {frame_num}, read={ret}', file=sys.stderr); " +
+                        "cap.release(); " +
+                        "cv2.imwrite(r'" + inputPath.replace(/'/g, "\\'") + "', frame) if ret else sys.exit(1)";
 
                     try {
-                        cp.execFileSync(pythonExe, ['-c', extractCode], {timeout: 30000});
+                        cp.execFileSync(pythonExe, ['-c', extractCode], {timeout: 30000, stdio: ['pipe', 'pipe', 'pipe']});
                     } catch(e) {
                         status('Error');
-                        log('Error: Could not extract frame');
+                        var errDetail = (e.stderr ? e.stderr.toString() : '') || e.message;
+                        log('Error extracting: ' + errDetail);
                         return;
                     }
 
@@ -354,23 +397,21 @@
                     // Show preview
                     showPreview(outputPath);
 
-                    if (!previewOnly) {
+                    if (!previewOnly && document.getElementById('addToTimeline').checked) {
                         // Import into Premiere via ExtendScript
                         var escapedPath = outputPath.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
                         cs.evalScript("ppro_importFile('" + escapedPath + "')", function(importResult) {
                             if (importResult && importResult.indexOf('success') === 0) {
                                 status('Done!');
-                                log('Frame processed and imported');
+                                log('Frame keyed and added to timeline');
                             } else {
-                                // Processing worked, import is secondary
                                 status('Done!');
-                                log('Frame keyed! Output: ' + outputPath);
-                                log('(Auto-import not available — drag from: ' + outputPath + ')');
+                                log('Frame keyed! Saved to: ' + outputPath);
                             }
                         });
                     } else {
                         status('Done!');
-                        log('Preview ready');
+                        log(previewOnly ? 'Preview ready' : 'Frame keyed! Saved to: ' + outputPath);
                     }
 
                     // Cleanup input
@@ -525,6 +566,8 @@
             } else {
                 log('CorridorKey Panel Ready (After Effects)');
             }
+            // Set output folder to project directory by default
+            updateDefaultOutput();
         });
     </script>
 </body>

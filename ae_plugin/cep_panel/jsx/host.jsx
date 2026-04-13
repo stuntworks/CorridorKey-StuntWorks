@@ -63,6 +63,7 @@ if (typeof CompItem !== "undefined") {
 }
 
 function getProjectOutputDir() {
+    // Try AE method first
     try {
         var projFile = app.project.file;
         if (projFile) {
@@ -72,6 +73,17 @@ function getProjectOutputDir() {
             return ckDir.fsName;
         }
     } catch (e) {}
+    // Try Premiere method
+    try {
+        var projPath = app.project.path;
+        if (projPath && projPath.length > 0) {
+            var projFolder = new File(projPath).parent.fsName;
+            var ckDir = new Folder(projFolder + "/CorridorKey");
+            if (!ckDir.exists) ckDir.create();
+            return ckDir.fsName;
+        }
+    } catch (e) {}
+    // Fallback to Documents
     return Folder.myDocuments.fsName + "/CorridorKey";
 }
 
@@ -281,7 +293,6 @@ function ppro_getClipInfo() {
         if (!seq) return JSON.stringify({error: "No active sequence"});
 
         var playerPos = seq.getPlayerPosition();
-        var ticksPerSecond = 254016000000;
 
         var videoTracks = seq.videoTracks;
         if (videoTracks.numTracks < 1) return JSON.stringify({error: "No video tracks"});
@@ -299,31 +310,43 @@ function ppro_getClipInfo() {
         }
 
         if (!targetClip) {
-            // Debug: report what we see
-            var dbg = "No clip at playhead. Playhead ticks=" + playerPos.ticks + " Clips on V1=" + clips.numItems;
+            var dbg = "No clip at playhead. Clips on V1=" + clips.numItems;
             for (var di = 0; di < clips.numItems && di < 3; di++) {
-                dbg += " | Clip" + di + " start=" + clips[di].start.ticks + " end=" + clips[di].end.ticks;
+                dbg += " | Clip" + di + " start=" + clips[di].start.seconds + "s end=" + clips[di].end.seconds + "s";
             }
+            dbg += " | Playhead=" + playerPos.seconds + "s";
             return JSON.stringify({error: dbg});
         }
 
         var filePath = targetClip.projectItem.getMediaPath();
         if (!filePath) return JSON.stringify({error: "Cannot get source file path"});
 
-        // Premiere videoFrameRate can be a TimeCode object or number
+        // Get fps from sequence settings
         var fpsRaw = seq.getSettings().videoFrameRate;
         var fps = parseFloat(fpsRaw);
-        if (isNaN(fps) || fps <= 0) fps = 24; // safe fallback
+        if (isNaN(fps) || fps <= 0) fps = 24;
 
-        var clipOffsetTicks = playerPos.ticks - targetClip.start.ticks + targetClip.inPoint.ticks;
-        var sourceTimeSec = clipOffsetTicks / ticksPerSecond;
-        var sourceFrame = Math.floor(sourceTimeSec * fps);
+        // Use .seconds property (avoids ticks math entirely)
+        var playheadSec = playerPos.seconds;
+        var clipStartSec = targetClip.start.seconds;
+        var clipInPointSec = targetClip.inPoint.seconds;
+
+        // How far into the clip is the playhead
+        var offsetInClip = playheadSec - clipStartSec;
+        // Source media time = clip inPoint + offset
+        var sourceTimeSec = clipInPointSec + offsetInClip;
+        var sourceFrame = Math.floor(sourceTimeSec * fps) - 1;
+        if (sourceFrame < 0) sourceFrame = 0;
+
+        var clipDurationSec = targetClip.end.seconds - targetClip.start.seconds;
+        var totalFrames = Math.floor(clipDurationSec * fps);
 
         return JSON.stringify({
             sourcePath: filePath,
             sourceFrame: sourceFrame,
             fps: fps,
-            playerTicks: String(playerPos.ticks)
+            totalFrames: totalFrames,
+            debug: "playhead=" + playheadSec.toFixed(2) + "s clipStart=" + clipStartSec.toFixed(2) + "s inPoint=" + clipInPointSec.toFixed(2) + "s offset=" + offsetInClip.toFixed(2) + "s srcTime=" + sourceTimeSec.toFixed(2) + "s"
         });
     } catch (e) {
         return JSON.stringify({error: e.toString()});
@@ -370,26 +393,58 @@ function ppro_getWorkAreaInfo() {
 
 function ppro_importFile(filePath) {
     try {
-        // Premiere: import via project.importFiles with all required params
-        // suppressUI, targetBin, importAsNumberedStills
-        var targetBin = app.project.rootItem;
-        var success = app.project.importFiles([filePath], true, targetBin, false);
-        return "success";
-    } catch (e1) {
-        // Try alternate method
-        try {
-            app.project.importFiles([filePath]);
-            return "success";
-        } catch (e2) {
-            // Try importFile (singular)
-            try {
-                var fileObj = new File(filePath);
-                app.project.importFile(filePath);
-                return "success";
-            } catch (e3) {
-                return "Error: " + e1.toString() + " | " + e2.toString() + " | " + e3.toString();
+        // Find or create CorridorKey bin
+        var rootItem = app.project.rootItem;
+        var ckBin = null;
+        for (var i = 0; i < rootItem.children.numItems; i++) {
+            if (rootItem.children[i].name === "CorridorKey" && rootItem.children[i].type === 2) {
+                ckBin = rootItem.children[i];
+                break;
             }
         }
+        if (!ckBin) {
+            ckBin = rootItem.createBin("CorridorKey");
+        }
+
+        // Import to CorridorKey bin
+        var imported = app.project.importFiles([filePath], true, ckBin, false);
+
+        // Find the imported item (last in the bin)
+        var importedItem = null;
+        for (var j = 0; j < ckBin.children.numItems; j++) {
+            importedItem = ckBin.children[j]; // last one
+        }
+
+        if (!importedItem) return "success:bin_only";
+
+        // Insert on timeline V2 at playhead
+        var seq = app.project.activeSequence;
+        if (seq) {
+            var playerPos = seq.getPlayerPosition();
+            var vTracks = seq.videoTracks;
+            if (vTracks.numTracks >= 2) {
+                // Use overwriteClip instead of insertClip — doesn't push other clips
+                vTracks[1].overwriteClip(importedItem, playerPos.seconds);
+
+                // Find the clip we just inserted and trim to 1 frame
+                var fps = parseFloat(seq.getSettings().videoFrameRate) || 24;
+                var frameDuration = 1.0 / fps;
+                var track2 = vTracks[1];
+                for (var ci = 0; ci < track2.clips.numItems; ci++) {
+                    var c = track2.clips[ci];
+                    if (Math.abs(c.start.seconds - playerPos.seconds) < 0.01) {
+                        c.end = c.start.seconds + frameDuration;
+                        break;
+                    }
+                }
+                return "success";
+            } else {
+                return "success:bin_only";
+            }
+        }
+        return "success:bin_only";
+    } catch (e) {
+        return "Error: " + e.toString();
     }
 }
 
