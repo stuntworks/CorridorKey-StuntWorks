@@ -8,8 +8,9 @@
 [![After Effects](https://img.shields.io/badge/After_Effects-2020+-9999FF?style=for-the-badge&logo=adobeaftereffects&logoColor=white)](https://www.adobe.com/products/aftereffects.html)
 [![Premiere Pro](https://img.shields.io/badge/Premiere_Pro-2020+-9999FF?style=for-the-badge&logo=adobepremierepro&logoColor=white)](https://www.adobe.com/products/premiere.html)
 
+[![Ko-fi](https://img.shields.io/badge/Buy_Me_A_Coffee-Support_Development-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white)](https://ko-fi.com/stuntworks)
+
 [![License](https://img.shields.io/badge/License-CC--BY--NC--SA--4.0-green?style=flat-square)](LICENSE)
-[![Ko-fi](https://img.shields.io/badge/Support-Ko--fi-FF5E5B?style=flat-square&logo=ko-fi&logoColor=white)](https://ko-fi.com/stuntworks)
 [![YouTube](https://img.shields.io/badge/YouTube-StuntWorks-FF0000?style=flat-square&logo=youtube&logoColor=white)](https://www.youtube.com/@stuntworkscinema)
 
 ---
@@ -18,8 +19,6 @@
 **by Niko Pueringer / Corridor Digital**
 
 *Plugin by Roberto Lopez / [StuntWorks](https://www.youtube.com/@stuntworkscinema)*
-
-![CorridorKey in DaVinci Resolve](docs/resolve_screenshot.png)
 
 </div>
 
@@ -30,6 +29,14 @@
 | Before | Keyed | Composite |
 |:---:|:---:|:---:|
 | ![Before](docs/ae_before.png) | ![Keyed](docs/ae_keyed.png) | ![Composite](docs/ae_composite.png) |
+
+---
+
+## Screenshots
+
+| DaVinci Resolve | Premiere Pro |
+|:---:|:---:|
+| ![Resolve](docs/resolve_screenshot.png) | ![Premiere](docs/premiere_screenshot.png) |
 
 ---
 
