@@ -112,12 +112,17 @@ def process_frame(input_path, output_path, screen_type="green", despill=0.5,
         # Merge to BGRA
         output = cv2.merge([fg_bgr[:, :, 0], fg_bgr[:, :, 1], fg_bgr[:, :, 2], alpha_uint8])
 
-        # Save output
+        # Save output (keyed RGBA)
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(output_path), output)
 
+        # Save matte (white on black)
+        matte_path = str(output_path).replace(".png", "_matte.png")
+        cv2.imwrite(matte_path, alpha_uint8)
+
         log.info(f"Saved: {output_path}")
+        log.info(f"Matte: {matte_path}")
         processor.cleanup()
         return True
 

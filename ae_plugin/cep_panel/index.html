@@ -2,7 +2,7 @@
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>CorridorKey</title>
+    <title>CorridorKey StuntWorks</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
@@ -11,15 +11,24 @@
             color: #e0e0e0;
             padding: 15px;
             font-size: 12px;
+            overflow-y: auto;
         }
         h1 {
             color: #4CAF50;
-            font-size: 18px;
+            font-size: 16px;
             text-align: center;
-            margin-bottom: 15px;
+            margin-bottom: 2px;
         }
+        .credit {
+            text-align: center;
+            font-size: 9px;
+            color: #777;
+            margin-bottom: 12px;
+        }
+        .credit a { color: #999; text-decoration: none; }
+        .credit a:hover { color: #4CAF50; }
         .section {
-            margin-bottom: 15px;
+            margin-bottom: 12px;
         }
         label {
             display: block;
@@ -83,14 +92,34 @@
             color: white;
         }
         .btn-batch:hover { background: #1976D2; }
+        #preview-container {
+            margin-top: 10px;
+            text-align: center;
+            background: #1a1a1a;
+            border-radius: 4px;
+            min-height: 40px;
+            overflow: hidden;
+        }
+        #preview-container img {
+            width: 48%;
+            display: inline-block;
+            border-radius: 4px;
+            margin: 1%;
+        }
+        #preview-label {
+            color: #666;
+            font-size: 10px;
+            padding: 12px;
+        }
         #status {
             text-align: center;
-            padding: 10px;
-            margin-top: 10px;
+            padding: 8px;
+            margin-top: 8px;
             background: #1a1a1a;
             border-radius: 4px;
             color: #0ff;
             font-weight: bold;
+            font-size: 11px;
         }
         #log {
             background: #111;
@@ -98,8 +127,8 @@
             font-family: monospace;
             font-size: 10px;
             padding: 8px;
-            margin-top: 10px;
-            height: 80px;
+            margin-top: 8px;
+            height: 60px;
             overflow-y: auto;
             border-radius: 4px;
         }
@@ -107,6 +136,14 @@
 </head>
 <body>
     <h1>CorridorKey StuntWorks</h1>
+    <div class="credit">
+        AI Keyer by <a href="https://github.com/nikopueringer/CorridorKey">Niko Pueringer / Corridor Digital</a><br>
+        Plugin by <a href="https://github.com/stuntworks">Berto Labs / StuntWorks</a>
+    </div>
+
+    <div id="preview-container">
+        <span id="preview-label">Preview will appear here</span>
+    </div>
 
     <div class="section">
         <label>Screen Type</label>
@@ -139,6 +176,14 @@
         <span>px</span>
     </div>
 
+    <div class="section">
+        <label>Output Folder</label>
+        <div style="display:flex;gap:5px;">
+            <input type="text" id="outputPath" readonly style="flex:1;padding:6px;background:#333;border:1px solid #444;color:#fff;border-radius:4px;font-size:11px;">
+            <button onclick="browseOutput()" style="width:auto;padding:6px 12px;margin:0;background:#555;font-size:11px;">Browse</button>
+        </div>
+    </div>
+
     <button class="btn-preview" onclick="processFrame(true)">PREVIEW FRAME</button>
     <button class="btn-process" onclick="processFrame(false)">PROCESS FRAME</button>
     <button class="btn-batch" onclick="processWorkArea()">PROCESS WORK AREA</button>
@@ -149,6 +194,29 @@
     <script src="./js/CSInterface.js"></script>
     <script>
         const cs = new CSInterface();
+        var lastOutputPath = null;
+        const OUTPUT_KEY = 'ck_output_path';
+
+        // Load saved output path or default
+        var savedOutput = localStorage.getItem(OUTPUT_KEY);
+        if (!savedOutput) {
+            savedOutput = require('os').homedir().replace(/\\/g, '/') + '/Documents/CorridorKey';
+        }
+        document.getElementById('outputPath').value = savedOutput;
+
+        function browseOutput() {
+            var result = cs.evalScript('Folder.selectDialog("Choose output folder")', function(r) {});
+            // CEP folder picker
+            var cepResult = window.cep && window.cep.fs && window.cep.fs.showOpenDialogEx
+                ? window.cep.fs.showOpenDialogEx(false, true, 'Choose Output Folder', savedOutput)
+                : null;
+            if (cepResult && cepResult.data && cepResult.data.length > 0) {
+                savedOutput = cepResult.data[0].replace(/\\/g, '/');
+                document.getElementById('outputPath').value = savedOutput;
+                localStorage.setItem(OUTPUT_KEY, savedOutput);
+                log('Output folder: ' + savedOutput);
+            }
+        }
 
         // Slider updates
         document.getElementById('despill').oninput = function() {
@@ -166,6 +234,15 @@
 
         function status(msg) {
             document.getElementById('status').textContent = msg;
+        }
+
+        function showPreview(filePath) {
+            const container = document.getElementById('preview-container');
+            const ts = Date.now();
+            const fileUri = 'file:///' + filePath.replace(/\\/g, '/');
+            const matteUri = 'file:///' + filePath.replace(/\\/g, '/').replace('.png', '_matte.png');
+            container.innerHTML = '<img src="' + fileUri + '?' + ts + '" alt="Keyed" title="Keyed Result">' +
+                                  '<img src="' + matteUri + '?' + ts + '" alt="Matte" title="Alpha Matte">';
         }
 
         function getSettings() {
@@ -186,7 +263,16 @@
             const settingsJson = JSON.stringify(settings).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
 
             cs.evalScript("processCurrentFrame('" + settingsJson + "', " + previewOnly + ")", function(result) {
-                if (result === 'success') {
+                if (result && result.indexOf('success:') === 0) {
+                    status('Done!');
+                    log('Frame processed successfully');
+                    // Show preview in panel
+                    var outputPath = result.replace('success:', '');
+                    if (outputPath) {
+                        showPreview(outputPath);
+                        lastOutputPath = outputPath;
+                    }
+                } else if (result === 'success') {
                     status('Done!');
                     log('Frame processed successfully');
                 } else {

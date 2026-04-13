@@ -51,7 +51,7 @@ if (!CORRIDORKEY_ROOT) {
     // Last resort fallback
     CORRIDORKEY_ROOT = "D:\\New AI Projects\\CorridorKey";
 }
-var PYTHON_EXE = CORRIDORKEY_ROOT + "\\.venv\\Scripts\\python.exe";
+var PYTHON_EXE = CORRIDORKEY_ROOT + "\\.venv\\Scripts\\pythonw.exe";
 var PROCESSOR_SCRIPT = CORRIDORKEY_ROOT + "\\ae_plugin\\ae_processor.py";
 var TEMP_DIR = Folder.temp.fsName;
 
@@ -61,6 +61,21 @@ if (typeof CompItem !== "undefined") {
     HOST_APP = "ae";
 } else if (typeof ProjectItem !== "undefined" || (app && app.project && app.project.activeSequence !== undefined)) {
     HOST_APP = "ppro";
+}
+
+function getProjectOutputDir() {
+    // Returns a CorridorKey subfolder next to the AE project file
+    try {
+        var projFile = app.project.file;
+        if (projFile) {
+            var projDir = projFile.parent.fsName;
+            var ckDir = new Folder(projDir + "/CorridorKey");
+            if (!ckDir.exists) ckDir.create();
+            return ckDir.fsName;
+        }
+    } catch (e) {}
+    // Fallback to Documents
+    return Folder.myDocuments.fsName + "/CorridorKey";
 }
 
 function getHostApp() {
@@ -103,7 +118,7 @@ function ae_processCurrentFrame(settingsJson, previewOnly) {
         var fps = comp.frameRate;
         var layerTimeInComp = comp.time - layer.startTime;
         var sourceTime = layerTimeInComp + layer.inPoint;
-        var frameNum = Math.floor(sourceTime * fps);
+        var frameNum = Math.floor(sourceTime * fps + 0.5) - 1;
 
         // Use Python to extract frame
         var extractCmd = '"' + PYTHON_EXE + '" -c "' +
@@ -140,20 +155,37 @@ function ae_processCurrentFrame(settingsJson, previewOnly) {
             return "Error: Processing failed - no output. CMD: " + cmd + " | Result: " + result;
         }
 
-        // Import keyed frame to comp above selected layer (both preview and process)
-        var importedFile = app.project.importFile(new ImportOptions(outputFile));
-        if (importedFile) {
-            var newLayer = comp.layers.add(importedFile);
-            newLayer.moveBefore(layer);
-            newLayer.startTime = comp.time;
-            newLayer.outPoint = comp.time + comp.frameDuration;
+        // Import keyed frame to comp above selected layer
+        app.beginUndoGroup("CorridorKey Process");
+        try {
+            var normalizedOutput = outputPath.replace(/\\/g, "/");
+            var importFile = new File(normalizedOutput);
+            var io = new ImportOptions(importFile);
+            io.importAs = ImportAsType.FOOTAGE;
+            io.sequence = false;  // CRITICAL: filename ends in digits, AE thinks it's a sequence
+
+            var importedItem = app.project.importFile(io);
+            if (importedItem) {
+                var playheadTime = comp.time;
+                var newLayer = comp.layers.add(importedItem);
+                newLayer.enabled = true;
+                newLayer.moveBefore(layer);
+                // Position at playhead — set startTime AFTER moveBefore
+                newLayer.startTime = playheadTime;
+                newLayer.outPoint = playheadTime + comp.frameDuration;
+                comp.time = comp.time;  // Force UI refresh
+            }
+        } catch (importErr) {
+            return "Error importing: " + importErr.toString();
+        } finally {
+            app.endUndoGroup();
         }
 
         // Cleanup input
         var inputFile = new File(inputPath);
         if (inputFile.exists) inputFile.remove();
 
-        return "success";
+        return "success:" + outputPath;
 
     } catch (e) {
         return "Error: " + e.toString();
