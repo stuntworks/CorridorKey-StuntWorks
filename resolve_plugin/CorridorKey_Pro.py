@@ -469,16 +469,44 @@ def process_current_frame(preview_only=False):
         if not imp: status("Import failed"); return
         if settings["output_mode"] in [0, 2]:
             tc = timeline.GetTrackCount("video")
-            log(f"[v0.3] Video tracks: {tc}")
+            log(f"[v0.7] Video tracks: {tc}")
             if tc < 2:
-                added = timeline.AddTrack("video")
-                log(f"AddTrack result: {added}")
+                timeline.AddTrack("video")
                 tc = timeline.GetTrackCount("video")
                 log(f"Tracks after add: {tc}")
-            ci = {"mediaPoolItem": imp[0], "startFrame": 0, "endFrame": 0, "trackIndex": 2, "recordFrame": cs, "mediaType": 1}
-            log(f"Inserting on track 2 at frame {cs}")
-            result = media_pool.AppendToTimeline([ci])
+            # Try multiple append methods
+            # Set clip In/Out to 1 frame before append (helps recordFrame work)
+            try:
+                imp[0].SetClipProperty("In", "00:00:00:00")
+                imp[0].SetClipProperty("Out", "00:00:00:00")
+            except: pass
+            # Try recordFrame with constrained clip first
+            target_frame = cf + 1
+            log(f"[v1.2] Track 2, recordFrame={target_frame}")
+            result = media_pool.AppendToTimeline([{"mediaPoolItem": imp[0], "trackIndex": 2, "recordFrame": target_frame}])
+            if not result:
+                log("recordFrame failed, append without it")
+                result = media_pool.AppendToTimeline([{"mediaPoolItem": imp[0], "trackIndex": 2}])
             if result:
+                try:
+                    track2_items = timeline.GetItemListInTrack("video", 2)
+                    if track2_items:
+                        placed = track2_items[-1]
+                        # Trim to 1 frame
+                        dur = placed.GetDuration()
+                        if dur > 1:
+                            excess = dur - 1
+                            ro = placed.GetRightOffset()
+                            placed.SetRightOffset(ro + excess)
+                            log(f"Trimmed {dur} → {placed.GetDuration()} frame(s)")
+                        # Move to playhead position
+                        current_start = placed.GetStart()
+                        if current_start != cf:
+                            offset = cf - current_start
+                            moved = placed.SetProperty("Start", cf)
+                            log(f"Move: {current_start} → {cf} (result: {moved})")
+                except Exception as trim_err:
+                    log(f"Trim/Move: {trim_err}")
                 if items["DisableTrack1"].Checked and clip:
                     clip.SetClipEnabled(False)
                     log(f"Disabled source clip: {os.path.basename(fp)}")
