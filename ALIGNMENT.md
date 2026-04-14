@@ -66,6 +66,24 @@ imported.setInPoint(tIn, 4);   // media type 4 = video
 imported.setOutPoint(tOut, 4);
 ```
 
+### 5. Imported PNG sequence needs its frame rate FORCED to match V1.
+
+Premiere's numbered-stills import ignores the PNG sequence's "intended" frame
+rate and applies its own default (usually the project fps). If V1's native
+fps differs from the project fps (24-fps source clip on a 23.976 sequence,
+or a conformed clip), V2 will drift relative to V1 because Premiere
+interprets the two clips at different rates.
+
+**Compensation:**
+`ppro_getInOutInfo` reads V1's `FootageInterpretation.frameRate` and
+returns it as `sourceFrameRate`. `ppro_importSequence` applies that exact
+rate to the imported PNG sequence via `setOverrideFrameRate` (or
+`setFootageInterpretation` fallback) *before* placement. V1 and V2 now
+conform identically and stay locked across the whole range.
+
+Discovered 2026-04-14 (this was the "frames don't line up" drift Berto
+saw on 47-frame batch even though single-frame was perfect).
+
 ### 4. Placement needs `+1` frame nudge for *batch* but NOT for single frame.
 
 The -1 offset from Behavior 1 already compensates for the next-boundary
@@ -163,3 +181,4 @@ click KEY CURRENT FRAME, verify the new layer starts at exactly
 | 2026-04-13 | `ab63d6d`  | `-1 not +1` confirmed by testing |
 | 2026-04-14 | `41bd9bd`  | Full rewrite reintroduced alignment bugs |
 | 2026-04-14 | `54a6a78`  | Frame drift fixed (Behavior 2), single-frame placement + duration fixed (Behaviors 3, 4) |
+| 2026-04-14 | (next)     | Batch drift second source: imported sequence frame rate override (Behavior 5) |

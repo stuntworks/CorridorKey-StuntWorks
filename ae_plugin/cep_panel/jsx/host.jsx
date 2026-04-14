@@ -297,6 +297,17 @@ function ppro_getInOutInfo() {
         var filePath = sourceClip.projectItem.getMediaPath();
         if (!filePath) return JSON.stringify({ ok: false, error: "Cannot get source file path" });
 
+        // Capture V1's footage-interpretation frame rate. We will apply this exact rate
+        // to the imported PNG sequence so Premiere conforms V1 and V2 identically —
+        // without this, V2 drifts because Premiere defaults numbered-stills imports to
+        // the project fps, which may not match V1's native rate.
+        var sourceFrameRate = 0;
+        try {
+            var fi = sourceClip.projectItem.getFootageInterpretation();
+            if (fi && fi.frameRate) sourceFrameRate = Number(fi.frameRate);
+        } catch (_) {}
+        if (!sourceFrameRate || sourceFrameRate <= 0) sourceFrameRate = fps;
+
         // Compute source-media TIME range in SECONDS. We do not convert to frames here
         // because the sequence fps can differ from the source clip's native fps —
         // converting on the JSX side with the wrong fps causes drift across the batch.
@@ -320,6 +331,7 @@ function ppro_getInOutInfo() {
             startSeconds: rangeStartSec,
             endSeconds: rangeEndSec,
             fps: fps,
+            sourceFrameRate: sourceFrameRate,
             inPointSeconds: timelineInSec,
             usedSeqMarkers: haveSeqRange
         });
@@ -412,7 +424,7 @@ function ppro_importFrame(outputPath, playheadSeconds, fps) {
 // DEPENDS-ON: firstFramePath exists; its folder contains a clean output_NNNNN.png pattern
 //   with no other PNG series (mattes live in a subfolder).
 // AFFECTS: Project panel (bin + imported item), timeline V2 (overwriteClip).
-function ppro_importSequence(firstFramePath, startSeconds, fps) {
+function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate) {
     try {
         var seq = app.project.activeSequence;
         if (!seq) return JSON.stringify({ ok: false, error: "No active sequence" });
@@ -446,6 +458,37 @@ function ppro_importSequence(firstFramePath, startSeconds, fps) {
             });
         }
 
+        // Force the imported PNG sequence's footage frame rate to match V1's. Without
+        // this, Premiere applies its default (usually the project fps) and V2 drifts
+        // relative to V1 whenever the source's native fps differs. Try both APIs —
+        // setOverrideFrameRate exists on newer Premieres, getFootageInterpretation +
+        // setFootageInterpretation on older ones.
+        var appliedRate = 0;
+        var targetRate = Number(sourceFrameRate);
+        if (!targetRate || isNaN(targetRate) || targetRate <= 0) targetRate = Number(fps || 24);
+        try {
+            if (typeof imported.setOverrideFrameRate === "function") {
+                imported.setOverrideFrameRate(targetRate);
+                appliedRate = targetRate;
+            } else {
+                var fi2 = imported.getFootageInterpretation();
+                if (fi2) {
+                    fi2.frameRate = targetRate;
+                    imported.setFootageInterpretation(fi2);
+                    appliedRate = targetRate;
+                }
+            }
+        } catch (_) {
+            try {
+                var fi3 = imported.getFootageInterpretation();
+                if (fi3) {
+                    fi3.frameRate = targetRate;
+                    imported.setFootageInterpretation(fi3);
+                    appliedRate = targetRate;
+                }
+            } catch (_) {}
+        }
+
         // Move the new item into the CorridorKey bin (create if missing). If the move
         // fails we leave it at the root — still visible to the user.
         var ckBin = null;
@@ -464,10 +507,14 @@ function ppro_importSequence(firstFramePath, startSeconds, fps) {
 
         var placeSec = Number(startSeconds);
         if (isNaN(placeSec) || placeSec < 0) placeSec = 0;
-        var nudge = 1.0 / Number(fps || 24);
+        // Nudge by one frame at the SOURCE'S rate (since that's what the imported
+        // sequence is now conformed to) to compensate for Premiere dropping the first
+        // frame of a numbered-stills import. The dummy output_00000.png takes that hit.
+        var rateForNudge = appliedRate || targetRate;
+        var nudge = 1.0 / Number(rateForNudge || 24);
         try {
             v2.overwriteClip(imported, placeSec + nudge);
-            return JSON.stringify({ ok: true, placed: true, binName: imported.name });
+            return JSON.stringify({ ok: true, placed: true, binName: imported.name, appliedRate: appliedRate });
         } catch (e) {
             return JSON.stringify({ ok: true, placed: false, binName: imported.name,
                 note: "Imported into bin but overwriteClip failed: " + String(e) });
