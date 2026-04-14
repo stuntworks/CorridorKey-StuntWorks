@@ -340,8 +340,14 @@ function processFrame(previewOnly) {
             const framePng = randomTempPath('extract', '.png');
             const keyedPng = randomTempPath('keyed', '.png');
 
-            // Step 1 — extract the single frame from the video via Python (not inline cv2).
-            runPython(['extract', info.sourceFile, framePng, '--frame', String(info.sourceFrame)]);
+            // Step 1 — extract the single frame from the video. For Premiere we pass
+            // --time SECONDS so Python can seek by CAP_PROP_POS_MSEC using the source's
+            // native fps, avoiding the drift that happens when we convert to frames
+            // using the sequence's fps. AE still uses --frame (comp fps matches source).
+            const extractArgs = (HOST_APP === 'ppro' && typeof info.sourceTimeSeconds === 'number')
+                ? ['extract', info.sourceFile, framePng, '--time', String(info.sourceTimeSeconds)]
+                : ['extract', info.sourceFile, framePng, '--frame', String(info.sourceFrame)];
+            runPython(extractArgs);
             if (!fs.existsSync(framePng)) throw new Error('Extract produced no output');
 
             // Step 2 — key it (params via JSON file, not argv).
@@ -394,15 +400,18 @@ function processBatch() {
             const outDir = path.join(savedOutput, 'ck_batch_' + crypto.randomBytes(6).toString('hex'));
             fs.mkdirSync(outDir, { recursive: true });
 
-            const paramsPath = writeParamsFile(
-                Object.assign({}, settings, {
-                    startFrame: info.startFrame,
-                    endFrame: info.endFrame,
-                    fps: info.fps
-                })
-            );
+            // For Premiere, pass the range in SECONDS so Python uses source-native fps
+            // (no drift). For AE, pass frame numbers as before (comp fps == source fps
+            // in the normal case).
+            const rangeFields = (HOST_APP === 'ppro' && typeof info.startSeconds === 'number')
+                ? { startSeconds: info.startSeconds, endSeconds: info.endSeconds, fps: info.fps }
+                : { startFrame: info.startFrame, endFrame: info.endFrame, fps: info.fps };
+            const paramsPath = writeParamsFile(Object.assign({}, settings, rangeFields));
 
-            status('Keying ' + (info.endFrame - info.startFrame) + ' frames...');
+            const approxFrames = (HOST_APP === 'ppro')
+                ? Math.round((info.endSeconds - info.startSeconds) * info.fps)
+                : (info.endFrame - info.startFrame);
+            status('Keying ~' + approxFrames + ' frames...');
 
             runPython(
                 ['batch', info.sourceFile, outDir, '--params', paramsPath],
@@ -424,7 +433,7 @@ function processBatch() {
 
             const importFn = HOST_APP === 'ppro' ? 'ppro_importSequence' : 'ae_importSequence';
             const importArgs = HOST_APP === 'ppro'
-                ? [firstFrame]
+                ? [firstFrame, info.inPointSeconds, info.fps]
                 : [firstFrame, info.fps, info.compStartTime];
             jsxCall(importFn, importArgs, (imp) => {
                 if (!imp.ok) { logLine('import error: ' + imp.error, true); status('Import failed'); }
