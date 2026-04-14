@@ -338,6 +338,198 @@ def cmd_batch(source_video, output_folder, settings,
     return processed
 
 
+# ── Subcommand: cache (stage 1 only — live-preview support) ───
+# WHAT IT DOES: Runs the CorridorKey neural net on a PNG input and writes the raw
+#   foreground + alpha to disk with post-proc DISABLED (despill=0, despeckle=off).
+#   This is stage 1 of a two-stage split that lets the live preview viewer re-run
+#   only the cheap post-proc when a slider moves — no neural-net re-run required.
+# DEPENDS-ON: corridorkey_processor.CorridorKeyProcessor, an input PNG that has
+#   already been extracted from the source video (see cmd_extract), CUDA GPU.
+# AFFECTS: writes fg.png + alpha.png + meta.json into the given session directory.
+# NOTE: refiner_scale IS applied here because it's NN-internal — it's not
+#   separable the way despill and despeckle are. Refiner slider changes still
+#   require a full cache re-run; despill and despeckle sliders do not.
+def cmd_cache(input_path, session_dir, settings):
+    import numpy as np
+    import cv2
+    sess = Path(session_dir)
+    sess.mkdir(parents=True, exist_ok=True)
+
+    log.info(f"Cache: {input_path} -> {sess}")
+    img = cv2.imread(str(input_path), cv2.IMREAD_UNCHANGED)
+    if img is None:
+        log.error(f"Cannot read: {input_path}")
+        return False
+
+    has_alpha = len(img.shape) == 3 and img.shape[2] == 4
+    if has_alpha:
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
+    else:
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    if img_rgb.dtype == np.uint8:
+        img_rgb = img_rgb.astype(np.float32) / 255.0
+    elif img_rgb.dtype == np.uint16:
+        img_rgb = img_rgb.astype(np.float32) / 65535.0
+
+    alpha_hint = generate_chroma_hint(img_rgb, settings["screenType"])
+
+    from corridorkey_processor import CorridorKeyProcessor, ProcessingSettings
+    processor = CorridorKeyProcessor(device="cuda")
+    try:
+        # Post-proc disabled: we capture the pre-post-proc NN output so the live
+        # viewer can re-apply despill/despeckle with variable settings. Refiner
+        # stays at the user's value because it's NN-internal.
+        ps = ProcessingSettings(
+            screen_type=settings["screenType"],
+            despill_strength=0.0,
+            despeckle_enabled=False,
+            despeckle_size=settings.get("despeckleSize", 400),
+            refiner_strength=float(settings.get("refiner", 1.0)),
+        )
+        result = processor.process_frame(img_rgb, alpha_hint, ps)
+        fg = result.get("fg")
+        alpha = result.get("alpha")
+        if fg is None or alpha is None:
+            log.error("Cache keyer returned no output")
+            return False
+        if len(alpha.shape) == 3:
+            alpha = alpha[:, :, 0]
+
+        # Write as uint16 PNG to keep extra precision vs uint8. The viewer reads
+        # these back, normalizes to float32, and runs post-proc. uint16 PNG is
+        # widely supported by OpenCV and keeps file sizes modest.
+        fg_u16 = (np.clip(fg, 0, 1) * 65535.0).astype(np.uint16)
+        alpha_u16 = (np.clip(alpha, 0, 1) * 65535.0).astype(np.uint16)
+        fg_bgr_u16 = cv2.cvtColor(fg_u16, cv2.COLOR_RGB2BGR)
+
+        cv2.imwrite(str(sess / "fg.png"), fg_bgr_u16)
+        cv2.imwrite(str(sess / "alpha.png"), alpha_u16)
+
+        meta = {
+            "source": str(input_path),
+            "width": int(img_rgb.shape[1]),
+            "height": int(img_rgb.shape[0]),
+            "screenType": settings["screenType"],
+            "refiner": float(settings.get("refiner", 1.0)),
+            "created": __import__("datetime").datetime.now().isoformat(),
+            "dtype": "uint16",
+            "note": "Post-proc disabled — apply despill/despeckle at view time via postproc subcommand or color_utils.",
+        }
+        (sess / "meta.json").write_text(json.dumps(meta, indent=2))
+        log.info(f"Cached stage-1 outputs to {sess}")
+        return True
+    finally:
+        processor.cleanup()
+
+
+# ── Subcommand: postproc (stage 2 — cheap, slider-driven) ─────
+# WHAT IT DOES: Reads the cached fg.png + alpha.png from a session directory, applies
+#   despill + despeckle with the given settings, optionally composites onto a chosen
+#   background, and writes the result as a single RGBA PNG. This is the cheap stage
+#   that runs on every slider move in the live preview viewer — no neural net involved.
+# DEPENDS-ON: a prior `cache` run having written fg.png + alpha.png to session_dir,
+#   CorridorKeyModule/core/color_utils.py (despill_opencv, clean_matte_opencv).
+# AFFECTS: writes the given output PNG.
+# NOTE: The background argument controls what the keyed foreground is composited over.
+#   'none' = raw RGBA with no composite. 'black'/'white'/'checker' = solid or generated.
+#   'v1-below' expects the caller to pass --v1-path pointing at a PNG of the timeline
+#   V1 frame to use as a background plate.
+def cmd_postproc(session_dir, output_path, settings, background="checker", v1_path=None):
+    import numpy as np
+    import cv2
+    sess = Path(session_dir)
+    fg_path = sess / "fg.png"
+    alpha_path = sess / "alpha.png"
+    if not fg_path.exists() or not alpha_path.exists():
+        log.error(f"Session missing fg.png or alpha.png: {sess}")
+        return False
+
+    fg_raw = cv2.imread(str(fg_path), cv2.IMREAD_UNCHANGED)
+    alpha_raw = cv2.imread(str(alpha_path), cv2.IMREAD_UNCHANGED)
+    if fg_raw is None or alpha_raw is None:
+        log.error("Cannot read cached fg/alpha")
+        return False
+
+    # Normalize to float32 0..1 regardless of stored dtype
+    fg_bgr = fg_raw.astype(np.float32)
+    fg_bgr /= (65535.0 if fg_raw.dtype == np.uint16 else 255.0)
+    alpha = alpha_raw.astype(np.float32)
+    alpha /= (65535.0 if alpha_raw.dtype == np.uint16 else 255.0)
+    if len(alpha.shape) == 3:
+        alpha = alpha[:, :, 0]
+    fg_rgb = cv2.cvtColor(fg_bgr, cv2.COLOR_BGR2RGB)
+
+    # Reuse engine's post-proc math so our output matches what the full `single`
+    # pipeline produces with the same settings — no drift between preview and commit.
+    from CorridorKeyModule.core import color_utils as cu
+
+    # Despeckle (operates on alpha)
+    if settings.get("despeckle", True):
+        alpha = cu.clean_matte_opencv(
+            alpha,
+            area_threshold=int(settings.get("despeckleSize", 400)),
+            dilation=25,
+            blur_size=5,
+        )
+
+    # Despill (operates on RGB foreground)
+    despill_strength = float(settings.get("despill", 0.5))
+    if despill_strength > 0.0:
+        fg_rgb = cu.despill_opencv(fg_rgb, green_limit_mode="average", strength=despill_strength)
+
+    # Build background buffer
+    h, w = fg_rgb.shape[:2]
+    if background == "black":
+        bg_rgb = np.zeros((h, w, 3), dtype=np.float32)
+    elif background == "white":
+        bg_rgb = np.ones((h, w, 3), dtype=np.float32)
+    elif background == "checker":
+        bg_rgb = cu.create_checkerboard(w, h, checker_size=64)
+    elif background == "v1-below":
+        if not v1_path or not Path(v1_path).exists():
+            log.warning("v1-below requested but no --v1-path given or file missing — falling back to checker")
+            bg_rgb = cu.create_checkerboard(w, h, checker_size=64)
+        else:
+            v1_img = cv2.imread(str(v1_path), cv2.IMREAD_UNCHANGED)
+            if v1_img is None:
+                log.warning(f"Cannot read v1_path {v1_path} — falling back to checker")
+                bg_rgb = cu.create_checkerboard(w, h, checker_size=64)
+            else:
+                v1_rgb = cv2.cvtColor(v1_img, cv2.COLOR_BGR2RGB).astype(np.float32)
+                v1_rgb /= (65535.0 if v1_img.dtype == np.uint16 else 255.0)
+                if v1_rgb.shape[:2] != (h, w):
+                    v1_rgb = cv2.resize(v1_rgb, (w, h))
+                bg_rgb = v1_rgb
+    elif background == "none":
+        bg_rgb = None
+    else:
+        log.warning(f"Unknown background '{background}' — falling back to checker")
+        bg_rgb = cu.create_checkerboard(w, h, checker_size=64)
+
+    # Composite or write raw RGBA
+    out_path = Path(output_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    # Expand alpha to (H,W,1) so it broadcasts cleanly against (H,W,3) RGB buffers.
+    alpha_3d = alpha[..., np.newaxis] if alpha.ndim == 2 else alpha
+    if bg_rgb is None:
+        # Write raw RGBA with alpha channel
+        rgba_u8 = np.dstack([
+            (np.clip(fg_rgb, 0, 1) * 255).astype(np.uint8),
+            (np.clip(alpha, 0, 1) * 255).astype(np.uint8),
+        ])
+        bgra = cv2.cvtColor(rgba_u8, cv2.COLOR_RGBA2BGRA)
+        cv2.imwrite(str(out_path), bgra)
+    else:
+        # composite_straight signature: (fg, bg, alpha) — NOT (fg, alpha, bg). Bug fix.
+        comp = cu.composite_straight(fg_rgb, bg_rgb, alpha_3d)
+        comp_u8 = (np.clip(comp, 0, 1) * 255).astype(np.uint8)
+        comp_bgr = cv2.cvtColor(comp_u8, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(str(out_path), comp_bgr)
+
+    log.info(f"Postproc -> {out_path} (bg={background})")
+    return True
+
+
 # ── Arg parsing ───────────────────────────────────────────────
 def build_parser():
     p = argparse.ArgumentParser(description="CorridorKey AE/Premiere processor")
@@ -379,6 +571,26 @@ def build_parser():
     bt.add_argument("--despeckle", type=int)
     bt.add_argument("--despeckle-size", dest="despeckle_size", type=int)
     bt.add_argument("--refiner", type=float)
+
+    # cache: stage-1 only — feeds the live preview viewer
+    cc = sub.add_parser("cache", help="Run NN only, write raw fg.png + alpha.png for live preview")
+    cc.add_argument("input", help="Input PNG (already extracted frame)")
+    cc.add_argument("session_dir", help="Session directory to write fg.png + alpha.png + meta.json")
+    cc.add_argument("--params", help="JSON file with settings (screenType, refiner)")
+    cc.add_argument("--screen", choices=["green", "blue"])
+    cc.add_argument("--refiner", type=float)
+
+    # postproc: stage-2 only — reads cached fg/alpha, applies despill+despeckle+composite
+    pp = sub.add_parser("postproc", help="Apply despill/despeckle + background composite to a cached session")
+    pp.add_argument("session_dir", help="Session directory (must contain fg.png + alpha.png)")
+    pp.add_argument("output", help="Output PNG path")
+    pp.add_argument("--params", help="JSON file with settings (despill, despeckle, despeckleSize)")
+    pp.add_argument("--despill", type=float)
+    pp.add_argument("--despeckle", type=int)
+    pp.add_argument("--despeckle-size", dest="despeckle_size", type=int)
+    pp.add_argument("--background", default="checker",
+                    choices=["none", "black", "white", "checker", "v1-below"])
+    pp.add_argument("--v1-path", dest="v1_path", help="PNG of V1 frame (required for --background v1-below)")
     return p
 
 
@@ -414,6 +626,17 @@ def main():
                           start_frame=start_frame, end_frame=end_frame, fps=fps,
                           start_seconds=start_sec, end_seconds=end_sec)
             sys.exit(0 if n > 0 else 1)
+
+        if args.mode == "cache":
+            settings = load_settings(args.params, args)
+            ok = cmd_cache(args.input, args.session_dir, settings)
+            sys.exit(0 if ok else 1)
+
+        if args.mode == "postproc":
+            settings = load_settings(args.params, args)
+            ok = cmd_postproc(args.session_dir, args.output, settings,
+                              background=args.background, v1_path=args.v1_path)
+            sys.exit(0 if ok else 1)
 
         parser.print_help()
         sys.exit(2)

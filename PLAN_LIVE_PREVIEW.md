@@ -149,13 +149,37 @@ that keeps the Critic's warning satisfied.**
 Each phase is a separate commit. Each phase is independently reversible.
 Each phase ends with its own smoke test.
 
-### Phase 1 — Factor post-proc into a shared module (~2 h)
+### Phase 1 — Cache subcommand + confirm post-proc modularity (~1 h)
 
-- Extract despill / refiner / despeckle into `postproc.py`.
-- Both `corridorkey_processor.py` and future `preview_viewer.py` call the
-  same functions.
-- Unit-test: same image in → same image out as before the extraction.
+**Discovery:** the engine already has post-proc as standalone functions
+in `CorridorKeyModule/core/color_utils.py`: `despill_opencv`,
+`clean_matte_opencv`, `create_checkerboard`, `composite_straight`. No
+extraction needed — the live viewer will import these directly.
+
+**Caveat:** the **edge refiner** is NN-internal (applied inside the model
+forward pass at `inference_engine.py:452`). It is NOT separable. Refiner
+changes require a full stage-1 re-run. Three of four sliders (despill,
+despeckle toggle, despeckle size) are truly live; refiner debounces at
+~300 ms with a full re-key under the hood.
+
+**Phase 1 actual work:**
+- Add a `cache` subcommand to `ae_plugin/ae_processor.py` that runs the
+  engine with `despill_strength=0`, `auto_despeckle=False`, current
+  `refiner_scale`, and writes `fg.png` (straight RGB, float32) + `alpha.png`
+  (grayscale float32) + `meta.json` to a session directory.
+- Add a companion `postproc` subcommand: reads `fg.png` + `alpha.png` +
+  a settings JSON, applies `despill_opencv` and `clean_matte_opencv`,
+  and writes a composite PNG. This is what the live viewer will call on
+  slider changes (later it happens in-process, but the subcommand makes
+  it testable at the CLI today).
+- Smoke test at the CLI: run `cache` on a real frame, then run `postproc`
+  on the cached outputs with different slider settings, verify the
+  composite changes match what the full `single` pipeline produces
+  with the same settings (within 2/255 pixel tolerance).
 - Commit.
+
+No `corridorkey_processor.py` change. No engine change. No module
+extraction. Pure plugin-repo work.
 
 ### Phase 2 — Persistent viewer (~3 h)
 
