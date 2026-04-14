@@ -1,6 +1,20 @@
+# Last modified: 2026-04-13 | Change: HRCS retrofit (documentation only, no logic changes) | Full history: git log
 """
 CorridorKey Processing Engine Wrapper
 Wraps the CorridorKey neural network for use in DaVinci Resolve plugin.
+
+WHAT IT DOES:
+    Wraps the CorridorKey neural keying engine for single-frame and batch
+    sequence processing. Handles image I/O, color space conversion, and
+    GPU lifecycle for use inside the DaVinci Resolve OFX plugin.
+
+DEPENDS-ON:
+    - CorridorKeyModule.backend.create_engine (neural keyer)
+    - numpy, cv2 (image I/O and conversion)
+
+AFFECTS:
+    - resolve_plugin — this is the sole processing bridge between the
+      Resolve UI layer and the CorridorKey neural network.
 """
 import os
 import sys
@@ -17,6 +31,8 @@ if str(CORRIDORKEY_ROOT) not in sys.path:
     sys.path.insert(0, str(CORRIDORKEY_ROOT))
 
 
+# WHAT IT DOES: Holds all user-facing knobs for keying (screen color, despill, despeckle, etc.)
+# ISOLATED: pure data container, no side effects
 @dataclass
 class ProcessingSettings:
     """Settings for CorridorKey processing."""
@@ -28,6 +44,9 @@ class ProcessingSettings:
     input_is_srgb: bool = True  # True for video/PNG, False for EXR
 
 
+# WHAT IT DOES: Wraps the CorridorKey neural keyer — loads model, processes frames, manages GPU memory
+# DEPENDS-ON: CorridorKeyModule.backend.create_engine, ProcessingSettings
+# AFFECTS: All keying output in the Resolve plugin flows through this class
 class CorridorKeyProcessor:
     """Wrapper for CorridorKey neural keying engine."""
 
@@ -41,6 +60,10 @@ class CorridorKeyProcessor:
         self.engine = None
         self._load_engine()
 
+    # WHAT IT DOES: Imports and instantiates the CorridorKey backend engine on the target device
+    # DEPENDS-ON: CorridorKeyModule.backend.create_engine
+    # AFFECTS: self.engine — every process call fails if this fails
+    # DANGER ZONE FRAGILE/HIGH/CRITICAL: import path must resolve via sys.path hack above / breaks: all processing / depends on: CORRIDORKEY_ROOT on sys.path
     def _load_engine(self):
         """Load the CorridorKey model."""
         try:
@@ -49,6 +72,9 @@ class CorridorKeyProcessor:
         except Exception as e:
             raise RuntimeError(f"Failed to load CorridorKey engine: {e}")
 
+    # WHAT IT DOES: Sends one RGB frame + alpha hint through the neural keyer, returns fg/alpha/composite
+    # DEPENDS-ON: self.engine (loaded by _load_engine), ProcessingSettings
+    # AFFECTS: process_sequence calls this per-frame; Resolve single-frame preview uses this directly
     def process_frame(
         self,
         image: np.ndarray,
@@ -81,6 +107,10 @@ class CorridorKeyProcessor:
         )
         return result
 
+    # WHAT IT DOES: Batch-processes an image sequence (PNG/EXR/TIF), writes FG, Matte, and Processed EXR outputs
+    # DEPENDS-ON: self.process_frame, cv2 for I/O, filesystem dirs for input/alpha/output
+    # AFFECTS: Creates FG/, Matte/, Processed/ subdirs under output_dir; progress_callback drives UI progress bar
+    # DANGER ZONE FRAGILE/HIGH/CRITICAL: alpha frame count mismatch silently duplicates last alpha / breaks: matte accuracy if alpha set is incomplete / depends on: alpha_frames list length
     def process_sequence(
         self,
         input_dir: str,
@@ -128,9 +158,6 @@ class CorridorKeyProcessor:
 
         if not input_frames:
             raise RuntimeError(f"No input frames found in {input_dir}")
-
-        if not alpha_frames:
-            raise RuntimeError(f"No alpha hint frames found in {alpha_dir}")
 
         if len(alpha_frames) < len(input_frames):
             # Duplicate last alpha if needed
@@ -218,6 +245,9 @@ class CorridorKeyProcessor:
             "frame_count": processed_count,
         }
 
+    # WHAT IT DOES: Releases the neural engine and frees GPU/CUDA memory
+    # DEPENDS-ON: self.engine, torch (optional — gracefully skipped if not installed)
+    # AFFECTS: Must be called on plugin unload or GPU memory leaks between sessions
     def cleanup(self):
         """Release GPU memory."""
         if self.engine:

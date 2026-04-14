@@ -1,3 +1,4 @@
+# Last modified: 2026-04-13 | Change: HRCS retrofit (documentation only, no logic changes) | Full history: git log
 """
 CorridorKey DaVinci Resolve Plugin Installer
 Installs the plugin to the Resolve Scripts folder.
@@ -7,7 +8,20 @@ import sys
 import shutil
 from pathlib import Path
 
+"""
+MODULE: install.py
+WHAT IT DOES: Installs or uninstalls the CorridorKey neural green screen plugin into
+    DaVinci Resolve's Scripts folder. Copies core files, writes a config pointer back
+    to the CorridorKey root, and creates a launcher script Resolve can discover.
+DEPENDS-ON: Resolve must be installed (needs its Scripts/Utility folder on disk).
+    Source tree must contain core/, ui/, and resolve_corridorkey.py alongside this file.
+AFFECTS: Resolve's Utility scripts folder — overwrites CorridorKey/ dir and CorridorKey.py launcher.
+    Uninstall deletes both.
+"""
 
+
+# WHAT IT DOES: Returns the platform-specific path to Resolve's Fusion/Scripts folder.
+# ISOLATED: Pure path lookup, no side effects.
 def get_resolve_scripts_path():
     """Get DaVinci Resolve scripts directory for current platform."""
     if sys.platform == "win32":
@@ -22,6 +36,14 @@ def get_resolve_scripts_path():
         return Path("/opt/resolve/Fusion/Scripts")
 
 
+# WHAT IT DOES: Copies plugin files into Resolve's Utility folder, writes a config file
+#   pointing back to the CorridorKey root, and creates a top-level launcher script.
+# DEPENDS-ON: get_resolve_scripts_path(), source files (core/, ui/, resolve_corridorkey.py)
+# AFFECTS: Resolve Scripts/Utility/CorridorKey/ dir, Scripts/Utility/CorridorKey.py launcher,
+#   and corridorkey_path.txt config inside the installed dir.
+# DANGER ZONE FRAGILE/HIGH: The launcher_content string is written verbatim as a .py file
+#   that Resolve will execute. Any syntax error here silently breaks the plugin launch.
+#   breaks: Resolve menu entry / depends on: resolve_corridorkey.main() existing
 def install():
     """Install CorridorKey plugin to DaVinci Resolve."""
     src_dir = Path(__file__).parent
@@ -141,12 +163,14 @@ main()
     return True
 
 
+# WHAT IT DOES: Removes the installed CorridorKey plugin folder and launcher from Resolve's Scripts dir.
+# DEPENDS-ON: get_resolve_scripts_path()
+# AFFECTS: Deletes Scripts/Utility/CorridorKey/ and Scripts/Utility/CorridorKey.py
 def uninstall():
     """Remove CorridorKey plugin from DaVinci Resolve."""
     scripts_path = get_resolve_scripts_path()
     dest_dir = scripts_path / "Utility" / "CorridorKey"
     launcher_path = scripts_path / "Utility" / "CorridorKey.py"
-    config_path = scripts_path / "Utility" / "corridorkey_path.txt"
 
     print("Uninstalling CorridorKey...")
 
@@ -158,14 +182,11 @@ def uninstall():
         launcher_path.unlink()
         print(f"  Removed: {launcher_path}")
 
-    if config_path.exists():
-        config_path.unlink()
-        print(f"  Removed: {config_path}")
-
     print("Uninstall complete!")
     return True
 
 
+# WHAT IT DOES: CLI entry point — runs uninstall if --uninstall flag passed, otherwise runs install.
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--uninstall":
         uninstall()

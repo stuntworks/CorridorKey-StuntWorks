@@ -1,6 +1,21 @@
+# Last modified: 2026-04-13 | Change: HRCS retrofit (documentation only, no logic changes) | Full history: git log
 """
 Alpha Hint Generator for CorridorKey
 Generates rough alpha masks using simple chroma key detection.
+
+WHAT IT DOES:
+    Takes color images (stills, sequences, or video) with green/blue screen backgrounds
+    and produces single-channel alpha hint masks using HSV-based chroma detection.
+    These hints feed downstream keying/compositing stages as a rough matte starting point.
+
+DEPENDS-ON:
+    - cv2 (OpenCV) for color conversion, morphology, blur, video I/O
+    - numpy for array operations and dtype handling
+    - pathlib / os for filesystem traversal
+
+AFFECTS:
+    - Any pipeline stage that consumes alpha hint PNGs (frame_NNNNN_alpha.png naming)
+    - Downstream composite quality depends on tolerance/softness tuning here
 """
 import os
 from pathlib import Path
@@ -10,6 +25,9 @@ import cv2
 import numpy as np
 
 
+# WHAT IT DOES: Wraps all chroma-based alpha hint generation — single frames, image sequences, and video files.
+# DEPENDS-ON: cv2, numpy
+# AFFECTS: Every downstream consumer of alpha hint masks in the CorridorKey pipeline.
 class AlphaHintGenerator:
     """Generate alpha hint masks using simple chroma detection."""
 
@@ -38,6 +56,12 @@ class AlphaHintGenerator:
             self.lower_hsv = np.array([100, 50, 50])
             self.upper_hsv = np.array([130, 255, 255])
 
+    # WHAT IT DOES: Produces an alpha hint mask from a single image via HSV chroma detection,
+    #   morphological cleanup, and optional Gaussian softening.
+    # DEPENDS-ON: self.screen_type, self.tolerance, self.softness, self.lower_hsv, self.upper_hsv
+    # AFFECTS: All single-frame and batch callers (generate_hints_for_sequence, generate_hint_from_video).
+    # DANGER ZONE FRAGILE/HIGH: HSV range constants (lower_hsv/upper_hsv) are hardcoded in __init__.
+    #   Changing them silently alters every mask in the pipeline. / breaks: all output masks / depends on: __init__ ranges
     def generate_hint(self, image: np.ndarray, color_format: str = "bgr") -> np.ndarray:
         """Generate alpha hint from image using chroma detection.
 
@@ -90,6 +114,10 @@ class AlphaHintGenerator:
 
         return subject_mask
 
+    # WHAT IT DOES: Iterates all image files (png/exr/tif/tiff/jpg/jpeg) in a directory,
+    #   generates an alpha hint for each, and writes results as <stem>_alpha.png.
+    # DEPENDS-ON: generate_hint(), cv2.imread, pathlib glob patterns
+    # AFFECTS: Batch output directory contents; downstream compositors expect the _alpha.png naming convention.
     def generate_hints_for_sequence(
         self,
         input_dir: str,
@@ -149,6 +177,10 @@ class AlphaHintGenerator:
 
         return processed
 
+    # WHAT IT DOES: Opens a video file, reads every frame, generates an alpha hint per frame,
+    #   and writes numbered output PNGs (frame_00000_alpha.png).
+    # DEPENDS-ON: generate_hint(), cv2.VideoCapture
+    # AFFECTS: Batch output directory contents; frame numbering starts at 0 with zero-padded 5-digit names.
     def generate_hint_from_video(
         self,
         video_path: str,

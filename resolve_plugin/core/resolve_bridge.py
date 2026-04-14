@@ -1,6 +1,21 @@
+# Last modified: 2026-04-13 | Change: HRCS retrofit (documentation only, no logic changes) | Full history: git log
 """
-DaVinci Resolve API Bridge for CorridorKey
-Handles all communication with running Resolve instance.
+DaVinci Resolve API Bridge for CorridorKey.
+
+WHAT IT DOES:
+    Wraps the DaVinci Resolve scripting API (DaVinciResolveScript) to provide
+    timeline inspection, frame export, media pool import, and UI access for the
+    CorridorKey plugin.
+
+DEPENDS-ON:
+    - DaVinciResolveScript module (ships with DaVinci Resolve, path varies by OS)
+    - A running DaVinci Resolve instance with external scripting enabled
+    - fusionscript module (optional, for UI dispatcher)
+
+AFFECTS:
+    - resolve_plugin/core/* — any module that talks to Resolve goes through this bridge
+    - resolve_plugin/ui/* — UI panels obtain UIManager/dispatcher from here
+    - Render queue — export_clip_frames creates and deletes render jobs
 """
 import os
 import sys
@@ -9,6 +24,8 @@ import time
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 
+# WHAT IT DOES: Detects OS and adds the correct Resolve scripting module path to sys.path
+# ISOLATED: no external dependencies beyond sys/os
 # Add Resolve scripting module path
 def _add_resolve_paths():
     """Add DaVinci Resolve scripting paths to sys.path."""
@@ -33,11 +50,16 @@ except ImportError:
     dvr_script = None
 
 
+# WHAT IT DOES: Custom exception raised when Resolve is not running or scripting module is missing
+# AFFECTS: Any caller that catches connection failures (UI layer, CLI entry points)
 class ResolveConnectionError(Exception):
     """Could not connect to DaVinci Resolve."""
     pass
 
 
+# WHAT IT DOES: Central bridge object — holds live Resolve/Fusion handles and exposes all API operations
+# DEPENDS-ON: DaVinciResolveScript module, running Resolve instance
+# AFFECTS: Every feature that reads/writes timeline data, exports frames, or imports media
 class ResolveBridge:
     """Wrapper for DaVinci Resolve scripting API."""
 
@@ -50,6 +72,10 @@ class ResolveBridge:
         self.media_pool = None
         self._connect()
 
+    # WHAT IT DOES: Establishes live connection to Resolve, caches project/timeline/media_pool handles
+    # DEPENDS-ON: dvr_script module (imported at module level), Resolve running with scripting enabled
+    # AFFECTS: All other methods — if this fails, nothing else works
+    # DANGER ZONE FRAGILE/HIGH/CRITICAL: Resolve must be running BEFORE instantiation / breaks: entire bridge / depends on: external process state
     def _connect(self):
         """Connect to running DaVinci Resolve instance."""
         if dvr_script is None:
@@ -76,6 +102,8 @@ class ResolveBridge:
             self.timeline = self.project.GetCurrentTimeline()
             self.media_pool = self.project.GetMediaPool()
 
+    # WHAT IT DOES: Returns all video clips on a single timeline track
+    # DEPENDS-ON: self.timeline (set by _connect)
     def get_timeline_video_items(self, track_index: int = 1) -> List[Any]:
         """Get all video items from a timeline track.
 
@@ -89,6 +117,8 @@ class ResolveBridge:
             return []
         return self.timeline.GetItemListInTrack("video", track_index) or []
 
+    # WHAT IT DOES: Iterates every video track and collects all clips into a flat list
+    # DEPENDS-ON: self.timeline (set by _connect)
     def get_all_video_items(self) -> List[Any]:
         """Get all video items from all tracks."""
         if not self.timeline:
@@ -102,6 +132,8 @@ class ResolveBridge:
                 items.extend(track_items)
         return items
 
+    # WHAT IT DOES: Extracts name, frame range, file path, and FPS from a timeline item
+    # DEPENDS-ON: self.timeline, timeline_item.GetMediaPoolItem()
     def get_clip_info(self, timeline_item) -> Dict[str, Any]:
         """Get information about a timeline item.
 
@@ -125,6 +157,10 @@ class ResolveBridge:
             "fps": self.timeline.GetSetting("timelineFrameRate") if self.timeline else "24",
         }
 
+    # WHAT IT DOES: Exports frames from a clip via Resolve's render queue (creates job, polls, deletes job)
+    # DEPENDS-ON: self.project, self.timeline, get_clip_info(), _frame_to_timecode()
+    # AFFECTS: Resolve render queue — adds then removes a render job; writes image files to output_dir
+    # DANGER ZONE FRAGILE/HIGH/CRITICAL: Mutates Resolve render queue / breaks: other pending renders / depends on: no concurrent render jobs
     def export_clip_frames(
         self,
         timeline_item,
@@ -207,6 +243,9 @@ class ResolveBridge:
             "end_frame": end_frame,
         }
 
+    # WHAT IT DOES: Imports an image sequence folder into a named MediaPool bin, optionally generates proxy
+    # DEPENDS-ON: self.media_pool, generate_proxy_for_clip()
+    # AFFECTS: MediaPool structure — creates bin if missing, adds media items
     def import_sequence_to_mediapool(
         self,
         folder_path: str,
@@ -257,6 +296,9 @@ class ResolveBridge:
             return media_pool_item
         return None
 
+    # WHAT IT DOES: Kicks off proxy generation for a single MediaPoolItem using project proxy settings
+    # DEPENDS-ON: media_pool_item.GenerateProxy() — may not exist in older Resolve versions
+    # DANGER ZONE FRAGILE/MEDIUM/CRITICAL: API availability varies by Resolve version / breaks: silently fails / depends on: Resolve version
     def generate_proxy_for_clip(self, media_pool_item) -> bool:
         """Generate proxy media for a MediaPoolItem.
 
@@ -279,6 +321,8 @@ class ResolveBridge:
             print(f"Proxy generation not available: {e}")
             return False
 
+    # WHAT IT DOES: Reads current proxy mode, resolution, and format from project settings
+    # DEPENDS-ON: self.project
     def get_proxy_settings(self) -> Dict[str, Any]:
         """Get current project proxy settings.
 
@@ -293,6 +337,9 @@ class ResolveBridge:
             "proxy_format": self.project.GetSetting("proxyFormat"),
         }
 
+    # WHAT IT DOES: Places a MediaPoolItem onto the timeline at a specific track and frame position
+    # DEPENDS-ON: self.media_pool
+    # AFFECTS: Timeline — inserts new video item which shifts downstream clips
     def add_clip_to_timeline(
         self,
         media_pool_item,
@@ -320,6 +367,8 @@ class ResolveBridge:
 
         return result[0] if result else None
 
+    # WHAT IT DOES: Converts an absolute frame number to HH:MM:SS:FF timecode string
+    # ISOLATED: pure math, no external dependencies
     def _frame_to_timecode(self, frame: int, fps: str) -> str:
         """Convert frame number to timecode string."""
         fps_num = float(fps) if fps else 24.0
@@ -330,12 +379,17 @@ class ResolveBridge:
         frames = int((total_seconds % 1) * fps_num)
         return f"{hours:02d}:{minutes:02d}:{seconds:02d}:{frames:02d}"
 
+    # WHAT IT DOES: Returns Fusion UIManager handle used to build custom UI panels inside Resolve
+    # DEPENDS-ON: self.fusion (set by _connect)
     def get_ui_manager(self):
         """Get Fusion UIManager for creating panels."""
         if self.fusion:
             return self.fusion.UIManager
         return None
 
+    # WHAT IT DOES: Creates a UIDispatcher for handling UI events (buttons, inputs) in custom panels
+    # DEPENDS-ON: fusionscript module (optional import), get_ui_manager()
+    # DANGER ZONE FRAGILE/MEDIUM/CRITICAL: fusionscript import may fail depending on Resolve edition / breaks: UI event loop / depends on: Resolve Studio vs Free
     def get_ui_dispatcher(self):
         """Get UI dispatcher for event handling."""
         try:

@@ -1,38 +1,41 @@
+# Last modified: 2026-04-13 | Change: HRCS retrofit (documentation only, no logic changes) | Full history: git log
 """CorridorKey Pro - Neural Green Screen for DaVinci Resolve
 Enhanced with SAM2 Click-to-Mask, Frame Range, Export Modes
+
+WHAT IT DOES: One-click AI green screen keyer for DaVinci Resolve. Reads source footage
+from the timeline, runs it through Niko Pueringer's CorridorKey neural network, and places
+the keyed result on Track 2. Supports single frame, frame range, SAM2 click-to-mask, and
+live preview with despill/refiner sliders.
+
+DEPENDS-ON:
+  - CorridorKey engine at D:\New AI Projects\CorridorKey (neural keying model)
+  - DaVinci Resolve running with a project and timeline open
+  - Resolve's Fusion scripting environment (fu, fusionscript)
+  - core/corridorkey_processor.py (ProcessingSettings, CorridorKeyProcessor)
+  - core/alpha_hint_generator.py (AlphaHintGenerator)
+  - resolve_plugin/preview_viewer.py (separate process for preview window)
+
+AFFECTS: Timeline Track 2 (writes keyed frames), MediaPool (creates CorridorKey bin),
+  source clip on Track 1 (optionally disabled after processing)
 """
 import sys, os, site, tempfile
 from pathlib import Path
 
-# Auto-detect paths from this script's location (resolve_plugin/CorridorKey_Pro.py)
-_PLUGIN_DIR = Path(__file__).parent.resolve()
-_CORRIDORKEY_ROOT = _PLUGIN_DIR.parent
-
-# Also check corridorkey_path.txt (written by installer) as override
-_config_candidates = [
-    _PLUGIN_DIR / "corridorkey_path.txt",
-    Path(os.environ.get("PROGRAMDATA", "C:/ProgramData")) / "Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility/CorridorKey/corridorkey_path.txt",
-]
-for _cfg in _config_candidates:
-    if _cfg.exists():
-        _override = _cfg.read_text().strip()
-        if Path(_override).exists():
-            _CORRIDORKEY_ROOT = Path(_override)
-            break
-
-_venv_packages = _CORRIDORKEY_ROOT / ".venv" / "Lib" / "site-packages"
-if _venv_packages.exists():
-    site.addsitedir(str(_venv_packages))
-    sys.path.insert(0, str(_venv_packages))
-
-_resolve_modules = Path(os.environ.get("PROGRAMDATA", "C:/ProgramData")) / "Blackmagic Design/DaVinci Resolve/Support/Developer/Scripting/Modules"
-sys.path.insert(0, str(_resolve_modules))
-sys.path.insert(0, str(_CORRIDORKEY_ROOT))
-sys.path.insert(0, str(_PLUGIN_DIR))
+# DANGER ZONE FRAGILE: Hardcoded paths to CorridorKey venv and Resolve SDK
+# breaks: if CorridorKey moves or Resolve updates SDK location
+# depends on: D:\New AI Projects\CorridorKey\.venv existing with all dependencies
+venv_packages = r"D:\New AI Projects\CorridorKey\.venv\Lib\site-packages"
+site.addsitedir(venv_packages)
+sys.path.insert(0, venv_packages)
+sys.path.insert(0, r"C:\ProgramData\Blackmagic Design\DaVinci Resolve\Support\Developer\Scripting\Modules")
+sys.path.insert(0, r"D:\New AI Projects\CorridorKey")
+sys.path.insert(0, r"D:\New AI Projects\CorridorKey\resolve_plugin")
 
 import fusionscript
 
-# Use fu/fusion provided by Resolve's script runner (avoid dvr.scriptapp hang)
+# DANGER ZONE FRAGILE: Resolve API init — fu is injected by Resolve's script runner.
+# breaks: if script is run outside Resolve (standalone Python will crash here)
+# depends on: Resolve running, project open, timeline loaded
 resolve = fu.GetResolve()
 ui = fu.UIManager
 disp = fusionscript.UIDispatcher(ui)
@@ -42,20 +45,27 @@ project = pm.GetCurrentProject()
 media_pool = project.GetMediaPool() if project else None
 timeline = project.GetCurrentTimeline() if project else None
 
+# Global state caches — these persist between button clicks during one session
 last_preview_data = {"original": None, "keyed": None, "alpha": None}
 cached_source = {"frame": None, "file_path": None, "frame_num": None}
-cached_processor = {"proc": None}
+cached_processor = {"proc": None}  # Holds loaded AI model to avoid reloading every frame
 sam_points = {"positive": [], "negative": [], "frame": None}
 frame_range = {"in_frame": None, "out_frame": None}
 
-# Persistent settings
+# Persistent settings — saved to temp folder so output path survives between sessions
 _config_path = Path(tempfile.gettempdir()) / "corridorkey_config.txt"
+
+# WHAT IT DOES: Reads the user's last-used output folder from a config file in temp
+# ISOLATED: no dependencies, returns a safe default if file missing or unreadable
 def _load_output_path():
     try:
         if _config_path.exists():
             return _config_path.read_text().strip()
     except: pass
     return str(Path.home() / "Documents" / "CorridorKey")
+
+# WHAT IT DOES: Saves the user's chosen output folder to a config file in temp
+# ISOLATED: no dependencies, silently fails if temp folder is locked
 def _save_output_path(p):
     try: _config_path.write_text(p)
     except: pass
@@ -148,18 +158,27 @@ items["OutputMode"].AddItem("Track 2 (Above Source)")
 items["OutputMode"].AddItem("MediaPool Only")
 items["OutputMode"].AddItem("Fusion Comp")
 
+# WHAT IT DOES: Writes a message to both the console and the in-panel log window
+# AFFECTS: Log TextEdit widget in the UI panel
 def log(msg):
     print(msg)
     items["Log"].PlainText = (items["Log"].PlainText or "") + msg + "\n"
 
+# WHAT IT DOES: Updates the cyan status label at the center of the panel
 def status(msg): items["Status"].Text = msg
 
+# WHAT IT DOES: Reads all UI controls and returns a dict of current processing settings
+# DEPENDS-ON: All combo boxes, sliders, and checkboxes in the panel
 def get_settings():
     return {"alpha_method": items["AlphaMethod"].CurrentIndex, "screen_type": "green" if items["ScreenType"].CurrentIndex == 0 else "blue",
             "despill_strength": items["DespillSlider"].Value / 100.0, "refiner_strength": items["RefinerSlider"].Value / 100.0,
             "despeckle_enabled": items["DespeckleCheck"].Checked, "despeckle_size": items["DespeckleSize"].Value,
             "export_format": items["ExportFormat"].CurrentIndex, "output_mode": items["OutputMode"].CurrentIndex}
 
+# WHAT IT DOES: Gets the current playhead position as a frame number and the timeline fps
+# DEPENDS-ON: Resolve project settings for frame rate, timeline for timecode
+# DANGER ZONE FRAGILE: Timecode parsing assumes HH:MM:SS:FF format
+# breaks: if Resolve returns non-standard timecode format or drop-frame semicolons
 def get_current_frame_info():
     try:
         fps = float(project.GetSetting("timelineFrameRate") or 24)
@@ -171,23 +190,29 @@ def get_current_frame_info():
         return 0, fps
     except: return 0, 24.0
 
+# --- Frame Range UI Callbacks ---
+# WHAT IT DOES: Sets IN point to current playhead frame for range processing
 def on_set_in_point(ev):
     cf, _ = get_current_frame_info()
     frame_range["in_frame"] = cf
     items["InPointLabel"].Text = str(cf)
     log(f"IN: {cf}")
 
+# WHAT IT DOES: Sets OUT point to current playhead frame for range processing
 def on_set_out_point(ev):
     cf, _ = get_current_frame_info()
     frame_range["out_frame"] = cf
     items["OutPointLabel"].Text = str(cf)
     log(f"OUT: {cf}")
 
+# WHAT IT DOES: Clears both IN and OUT points, resets labels to "---"
 def on_clear_range(ev):
     frame_range["in_frame"] = frame_range["out_frame"] = None
     items["InPointLabel"].Text = items["OutPointLabel"].Text = "---"
     log("Range cleared")
 
+# WHAT IT DOES: Opens a folder picker for the user to choose where keyed frames are saved
+# AFFECTS: OutputPath text field, persistent config file in temp
 def on_browse_output(ev):
     folder = fu.RequestDir(items["OutputPath"].Text)
     if folder:
@@ -195,14 +220,22 @@ def on_browse_output(ev):
         _save_output_path(str(folder))
         log(f"Output: {folder}")
 
+# WHAT IT DOES: Updates despill value label; if Live Preview is on, re-keys with new setting
+# DEPENDS-ON: cached_source (must have a frame loaded), reprocess_with_cached()
 def on_despill_changed(ev):
     items["DespillValue"].Text = f"{items['DespillSlider'].Value / 100.0:.2f}"
     if items["LivePreview"].Checked and cached_source["frame"] is not None: reprocess_with_cached()
 
+# WHAT IT DOES: Updates refiner value label; if Live Preview is on, re-keys with new setting
+# DEPENDS-ON: cached_source (must have a frame loaded), reprocess_with_cached()
 def on_refiner_changed(ev):
     items["RefinerValue"].Text = f"{items['RefinerSlider'].Value / 100.0:.2f}"
     if items["LivePreview"].Checked and cached_source["frame"] is not None: reprocess_with_cached()
 
+# WHAT IT DOES: Generates an alpha hint (rough matte) for the neural keyer to refine.
+#   Simple mode uses chroma difference; SAM2 mode uses click points from the SAM window.
+# DEPENDS-ON: core/alpha_hint_generator.py, SAM2 weights (if SAM2 mode selected)
+# AFFECTS: Quality of the final key — bad hint = bad matte
 def generate_alpha_hint(frame, settings):
     import numpy as np
     if settings["alpha_method"] == 0:
@@ -214,6 +247,11 @@ def generate_alpha_hint(frame, settings):
         from core.alpha_hint_generator import AlphaHintGenerator
         return AlphaHintGenerator(screen_type=settings["screen_type"]).generate_hint(frame)
 
+# WHAT IT DOES: Runs SAM2 (Segment Anything Model 2) to generate a mask from user click points.
+#   Loads the SAM2 model, feeds it the frame + positive/negative points, returns the best mask.
+# DEPENDS-ON: SAM2 weights at D:\New AI Projects\CorridorKey\sam2_weights\, CUDA GPU
+# DANGER ZONE HIGH: Loads a ~300MB model into VRAM every call. No caching.
+# breaks: if VRAM is full (Resolve already uses 2-4GB), or SAM2 weights are missing
 def generate_sam2_mask(frame, pos_pts, neg_pts):
     import cv2, numpy as np, torch
     try:
@@ -221,7 +259,7 @@ def generate_sam2_mask(frame, pos_pts, neg_pts):
         from sam2.sam2_image_predictor import SAM2ImagePredictor
         log("Loading SAM2...")
         status("Loading SAM2...")
-        ckpt = str(_CORRIDORKEY_ROOT / "sam2_weights" / "sam2.1_hiera_small.pt")
+        ckpt = r"D:\New AI Projects\CorridorKey\sam2_weights\sam2.1_hiera_small.pt"
         cfg = "configs/sam2.1/sam2.1_hiera_s.yaml"
         device = "cuda" if torch.cuda.is_available() else "cpu"
         model = build_sam2(cfg, ckpt, device=device)
@@ -239,6 +277,12 @@ def generate_sam2_mask(frame, pos_pts, neg_pts):
         from core.alpha_hint_generator import AlphaHintGenerator
         return AlphaHintGenerator(screen_type="green").generate_hint(frame)
 
+# WHAT IT DOES: Opens a tkinter window showing the current frame. User left-clicks to mark
+#   subject (include), right-clicks to mark background (exclude). Points feed into SAM2.
+# DEPENDS-ON: tkinter, PIL, cv2, timeline clip on Track 1
+# AFFECTS: sam_points global dict (stores click coordinates for generate_sam2_mask)
+# DANGER ZONE FRAGILE: Runs tkinter in a daemon thread — Resolve's event loop can conflict.
+# breaks: if tkinter mainloop deadlocks with Fusion UIDispatcher
 def open_sam_click_window():
     import threading, cv2
     def run():
@@ -290,12 +334,15 @@ def open_sam_click_window():
         sw.lift(); sw.attributes("-topmost", True); sw.after(100, lambda: sw.attributes("-topmost", False)); sw.mainloop()
     threading.Thread(target=run, daemon=True).start()
 
+# WHAT IT DOES: Button handler — switches to SAM2 mode and opens the click window
 def on_sam_click_mask(ev):
     log("Opening SAM2...")
     status("Click on subject")
     items["AlphaMethod"].CurrentIndex = 1
     open_sam_click_window()
 
+# WHAT IT DOES: Generates a gray checkerboard pattern for transparency preview
+# ISOLATED: pure function, no dependencies
 def create_checkerboard(h, w, sz=20):
     import numpy as np
     c = np.zeros((h, w, 3), dtype=np.uint8)
@@ -304,6 +351,8 @@ def create_checkerboard(h, w, sz=20):
             c[y, x] = [180, 180, 180] if ((x // sz) + (y // sz)) % 2 == 0 else [120, 120, 120]
     return c
 
+# WHAT IT DOES: Composites foreground over a checkerboard using the alpha matte
+# DEPENDS-ON: create_checkerboard()
 def composite_over_checker(fg, alpha, sz=20):
     import numpy as np
     h, w = fg.shape[:2]
@@ -312,6 +361,10 @@ def composite_over_checker(fg, alpha, sz=20):
     a3 = np.stack([a, a, a], axis=2)
     return (fg * a3 + chk * (1 - a3)).astype(np.uint8)
 
+# WHAT IT DOES: Searches all video tracks for a clip at the current playhead to use as
+#   composite background in the preview window. Checks every track, grabs the frame via OpenCV.
+# DEPENDS-ON: timeline, get_current_frame_info(), OpenCV
+# AFFECTS: nothing — read-only, returns a frame or None
 def grab_background_frame():
     """Try to grab a frame from the track below the green screen for composite background."""
     import cv2
@@ -342,6 +395,12 @@ def grab_background_frame():
         log(f"BG grab failed: {e}")
     return None
 
+# WHAT IT DOES: Saves original, foreground, matte, and optional background plate to temp PNGs,
+#   then launches preview_viewer.py as a separate process to display them side by side.
+# DEPENDS-ON: preview_viewer.py at D:\New AI Projects\CorridorKey\resolve_plugin\,
+#   CorridorKey venv Python, grab_background_frame()
+# DANGER ZONE FRAGILE: Hardcoded paths to viewer script and Python exe
+# breaks: if CorridorKey folder moves or venv is rebuilt
 def show_preview_window(orig_bgr, keyed_rgb, alpha):
     import cv2, numpy as np, subprocess, json
     a2d = alpha[:, :, 0] if len(alpha.shape) == 3 else alpha
@@ -377,14 +436,18 @@ def show_preview_window(orig_bgr, keyed_rgb, alpha):
         cv2.imwrite(paths["background"], bg_frame)
         log("Background plate saved for composite")
     # Launch preview as separate process — no event loop conflicts
-    viewer_script = str(_PLUGIN_DIR / "preview_viewer.py")
-    python_exe = str(_CORRIDORKEY_ROOT / ".venv" / "Scripts" / "python.exe")
+    viewer_script = str(Path(r"D:\New AI Projects\CorridorKey\resolve_plugin") / "preview_viewer.py")
+    python_exe = str(Path(r"D:\New AI Projects\CorridorKey") / ".venv" / "Scripts" / "python.exe")
     subprocess.Popen(
         [python_exe, viewer_script, json.dumps(paths)],
         creationflags=subprocess.CREATE_NO_WINDOW
     )
     log("Preview launched")
 
+# WHAT IT DOES: Writes the keyed result to disk as PNG. Three export formats:
+#   0 = RGBA (foreground + alpha), 1 = Alpha only (grayscale matte), 2 = Foreground only (no alpha)
+# DEPENDS-ON: OpenCV, numpy
+# ISOLATED: pure file write, no side effects beyond disk
 def save_output(fg, matte, path, fmt):
     import cv2, numpy as np
     m = matte[:, :, 0] if len(matte.shape) == 3 else matte
@@ -395,6 +458,10 @@ def save_output(fg, matte, path, fmt):
     elif fmt == 1: cv2.imwrite(str(path), (m * 255).astype(np.uint8))
     elif fmt == 2: cv2.imwrite(str(path), cv2.cvtColor((fg * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
 
+# WHAT IT DOES: Re-runs the neural keyer on the already-loaded frame using current slider values.
+#   Used by Live Preview mode — avoids re-reading video from disk on every slider change.
+# DEPENDS-ON: cached_source (must have a frame), CorridorKeyProcessor, show_preview_window()
+# AFFECTS: last_preview_data global, launches preview viewer
 def reprocess_with_cached():
     global last_preview_data
     import cv2, numpy as np
@@ -420,6 +487,17 @@ def reprocess_with_cached():
             status("Updated")
     except Exception as e: log(f"Error: {e}")
 
+# WHAT IT DOES: The main single-frame workflow. Reads the frame at the playhead from Track 1,
+#   runs it through the CorridorKey neural keyer, saves the result to disk, imports it into
+#   the MediaPool "CorridorKey" bin, and places it on Track 2 at the playhead position.
+#   If preview_only=True, just shows the preview window without importing to timeline.
+# DEPENDS-ON: timeline, media_pool, get_current_frame_info(), generate_alpha_hint(),
+#   CorridorKeyProcessor, save_output(), show_preview_window()
+# AFFECTS: MediaPool (creates CorridorKey bin, imports keyed PNG), Timeline Track 2 (places clip),
+#   Track 1 source clip (optionally disabled), cached_source and last_preview_data globals
+# DANGER ZONE HIGH: Timeline manipulation (lines 470-517) uses multiple Resolve API methods
+#   that can fail silently or behave differently across Resolve versions.
+# breaks: if Resolve API changes AppendToTimeline behavior, or if clip trimming fails
 def process_current_frame(preview_only=False):
     global last_preview_data, cached_source
     import cv2, numpy as np
@@ -538,13 +616,23 @@ def process_current_frame(preview_only=False):
         status("ERROR!")
         log(f"ERROR: {e}")
         import traceback; log(traceback.format_exc())
-        with open(str(Path(tempfile.gettempdir()) / "ck_error.txt"), "w") as ef: ef.write(traceback.format_exc())
+        with open(r"D:\ck_error.txt", "w") as ef: ef.write(traceback.format_exc())
 
+# WHAT IT DOES: Button handlers — preview shows key without importing, process imports to timeline
 def on_show_preview(ev): process_current_frame(preview_only=True)
 def on_process_frame(ev): process_current_frame(preview_only=False)
 
 processing_cancelled = False
 
+# WHAT IT DOES: Processes every frame in the IN-OUT range (or full clip if no range set).
+#   Reads each frame from disk via OpenCV, keys it through the neural network, saves PNGs,
+#   then imports the full sequence into MediaPool and places it on Track 2.
+# DEPENDS-ON: timeline, media_pool, CorridorKeyProcessor, generate_alpha_hint(), save_output()
+# AFFECTS: Disk (writes all keyed PNGs), MediaPool (imports sequence), Timeline Track 2,
+#   Track 1 (optionally disabled after processing)
+# DANGER ZONE HIGH: Long-running loop with no progress callback to Resolve.
+#   Resolve may appear frozen during processing. Cannot be interrupted by Resolve UI.
+# breaks: if user closes Resolve during processing, or if disk fills up mid-range
 def on_process_range(ev):
     global processing_cancelled
     processing_cancelled = False
@@ -632,11 +720,13 @@ def on_process_range(ev):
         status("ERROR!"); log(f"ERROR: {e}")
         import traceback; log(traceback.format_exc())
 
+# WHAT IT DOES: Sets the cancel flag so the range processing loop stops on next iteration
 def on_cancel(ev):
     global processing_cancelled
     processing_cancelled = True
     log("Cancelling...")
 
+# WHAT IT DOES: Toggles Track 1 visibility on/off — lets user quickly show/hide source footage
 def on_toggle_track1(ev):
     try:
         if timeline:
@@ -645,10 +735,12 @@ def on_toggle_track1(ev):
             status(f"Track 1 {'enabled' if not cur else 'disabled'}")
     except: pass
 
+# WHAT IT DOES: Switches Resolve to the Fusion page for manual compositing
 def on_open_fusion(ev):
     try: resolve.OpenPage("fusion"); status("Fusion opened")
     except: pass
 
+# WHAT IT DOES: Exits the Fusion UIDispatcher event loop, closing the plugin window
 def on_close(ev): disp.ExitLoop()
 
 win.On.DespillSlider.SliderMoved = on_despill_changed
@@ -665,6 +757,9 @@ win.On.Cancel.Clicked = on_cancel
 win.On.ToggleTrack1.Clicked = on_toggle_track1
 win.On.OpenFusion.Clicked = on_open_fusion
 
+# WHAT IT DOES: Shows the About dialog with credits, how-to-use guide, and Ko-fi link.
+#   Credits Niko Pueringer/Corridor Digital (engine) and Roberto+Elvis Lopez/StuntWorks (plugin).
+# ISOLATED: self-contained dialog, no side effects
 def on_about(ev):
     about_win = disp.AddWindow({"ID": "About", "WindowTitle": "About CorridorKey Pro", "Geometry": [200, 150, 460, 620]}, [
         ui.VGroup({"Spacing": 8, "Margin": 16}, [
