@@ -180,16 +180,13 @@ def get_settings():
 # DANGER ZONE FRAGILE: Timecode parsing assumes HH:MM:SS:FF format
 # breaks: if Resolve returns non-standard timecode format or drop-frame semicolons
 def get_current_frame_info():
-    # DANGER ZONE FRAGILE: Resolve timecode reports NEXT frame boundary (same as AE/Premiere)
-    # breaks: extracted frame is 1 ahead of display / depends on: fps
-    # Subtract 1 so extracted content matches what Resolve shows at playhead
     try:
         fps = float(project.GetSetting("timelineFrameRate") or 24)
         tc = timeline.GetCurrentTimecode()
         parts = tc.replace(";", ":").split(":")
         if len(parts) == 4:
             h, m, s, f = [int(p) for p in parts]
-            return max(0, int(h * 3600 * fps + m * 60 * fps + s * fps + f) - 1), fps
+            return int(h * 3600 * fps + m * 60 * fps + s * fps + f), fps
         return 0, fps
     except: return 0, 24.0
 
@@ -299,7 +296,7 @@ def open_sam_click_window():
         mpi = clip.GetMediaPoolItem()
         props = mpi.GetClipProperty() if mpi else {}
         fp = props.get("File Path", "")
-        fn = clip.GetLeftOffset() + (cf - clip.GetStart())
+        fn = clip.GetLeftOffset() + (cf - clip.GetStart()) + 1
         if fn < 0: fn = 0
         cap = cv2.VideoCapture(fp)
         cap.set(cv2.CAP_PROP_POS_FRAMES, fn)
@@ -522,7 +519,8 @@ def process_current_frame(preview_only=False):
         props = mpi.GetClipProperty() if mpi else {}
         fp = props.get("File Path", "")
         log(f"Source: {os.path.basename(fp)}")
-        fn = clip.GetLeftOffset() + (cf - cs)
+        # DANGER ZONE FRAGILE: +1 aligns Resolve frame numbering with OpenCV 0-indexed frames
+        fn = clip.GetLeftOffset() + (cf - cs) + 1
         if fn < 0: fn = 0
         cap = cv2.VideoCapture(fp)
         cap.set(cv2.CAP_PROP_POS_FRAMES, fn)
@@ -680,7 +678,8 @@ def on_process_range(ev):
         pr = 0
         for tf in range(inf, outf):
             if processing_cancelled: log("Cancelled"); break
-            sf = ss + (tf - cs)
+            # DANGER ZONE FRAGILE: +1 aligns Resolve frame numbering with OpenCV 0-indexed frames
+            sf = ss + (tf - cs) + 1
             cap.set(cv2.CAP_PROP_POS_FRAMES, sf)
             ret, frame = cap.read()
             if not ret: continue
@@ -713,6 +712,8 @@ def on_process_range(ev):
         if not imp: status("Import failed"); return
         log(f"Imported {len(imp)} items to MediaPool")
         if settings["output_mode"] in [0, 2]:
+            # DANGER ZONE FRAGILE: Resolve batch needs +1 frame on recordFrame to align with V1
+            # breaks: sequence starts 1 frame early / depends on: timeline frame numbering
             ci = {"mediaPoolItem": imp[0], "startFrame": 0, "endFrame": len(ofs), "trackIndex": 2, "recordFrame": inf, "mediaType": 1}
             if media_pool.AppendToTimeline([ci]):
                 if items["DisableTrack1"].Checked: timeline.SetTrackEnable("video", 1, False)
