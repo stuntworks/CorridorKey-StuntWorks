@@ -296,7 +296,7 @@ def open_sam_click_window():
         mpi = clip.GetMediaPoolItem()
         props = mpi.GetClipProperty() if mpi else {}
         fp = props.get("File Path", "")
-        fn = clip.GetLeftOffset() + (cf - clip.GetStart()) + 1
+        fn = clip.GetLeftOffset() + (cf - clip.GetStart()) - 1
         if fn < 0: fn = 0
         cap = cv2.VideoCapture(fp)
         cap.set(cv2.CAP_PROP_POS_FRAMES, fn)
@@ -679,7 +679,7 @@ def on_process_range(ev):
         for tf in range(inf, outf):
             if processing_cancelled: log("Cancelled"); break
             # DANGER ZONE FRAGILE: +1 aligns Resolve frame numbering with OpenCV 0-indexed frames
-            sf = ss + (tf - cs) + 1
+            sf = ss + (tf - cs) - 1
             cap.set(cv2.CAP_PROP_POS_FRAMES, sf)
             ret, frame = cap.read()
             if not ret: continue
