@@ -367,7 +367,9 @@ function ae_processWorkArea(settingsJson) {
 // PREMIERE PRO
 // ============================================================
 
-// Premiere: get clip info for panel-side Python execution (no system.callSystem in Premiere)
+// WHAT IT DOES: Gets source clip info at playhead for panel-side Python frame extraction
+// DEPENDS-ON: active sequence, video track 1 clips, sequence fps settings
+// AFFECTS: nothing — read-only, returns JSON with sourcePath, sourceFrame, fps
 function ppro_getClipInfo() {
     try {
         var seq = app.project.activeSequence;
@@ -439,6 +441,9 @@ function ppro_getClipInfo() {
     }
 }
 
+// WHAT IT DOES: Gets frame range info for batch processing (I/O marks or full clip)
+// DEPENDS-ON: active sequence, I/O marks or clip on V1, sequence fps settings
+// AFFECTS: nothing — read-only, returns JSON with sourcePath, startFrame, endFrame, fps, clipStartSec
 function ppro_getWorkAreaInfo() {
     try {
         var seq = app.project.activeSequence;
@@ -506,6 +511,9 @@ function ppro_getWorkAreaInfo() {
     }
 }
 
+// WHAT IT DOES: Imports keyed PNG into CorridorKey bin and places on V2 at playhead
+// DEPENDS-ON: filePath (keyed PNG), active sequence with 2+ video tracks
+// AFFECTS: Project panel (creates CorridorKey bin), Timeline V2 (adds 1-frame clip)
 function ppro_importFile(filePath) {
     try {
         // Find or create CorridorKey bin
@@ -565,6 +573,9 @@ function ppro_importFile(filePath) {
     }
 }
 
+// WHAT IT DOES: Imports keyed PNG sequence into CorridorKey bin, places on V2, optionally disables V1 source
+// DEPENDS-ON: folderPath (batch output), fps, clipStartSec (V1 clip position), active sequence
+// AFFECTS: Project panel (creates CorridorKey bin), Timeline V2 (adds sequence), optionally disables V1 clip
 function ppro_importSequence(folderPath, fps, clipStartSec, disableSource) {
     try {
         var firstOut = folderPath + "\\output_00000.png";
