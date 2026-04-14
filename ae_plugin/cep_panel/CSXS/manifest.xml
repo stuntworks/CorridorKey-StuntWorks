@@ -21,6 +21,13 @@
                 <Resources>
                     <MainPath>./index.html</MainPath>
                     <ScriptPath>./jsx/host.jsx</ScriptPath>
+                    <!-- The enable-nodejs flag turns on Node.js inside the panel so
+                         panel JS can call child_process.spawnSync with an argv array
+                         (no shell, so no injection) to run Python. The mixed-context
+                         flag lets HTML and Node share globals so require works directly.
+                         Removing either flag forces Python invocation back through
+                         ExtendScript system.callSystem, which was the injection path
+                         we eliminated. Do not remove. -->
                     <CEFCommandLine>
                         <Parameter>--enable-nodejs</Parameter>
                         <Parameter>--mixed-context</Parameter>

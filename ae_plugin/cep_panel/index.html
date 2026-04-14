@@ -1,137 +1,48 @@
 <!DOCTYPE html>
+<!-- Last modified: 2026-04-14 | Change: Move all Python exec from ExtendScript to Node.js
+     panel side (child_process.execFileSync with argv array). Zero shell, zero injection.
+     Added real log file, crypto-random temp names, settings-via-JSON-file. -->
 <html>
 <head>
     <meta charset="UTF-8">
     <title>CorridorKey StuntWorks</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
-        body {
-            font-family: 'Segoe UI', Arial, sans-serif;
-            background: #232323;
-            color: #e0e0e0;
-            padding: 15px;
-            font-size: 12px;
-            overflow-y: auto;
-        }
-        h1 {
-            color: #4CAF50;
-            font-size: 16px;
-            text-align: center;
-            margin-bottom: 2px;
-        }
-        .credit {
-            text-align: center;
-            font-size: 9px;
-            color: #777;
-            margin-bottom: 12px;
-        }
+        body { font-family: 'Segoe UI', Arial, sans-serif; background: #232323; color: #e0e0e0;
+               padding: 15px; font-size: 12px; overflow-y: auto; }
+        h1 { color: #4CAF50; font-size: 16px; text-align: center; margin-bottom: 2px; }
+        .credit { text-align: center; font-size: 9px; color: #777; margin-bottom: 12px; }
         .credit a { color: #999; text-decoration: none; }
         .credit a:hover { color: #4CAF50; }
-        .section {
-            margin-bottom: 12px;
-        }
-        label {
-            display: block;
-            margin-bottom: 5px;
-            color: #aaa;
-        }
-        select, input[type="range"] {
-            width: 100%;
-            padding: 8px;
-            background: #333;
-            border: 1px solid #444;
-            color: #fff;
-            border-radius: 4px;
-        }
-        input[type="range"] {
-            padding: 0;
-            height: 20px;
-        }
-        .slider-row {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-        .slider-row input {
-            flex: 1;
-        }
-        .slider-value {
-            width: 40px;
-            text-align: right;
-            color: #4CAF50;
-        }
-        .checkbox-row {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            margin: 10px 0;
-        }
-        button {
-            width: 100%;
-            padding: 12px;
-            margin: 5px 0;
-            border: none;
-            border-radius: 4px;
-            font-size: 13px;
-            font-weight: bold;
-            cursor: pointer;
-            transition: background 0.2s;
-        }
-        .btn-process {
-            background: #4CAF50;
-            color: white;
-        }
-        .btn-process:hover { background: #45a049; }
-        .btn-preview {
-            background: #9C27B0;
-            color: white;
-        }
-        .btn-preview:hover { background: #7B1FA2; }
-        .btn-batch {
-            background: #2196F3;
-            color: white;
-        }
-        .btn-batch:hover { background: #1976D2; }
-        #preview-container {
-            margin-top: 10px;
-            text-align: center;
-            background: #1a1a1a;
-            border-radius: 4px;
-            min-height: 40px;
-            overflow: hidden;
-        }
-        #preview-container img {
-            width: 48%;
-            display: inline-block;
-            border-radius: 4px;
-            margin: 1%;
-        }
-        #preview-label {
-            color: #666;
-            font-size: 10px;
-            padding: 12px;
-        }
-        #status {
-            text-align: center;
-            padding: 8px;
-            margin-top: 8px;
-            background: #1a1a1a;
-            border-radius: 4px;
-            color: #0ff;
-            font-weight: bold;
-            font-size: 11px;
-        }
-        #log {
-            background: #111;
-            color: #0f0;
-            font-family: monospace;
-            font-size: 10px;
-            padding: 8px;
-            margin-top: 8px;
-            height: 60px;
-            overflow-y: auto;
-            border-radius: 4px;
-        }
+        .section { margin-bottom: 12px; }
+        label { display: block; margin-bottom: 5px; color: #aaa; }
+        select, input[type="range"] { width: 100%; padding: 8px; background: #333;
+            border: 1px solid #444; color: #fff; border-radius: 4px; }
+        input[type="range"] { padding: 0; height: 20px; }
+        .slider-row { display: flex; align-items: center; gap: 10px; }
+        .slider-row input { flex: 1; }
+        .slider-value { width: 40px; text-align: right; color: #4CAF50; }
+        .checkbox-row { display: flex; align-items: center; gap: 8px; margin: 10px 0; }
+        button { width: 100%; padding: 12px; margin: 5px 0; border: none; border-radius: 4px;
+            font-size: 13px; font-weight: bold; cursor: pointer; transition: background 0.2s; }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+        .btn-process { background: #4CAF50; color: white; }
+        .btn-process:hover:enabled { background: #45a049; }
+        .btn-preview { background: #9C27B0; color: white; }
+        .btn-preview:hover:enabled { background: #7B1FA2; }
+        .btn-batch { background: #2196F3; color: white; }
+        .btn-batch:hover:enabled { background: #1976D2; }
+        #preview-container { margin-top: 10px; text-align: center; background: #1a1a1a;
+            border-radius: 4px; min-height: 40px; overflow: hidden; }
+        #preview-container img { width: 48%; display: inline-block; border-radius: 4px; margin: 1%; }
+        #preview-label { color: #666; font-size: 10px; padding: 12px; }
+        #status { text-align: center; padding: 8px; margin-top: 8px; background: #1a1a1a;
+            border-radius: 4px; color: #0ff; font-weight: bold; font-size: 11px; }
+        #progress-bar { margin-top: 6px; height: 6px; background: #111; border-radius: 3px; overflow: hidden; display: none; }
+        #progress-fill { height: 100%; width: 0%; background: #2196F3; transition: width 0.2s; }
+        #log { background: #111; color: #0f0; font-family: monospace; font-size: 10px;
+            padding: 8px; margin-top: 8px; height: 80px; overflow-y: auto; border-radius: 4px; }
+        .log-err { color: #f66; }
     </style>
 </head>
 <body>
@@ -184,405 +95,369 @@
         </div>
     </div>
 
-    <div class="checkbox-row">
-        <input type="checkbox" id="addToTimeline" checked>
-        <label for="addToTimeline" style="margin:0">Add keyed clip to timeline</label>
-    </div>
-    <div class="checkbox-row">
-        <input type="checkbox" id="disableSource">
-        <label for="disableSource" style="margin:0">Disable source clip after processing</label>
-    </div>
-    <div style="font-size:9px; color:#777; margin:-4px 0 8px 24px;">Tip: Re-enable any clip with <span style="color:#4CAF50; font-weight:bold;">Shift+E</span> (Windows)</div>
-
-    <button class="btn-preview" onclick="processFrame(true)">PREVIEW FRAME</button>
-    <button class="btn-process" onclick="processFrame(false)">PROCESS FRAME</button>
-    <button class="btn-batch" onclick="processWorkArea()">PROCESS WORK AREA</button>
+    <button id="btn-preview" class="btn-preview" onclick="processFrame(true)">PREVIEW FRAME</button>
+    <button id="btn-process" class="btn-process" onclick="processFrame(false)">KEY CURRENT FRAME</button>
+    <button id="btn-batch"   class="btn-batch"   onclick="processBatch()">PROCESS WORK AREA</button>
 
     <div id="status">Ready</div>
+    <div id="progress-bar"><div id="progress-fill"></div></div>
     <div id="log"></div>
 
     <script src="./js/CSInterface.js"></script>
     <script>
-        const cs = new CSInterface();
-        const cp = require('child_process');
-        const path = require('path');
-        const fs = require('fs');
-        const os = require('os');
+/* ============================================================
+   CorridorKey — Panel Controller
+   Last modified: 2026-04-14 | Change: Node.js-side Python exec, crypto-random temp
+      names, real log file, settings via JSON file.
 
-        var lastOutputPath = null;
-        var hostApp = 'ae';
+   WHAT THIS CODE DOES:
+   1. Reads timeline state from ExtendScript (host.jsx returns JSON strings).
+   2. Writes settings to a temp JSON file using Node.js fs.
+   3. Spawns ae_processor.py via child_process.execFileSync with an argv array —
+      arguments never touch a shell, so shell-injection is architecturally impossible.
+   4. On success, calls back into ExtendScript to import the result onto the timeline.
+   5. Writes a plain-text log of everything to %TEMP%\corridorkey.log for support.
 
-        // Read CorridorKey root from config
-        var ckRoot = '';
-        var configPath = path.join(__dirname, 'corridorkey_path.txt');
-        try {
-            ckRoot = fs.readFileSync(configPath, 'utf8').trim();
-        } catch(e) {
-            ckRoot = 'D:\\New AI Projects\\CorridorKey';
-        }
-        var pythonExe = path.join(ckRoot, '.venv', 'Scripts', 'pythonw.exe');
-        var processorScript = path.join(ckRoot, 'ae_plugin', 'ae_processor.py');
+   DEPENDS-ON: CEP panel with --enable-nodejs --mixed-context (set in manifest.xml).
+               Node.js modules: child_process, fs, path, os, crypto.
+               host.jsx functions that return JSON-serialized state.
+   AFFECTS: Filesystem (temp JSON + output PNG), timeline (via host.jsx).
+   ============================================================ */
 
-        function openURL(url) {
-            cs.openURLInDefaultBrowser(url);
-        }
+const cs = new CSInterface();
 
-        const OUTPUT_KEY = 'ck_output_path';
+// Node.js modules loaded via CEP's mixed-context (not browser require — Node require).
+const childProcess = require('child_process');
+const fs   = require('fs');
+const path = require('path');
+const os   = require('os');
+const crypto = require('crypto');
 
-        var savedOutput = localStorage.getItem(OUTPUT_KEY);
-        if (!savedOutput) {
-            savedOutput = os.homedir().replace(/\\/g, '/') + '/Documents/CorridorKey';
-        }
+// ── Path discovery ──────────────────────────────────────────
+// The panel folder inside the Adobe CEP extensions dir. When installed it is:
+//   Windows: %APPDATA%\Adobe\CEP\extensions\com.corridorkey.panel
+//   macOS:   ~/Library/Application Support/Adobe/CEP/extensions/com.corridorkey.panel
+const PANEL_DIR = path.dirname(decodeURIComponent(window.location.pathname).replace(/^\//, ''));
+
+// WHAT IT DOES: Resolves the CorridorKey engine root the same way the Resolve plugin does:
+//   env var → corridorkey_path.txt → sibling CorridorKey folder → legacy D: fallback → ~.
+function findCorridorkeyRoot() {
+    const candidates = [];
+    if (process.env.CORRIDORKEY_ROOT) candidates.push(process.env.CORRIDORKEY_ROOT);
+    const configPaths = [
+        path.join(PANEL_DIR, 'corridorkey_path.txt'),
+        path.join(PANEL_DIR, '..', 'corridorkey_path.txt')
+    ];
+    for (const cp of configPaths) {
+        try { if (fs.existsSync(cp)) candidates.push(fs.readFileSync(cp, 'utf8').trim()); } catch (_) {}
+    }
+    candidates.push(path.resolve(PANEL_DIR, '..', '..', 'CorridorKey'));
+    candidates.push('D:\\New AI Projects\\CorridorKey');
+    candidates.push(path.join(os.homedir(), 'CorridorKey'));
+    for (const p of candidates) {
+        if (!p) continue;
+        const venv = path.join(p, '.venv');
+        if (fs.existsSync(p) && fs.existsSync(venv)) return p;
+    }
+    throw new Error('CorridorKey engine not found. Tried:\n  ' + candidates.join('\n  ') +
+        '\n\nFix: set CORRIDORKEY_ROOT env var or drop corridorkey_path.txt in the panel folder.');
+}
+
+// WHAT IT DOES: Returns the Python executable inside the engine venv (Win or Unix layout).
+function findPythonExe(ckRoot) {
+    if (process.platform === 'win32') return path.join(ckRoot, '.venv', 'Scripts', 'python.exe');
+    return path.join(ckRoot, '.venv', 'bin', 'python');
+}
+
+// ── Logging ─────────────────────────────────────────────────
+const LOG_PATH = path.join(os.tmpdir(), 'corridorkey.log');
+
+// WHAT IT DOES: Writes one line to both the panel UI and the persistent log file.
+//   If file logging fails (unlikely), drop silently — we never want logging to crash the panel.
+function logLine(msg, isErr) {
+    try {
+        const ts = new Date().toISOString();
+        fs.appendFileSync(LOG_PATH, `[${ts}] ${msg}\n`);
+    } catch (_) {}
+    const el = document.getElementById('log');
+    const span = document.createElement('div');
+    if (isErr) span.className = 'log-err';
+    span.textContent = msg;
+    el.appendChild(span);
+    el.scrollTop = el.scrollHeight;
+}
+
+function status(msg) { document.getElementById('status').textContent = msg; }
+
+function setBusy(busy) {
+    for (const id of ['btn-preview', 'btn-process', 'btn-batch']) {
+        document.getElementById(id).disabled = busy;
+    }
+    document.getElementById('progress-bar').style.display = busy ? 'block' : 'none';
+    if (!busy) document.getElementById('progress-fill').style.width = '0%';
+}
+
+function setProgress(pct) {
+    document.getElementById('progress-fill').style.width = Math.max(0, Math.min(100, pct)) + '%';
+}
+
+function openURL(url) { cs.openURLInDefaultBrowser(url); }
+
+// ── Output path ─────────────────────────────────────────────
+const OUTPUT_KEY = 'ck_output_path';
+let savedOutput = localStorage.getItem(OUTPUT_KEY) ||
+    path.join(os.homedir(), 'Documents', 'CorridorKey');
+document.getElementById('outputPath').value = savedOutput;
+
+function browseOutput() {
+    const dlg = window.cep && window.cep.fs && window.cep.fs.showOpenDialogEx
+        ? window.cep.fs.showOpenDialogEx(false, true, 'Choose Output Folder', savedOutput)
+        : null;
+    if (dlg && dlg.data && dlg.data.length > 0) {
+        savedOutput = dlg.data[0];
         document.getElementById('outputPath').value = savedOutput;
+        localStorage.setItem(OUTPUT_KEY, savedOutput);
+        logLine('Output folder: ' + savedOutput);
+    }
+}
 
-        function browseOutput() {
-            var cepResult = window.cep && window.cep.fs && window.cep.fs.showOpenDialogEx
-                ? window.cep.fs.showOpenDialogEx(false, true, 'Choose Output Folder', savedOutput)
-                : null;
-            if (cepResult && cepResult.data && cepResult.data.length > 0) {
-                savedOutput = cepResult.data[0].replace(/\\/g, '/');
-                document.getElementById('outputPath').value = savedOutput;
-                localStorage.setItem(OUTPUT_KEY, savedOutput);
-                log('Output folder: ' + savedOutput);
-            }
+// ── UI ──────────────────────────────────────────────────────
+document.getElementById('despill').oninput = function() {
+    document.getElementById('despillVal').textContent = (this.value / 100).toFixed(2);
+};
+document.getElementById('refiner').oninput = function() {
+    document.getElementById('refinerVal').textContent = (this.value / 100).toFixed(2);
+};
+
+// WHAT IT DOES: Collects the current UI state into a plain settings object.
+//   Validated here — Python receives the sanitized object via a JSON file.
+function getSettings() {
+    const despill = parseFloat(document.getElementById('despill').value) / 100;
+    const refiner = parseFloat(document.getElementById('refiner').value) / 100;
+    const despeckleSize = parseInt(document.getElementById('despeckleSize').value, 10);
+    return {
+        screenType: document.getElementById('screenType').value === 'blue' ? 'blue' : 'green',
+        despill: isFinite(despill) && despill >= 0 && despill <= 1 ? despill : 0.5,
+        refiner: isFinite(refiner) && refiner >= 0 && refiner <= 1 ? refiner : 1.0,
+        despeckle: document.getElementById('despeckle').checked,
+        despeckleSize: isFinite(despeckleSize) && despeckleSize >= 50 && despeckleSize <= 2000 ? despeckleSize : 400
+    };
+}
+
+// WHAT IT DOES: Builds a crypto-random temp path. Avoids PID-based names that a local
+//   attacker could pre-create as symlinks to overwrite arbitrary files.
+function randomTempPath(prefix, ext) {
+    const id = crypto.randomBytes(12).toString('hex');
+    return path.join(os.tmpdir(), `ck_${prefix}_${id}${ext || ''}`);
+}
+
+// WHAT IT DOES: Writes a JSON file with the run parameters and returns its path. Python
+//   reads all its inputs from this file — nothing travels through argv that an attacker
+//   could influence beyond a fixed, hex-only filename we generate.
+function writeParamsFile(obj) {
+    const p = randomTempPath('params', '.json');
+    fs.writeFileSync(p, JSON.stringify(obj), 'utf8');
+    return p;
+}
+
+// WHAT IT DOES: Runs the engine's Python with a safe argv array. No shell. Captures stdout
+//   + stderr and mirrors them to the log file on both success and failure.
+// DEPENDS-ON: CK root + venv exist; ae_processor.py is bundled next to index.html.
+function runPython(args, onProgressLine) {
+    const ckRoot = findCorridorkeyRoot();
+    const python = findPythonExe(ckRoot);
+    const processor = path.join(PANEL_DIR, 'ae_processor.py');
+
+    if (!fs.existsSync(python)) throw new Error('Python not found: ' + python);
+    if (!fs.existsSync(processor)) throw new Error('Processor not found: ' + processor);
+
+    logLine('exec: ' + python + ' ' + args.join(' '));
+
+    // execFileSync with arg array — no shell is invoked. windowsHide keeps the console off-screen.
+    const res = childProcess.spawnSync(python, [processor].concat(args), {
+        encoding: 'utf8',
+        windowsHide: true,
+        maxBuffer: 64 * 1024 * 1024
+    });
+
+    if (res.stdout) {
+        for (const line of res.stdout.split(/\r?\n/)) {
+            if (!line) continue;
+            logLine('py: ' + line);
+            if (onProgressLine) onProgressLine(line);
         }
-
-        document.getElementById('despill').oninput = function() {
-            document.getElementById('despillVal').textContent = (this.value / 100).toFixed(2);
-        };
-        document.getElementById('refiner').oninput = function() {
-            document.getElementById('refinerVal').textContent = (this.value / 100).toFixed(2);
-        };
-
-        function log(msg) {
-            const el = document.getElementById('log');
-            el.innerHTML += msg + '<br>';
-            el.scrollTop = el.scrollHeight;
+    }
+    if (res.stderr) {
+        for (const line of res.stderr.split(/\r?\n/)) {
+            if (line) logLine('py-err: ' + line, true);
         }
+    }
+    if (res.error) throw res.error;
+    if (typeof res.status === 'number' && res.status !== 0) {
+        throw new Error('Python exited with code ' + res.status);
+    }
+    return res;
+}
 
-        function status(msg) {
-            document.getElementById('status').textContent = msg;
-        }
+// ── evalScript helper that expects JSON back ────────────────
+// WHAT IT DOES: Calls a JSX function and parses its response as JSON (native, not eval).
+//   The function's single string arg is wrapped with our own safe JSON escape — never eval'd.
+function jsxCall(fn, args, cb) {
+    const safeArgs = (args || []).map(a => {
+        if (typeof a === 'number' || typeof a === 'boolean') return String(a);
+        return JSON.stringify(String(a));  // native browser JSON.stringify — safely escaped
+    }).join(', ');
+    cs.evalScript(`${fn}(${safeArgs})`, (raw) => {
+        if (!raw) return cb({ ok: false, error: 'No response from host' });
+        try { cb(JSON.parse(raw)); } catch (e) { cb({ ok: false, error: 'Bad JSON: ' + raw }); }
+    });
+}
 
-        function showPreview(filePath) {
-            const container = document.getElementById('preview-container');
-            const ts = Date.now();
-            const fileUri = 'file:///' + filePath.replace(/\\/g, '/');
-            const mattePath = filePath.replace('.png', '_matte.png');
-            // Only show matte if the file exists (batch mode creates it, single doesn't)
-            var hasMatteFile = false;
-            try { hasMatteFile = fs.existsSync(mattePath); } catch(e) {}
-            if (hasMatteFile) {
-                const matteUri = 'file:///' + mattePath.replace(/\\/g, '/');
-                container.innerHTML = '<img src="' + fileUri + '?' + ts + '" alt="Keyed" title="Keyed Result">' +
-                                      '<img src="' + matteUri + '?' + ts + '" alt="Matte" title="Alpha Matte">';
-            } else {
-                container.innerHTML = '<img src="' + fileUri + '?' + ts + '" alt="Keyed Result" style="width:96%;margin:2%">';
-            }
-        }
+// ── Preview rendering ──────────────────────────────────────
+function showPreview(filePath) {
+    const container = document.getElementById('preview-container');
+    const ts = Date.now();
+    const keyedUri = 'file:///' + filePath.replace(/\\/g, '/');
+    const matteUri = keyedUri.replace(/\.png$/i, '_matte.png');
+    container.innerHTML = '<img src="' + keyedUri + '?' + ts + '" alt="Keyed" title="Keyed Result">' +
+                          '<img src="' + matteUri + '?' + ts + '" alt="Matte" title="Alpha Matte">';
+}
 
-        function getSettings() {
-            return {
-                screenType: document.getElementById('screenType').value,
-                despill: document.getElementById('despill').value / 100,
-                refiner: document.getElementById('refiner').value / 100,
-                despeckle: document.getElementById('despeckle').checked,
-                despeckleSize: document.getElementById('despeckleSize').value
-            };
-        }
+// ============================================================
+// SINGLE-FRAME FLOW
+// ============================================================
+let HOST_APP = 'unknown';
 
-        // Get output directory — project folder by default, user can override via Browse
-        function getOutputDir() {
-            var outPath = document.getElementById('outputPath').value;
-            if (outPath) {
-                fs.mkdirSync(outPath, {recursive: true});
-                return outPath;
-            }
-            return path.join(os.homedir(), 'Documents', 'CorridorKey');
-        }
+function processFrame(previewOnly) {
+    setBusy(true);
+    status(previewOnly ? 'Extracting preview...' : 'Keying frame...');
 
-        // Set default output to project folder if available
-        function updateDefaultOutput() {
-            cs.evalScript('getProjectOutputDir()', function(result) {
-                if (result && result !== 'undefined' && result !== 'null') {
-                    var current = document.getElementById('outputPath').value;
-                    // Only override if still on the generic default
-                    if (!current || current.indexOf('Documents/CorridorKey') !== -1 || current.indexOf('Documents\\CorridorKey') !== -1) {
-                        document.getElementById('outputPath').value = result.replace(/\\/g, '/');
-                        localStorage.setItem(OUTPUT_KEY, result);
-                    }
-                }
-            });
-        }
+    const infoFn = HOST_APP === 'ppro' ? 'ppro_getFrameInfo' : 'ae_getFrameInfo';
+    jsxCall(infoFn, [], (info) => {
+        if (!info.ok) { logLine('host error: ' + info.error, true); status('Error'); setBusy(false); return; }
+        try {
+            const settings = getSettings();
+            const framePng = randomTempPath('extract', '.png');
+            const keyedPng = randomTempPath('keyed', '.png');
 
-        // Build Python args for single frame processing
-        function buildProcessArgs(inputPath, outputPath, settings) {
-            return [processorScript, 'single', inputPath, outputPath,
-                '--screen', settings.screenType || 'green',
-                '--despill', String(settings.despill || 0.5),
-                '--refiner', String(settings.refiner || 1.0),
-                '--despeckle', settings.despeckle ? '1' : '0',
-                '--despeckle-size', String(settings.despeckleSize || 400)];
-        }
+            // Step 1 — extract the single frame from the video via Python (not inline cv2).
+            runPython(['extract', info.sourceFile, framePng, '--frame', String(info.sourceFrame)]);
+            if (!fs.existsSync(framePng)) throw new Error('Extract produced no output');
 
-        // Run Python via Node.js child_process (works in both AE and Premiere)
-        function runPython(args) {
-            return cp.execFileSync(pythonExe, args, {timeout: 300000, encoding: 'utf8'});
-        }
+            // Step 2 — key it (params via JSON file, not argv).
+            const paramsPath = writeParamsFile(settings);
+            runPython(['single', framePng, keyedPng, '--params', paramsPath]);
+            try { fs.unlinkSync(paramsPath); } catch (_) {}
+            if (!fs.existsSync(keyedPng)) throw new Error('Keyer produced no output');
 
-        // ── Premiere Pro: panel-side Python execution ──
+            showPreview(keyedPng);
+            status('Done');
+            logLine(previewOnly ? 'Preview ready' : 'Keyed, importing...');
 
-        function ppro_processFrame(previewOnly) {
-            status('Processing...');
-            log('Getting clip info...');
-
-            cs.evalScript('ppro_getClipInfo()', function(resultJson) {
-                try {
-                    var info = JSON.parse(resultJson);
-                    if (info.error) {
-                        status('Error');
-                        log('Error: ' + info.error);
-                        return;
-                    }
-
-                    var pid = Math.floor(Math.random() * 100000);
-                    var tmpDir = os.tmpdir();
-                    var inputPath = path.join(tmpDir, 'ck_ppro_in_' + pid + '.png');
-
-                    // Save output to user's chosen folder (like Resolve does)
-                    var clipName = path.basename(info.sourcePath, path.extname(info.sourcePath));
-                    var outDir = getOutputDir();
-                    var clipDir = path.join(outDir, 'CK_' + clipName);
-                    fs.mkdirSync(clipDir, {recursive: true});
-                    var outputPath = path.join(clipDir, 'CK_' + clipName + '_' + String(info.sourceFrame).padStart(6, '0') + '.png');
-
-                    log('Frame ' + info.sourceFrame + '/' + (info.totalFrames || '?') + ' | ' + (info.debug || ''));
-                    log('Extracting...');
-
-                    // Extract frame via Python/OpenCV with error reporting
-                    var extractCode = "import cv2, sys; " +
-                        "cap = cv2.VideoCapture(r'" + info.sourcePath.replace(/'/g, "\\'") + "'); " +
-                        "total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)); " +
-                        "fps = cap.get(cv2.CAP_PROP_FPS); " +
-                        "print(f'Video: {total} frames, {fps} fps', file=sys.stderr); " +
-                        "frame_num = min(" + info.sourceFrame + ", total - 1); " +
-                        "cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num); " +
-                        "ret, frame = cap.read(); " +
-                        "print(f'Seek to {frame_num}, read={ret}', file=sys.stderr); " +
-                        "cap.release(); " +
-                        "cv2.imwrite(r'" + inputPath.replace(/'/g, "\\'") + "', frame) if ret else sys.exit(1)";
-
-                    try {
-                        cp.execFileSync(pythonExe, ['-c', extractCode], {timeout: 30000, stdio: ['pipe', 'pipe', 'pipe']});
-                    } catch(e) {
-                        status('Error');
-                        var errDetail = (e.stderr ? e.stderr.toString() : '') || e.message;
-                        log('Error extracting: ' + errDetail);
-                        return;
-                    }
-
-                    if (!fs.existsSync(inputPath)) {
-                        status('Error');
-                        log('Error: Frame extraction produced no output');
-                        return;
-                    }
-
-                    // Process through CorridorKey
-                    log('Running CorridorKey...');
-                    var settings = getSettings();
-                    var args = buildProcessArgs(inputPath, outputPath, settings);
-
-                    try {
-                        runPython(args);
-                    } catch(e) {
-                        status('Error');
-                        var errMsg = e.stderr || e.stdout || e.message || 'Unknown error';
-                        log('Error: ' + errMsg);
-                        return;
-                    }
-
-                    if (!fs.existsSync(outputPath)) {
-                        status('Error');
-                        log('Error: No output produced');
-                        return;
-                    }
-
-                    // Show preview
-                    showPreview(outputPath);
-
-                    if (!previewOnly && document.getElementById('addToTimeline').checked) {
-                        // Import into Premiere via ExtendScript
-                        var escapedPath = outputPath.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-                        cs.evalScript("ppro_importFile('" + escapedPath + "')", function(importResult) {
-                            if (importResult && importResult.indexOf('success') === 0) {
-                                status('Done!');
-                                log('Frame keyed and added to timeline');
-                            } else {
-                                status('Done!');
-                                log('Frame keyed! Saved to: ' + outputPath);
-                            }
-                        });
-                    } else {
-                        status('Done!');
-                        log(previewOnly ? 'Preview ready' : 'Frame keyed! Saved to: ' + outputPath);
-                    }
-
-                    // Cleanup input
-                    try { fs.unlinkSync(inputPath); } catch(e) {}
-
-                } catch(e) {
-                    status('Error');
-                    log('Error: ' + e.message);
-                }
-            });
-        }
-
-        function ppro_processWorkArea() {
-            status('Processing work area...');
-            log('Getting clip info...');
-
-            cs.evalScript('ppro_getWorkAreaInfo()', function(resultJson) {
-                try {
-                    var info = JSON.parse(resultJson);
-                    if (info.error) {
-                        status('Error');
-                        log('Error: ' + info.error);
-                        return;
-                    }
-
-                    var pid = Math.floor(Math.random() * 100000);
-                    var tmpDir = os.tmpdir();
-                    var outputFolder = path.join(tmpDir, 'ck_ppro_seq_' + pid);
-                    fs.mkdirSync(outputFolder, {recursive: true});
-
-                    var totalFrames = info.endFrame - info.startFrame;
-                    log('Batch: ' + totalFrames + ' frames (' + info.startFrame + '-' + info.endFrame + ')');
-                    status('Processing ' + totalFrames + ' frames...');
-
-                    var settings = getSettings();
-                    var args = [processorScript, 'batch',
-                        info.sourcePath, outputFolder,
-                        '--start-frame', String(info.startFrame),
-                        '--end-frame', String(info.endFrame),
-                        '--fps', String(info.fps),
-                        '--screen', settings.screenType || 'green',
-                        '--despill', String(settings.despill || 0.5),
-                        '--despeckle', settings.despeckle ? '1' : '0',
-                        '--despeckle-size', String(settings.despeckleSize || 400),
-                        '--refiner', String(settings.refiner || 1.0)];
-
-                    try {
-                        runPython(args);
-                    } catch(e) {
-                        status('Error');
-                        log('Error: Batch processing failed - ' + e.message);
-                        return;
-                    }
-
-                    // Read result
-                    var resultPath = path.join(outputFolder, 'batch_result.txt');
-                    var processed = 0;
-                    try {
-                        var txt = fs.readFileSync(resultPath, 'utf8');
-                        processed = parseInt(txt.split(',')[0], 10);
-                    } catch(e) {}
-
-                    if (processed === 0) {
-                        status('Error');
-                        log('Error: No frames produced');
-                        return;
-                    }
-
-                    // Import sequence into Premiere
-                    var escapedFolder = outputFolder.replace(/\\/g, '\\\\');
-                    var disableSrc = document.getElementById('disableSource').checked;
-                    cs.evalScript("ppro_importSequence('" + escapedFolder + "', " + info.fps + ", " + (info.clipStartSec || 0) + ", " + disableSrc + ")", function(importResult) {
-                        if (importResult === 'success') {
-                            status('Done!');
-                            log('Batch complete: ' + processed + '/' + totalFrames + ' frames');
-                        } else {
-                            status('Done (import issue)');
-                            log('Processed but: ' + importResult);
-                        }
-                    });
-
-                } catch(e) {
-                    status('Error');
-                    log('Error: ' + e.message);
-                }
-            });
-        }
-
-        // ── Unified handlers — route to AE or Premiere ──
-
-        function processFrame(previewOnly) {
-            if (hostApp === 'ppro') {
-                ppro_processFrame(previewOnly);
+            if (previewOnly) {
+                try { fs.unlinkSync(framePng); } catch (_) {}
+                setBusy(false);
                 return;
             }
 
-            // AE path — uses ExtendScript system.callSystem
-            status('Processing...');
-            log('Starting process...');
+            // Step 3 — back to ExtendScript to import onto timeline.
+            const importFn = HOST_APP === 'ppro' ? 'ppro_importFrame' : 'ae_importFrame';
+            const importArgs = HOST_APP === 'ppro'
+                ? [keyedPng, info.playheadSeconds, info.fps]
+                : [keyedPng];
+            jsxCall(importFn, importArgs, (imp) => {
+                try { fs.unlinkSync(framePng); } catch (_) {}
+                if (!imp.ok) { logLine('import error: ' + imp.error, true); status('Import failed'); }
+                else { status('Done — placed on timeline'); logLine('Imported to timeline'); }
+                setBusy(false);
+            });
+        } catch (e) {
+            logLine('fatal: ' + e.message, true);
+            status('Error');
+            setBusy(false);
+        }
+    });
+}
 
+// ============================================================
+// BATCH FLOW
+// ============================================================
+function processBatch() {
+    setBusy(true);
+    status('Reading range...');
+
+    const infoFn = HOST_APP === 'ppro' ? 'ppro_getInOutInfo' : 'ae_getWorkAreaInfo';
+    jsxCall(infoFn, [], (info) => {
+        if (!info.ok) { logLine('host error: ' + info.error, true); status('Error'); setBusy(false); return; }
+        try {
             const settings = getSettings();
-            const settingsJson = JSON.stringify(settings).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+            const outDir = path.join(savedOutput, 'ck_batch_' + crypto.randomBytes(6).toString('hex'));
+            fs.mkdirSync(outDir, { recursive: true });
 
-            cs.evalScript("processCurrentFrame('" + settingsJson + "', " + previewOnly + ")", function(result) {
-                if (result && result.indexOf('success:') === 0) {
-                    status('Done!');
-                    log('Frame processed successfully');
-                    var outputPath = result.replace('success:', '');
-                    if (outputPath) {
-                        showPreview(outputPath);
-                        lastOutputPath = outputPath;
+            const paramsPath = writeParamsFile(
+                Object.assign({}, settings, {
+                    startFrame: info.startFrame,
+                    endFrame: info.endFrame,
+                    fps: info.fps
+                })
+            );
+
+            status('Keying ' + (info.endFrame - info.startFrame) + ' frames...');
+
+            runPython(
+                ['batch', info.sourceFile, outDir, '--params', paramsPath],
+                (line) => {
+                    // Python emits progress lines like "PROGRESS n/m"
+                    const m = line.match(/PROGRESS\s+(\d+)\/(\d+)/);
+                    if (m) {
+                        const pct = (parseInt(m[1], 10) / parseInt(m[2], 10)) * 100;
+                        setProgress(pct);
+                        status('Keyed ' + m[1] + '/' + m[2]);
                     }
-                } else if (result === 'success') {
-                    status('Done!');
-                    log('Frame processed successfully');
-                } else {
-                    status('Error');
-                    log('Error: ' + result);
                 }
+            );
+            try { fs.unlinkSync(paramsPath); } catch (_) {}
+
+            // Import sequence via the appropriate host hook
+            const firstFrame = path.join(outDir, 'output_00000.png');
+            if (!fs.existsSync(firstFrame)) throw new Error('No output frames produced');
+
+            const importFn = HOST_APP === 'ppro' ? 'ppro_importSequence' : 'ae_importSequence';
+            const importArgs = HOST_APP === 'ppro'
+                ? [firstFrame]
+                : [firstFrame, info.fps, info.compStartTime];
+            jsxCall(importFn, importArgs, (imp) => {
+                if (!imp.ok) { logLine('import error: ' + imp.error, true); status('Import failed'); }
+                else { status('Batch done'); logLine('Sequence imported'); }
+                setBusy(false);
             });
+        } catch (e) {
+            logLine('fatal: ' + e.message, true);
+            status('Error');
+            setBusy(false);
         }
+    });
+}
 
-        function processWorkArea() {
-            if (hostApp === 'ppro') {
-                ppro_processWorkArea();
-                return;
-            }
-
-            // AE path
-            status('Processing work area...');
-            log('Starting batch process...');
-
-            const settings = getSettings();
-            const settingsJson = JSON.stringify(settings).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-
-            cs.evalScript("processWorkArea('" + settingsJson + "')", function(result) {
-                if (result && result.startsWith && result.startsWith('success')) {
-                    status('Done!');
-                    log(result);
-                } else {
-                    status('Error');
-                    log('Error: ' + result);
-                }
-            });
-        }
-
-        // Detect host app and update UI
-        cs.evalScript('getHostApp()', function(host) {
-            hostApp = host;
-            if (host === 'ppro') {
-                log('CorridorKey Panel Ready (Premiere Pro)');
-                document.querySelector('.btn-batch').textContent = 'PROCESS IN/OUT RANGE';
-            } else {
-                log('CorridorKey Panel Ready (After Effects)');
-            }
-            // Set output folder to project directory by default
-            updateDefaultOutput();
-        });
+// ============================================================
+// INITIALIZE
+// ============================================================
+cs.evalScript('getHostApp()', (host) => {
+    HOST_APP = String(host || 'unknown');
+    logLine('Panel ready (' + HOST_APP + '). Log: ' + LOG_PATH);
+    if (HOST_APP === 'ppro') {
+        document.getElementById('btn-batch').textContent = 'PROCESS IN/OUT RANGE';
+    }
+    // Sanity-check engine discovery up front so the user learns about missing installs
+    // BEFORE they click a button.
+    try {
+        const root = findCorridorkeyRoot();
+        logLine('Engine: ' + root);
+    } catch (e) {
+        logLine('SETUP: ' + e.message, true);
+        status('Engine not found — see log');
+    }
+});
     </script>
 </body>
 </html>

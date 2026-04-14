@@ -1,0 +1,20 @@
+# CorridorKey Plugin — developer / testing dependencies
+# Last modified: 2026-04-14 | Change: Initial dev requirements
+#
+# These are NOT needed to run the plugin. They are for developers working on the
+# plugin source — testing, static analysis, packaging.
+#
+# INSTALL:  pip install -r requirements-dev.txt
+
+-r requirements.txt
+
+# --- Static analysis ---
+ruff>=0.4,<1.0          # Fast linter + formatter
+mypy>=1.7,<2.0          # Optional type checking
+
+# --- Testing ---
+pytest>=7.4,<9.0
+pytest-cov>=4.1,<6.0
+
+# --- Packaging ---
+build>=1.0,<2.0          # For building distributions

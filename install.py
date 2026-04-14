@@ -1,20 +1,40 @@
 #!/usr/bin/env python3
+# Last modified: 2026-04-14 | Change: Gate PlayerDebugMode behind explicit --allow-unsigned
+#   flag. Default install no longer toggles Adobe's developer mode.
 """
 CorridorKey Plugin — Unified Installer
 Installs to DaVinci Resolve, After Effects, and/or Premiere Pro.
 
 Usage:
-    python install.py           # Interactive — detect and choose
-    python install.py --all     # Install to all detected apps
-    python install.py --resolve # Resolve only
-    python install.py --adobe   # AE + Premiere only
+    python install.py                  # Interactive — detect and choose
+    python install.py --all            # Install to all detected apps
+    python install.py --resolve        # Resolve only
+    python install.py --adobe          # AE + Premiere only
     python install.py --uninstall
+    python install.py --allow-unsigned # Also flip Adobe's PlayerDebugMode registry flag
+                                       # so the unsigned CEP panel can load. Prints a
+                                       # clear warning — do not use blindly.
+
+SECURITY NOTE:
+    Older versions of this installer silently set Adobe's PlayerDebugMode = 1 on every
+    machine, which opens the Chromium remote-debug port inside every future AE/Premiere
+    session and removes the signature check on all CEP extensions. That behavior is now
+    OFF by default. Pass --allow-unsigned if you knowingly want it, or ship a
+    ZXP-signed build of the panel for production distribution.
 """
 import os
 import sys
 import shutil
 import argparse
 from pathlib import Path
+
+# Force UTF-8 on Windows so section headers and warning banners do not crash the default
+# cp1252 console. Runs before any print() so every output path stays safe.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 
 # ── Paths ─────────────────────────────────────────────────────
@@ -97,7 +117,7 @@ def check_write_permission(path):
 
 def install_resolve(ck_engine_path):
     """Install CorridorKey plugin to DaVinci Resolve."""
-    print("\n── DaVinci Resolve ──")
+    print("\n-- DaVinci Resolve --")
 
     scripts_path = get_resolve_scripts_path()
     utility_dir = scripts_path / "Utility"
@@ -177,9 +197,13 @@ main()
     return True
 
 
-def install_adobe(ck_engine_path):
-    """Install CorridorKey CEP panel for After Effects and Premiere Pro."""
-    print("\n── Adobe After Effects / Premiere Pro ──")
+def install_adobe(ck_engine_path, allow_unsigned=False):
+    """Install CorridorKey CEP panel for After Effects and Premiere Pro.
+
+    allow_unsigned: when True, also sets Adobe's PlayerDebugMode so the unsigned panel
+        can load without a signed .zxp. This is OFF by default — see module docstring.
+    """
+    print("\n-- Adobe After Effects / Premiere Pro --")
 
     cep_path = get_cep_extensions_path()
     dest_dir = cep_path / "com.corridorkey.panel"
@@ -228,21 +252,49 @@ def install_adobe(ck_engine_path):
     icons_dir = dest_dir / "icons"
     icons_dir.mkdir(exist_ok=True)
 
-    # Enable unsigned extensions (required for development)
-    enable_unsigned_extensions()
+    if allow_unsigned:
+        _print_unsigned_warning()
+        enable_unsigned_extensions()
+    else:
+        _print_signing_guidance()
 
     print("  Adobe CEP: INSTALLED")
     print("  Access via: Window > Extensions > CorridorKey")
     return True
 
 
+def _print_unsigned_warning():
+    """Big warning the user sees any time we flip PlayerDebugMode on their machine."""
+    print("")
+    print("  " + "!" * 60)
+    print("  !  --allow-unsigned: ENABLING Adobe PlayerDebugMode")
+    print("  !  This opens the Chromium remote-debug port on every")
+    print("  !  future AE / Premiere session and disables signature")
+    print("  !  checks on ALL CEP extensions you install.")
+    print("  !  Turn it off again with: python install.py --revoke-unsigned")
+    print("  " + "!" * 60)
+    print("")
+
+
+def _print_signing_guidance():
+    """Tell the user what their options are when we did NOT flip PlayerDebugMode."""
+    print("")
+    print("  Panel is installed but unsigned. Two ways to make it load:")
+    print("    1. Recommended: ship a signed .zxp (ZXPSignCmd). See INSTALL.md.")
+    print("    2. Developer / single machine: re-run with --allow-unsigned.")
+    print("")
+
+
 def enable_unsigned_extensions():
-    """Enable loading of unsigned CEP extensions (required for dev/sideloaded panels)."""
+    """Set Adobe PlayerDebugMode so unsigned CEP extensions load.
+
+    ONLY called when the user explicitly passes --allow-unsigned. See install.py
+    module docstring and _print_unsigned_warning() for the security trade-offs.
+    """
     if sys.platform == "win32":
         try:
             import winreg
-            # Set PlayerDebugMode for CSXS.11 (and a few versions)
-            for version in ["11", "12", "10", "9"]:
+            for version in ["9", "10", "11", "12"]:
                 key_path = f"Software\\Adobe\\CSXS.{version}"
                 try:
                     key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, key_path)
@@ -250,13 +302,35 @@ def enable_unsigned_extensions():
                     winreg.CloseKey(key)
                 except Exception:
                     pass
-            print("  Enabled unsigned extensions (registry)")
+            print("  PlayerDebugMode set in HKCU\\Software\\Adobe\\CSXS.{9,10,11,12}")
         except ImportError:
-            print("  Warning: Could not set registry. You may need to enable unsigned extensions manually.")
+            print("  Warning: could not write registry. Set PlayerDebugMode manually.")
     elif sys.platform == "darwin":
-        for version in ["11", "12", "10", "9"]:
+        for version in ["9", "10", "11", "12"]:
             os.system(f'defaults write com.adobe.CSXS.{version} PlayerDebugMode 1 2>/dev/null')
-        print("  Enabled unsigned extensions (defaults)")
+        print("  PlayerDebugMode set via defaults for CSXS.{9,10,11,12}")
+
+
+def revoke_unsigned_extensions():
+    """Undo a prior --allow-unsigned run."""
+    if sys.platform == "win32":
+        try:
+            import winreg
+            for version in ["9", "10", "11", "12"]:
+                try:
+                    key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, f"Software\\Adobe\\CSXS.{version}", 0, winreg.KEY_SET_VALUE)
+                    try: winreg.DeleteValue(key, "PlayerDebugMode")
+                    except FileNotFoundError: pass
+                    winreg.CloseKey(key)
+                except Exception:
+                    pass
+            print("  PlayerDebugMode cleared from HKCU\\Software\\Adobe\\CSXS.{9,10,11,12}")
+        except ImportError:
+            print("  Warning: could not edit registry.")
+    elif sys.platform == "darwin":
+        for version in ["9", "10", "11", "12"]:
+            os.system(f'defaults delete com.adobe.CSXS.{version} PlayerDebugMode 2>/dev/null')
+        print("  PlayerDebugMode cleared via defaults for CSXS.{9,10,11,12}")
 
 
 # ── Uninstaller ───────────────────────────────────────────────
@@ -295,12 +369,21 @@ def main():
     parser.add_argument("--resolve", action="store_true", help="Install to DaVinci Resolve only")
     parser.add_argument("--adobe", action="store_true", help="Install to After Effects / Premiere only")
     parser.add_argument("--uninstall", action="store_true", help="Remove from all apps")
+    parser.add_argument("--allow-unsigned", action="store_true",
+        help="Also set Adobe PlayerDebugMode so the unsigned CEP panel can load. "
+             "Disables signature checks on every CEP extension — see module docstring.")
+    parser.add_argument("--revoke-unsigned", action="store_true",
+        help="Clear Adobe PlayerDebugMode set by a previous --allow-unsigned run.")
     args = parser.parse_args()
 
     print("=" * 50)
     print("  CorridorKey Plugin Installer")
     print("  AI Green Screen for Video Editors")
     print("=" * 50)
+
+    if args.revoke_unsigned:
+        revoke_unsigned_extensions()
+        return
 
     if args.uninstall:
         uninstall()
@@ -361,7 +444,7 @@ def main():
             results.append("DaVinci Resolve")
 
     if install_adobe_flag:
-        if install_adobe(ck_path):
+        if install_adobe(ck_path, allow_unsigned=args.allow_unsigned):
             if has_ae: results.append("After Effects")
             if has_ppro: results.append("Premiere Pro")
 
