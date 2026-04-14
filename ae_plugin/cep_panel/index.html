@@ -433,7 +433,7 @@ function processBatch() {
 
             const importFn = HOST_APP === 'ppro' ? 'ppro_importSequence' : 'ae_importSequence';
             const importArgs = HOST_APP === 'ppro'
-                ? [firstFrame, info.inPointSeconds, info.fps]
+                ? [firstFrame, info.inPointSeconds, info.fps, info.sourceFrameRate || info.fps]
                 : [firstFrame, info.fps, info.compStartTime];
             jsxCall(importFn, importArgs, (imp) => {
                 if (!imp.ok) { logLine('import error: ' + imp.error, true); status('Import failed'); }
