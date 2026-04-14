@@ -180,13 +180,16 @@ def get_settings():
 # DANGER ZONE FRAGILE: Timecode parsing assumes HH:MM:SS:FF format
 # breaks: if Resolve returns non-standard timecode format or drop-frame semicolons
 def get_current_frame_info():
+    # DANGER ZONE FRAGILE: Resolve timecode reports NEXT frame boundary (same as AE/Premiere)
+    # breaks: extracted frame is 1 ahead of display / depends on: fps
+    # Subtract 1 so extracted content matches what Resolve shows at playhead
     try:
         fps = float(project.GetSetting("timelineFrameRate") or 24)
         tc = timeline.GetCurrentTimecode()
         parts = tc.replace(";", ":").split(":")
         if len(parts) == 4:
             h, m, s, f = [int(p) for p in parts]
-            return int(h * 3600 * fps + m * 60 * fps + s * fps + f), fps
+            return max(0, int(h * 3600 * fps + m * 60 * fps + s * fps + f) - 1), fps
         return 0, fps
     except: return 0, 24.0
 
