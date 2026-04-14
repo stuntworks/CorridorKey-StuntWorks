@@ -1,0 +1,43 @@
+# CorridorKey Plugin — Python runtime dependencies
+# Last modified: 2026-04-14 | Change: Initial requirements.txt
+#
+# WHAT THIS FILE IS:
+#   The Python packages that must be installed in the CorridorKey engine's virtual
+#   environment for this plugin to run. The plugin itself does NOT create its own venv —
+#   it imports from the engine's `.venv`. These are the packages that venv must contain.
+#
+# INSTALL:
+#   1. Install PyTorch with CUDA support FIRST (see requirements-gpu.txt).
+#   2. Then: pip install -r requirements.txt
+#   3. Then install SAM2 separately (see INSTALL.md — it is not on PyPI in a stable form).
+#
+# NOTE: torch/torchvision are NOT pinned here because the correct build depends on your
+# CUDA driver version. Install them from the official PyTorch index URL first.
+
+# --- Core image + numerical ---
+numpy>=1.24,<2.3
+opencv-python>=4.8,<5.0
+Pillow>=10.0,<12.0
+
+# --- Neural network support ---
+# timm provides pretrained vision backbones that CorridorKey's engine uses internally.
+timm>=0.9.0,<1.1.0
+
+# --- Progress bars (used by batch processors and alpha generators) ---
+tqdm>=4.66,<5.0
+
+# --- PyTorch (install with CUDA — see requirements-gpu.txt for the correct index URL) ---
+# These lines are intentionally loose. Use the GPU wheel index for the CUDA version that
+# matches your NVIDIA driver. Installing plain `torch` from PyPI gives a CPU-only build
+# that runs CorridorKey 10-50x slower.
+torch>=2.2,<2.6
+torchvision>=0.17,<0.21
+
+# --- Optional: Click-to-Mask with SAM2 ---
+# SAM2 (Segment Anything Model 2) from Meta is NOT installed from this file — it must
+# be cloned + installed from source. See INSTALL.md section "Enable SAM2 Click-to-Mask".
+# The plugin will still key without it, but the SAM2 point-prompt feature will be disabled.
+
+# --- Optional: BiRefNet alpha pre-pass ---
+# BiRefNet (dichotomous image segmentation) is used by the offline alpha generator script
+# `generate_birefnet_alphas.py`. Install from source — see INSTALL.md.

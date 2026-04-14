@@ -1,0 +1,28 @@
+# CorridorKey Plugin — GPU (CUDA) PyTorch install
+# Last modified: 2026-04-14 | Change: Initial CUDA requirements file
+#
+# WHAT THIS FILE IS:
+#   A pip installable list for PyTorch built against NVIDIA CUDA. The plain `torch` wheel
+#   from PyPI is CPU-only and will run CorridorKey 10-50x slower than GPU — so every user
+#   with an NVIDIA card MUST install from one of the index URLs below.
+#
+# HOW TO USE:
+#   1. Find your CUDA driver version:  `nvidia-smi`  (top-right shows e.g. CUDA Version 12.4)
+#   2. Pick the matching index URL from below.
+#   3. Run ONE of these commands in your engine venv (activated):
+#        pip install -r requirements-gpu.txt --index-url https://download.pytorch.org/whl/cu121
+#        pip install -r requirements-gpu.txt --index-url https://download.pytorch.org/whl/cu124
+#        pip install -r requirements-gpu.txt --index-url https://download.pytorch.org/whl/cu118
+#   4. Verify:  python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+#
+# INDEX URL GUIDE (choose ONE based on `nvidia-smi`):
+#   CUDA 12.4+ (driver 550+)  → https://download.pytorch.org/whl/cu124
+#   CUDA 12.1+ (driver 530+)  → https://download.pytorch.org/whl/cu121
+#   CUDA 11.8  (driver 520+)  → https://download.pytorch.org/whl/cu118
+#
+# If you have no NVIDIA GPU:
+#   pip install -r requirements-gpu.txt  (no index URL — gets CPU wheels, slow but works)
+
+torch>=2.2,<2.6
+torchvision>=0.17,<0.21
+torchaudio>=2.2,<2.6

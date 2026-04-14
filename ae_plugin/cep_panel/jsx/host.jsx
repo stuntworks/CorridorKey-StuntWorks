@@ -1,716 +1,348 @@
-// Last modified: 2026-04-13 | Change: Fix Premiere one-frame-forward placement bug (half-frame nudge) | Full history: git log
 /**
- * CorridorKey - Host Script for After Effects and Premiere Pro
- * Handles communication between CEP panel and host app.
+ * CorridorKey — Host Script (ExtendScript)
+ * Last modified: 2026-04-14 | Change: Remove all shell exec + all eval(). Python now
+ *   runs from the Node.js panel side (index.html). ExtendScript is pure timeline code.
+ *
+ * WHAT IT DOES: Reads timeline state from After Effects / Premiere Pro and returns it
+ *   to the CEP panel as a JSON string. Imports the PNG(s) Python produced back onto the
+ *   timeline. Does NOT spawn Python, does NOT run shell commands, does NOT eval() any
+ *   inbound string. All untrusted inputs arrive as separate function arguments.
+ *
+ * DEPENDS-ON: AE CompItem / Premiere Sequence scripting APIs.
+ * AFFECTS: Timeline (adds layers / clips), Project Panel (imports files).
  */
 
-// ── JSON polyfill for ExtendScript (no native JSON) ──
-if (typeof JSON === "undefined") {
-    JSON = {
-        parse: function(s) {
-            // Safe recursive-descent parser (no eval)
-            var _at = 0;
-            var _ch = " ";
-            function _error(m) { throw new Error("JSON parse error: " + m + " at position " + _at); }
-            function _next(c) {
-                if (c && c !== _ch) _error("Expected '" + c + "' got '" + _ch + "'");
-                _ch = s.charAt(_at); _at += 1; return _ch;
-            }
-            function _white() { while (_ch && _ch <= " ") _next(); }
-            function _string() {
-                var r = "";
-                if (_ch !== '"') _error("Expected string");
-                while (_next()) {
-                    if (_ch === '"') { _next(); return r; }
-                    if (_ch === "\\") {
-                        _next();
-                        if (_ch === "n") r += "\n";
-                        else if (_ch === "r") r += "\r";
-                        else if (_ch === "t") r += "\t";
-                        else if (_ch === "u") {
-                            var hex = ""; for (var i = 0; i < 4; i++) { hex += _next(); }
-                            r += String.fromCharCode(parseInt(hex, 16));
-                        } else r += _ch;
-                    } else r += _ch;
-                }
-                _error("Unterminated string");
-            }
-            function _number() {
-                var n = "";
-                if (_ch === "-") { n += _ch; _next(); }
-                while (_ch >= "0" && _ch <= "9") { n += _ch; _next(); }
-                if (_ch === ".") { n += _ch; _next(); while (_ch >= "0" && _ch <= "9") { n += _ch; _next(); } }
-                if (_ch === "e" || _ch === "E") { n += _ch; _next(); if (_ch === "+" || _ch === "-") { n += _ch; _next(); } while (_ch >= "0" && _ch <= "9") { n += _ch; _next(); } }
-                var v = +n; if (isNaN(v)) _error("Bad number"); return v;
-            }
-            function _word() {
-                if (_ch === "t") { _next("t"); _next("r"); _next("u"); _next("e"); return true; }
-                if (_ch === "f") { _next("f"); _next("a"); _next("l"); _next("s"); _next("e"); return false; }
-                if (_ch === "n") { _next("n"); _next("u"); _next("l"); _next("l"); return null; }
-                _error("Unexpected '" + _ch + "'");
-            }
-            function _array() {
-                var a = []; _next("["); _white();
-                if (_ch === "]") { _next(); return a; }
-                while (_ch) { a.push(_value()); _white(); if (_ch === "]") { _next(); return a; } _next(","); _white(); }
-                _error("Unterminated array");
-            }
-            function _object() {
-                var o = {}; _next("{"); _white();
-                if (_ch === "}") { _next(); return o; }
-                while (_ch) { var k = _string(); _white(); _next(":"); o[k] = _value(); _white(); if (_ch === "}") { _next(); return o; } _next(","); _white(); }
-                _error("Unterminated object");
-            }
-            function _value() {
-                _white();
-                if (_ch === "{") return _object();
-                if (_ch === "[") return _array();
-                if (_ch === '"') return _string();
-                if (_ch === "-" || (_ch >= "0" && _ch <= "9")) return _number();
-                return _word();
-            }
-            var result = _value();
-            _white();
-            if (_ch) _error("Unexpected trailing content");
-            return result;
-        },
-        stringify: function(obj) {
+// ============================================================
+// SAFE JSON STRINGIFY (no parse — we never eval inbound strings)
+// ============================================================
+// WHAT IT DOES: Minimal JSON.stringify implementation for ExtendScript, which has no native
+//   JSON object. We deliberately do NOT ship a JSON.parse — all inbound strings from the
+//   panel arrive as function arguments, not as JSON payloads to be parsed.
+// DEPENDS-ON: nothing.
+// AFFECTS: Defines JSON.stringify globally.
+(function() {
+    if (typeof JSON === "undefined") JSON = {};
+    if (typeof JSON.stringify === "undefined") {
+        JSON.stringify = function(obj) {
             if (obj === null) return "null";
             if (typeof obj === "undefined") return undefined;
-            if (typeof obj === "number" || typeof obj === "boolean") return String(obj);
-            if (typeof obj === "string") return '"' + obj.replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
+            if (typeof obj === "number") return isFinite(obj) ? String(obj) : "null";
+            if (typeof obj === "boolean") return String(obj);
+            if (typeof obj === "string") {
+                return '"' + obj
+                    .replace(/\\/g, "\\\\").replace(/"/g, '\\"')
+                    .replace(/\n/g, "\\n").replace(/\r/g, "\\r").replace(/\t/g, "\\t") + '"';
+            }
             if (obj instanceof Array) {
-                var items = [];
-                for (var i = 0; i < obj.length; i++) items.push(JSON.stringify(obj[i]));
-                return "[" + items.join(",") + "]";
+                var arr = [];
+                for (var i = 0; i < obj.length; i++) {
+                    var v = JSON.stringify(obj[i]);
+                    arr.push(v === undefined ? "null" : v);
+                }
+                return "[" + arr.join(",") + "]";
             }
             if (typeof obj === "object") {
                 var pairs = [];
                 for (var k in obj) {
-                    if (obj.hasOwnProperty(k)) pairs.push('"' + k + '":' + JSON.stringify(obj[k]));
+                    if (obj.hasOwnProperty(k)) {
+                        var vv = JSON.stringify(obj[k]);
+                        if (vv !== undefined) pairs.push(JSON.stringify(String(k)) + ":" + vv);
+                    }
                 }
                 return "{" + pairs.join(",") + "}";
             }
-            return String(obj);
-        }
-    };
-}
-
-// ── Path sanitizer: reject dangerous characters before shell use ──
-function sanitizePath(p) {
-    // Block shell metacharacters that could break out of quoted strings
-    if (/[;&|`$!<>{}()\r\n]/.test(p)) {
-        throw new Error("Unsafe characters in file path: " + p);
+            return undefined;
+        };
     }
-    // Escape single quotes for Python r-string and double quotes for cmd
-    p = p.replace(/'/g, "\\'").replace(/"/g, '\\"');
-    return p;
-}
+})();
 
-// Locate CorridorKey root: check config file in known CEP locations
-var CORRIDORKEY_ROOT = null;
-var _cepPaths = [
-    Folder(Folder.userData.fsName + "/Adobe/CEP/extensions/com.corridorkey.panel"),
-    Folder(Folder.appData.fsName + "/Adobe/CEP/extensions/com.corridorkey.panel"),
-    (new File($.fileName)).parent.parent
-];
-for (var _ci = 0; _ci < _cepPaths.length; _ci++) {
-    var _cf = new File(_cepPaths[_ci].fsName + "/corridorkey_path.txt");
-    if (_cf.exists) {
-        _cf.open("r");
-        CORRIDORKEY_ROOT = _cf.read().replace(/[\r\n]/g, "");
-        _cf.close();
-        break;
-    }
-}
-if (!CORRIDORKEY_ROOT) {
-    // Last resort: assume plugin is inside CorridorKey repo (cep_panel/jsx/ -> repo root)
-    var _scriptDir = (new File($.fileName)).parent;
-    CORRIDORKEY_ROOT = _scriptDir.parent.parent.parent.fsName;
-}
-var PYTHON_EXE = CORRIDORKEY_ROOT + "\\.venv\\Scripts\\pythonw.exe";
-var PROCESSOR_SCRIPT = CORRIDORKEY_ROOT + "\\ae_plugin\\ae_processor.py";
-var TEMP_DIR = Folder.temp.fsName;
-
-// Detect host application
-var HOST_APP = "unknown";
-if (typeof CompItem !== "undefined") {
-    HOST_APP = "ae";
-} else if (typeof ProjectItem !== "undefined" || (app && app.project && app.project.activeSequence !== undefined)) {
-    HOST_APP = "ppro";
-}
-
-function getProjectOutputDir() {
-    // Try AE method first
-    try {
-        var projFile = app.project.file;
-        if (projFile) {
-            var projDir = projFile.parent.fsName;
-            var ckDir = new Folder(projDir + "/CorridorKey");
-            if (!ckDir.exists) ckDir.create();
-            return ckDir.fsName;
-        }
-    } catch (e) {}
-    // Try Premiere method
-    try {
-        var projPath = app.project.path;
-        if (projPath && projPath.length > 0) {
-            var projFolder = new File(projPath).parent.fsName;
-            var ckDir = new Folder(projFolder + "/CorridorKey");
-            if (!ckDir.exists) ckDir.create();
-            return ckDir.fsName;
-        }
-    } catch (e) {}
-    // Fallback to Documents
-    return Folder.myDocuments.fsName + "/CorridorKey";
-}
-
+// ============================================================
+// HOST DETECTION
+// ============================================================
+// WHAT IT DOES: Returns "ae" / "ppro" / "unknown" so the panel routes to the right code path.
 function getHostApp() {
-    return HOST_APP;
+    if (typeof CompItem !== "undefined") return "ae";
+    if (typeof app !== "undefined" && app.project && app.project.activeSequence !== undefined) return "ppro";
+    return "unknown";
 }
 
 // ============================================================
-// AFTER EFFECTS
+// AFTER EFFECTS — read-only introspection
 // ============================================================
 
-function ae_processCurrentFrame(settingsJson, previewOnly) {
+// WHAT IT DOES: Returns the state the panel needs to process the current frame: source file
+//   path, source-media frame number, fps, comp time. All data is emitted as a JSON string.
+// DEPENDS-ON: A CompItem is the activeItem; one layer with a file source is selected.
+// AFFECTS: Read-only.
+function ae_getFrameInfo() {
     try {
-        var settings = JSON.parse(settingsJson);
         var comp = app.project.activeItem;
-
-        if (!(comp instanceof CompItem)) {
-            return "Error: No composition selected";
-        }
-
+        if (!(comp instanceof CompItem)) return JSON.stringify({ ok: false, error: "No composition selected" });
         var layer = comp.selectedLayers[0];
-        if (!layer) {
-            return "Error: No layer selected";
-        }
+        if (!layer) return JSON.stringify({ ok: false, error: "No layer selected" });
+        if (!layer.source || !layer.source.file) return JSON.stringify({ ok: false, error: "Selected layer has no source file" });
 
-        var pid = Math.floor(Math.random() * 100000);
-        var inputPath = TEMP_DIR + "\\ck_ae_in_" + pid + ".png";
-        var outputPath = TEMP_DIR + "\\ck_ae_out_" + pid + ".png";
+        var fps = 1.0 / comp.frameDuration;
+        var sourceTime = comp.time - layer.startTime + layer.inPoint;
+        var sourceFrame = Math.round(sourceTime * fps);
+        if (sourceFrame < 0) sourceFrame = 0;
 
-        // Extract frame directly from source file via Python/OpenCV
-        var sourceFile = null;
-        try {
-            sourceFile = layer.source.file.fsName;
-        } catch (e) {}
-
-        if (!sourceFile) {
-            return "Error: Cannot get source file from selected layer";
-        }
-
-        // Calculate source frame number
-        // DANGER ZONE FRAGILE: comp.time reports NEXT frame boundary (same as Premiere)
-        // breaks: extracted frame is 1 ahead of display / depends on: fps
-        var fps = comp.frameRate;
-        var layerTimeInComp = comp.time - layer.startTime;
-        var sourceTime = layerTimeInComp + layer.inPoint;
-        var frameNum = Math.max(0, Math.floor(sourceTime * fps + 0.5) - 1);
-
-        var safeSource = sanitizePath(sourceFile);
-        var safeInput = sanitizePath(inputPath);
-        var extractCmd = '"' + PYTHON_EXE + '" -c "' +
-            "import cv2; " +
-            "cap = cv2.VideoCapture(r'" + safeSource.replace(/\\/g, "\\\\") + "'); " +
-            "cap.set(cv2.CAP_PROP_POS_FRAMES, " + frameNum + "); " +
-            "ret, frame = cap.read(); " +
-            "cap.release(); " +
-            "cv2.imwrite(r'" + safeInput.replace(/\\/g, "\\\\") + "', frame) if ret else None" +
-            '"';
-        system.callSystem(extractCmd);
-
-        var inputCheck = new File(inputPath);
-        if (!inputCheck.exists) {
-            return "Error: Could not extract frame " + frameNum + " from: " + sourceFile;
-        }
-
-        var cmd = buildCommand(inputPath, outputPath, settings);
-        var result = system.callSystem(cmd);
-
-        var outputFile = new File(outputPath);
-        if (!outputFile.exists) {
-            return "Error: Processing failed - no output";
-        }
-
-        // Import keyed frame to comp above selected layer
-        app.beginUndoGroup("CorridorKey Process");
-        try {
-            var normalizedOutput = outputPath.replace(/\\/g, "/");
-            var importFile = new File(normalizedOutput);
-            var io = new ImportOptions(importFile);
-            io.importAs = ImportAsType.FOOTAGE;
-            io.sequence = false;
-
-            var importedItem = app.project.importFile(io);
-            if (importedItem) {
-                var playheadTime = comp.time;
-                var newLayer = comp.layers.add(importedItem);
-                newLayer.enabled = true;
-                newLayer.moveBefore(layer);
-                newLayer.startTime = playheadTime;
-                newLayer.outPoint = playheadTime + comp.frameDuration;
-                comp.time = comp.time;
-            }
-        } catch (importErr) {
-            return "Error importing: " + importErr.toString();
-        } finally {
-            app.endUndoGroup();
-        }
-
-        var inputFile = new File(inputPath);
-        if (inputFile.exists) inputFile.remove();
-
-        return "success:" + outputPath;
-
-    } catch (e) {
-        return "Error: " + e.toString();
-    }
+        return JSON.stringify({
+            ok: true,
+            sourceFile: layer.source.file.fsName,
+            sourceFrame: sourceFrame,
+            fps: fps,
+            compTime: comp.time,
+            frameDuration: comp.frameDuration
+        });
+    } catch (e) { return JSON.stringify({ ok: false, error: String(e) }); }
 }
 
-function ae_processWorkArea(settingsJson) {
+// WHAT IT DOES: Returns the work-area range mapped to source-media frame numbers.
+// DEPENDS-ON: A CompItem with a selected file-backed layer and a work area set.
+// AFFECTS: Read-only.
+function ae_getWorkAreaInfo() {
     try {
-        var settings = JSON.parse(settingsJson);
         var comp = app.project.activeItem;
-
-        if (!(comp instanceof CompItem)) {
-            return "Error: No composition selected";
-        }
-
+        if (!(comp instanceof CompItem)) return JSON.stringify({ ok: false, error: "No composition selected" });
         var layer = comp.selectedLayers[0];
-        if (!layer) {
-            return "Error: No layer selected";
-        }
+        if (!layer) return JSON.stringify({ ok: false, error: "No layer selected" });
+        if (!layer.source || !layer.source.file) return JSON.stringify({ ok: false, error: "Selected layer has no source file" });
 
-        // Get source file for batch processing
-        var sourceFile = null;
-        try { sourceFile = layer.source.file.fsName; } catch (e) {}
-        if (!sourceFile) return "Error: Cannot get source file";
-
-        var fps = comp.frameRate;
+        var fps = 1.0 / comp.frameDuration;
         var startTime = comp.workAreaStart;
         var duration = comp.workAreaDuration;
         var endTime = startTime + duration;
-
-        // Convert comp work area to source media frame numbers
-        // DANGER ZONE FRAGILE: AE work area times report NEXT frame boundary (same as comp.time)
-        // breaks: extracted frames are 1 ahead of display / depends on: fps
         var sourceStartTime = startTime - layer.startTime + layer.inPoint;
         var sourceEndTime = endTime - layer.startTime + layer.inPoint;
-        var startFrame = Math.max(0, Math.floor(sourceStartTime * fps + 0.5) - 1);
-        var endFrame = Math.max(0, Math.floor(sourceEndTime * fps + 0.5) - 1);
-        if (endFrame <= startFrame) return "Error: Invalid frame range";
+        var startFrame = Math.round(sourceStartTime * fps);
+        var endFrame = Math.round(sourceEndTime * fps);
+        if (startFrame < 0) startFrame = 0;
+        if (endFrame <= startFrame) return JSON.stringify({ ok: false, error: "Invalid frame range" });
 
-        var frameCount = endFrame - startFrame;
-
-        var pid = Math.floor(Math.random() * 100000);
-        var outputFolder = new Folder(TEMP_DIR + "\\ck_seq_" + pid);
-        if (!outputFolder.exists) outputFolder.create();
-
-        // ONE Python call for entire batch — Python reads video directly
-        var safeBatchSource = sanitizePath(sourceFile);
-        var safeBatchOutput = sanitizePath(outputFolder.fsName);
-        var cmd = '"' + PYTHON_EXE + '" "' + PROCESSOR_SCRIPT + '" batch ';
-        cmd += '"' + safeBatchSource + '" ';
-        cmd += '"' + safeBatchOutput + '" ';
-        cmd += '--start-frame ' + startFrame + ' ';
-        cmd += '--end-frame ' + endFrame + ' ';
-        cmd += '--fps ' + fps + ' ';
-        cmd += '--screen ' + ((settings.screenType === "blue") ? "blue" : "green") + ' ';
-        cmd += '--despill ' + (parseFloat(settings.despill) || 0.5) + ' ';
-        cmd += '--despeckle ' + (settings.despeckle ? '1' : '0') + ' ';
-        cmd += '--despeckle-size ' + (parseInt(settings.despeckleSize, 10) || 400) + ' ';
-        cmd += '--refiner ' + (parseFloat(settings.refiner) || 1.0);
-
-        system.callSystem(cmd);
-
-        // Read result summary
-        var resultFile = new File(outputFolder.fsName + "\\batch_result.txt");
-        var processedCount = 0;
-        if (resultFile.exists) {
-            resultFile.open("r");
-            var resultText = resultFile.read();
-            resultFile.close();
-            var parts = resultText.split(",");
-            processedCount = parseInt(parts[0], 10);
-        }
-
-        if (processedCount === 0) {
-            return "Error: Batch processing failed - no frames produced";
-        }
-
-        // Import output sequence
-        app.beginUndoGroup("CorridorKey Batch");
-
-        var firstFrame = new File(outputFolder.fsName + "\\output_00000.png");
-        if (firstFrame.exists) {
-            var importOptions = new ImportOptions(firstFrame);
-            importOptions.sequence = true;
-            var importedSeq = app.project.importFile(importOptions);
-
-            if (importedSeq) {
-                importedSeq.mainSource.conformFrameRate = fps;
-                var newLayer = comp.layers.add(importedSeq);
-                newLayer.moveBefore(layer);
-                newLayer.startTime = startTime;
-            }
-        }
-
-        app.endUndoGroup();
-        comp.time = comp.time;
-
-        return "success: " + processedCount + "/" + frameCount + " frames processed";
-
-    } catch (e) {
-        return "Error: " + e.toString();
-    }
+        return JSON.stringify({
+            ok: true,
+            sourceFile: layer.source.file.fsName,
+            startFrame: startFrame,
+            endFrame: endFrame,
+            fps: fps,
+            compStartTime: startTime
+        });
+    } catch (e) { return JSON.stringify({ ok: false, error: String(e) }); }
 }
 
 // ============================================================
-// PREMIERE PRO
+// AFTER EFFECTS — timeline mutators
 // ============================================================
 
-// WHAT IT DOES: Gets source clip info at playhead for panel-side Python frame extraction
-// DEPENDS-ON: active sequence, video track 1 clips, sequence fps settings
-// AFFECTS: nothing — read-only, returns JSON with sourcePath, sourceFrame, fps
-function ppro_getClipInfo() {
+// WHAT IT DOES: Imports a single PNG produced by Python above the currently selected layer,
+//   trimmed to one frame at the current comp time.
+// DEPENDS-ON: outputPath exists on disk (panel pre-verifies), comp still active.
+// AFFECTS: Adds ImportItem + Layer.
+function ae_importFrame(outputPath) {
+    try {
+        var comp = app.project.activeItem;
+        if (!(comp instanceof CompItem)) return JSON.stringify({ ok: false, error: "No composition selected" });
+        var layer = comp.selectedLayers[0];
+        if (!layer) return JSON.stringify({ ok: false, error: "No layer selected" });
+        var outputFile = new File(outputPath);
+        if (!outputFile.exists) return JSON.stringify({ ok: false, error: "Output file not found: " + outputPath });
+
+        app.beginUndoGroup("CorridorKey Frame");
+        var importedFile = app.project.importFile(new ImportOptions(outputFile));
+        if (importedFile) {
+            var newLayer = comp.layers.add(importedFile);
+            newLayer.moveBefore(layer);
+            newLayer.startTime = comp.time;
+            newLayer.outPoint = comp.time + comp.frameDuration;
+        }
+        app.endUndoGroup();
+        comp.time = comp.time; // force UI refresh
+        return JSON.stringify({ ok: true });
+    } catch (e) { return JSON.stringify({ ok: false, error: String(e) }); }
+}
+
+// WHAT IT DOES: Imports a PNG sequence produced by batch Python and lays it on the track
+//   above the source layer at the work-area start time.
+// DEPENDS-ON: firstFramePath exists and is the first PNG of a numbered sequence.
+// AFFECTS: Adds ImportItem + Layer.
+function ae_importSequence(firstFramePath, fps, compStartTime) {
+    try {
+        var comp = app.project.activeItem;
+        if (!(comp instanceof CompItem)) return JSON.stringify({ ok: false, error: "No composition selected" });
+        var layer = comp.selectedLayers[0];
+        if (!layer) return JSON.stringify({ ok: false, error: "No layer selected" });
+        var firstFrame = new File(firstFramePath);
+        if (!firstFrame.exists) return JSON.stringify({ ok: false, error: "First frame not found: " + firstFramePath });
+
+        app.beginUndoGroup("CorridorKey Batch");
+        var importOptions = new ImportOptions(firstFrame);
+        importOptions.sequence = true;
+        var importedSeq = app.project.importFile(importOptions);
+        if (importedSeq) {
+            importedSeq.mainSource.conformFrameRate = Number(fps);
+            var newLayer = comp.layers.add(importedSeq);
+            newLayer.moveBefore(layer);
+            newLayer.startTime = Number(compStartTime);
+        }
+        app.endUndoGroup();
+        comp.time = comp.time;
+        return JSON.stringify({ ok: true });
+    } catch (e) { return JSON.stringify({ ok: false, error: String(e) }); }
+}
+
+// ============================================================
+// PREMIERE PRO — read-only introspection
+// ============================================================
+
+// WHAT IT DOES: Returns clip-at-playhead info: file path, source-media frame number, fps.
+// DEPENDS-ON: An active sequence with a clip under the playhead on track 1.
+// AFFECTS: Read-only.
+// NOTE: Premiere reports the NEXT frame boundary for playerPos — we offset by -1 to match.
+function ppro_getFrameInfo() {
     try {
         var seq = app.project.activeSequence;
-        if (!seq) return JSON.stringify({error: "No active sequence"});
+        if (!seq) return JSON.stringify({ ok: false, error: "No active sequence" });
+
+        // Premiere's videoFrameRate can return a Time object, a string, or a number
+        // depending on version. parseFloat handles most; if it still fails, fall back
+        // to 24 rather than erroring — a wrong-by-a-bit fps beats a dead button.
+        var fps = parseFloat(seq.getSettings().videoFrameRate);
+        if (isNaN(fps) || fps <= 0) fps = 24;
 
         var playerPos = seq.getPlayerPosition();
-
         var videoTracks = seq.videoTracks;
-        if (videoTracks.numTracks < 1) return JSON.stringify({error: "No video tracks"});
+        if (videoTracks.numTracks < 1) return JSON.stringify({ ok: false, error: "No video tracks" });
 
         var track = videoTracks[0];
         var clips = track.clips;
         var targetClip = null;
-
         for (var i = 0; i < clips.numItems; i++) {
-            var clip = clips[i];
-            var pSec = playerPos.seconds;
-            var cStart = clip.start.seconds;
-            var cEnd = clip.end.seconds;
-            if (pSec >= cStart && pSec < cEnd) {
-                targetClip = clip;
-                break;
+            var c = clips[i];
+            if (playerPos.ticks >= c.start.ticks && playerPos.ticks < c.end.ticks) {
+                targetClip = c; break;
             }
         }
-
-        if (!targetClip) {
-            var dbg = "No clip at playhead. Clips on V1=" + clips.numItems;
-            for (var di = 0; di < clips.numItems && di < 3; di++) {
-                dbg += " | Clip" + di + " start=" + clips[di].start.seconds + "s end=" + clips[di].end.seconds + "s";
-            }
-            dbg += " | Playhead=" + playerPos.seconds + "s";
-            return JSON.stringify({error: dbg});
-        }
+        if (!targetClip) return JSON.stringify({ ok: false, error: "No clip at playhead on Track 1" });
 
         var filePath = targetClip.projectItem.getMediaPath();
-        if (!filePath) return JSON.stringify({error: "Cannot get source file path"});
+        if (!filePath) return JSON.stringify({ ok: false, error: "Cannot get source file path" });
 
-        // Get fps from sequence settings
-        var fpsRaw = seq.getSettings().videoFrameRate;
-        var fps = parseFloat(fpsRaw);
-        if (isNaN(fps) || fps <= 0) fps = 24;
-
-        // Use .seconds property (avoids ticks math entirely)
-        var playheadSec = playerPos.seconds;
-        var clipStartSec = targetClip.start.seconds;
-        var clipInPointSec = targetClip.inPoint.seconds;
-
-        // How far into the clip is the playhead
-        var offsetInClip = playheadSec - clipStartSec;
-        // Source media time = clip inPoint + offset
-        var sourceTimeSec = clipInPointSec + offsetInClip;
-        // DANGER ZONE FRAGILE: Premiere playhead reports time of the NEXT frame boundary
-        // breaks: extracted frame is 1 ahead of what's displayed / depends on: fps
-        // Subtract 1 frame so extracted content matches what Premiere shows at playhead
-        var sourceFrame = Math.max(0, Math.floor(sourceTimeSec * fps) - 1);
-
-        var clipDurationSec = targetClip.end.seconds - targetClip.start.seconds;
-        var totalFrames = Math.floor(clipDurationSec * fps);
+        var sourceTimeSec = playerPos.seconds - targetClip.start.seconds + targetClip.inPoint.seconds;
+        var sourceFrame = Math.floor(sourceTimeSec * fps) - 1;
+        if (sourceFrame < 0) sourceFrame = 0;
 
         return JSON.stringify({
-            sourcePath: filePath,
+            ok: true,
+            sourceFile: filePath,
             sourceFrame: sourceFrame,
             fps: fps,
-            totalFrames: totalFrames,
-            debug: "playhead=" + playheadSec.toFixed(2) + "s clipStart=" + clipStartSec.toFixed(2) + "s inPoint=" + clipInPointSec.toFixed(2) + "s offset=" + offsetInClip.toFixed(2) + "s srcTime=" + sourceTimeSec.toFixed(2) + "s"
+            playheadSeconds: playerPos.seconds
         });
-    } catch (e) {
-        return JSON.stringify({error: e.toString()});
-    }
+    } catch (e) { return JSON.stringify({ ok: false, error: String(e) }); }
 }
 
-// WHAT IT DOES: Gets frame range info for batch processing (I/O marks or full clip)
-// DEPENDS-ON: active sequence, I/O marks or clip on V1, sequence fps settings
-// AFFECTS: nothing — read-only, returns JSON with sourcePath, startFrame, endFrame, fps, clipStartSec
-function ppro_getWorkAreaInfo() {
+// WHAT IT DOES: Returns the in/out range of the sequence mapped to source-media frames.
+// DEPENDS-ON: In/out points set on an active sequence with clips on track 1.
+function ppro_getInOutInfo() {
     try {
         var seq = app.project.activeSequence;
-        if (!seq) return JSON.stringify({error: "No active sequence"});
+        if (!seq) return JSON.stringify({ ok: false, error: "No active sequence" });
 
-        var fpsRaw = seq.getSettings().videoFrameRate;
-        var fps = parseFloat(fpsRaw);
+        // Premiere's videoFrameRate can return a Time object, a string, or a number
+        // depending on version. parseFloat handles most; if it still fails, fall back
+        // to 24 rather than erroring — a wrong-by-a-bit fps beats a dead button.
+        var fps = parseFloat(seq.getSettings().videoFrameRate);
         if (isNaN(fps) || fps <= 0) fps = 24;
 
         var inPoint = seq.getInPointAsTime();
         var outPoint = seq.getOutPointAsTime();
-        var hasIOMarks = inPoint && outPoint && outPoint.seconds > inPoint.seconds;
-
-        var startFrame, endFrame, filePath, clipStartSec;
-
-        if (hasIOMarks) {
-            // Use sequence I/O marks
-            clipStartSec = inPoint.seconds;
-            startFrame = Math.floor(inPoint.seconds * fps);
-            endFrame = Math.floor(outPoint.seconds * fps);
-
-            var track = seq.videoTracks[0];
-            var clips = track.clips;
-            if (clips.numItems < 1) return JSON.stringify({error: "No clips on Track 1"});
-            filePath = clips[0].projectItem.getMediaPath();
-        } else {
-            // No I/O marks — fall back to clip at playhead
-            var playerPos = seq.getPlayerPosition();
-            var track = seq.videoTracks[0];
-            var clips = track.clips;
-            var targetClip = null;
-
-            for (var i = 0; i < clips.numItems; i++) {
-                var clip = clips[i];
-                if (playerPos.seconds >= clip.start.seconds && playerPos.seconds < clip.end.seconds) {
-                    targetClip = clip;
-                    break;
-                }
-            }
-
-            if (!targetClip) {
-                if (clips.numItems < 1) return JSON.stringify({error: "No clips on Track 1"});
-                targetClip = clips[0];
-            }
-
-            // Timeline position of the source clip
-            clipStartSec = targetClip.start.seconds;
-            filePath = targetClip.projectItem.getMediaPath();
-            startFrame = Math.floor(targetClip.inPoint.seconds * fps);
-            endFrame = Math.floor((targetClip.inPoint.seconds + (targetClip.end.seconds - targetClip.start.seconds)) * fps);
+        if (!inPoint || !outPoint || inPoint.seconds >= outPoint.seconds) {
+            return JSON.stringify({ ok: false, error: "Set in/out points on timeline first" });
         }
 
-        if (!filePath) return JSON.stringify({error: "Cannot get source file path"});
-        if (endFrame <= startFrame) return JSON.stringify({error: "Invalid frame range"});
+        var startFrame = Math.round(inPoint.seconds * fps);
+        var endFrame = Math.round(outPoint.seconds * fps);
+        if (endFrame <= startFrame) return JSON.stringify({ ok: false, error: "Invalid in/out range" });
+
+        var track = seq.videoTracks[0];
+        if (track.clips.numItems < 1) return JSON.stringify({ ok: false, error: "No clips on Track 1" });
+        var sourceClip = track.clips[0];
+        var filePath = sourceClip.projectItem.getMediaPath();
+        if (!filePath) return JSON.stringify({ ok: false, error: "Cannot get source file path" });
 
         return JSON.stringify({
-            sourcePath: filePath,
+            ok: true,
+            sourceFile: filePath,
             startFrame: startFrame,
             endFrame: endFrame,
             fps: fps,
-            clipStartSec: clipStartSec
+            inPointSeconds: inPoint.seconds
         });
-    } catch (e) {
-        return JSON.stringify({error: e.toString()});
-    }
+    } catch (e) { return JSON.stringify({ ok: false, error: String(e) }); }
 }
 
-// WHAT IT DOES: Imports keyed PNG into CorridorKey bin and places on V2 at playhead
-// DEPENDS-ON: filePath (keyed PNG), active sequence with 2+ video tracks
-// AFFECTS: Project panel (creates CorridorKey bin), Timeline V2 (adds 1-frame clip)
-function ppro_importFile(filePath) {
+// ============================================================
+// PREMIERE PRO — timeline mutators
+// ============================================================
+
+// WHAT IT DOES: Imports a single keyed PNG into the "CorridorKey" bin and overwrites it
+//   onto V2 at the playhead, trimmed to one frame.
+// DEPENDS-ON: outputPath exists; active sequence has ≥2 video tracks (creates if not).
+// AFFECTS: Project panel (import), timeline V2 (overwriteClip).
+// NOTE: Placement needs a +1 frame nudge to match the -1 offset used in ppro_getFrameInfo.
+function ppro_importFrame(outputPath, playheadSeconds, fps) {
     try {
-        // Find or create CorridorKey bin
-        var rootItem = app.project.rootItem;
-        var ckBin = null;
-        for (var i = 0; i < rootItem.children.numItems; i++) {
-            if (rootItem.children[i].name === "CorridorKey" && rootItem.children[i].type === 2) {
-                ckBin = rootItem.children[i];
-                break;
-            }
-        }
-        if (!ckBin) {
-            ckBin = rootItem.createBin("CorridorKey");
-        }
-
-        // Import to CorridorKey bin
-        var imported = app.project.importFiles([filePath], true, ckBin, false);
-
-        // Find the imported item (last in the bin)
-        var importedItem = null;
-        for (var j = 0; j < ckBin.children.numItems; j++) {
-            importedItem = ckBin.children[j]; // last one
-        }
-
-        if (!importedItem) return "success:bin_only";
-
-        // WHAT IT DOES: Places keyed PNG on V2 at playhead, trimmed to 1 frame
-        // DEPENDS-ON: importedItem (just imported), active sequence with 2+ video tracks
-        // AFFECTS: Timeline V2 — adds clip at playhead position
         var seq = app.project.activeSequence;
-        if (seq) {
-            var playerPos = seq.getPlayerPosition();
-            var vTracks = seq.videoTracks;
-            if (vTracks.numTracks >= 2) {
-                var fps = parseFloat(seq.getSettings().videoFrameRate) || 24;
-                var frameDuration = 1.0 / fps;
+        if (!seq) return JSON.stringify({ ok: false, error: "No active sequence" });
 
-                vTracks[1].overwriteClip(importedItem, playerPos.seconds);
-
-                // Find the clip we just inserted and trim to 1 frame
-                var track2 = vTracks[1];
-                for (var ci = 0; ci < track2.clips.numItems; ci++) {
-                    var c = track2.clips[ci];
-                    if (Math.abs(c.start.seconds - playerPos.seconds) < frameDuration) {
-                        c.end = c.start.seconds + frameDuration;
-                        break;
-                    }
-                }
-                return "success";
-            } else {
-                return "success:bin_only";
-            }
-        }
-        return "success:bin_only";
-    } catch (e) {
-        return "Error: " + e.toString();
-    }
-}
-
-// WHAT IT DOES: Imports keyed PNG sequence into CorridorKey bin, places on V2, optionally disables V1 source
-// DEPENDS-ON: folderPath (batch output), fps, clipStartSec (V1 clip position), active sequence
-// AFFECTS: Project panel (creates CorridorKey bin), Timeline V2 (adds sequence), optionally disables V1 clip
-function ppro_importSequence(folderPath, fps, clipStartSec, disableSource) {
-    try {
-        var firstOut = folderPath + "\\output_00000.png";
-        if (!new File(firstOut).exists) {
-            return "Error: No output files found";
-        }
+        var outputFile = new File(outputPath);
+        if (!outputFile.exists) return JSON.stringify({ ok: false, error: "Output file not found: " + outputPath });
 
         // Find or create CorridorKey bin
-        var rootItem = app.project.rootItem;
+        var root = app.project.rootItem;
         var ckBin = null;
-        for (var i = 0; i < rootItem.children.numItems; i++) {
-            if (rootItem.children[i].name === "CorridorKey" && rootItem.children[i].type === 2) {
-                ckBin = rootItem.children[i];
-                break;
-            }
+        for (var i = 0; i < root.children.numItems; i++) {
+            var item = root.children[i];
+            if (item.name === "CorridorKey" && item.type === 2 /* BIN */) { ckBin = item; break; }
         }
-        if (!ckBin) {
-            ckBin = rootItem.createBin("CorridorKey");
+        if (!ckBin) ckBin = root.createBin("CorridorKey");
+
+        // Import into the bin
+        var ok = app.project.importFiles([outputPath], true, ckBin, false);
+        if (!ok) return JSON.stringify({ ok: false, error: "Import failed" });
+
+        var imported = ckBin.children[ckBin.children.numItems - 1];
+        if (!imported) return JSON.stringify({ ok: false, error: "Imported item not found" });
+
+        // Make sure we have at least two video tracks
+        if (seq.videoTracks.numTracks < 2) seq.videoTracks.addTracks(1);
+        var v2 = seq.videoTracks[1];
+
+        // Place one frame ahead to compensate for Premiere's boundary reporting
+        var nudge = 1.0 / Number(fps);
+        var placeSec = Number(playheadSeconds) + nudge;
+        v2.overwriteClip(imported, placeSec);
+
+        return JSON.stringify({ ok: true });
+    } catch (e) { return JSON.stringify({ ok: false, error: String(e) }); }
+}
+
+// WHAT IT DOES: Imports a PNG sequence into the CorridorKey bin. Does NOT place on timeline —
+//   user drags from bin (safer for batch jobs that could be long / partial).
+// DEPENDS-ON: firstFramePath exists.
+function ppro_importSequence(firstFramePath) {
+    try {
+        var root = app.project.rootItem;
+        var ckBin = null;
+        for (var i = 0; i < root.children.numItems; i++) {
+            var item = root.children[i];
+            if (item.name === "CorridorKey" && item.type === 2) { ckBin = item; break; }
         }
+        if (!ckBin) ckBin = root.createBin("CorridorKey");
 
-        // Import sequence to CorridorKey bin
-        app.project.importFiles([firstOut], true, ckBin, true);
-
-        // Find the imported item (last in the bin)
-        var importedItem = null;
-        for (var j = 0; j < ckBin.children.numItems; j++) {
-            importedItem = ckBin.children[j];
-        }
-
-        if (!importedItem) return "success:bin_only";
-
-        // Match frame rate to source
-        if (fps && fps > 0) {
-            try {
-                importedItem.setOverrideFrameRate(fps);
-            } catch (fpsErr) {}
-        }
-
-        // WHAT IT DOES: Places keyed PNG sequence on V2 at source clip's timecode
-        // DEPENDS-ON: importedItem, active sequence, clipStartSec from getWorkAreaInfo
-        // AFFECTS: Timeline V2 — adds sequence at source clip position
-        var seq = app.project.activeSequence;
-        if (seq) {
-            var seqFps = parseFloat(seq.getSettings().videoFrameRate) || fps || 24;
-            var vTracks = seq.videoTracks;
-            if (vTracks.numTracks >= 2) {
-                var placeSec = (clipStartSec !== undefined && clipStartSec >= 0) ? clipStartSec : seq.getPlayerPosition().seconds;
-                // DANGER ZONE FRAGILE: Batch sequence needs +1 frame nudge to align with V1
-                // breaks: sequence starts 1 frame early / depends on: fps
-                var batchNudge = 1.0 / seqFps;
-                vTracks[1].overwriteClip(importedItem, placeSec + batchNudge);
-
-                // Disable source clip on V1 if requested
-                if (disableSource) {
-                    var v1clips = vTracks[0].clips;
-                    for (var ci = 0; ci < v1clips.numItems; ci++) {
-                        var c = v1clips[ci];
-                        if (c.start.seconds <= placeSec && c.end.seconds > placeSec) {
-                            try { c.disabled = true; } catch(de) {
-                                try { c.setClipEnabled(false); } catch(de2) {}
-                            }
-                            break;
-                        }
-                    }
-                }
-
-                return "success";
-            }
-        }
-        return "success:bin_only";
-    } catch (e) {
-        return "Error: " + e.toString();
-    }
-}
-
-// Legacy wrappers — these are called by the router but Premiere now uses panel-side execution
-function ppro_processCurrentFrame(settingsJson, previewOnly) {
-    return "PPRO_PANEL_SIDE";
-}
-
-function ppro_processWorkArea(settingsJson) {
-    return "PPRO_PANEL_SIDE";
-}
-
-// ============================================================
-// ROUTER
-// ============================================================
-
-function processCurrentFrame(settingsJson, previewOnly) {
-    if (HOST_APP === "ppro") {
-        return ppro_processCurrentFrame(settingsJson, previewOnly);
-    }
-    return ae_processCurrentFrame(settingsJson, previewOnly);
-}
-
-function processWorkArea(settingsJson) {
-    if (HOST_APP === "ppro") {
-        return ppro_processWorkArea(settingsJson);
-    }
-    return ae_processWorkArea(settingsJson);
-}
-
-// ============================================================
-// SHARED UTILITIES
-// ============================================================
-
-function buildCommand(inputPath, outputPath, settings) {
-    var screenType = (settings.screenType === "blue") ? "blue" : "green";
-    var despill = parseFloat(settings.despill);
-    if (isNaN(despill) || despill < 0 || despill > 1) despill = 0.5;
-    var refiner = parseFloat(settings.refiner);
-    if (isNaN(refiner) || refiner < 0 || refiner > 1) refiner = 1.0;
-    var despeckleSize = parseInt(settings.despeckleSize, 10);
-    if (isNaN(despeckleSize) || despeckleSize < 50 || despeckleSize > 2000) despeckleSize = 400;
-
-    var safeIn = sanitizePath(inputPath);
-    var safeOut = sanitizePath(outputPath);
-    var cmd = '"' + PYTHON_EXE + '" "' + PROCESSOR_SCRIPT + '" ';
-    cmd += '"' + safeIn + '" "' + safeOut + '" ';
-    cmd += '--screen ' + screenType + ' ';
-    cmd += '--despill ' + despill + ' ';
-    cmd += '--refiner ' + refiner + ' ';
-    cmd += '--despeckle ' + (settings.despeckle ? '1' : '0') + ' ';
-    cmd += '--despeckle-size ' + despeckleSize;
-    return cmd;
-}
-
-function padNumber(num, length) {
-    var str = num.toString();
-    while (str.length < length) {
-        str = '0' + str;
-    }
-    return str;
+        var ok = app.project.importFiles([firstFramePath], true, ckBin, true);
+        if (!ok) return JSON.stringify({ ok: false, error: "Sequence import failed" });
+        return JSON.stringify({ ok: true });
+    } catch (e) { return JSON.stringify({ ok: false, error: String(e) }); }
 }

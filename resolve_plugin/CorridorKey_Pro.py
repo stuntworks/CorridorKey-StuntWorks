@@ -1,4 +1,4 @@
-# Last modified: 2026-04-13 | Change: HRCS retrofit (documentation only, no logic changes) | Full history: git log
+# Last modified: 2026-04-14 | Change: Remove hardcoded D:\ paths — dynamic engine resolver | Full history: git log
 """CorridorKey Pro - Neural Green Screen for DaVinci Resolve
 Enhanced with SAM2 Click-to-Mask, Frame Range, Export Modes
 
@@ -8,7 +8,8 @@ the keyed result on Track 2. Supports single frame, frame range, SAM2 click-to-m
 live preview with despill/refiner sliders.
 
 DEPENDS-ON:
-  - CorridorKey engine at D:/New AI Projects/CorridorKey (neural keying model)
+  - CorridorKey engine folder — location resolved at startup by find_corridorkey_root()
+    which checks CORRIDORKEY_ROOT env var, corridorkey_path.txt config, then fallbacks.
   - DaVinci Resolve running with a project and timeline open
   - Resolve's Fusion scripting environment (fu, fusionscript)
   - core/corridorkey_processor.py (ProcessingSettings, CorridorKeyProcessor)
@@ -21,15 +22,61 @@ AFFECTS: Timeline Track 2 (writes keyed frames), MediaPool (creates CorridorKey 
 import sys, os, site, tempfile
 from pathlib import Path
 
-# DANGER ZONE FRAGILE: Hardcoded paths to CorridorKey venv and Resolve SDK
-# breaks: if CorridorKey moves or Resolve updates SDK location
-# depends on: D:\New AI Projects\CorridorKey\.venv existing with all dependencies
-venv_packages = r"D:\New AI Projects\CorridorKey\.venv\Lib\site-packages"
+# WHAT IT DOES: Finds the CorridorKey engine folder (neural-net code + .venv + model weights)
+#   by checking in order: 1) CORRIDORKEY_ROOT env var, 2) corridorkey_path.txt in the script
+#   dir or its parent, 3) sibling "CorridorKey" folder two levels up, 4) legacy dev location
+#   D:\New AI Projects\CorridorKey, 5) ~/CorridorKey. Raises a clear error if none work.
+# DEPENDS-ON: nothing — pure filesystem probe.
+# AFFECTS: returns a pathlib.Path. Does not modify sys.path itself.
+def find_corridorkey_root():
+    script_dir = Path(__file__).parent
+    candidates = []
+    env_root = os.environ.get("CORRIDORKEY_ROOT")
+    if env_root:
+        candidates.append(Path(env_root))
+    for probe_dir in (script_dir, script_dir.parent):
+        cfg = probe_dir / "corridorkey_path.txt"
+        if cfg.exists():
+            try:
+                candidates.append(Path(cfg.read_text().strip()))
+            except Exception:
+                pass
+    candidates.append(script_dir.parent.parent / "CorridorKey")
+    candidates.append(Path(r"D:\New AI Projects\CorridorKey"))
+    candidates.append(Path.home() / "CorridorKey")
+    for path in candidates:
+        if path and path.exists() and (path / ".venv").exists():
+            return path
+    probed = "\n  ".join(str(c) for c in candidates)
+    raise RuntimeError(
+        "CorridorKey engine not found. Tried:\n  " + probed + "\n\n"
+        "Fix: set the CORRIDORKEY_ROOT environment variable to the CorridorKey engine folder, "
+        "or place a corridorkey_path.txt file next to this script containing that path."
+    )
+
+# WHAT IT DOES: Returns the venv's site-packages directory, Windows or Unix layout.
+# DEPENDS-ON: CorridorKey's .venv built with standard python -m venv layout.
+# AFFECTS: returns a pathlib.Path.
+def find_venv_site_packages(venv_dir):
+    win_sp = venv_dir / "Lib" / "site-packages"
+    if win_sp.exists():
+        return win_sp
+    for p in (venv_dir / "lib").glob("python*/site-packages"):
+        return p
+    return win_sp  # leave as Windows path so downstream error points at the expected location
+
+# DANGER ZONE FRAGILE: If find_corridorkey_root() raises, nothing below this point runs.
+# breaks: user has not installed the CorridorKey engine, or the config points at a stale path.
+CK_ROOT = find_corridorkey_root()
+CK_VENV = CK_ROOT / ".venv"
+CK_PYTHON = CK_VENV / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+
+venv_packages = str(find_venv_site_packages(CK_VENV))
 site.addsitedir(venv_packages)
 sys.path.insert(0, venv_packages)
 sys.path.insert(0, r"C:\ProgramData\Blackmagic Design\DaVinci Resolve\Support\Developer\Scripting\Modules")
-sys.path.insert(0, r"D:\New AI Projects\CorridorKey")
-sys.path.insert(0, r"D:\New AI Projects\CorridorKey\resolve_plugin")
+sys.path.insert(0, str(CK_ROOT))
+sys.path.insert(0, str(CK_ROOT / "resolve_plugin"))
 
 import fusionscript
 
@@ -249,7 +296,7 @@ def generate_alpha_hint(frame, settings):
 
 # WHAT IT DOES: Runs SAM2 (Segment Anything Model 2) to generate a mask from user click points.
 #   Loads the SAM2 model, feeds it the frame + positive/negative points, returns the best mask.
-# DEPENDS-ON: SAM2 weights at D:\New AI Projects\CorridorKey\sam2_weights\, CUDA GPU
+# DEPENDS-ON: SAM2 weights at <CK_ROOT>/sam2_weights/sam2.1_hiera_small.pt, CUDA GPU
 # DANGER ZONE HIGH: Loads a ~300MB model into VRAM every call. No caching.
 # breaks: if VRAM is full (Resolve already uses 2-4GB), or SAM2 weights are missing
 def generate_sam2_mask(frame, pos_pts, neg_pts):
@@ -259,7 +306,7 @@ def generate_sam2_mask(frame, pos_pts, neg_pts):
         from sam2.sam2_image_predictor import SAM2ImagePredictor
         log("Loading SAM2...")
         status("Loading SAM2...")
-        ckpt = r"D:\New AI Projects\CorridorKey\sam2_weights\sam2.1_hiera_small.pt"
+        ckpt = str(CK_ROOT / "sam2_weights" / "sam2.1_hiera_small.pt")
         cfg = "configs/sam2.1/sam2.1_hiera_s.yaml"
         device = "cuda" if torch.cuda.is_available() else "cpu"
         model = build_sam2(cfg, ckpt, device=device)
@@ -296,7 +343,7 @@ def open_sam_click_window():
         mpi = clip.GetMediaPoolItem()
         props = mpi.GetClipProperty() if mpi else {}
         fp = props.get("File Path", "")
-        fn = clip.GetLeftOffset() + (cf - clip.GetStart()) - 1
+        fn = clip.GetLeftOffset() + (cf - clip.GetStart())
         if fn < 0: fn = 0
         cap = cv2.VideoCapture(fp)
         cap.set(cv2.CAP_PROP_POS_FRAMES, fn)
@@ -397,7 +444,7 @@ def grab_background_frame():
 
 # WHAT IT DOES: Saves original, foreground, matte, and optional background plate to temp PNGs,
 #   then launches preview_viewer.py as a separate process to display them side by side.
-# DEPENDS-ON: preview_viewer.py at D:\New AI Projects\CorridorKey\resolve_plugin\,
+# DEPENDS-ON: preview_viewer.py at <CK_ROOT>/resolve_plugin/,
 #   CorridorKey venv Python, grab_background_frame()
 # DANGER ZONE FRAGILE: Hardcoded paths to viewer script and Python exe
 # breaks: if CorridorKey folder moves or venv is rebuilt
@@ -436,8 +483,8 @@ def show_preview_window(orig_bgr, keyed_rgb, alpha):
         cv2.imwrite(paths["background"], bg_frame)
         log("Background plate saved for composite")
     # Launch preview as separate process — no event loop conflicts
-    viewer_script = str(Path(r"D:\New AI Projects\CorridorKey\resolve_plugin") / "preview_viewer.py")
-    python_exe = str(Path(r"D:\New AI Projects\CorridorKey") / ".venv" / "Scripts" / "python.exe")
+    viewer_script = str(CK_ROOT / "resolve_plugin" / "preview_viewer.py")
+    python_exe = str(CK_PYTHON)
     subprocess.Popen(
         [python_exe, viewer_script, json.dumps(paths)],
         creationflags=subprocess.CREATE_NO_WINDOW
@@ -519,8 +566,7 @@ def process_current_frame(preview_only=False):
         props = mpi.GetClipProperty() if mpi else {}
         fp = props.get("File Path", "")
         log(f"Source: {os.path.basename(fp)}")
-        # DANGER ZONE FRAGILE: +1 aligns Resolve frame numbering with OpenCV 0-indexed frames
-        fn = clip.GetLeftOffset() + (cf - cs) + 1
+        fn = clip.GetLeftOffset() + (cf - cs)
         if fn < 0: fn = 0
         cap = cv2.VideoCapture(fp)
         cap.set(cv2.CAP_PROP_POS_FRAMES, fn)
@@ -617,7 +663,9 @@ def process_current_frame(preview_only=False):
         status("ERROR!")
         log(f"ERROR: {e}")
         import traceback; log(traceback.format_exc())
-        with open(r"D:\ck_error.txt", "w") as ef: ef.write(traceback.format_exc())
+        err_log = Path(tempfile.gettempdir()) / "corridorkey_error.txt"
+        with open(err_log, "w") as ef: ef.write(traceback.format_exc())
+        log(f"Error trace written to {err_log}")
 
 # WHAT IT DOES: Button handlers — preview shows key without importing, process imports to timeline
 def on_show_preview(ev): process_current_frame(preview_only=True)
@@ -678,8 +726,7 @@ def on_process_range(ev):
         pr = 0
         for tf in range(inf, outf):
             if processing_cancelled: log("Cancelled"); break
-            # DANGER ZONE FRAGILE: +1 aligns Resolve frame numbering with OpenCV 0-indexed frames
-            sf = ss + (tf - cs) - 1
+            sf = ss + (tf - cs)
             cap.set(cv2.CAP_PROP_POS_FRAMES, sf)
             ret, frame = cap.read()
             if not ret: continue
@@ -712,8 +759,6 @@ def on_process_range(ev):
         if not imp: status("Import failed"); return
         log(f"Imported {len(imp)} items to MediaPool")
         if settings["output_mode"] in [0, 2]:
-            # DANGER ZONE FRAGILE: Resolve batch needs +1 frame on recordFrame to align with V1
-            # breaks: sequence starts 1 frame early / depends on: timeline frame numbering
             ci = {"mediaPoolItem": imp[0], "startFrame": 0, "endFrame": len(ofs), "trackIndex": 2, "recordFrame": inf, "mediaType": 1}
             if media_pool.AppendToTimeline([ci]):
                 if items["DisableTrack1"].Checked: timeline.SetTrackEnable("video", 1, False)
