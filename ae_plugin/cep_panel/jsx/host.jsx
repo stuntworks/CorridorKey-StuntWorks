@@ -228,14 +228,18 @@ function ppro_getFrameInfo() {
         var filePath = targetClip.projectItem.getMediaPath();
         if (!filePath) return JSON.stringify({ ok: false, error: "Cannot get source file path" });
 
+        // Source-media TIME in seconds. Subtract one sequence-frame's worth because
+        // Premiere's playerPos reports the NEXT frame boundary. Python seeks by
+        // CAP_PROP_POS_MSEC (accurate across long-GOP codecs + fps mismatches),
+        // not by frame number.
         var sourceTimeSec = playerPos.seconds - targetClip.start.seconds + targetClip.inPoint.seconds;
-        var sourceFrame = Math.floor(sourceTimeSec * fps) - 1;
-        if (sourceFrame < 0) sourceFrame = 0;
+        sourceTimeSec = sourceTimeSec - (1.0 / fps);
+        if (sourceTimeSec < 0) sourceTimeSec = 0;
 
         return JSON.stringify({
             ok: true,
             sourceFile: filePath,
-            sourceFrame: sourceFrame,
+            sourceTimeSeconds: sourceTimeSec,
             fps: fps,
             playheadSeconds: playerPos.seconds
         });
@@ -255,29 +259,69 @@ function ppro_getInOutInfo() {
         var fps = parseFloat(seq.getSettings().videoFrameRate);
         if (isNaN(fps) || fps <= 0) fps = 24;
 
-        var inPoint = seq.getInPointAsTime();
-        var outPoint = seq.getOutPointAsTime();
-        if (!inPoint || !outPoint || inPoint.seconds >= outPoint.seconds) {
-            return JSON.stringify({ ok: false, error: "Set in/out points on timeline first" });
-        }
-
-        var startFrame = Math.round(inPoint.seconds * fps);
-        var endFrame = Math.round(outPoint.seconds * fps);
-        if (endFrame <= startFrame) return JSON.stringify({ ok: false, error: "Invalid in/out range" });
-
+        // Preferred: sequence in/out markers.
+        // Fallback: the clip the playhead sits on (or the first clip on V1) — we use
+        // its own in/out trim to decide what source-media frame range to key. This
+        // lets the user click PROCESS IN/OUT RANGE without first setting timeline
+        // markers, which was the behavior before the rewrite and the one Berto
+        // expects.
         var track = seq.videoTracks[0];
         if (track.clips.numItems < 1) return JSON.stringify({ ok: false, error: "No clips on Track 1" });
-        var sourceClip = track.clips[0];
+
+        var inPoint = seq.getInPointAsTime();
+        var outPoint = seq.getOutPointAsTime();
+        var haveSeqRange = inPoint && outPoint && inPoint.seconds < outPoint.seconds;
+
+        var sourceClip = null;
+        if (haveSeqRange) {
+            // Find a clip overlapping the marker range (prefer the one at inPoint).
+            for (var i = 0; i < track.clips.numItems; i++) {
+                var c = track.clips[i];
+                if (inPoint.seconds >= c.start.seconds && inPoint.seconds < c.end.seconds) {
+                    sourceClip = c; break;
+                }
+            }
+            if (!sourceClip) sourceClip = track.clips[0];
+        } else {
+            // No markers — use the clip under the playhead, or the first clip.
+            var playheadSec = seq.getPlayerPosition().seconds;
+            for (var j = 0; j < track.clips.numItems; j++) {
+                var cc = track.clips[j];
+                if (playheadSec >= cc.start.seconds && playheadSec < cc.end.seconds) {
+                    sourceClip = cc; break;
+                }
+            }
+            if (!sourceClip) sourceClip = track.clips[0];
+        }
+
         var filePath = sourceClip.projectItem.getMediaPath();
         if (!filePath) return JSON.stringify({ ok: false, error: "Cannot get source file path" });
+
+        // Compute source-media TIME range in SECONDS. We do not convert to frames here
+        // because the sequence fps can differ from the source clip's native fps —
+        // converting on the JSX side with the wrong fps causes drift across the batch.
+        // Python opens the video, reads its native fps via cv2.CAP_PROP_FPS, and seeks
+        // with cv2.CAP_PROP_POS_MSEC. No drift because no mismatched conversion.
+        var rangeStartSec, rangeEndSec, timelineInSec;
+        if (haveSeqRange) {
+            rangeStartSec = inPoint.seconds - sourceClip.start.seconds + sourceClip.inPoint.seconds;
+            rangeEndSec   = outPoint.seconds - sourceClip.start.seconds + sourceClip.inPoint.seconds;
+            timelineInSec = inPoint.seconds;
+        } else {
+            rangeStartSec = sourceClip.inPoint.seconds;
+            rangeEndSec   = sourceClip.outPoint.seconds;
+            timelineInSec = sourceClip.start.seconds;
+        }
+        if (rangeEndSec <= rangeStartSec) return JSON.stringify({ ok: false, error: "Invalid range" });
 
         return JSON.stringify({
             ok: true,
             sourceFile: filePath,
-            startFrame: startFrame,
-            endFrame: endFrame,
+            startSeconds: rangeStartSec,
+            endSeconds: rangeEndSec,
             fps: fps,
-            inPointSeconds: inPoint.seconds
+            inPointSeconds: timelineInSec,
+            usedSeqMarkers: haveSeqRange
         });
     } catch (e) { return JSON.stringify({ ok: false, error: String(e) }); }
 }
@@ -286,11 +330,14 @@ function ppro_getInOutInfo() {
 // PREMIERE PRO — timeline mutators
 // ============================================================
 
-// WHAT IT DOES: Imports a single keyed PNG into the "CorridorKey" bin and overwrites it
-//   onto V2 at the playhead, trimmed to one frame.
-// DEPENDS-ON: outputPath exists; active sequence has ≥2 video tracks (creates if not).
-// AFFECTS: Project panel (import), timeline V2 (overwriteClip).
-// NOTE: Placement needs a +1 frame nudge to match the -1 offset used in ppro_getFrameInfo.
+// WHAT IT DOES: Imports a single keyed PNG into the "CorridorKey" bin, TRIMS the project
+//   item's in/out to exactly one frame so overwriteClip doesn't drop Premiere's default
+//   5-second still duration, then places it on V2 at the playhead.
+// DEPENDS-ON: outputPath exists; active sequence has >=2 video tracks (created if not).
+// AFFECTS: Project panel (import + in/out trim), timeline V2 (overwriteClip).
+// NOTE: Placement is AT playhead (no +1 nudge). The -1 frame offset in ppro_getFrameInfo
+//   already compensated for Premiere's next-frame-boundary reporting — nudging placement
+//   too would stack a second offset and land one frame off.
 function ppro_importFrame(outputPath, playheadSeconds, fps) {
     try {
         var seq = app.project.activeSequence;
@@ -299,50 +346,131 @@ function ppro_importFrame(outputPath, playheadSeconds, fps) {
         var outputFile = new File(outputPath);
         if (!outputFile.exists) return JSON.stringify({ ok: false, error: "Output file not found: " + outputPath });
 
-        // Find or create CorridorKey bin
+        // Diff root children before/after so we find the new item even when Premiere
+        // ignores the targetBin argument for still imports.
         var root = app.project.rootItem;
-        var ckBin = null;
+        var beforeIds = {};
         for (var i = 0; i < root.children.numItems; i++) {
-            var item = root.children[i];
-            if (item.name === "CorridorKey" && item.type === 2 /* BIN */) { ckBin = item; break; }
+            var ch = root.children[i];
+            beforeIds[ch.nodeId || String(i) + "-" + ch.name] = true;
         }
-        if (!ckBin) ckBin = root.createBin("CorridorKey");
 
-        // Import into the bin
-        var ok = app.project.importFiles([outputPath], true, ckBin, false);
+        var ok = app.project.importFiles([outputPath], true, root, false);
         if (!ok) return JSON.stringify({ ok: false, error: "Import failed" });
 
-        var imported = ckBin.children[ckBin.children.numItems - 1];
-        if (!imported) return JSON.stringify({ ok: false, error: "Imported item not found" });
+        var imported = null;
+        for (var j = 0; j < root.children.numItems; j++) {
+            var cj = root.children[j];
+            var id = cj.nodeId || String(j) + "-" + cj.name;
+            if (!beforeIds[id]) { imported = cj; break; }
+        }
+        if (!imported) return JSON.stringify({ ok: false, error: "Imported item not found after diff" });
 
-        // Make sure we have at least two video tracks
-        if (seq.videoTracks.numTracks < 2) seq.videoTracks.addTracks(1);
+        // Trim the still to exactly one frame of video. Premiere's default still
+        // duration is ~5 seconds which is what made the placed clip span the timeline.
+        // Media type 4 = VIDEO per Premiere's ProjectItem API.
+        try {
+            var oneFrameSec = 1.0 / Number(fps || 24);
+            var tIn = new Time(); tIn.seconds = 0;
+            var tOut = new Time(); tOut.seconds = oneFrameSec;
+            imported.setInPoint(tIn, 4);
+            imported.setOutPoint(tOut, 4);
+        } catch (trimErr) {
+            // If trim fails on this Premiere version, continue anyway — the clip
+            // lands but will be longer than one frame and user can trim manually.
+        }
+
+        // Move into the CorridorKey bin now that we found it.
+        var ckBin = null;
+        for (var k = 0; k < root.children.numItems; k++) {
+            var kc = root.children[k];
+            if (kc.name === "CorridorKey" && kc.type === 2) { ckBin = kc; break; }
+        }
+        if (!ckBin) { try { ckBin = root.createBin("CorridorKey"); } catch (_) {} }
+        if (ckBin) { try { imported.moveBin(ckBin); } catch (_) {} }
+
+        // Place on V2 at exact playhead time.
+        if (seq.videoTracks.numTracks < 2) { try { seq.videoTracks.addTracks(1); } catch (_) {} }
         var v2 = seq.videoTracks[1];
+        if (!v2) return JSON.stringify({ ok: true, placed: false, note: "Imported but V2 unavailable" });
 
-        // Place one frame ahead to compensate for Premiere's boundary reporting
-        var nudge = 1.0 / Number(fps);
-        var placeSec = Number(playheadSeconds) + nudge;
-        v2.overwriteClip(imported, placeSec);
-
-        return JSON.stringify({ ok: true });
+        var placeSec = Number(playheadSeconds);
+        if (isNaN(placeSec) || placeSec < 0) placeSec = 0;
+        try {
+            v2.overwriteClip(imported, placeSec);
+            return JSON.stringify({ ok: true, placed: true });
+        } catch (e) {
+            return JSON.stringify({ ok: true, placed: false, note: "Imported but overwriteClip failed: " + String(e) });
+        }
     } catch (e) { return JSON.stringify({ ok: false, error: String(e) }); }
 }
 
-// WHAT IT DOES: Imports a PNG sequence into the CorridorKey bin. Does NOT place on timeline —
-//   user drags from bin (safer for batch jobs that could be long / partial).
-// DEPENDS-ON: firstFramePath exists.
-function ppro_importSequence(firstFramePath) {
+// WHAT IT DOES: Imports a PNG sequence into the ROOT project bin (Premiere's importFiles
+//   ignores the targetBin argument for numbered-stills imports in many versions, so we
+//   import to root, locate the new item by diffing root.children before/after, then move
+//   it into the CorridorKey bin and overwrite onto V2.
+// DEPENDS-ON: firstFramePath exists; its folder contains a clean output_NNNNN.png pattern
+//   with no other PNG series (mattes live in a subfolder).
+// AFFECTS: Project panel (bin + imported item), timeline V2 (overwriteClip).
+function ppro_importSequence(firstFramePath, startSeconds, fps) {
     try {
-        var root = app.project.rootItem;
-        var ckBin = null;
-        for (var i = 0; i < root.children.numItems; i++) {
-            var item = root.children[i];
-            if (item.name === "CorridorKey" && item.type === 2) { ckBin = item; break; }
-        }
-        if (!ckBin) ckBin = root.createBin("CorridorKey");
+        var seq = app.project.activeSequence;
+        if (!seq) return JSON.stringify({ ok: false, error: "No active sequence" });
 
-        var ok = app.project.importFiles([firstFramePath], true, ckBin, true);
-        if (!ok) return JSON.stringify({ ok: false, error: "Sequence import failed" });
-        return JSON.stringify({ ok: true });
+        var root = app.project.rootItem;
+
+        // Snapshot existing root item IDs so we can find what the import just added.
+        var beforeIds = {};
+        for (var i = 0; i < root.children.numItems; i++) {
+            var child = root.children[i];
+            beforeIds[child.nodeId || String(i) + "-" + child.name] = true;
+        }
+
+        // Import to ROOT (targetBin arg is flaky for numbered-stills). suppressUI=true,
+        // importAsNumberedStills=true so Premiere detects the output_NNNNN.png sequence.
+        var ok = app.project.importFiles([firstFramePath], true, root, true);
+        if (!ok) return JSON.stringify({ ok: false, error: "importFiles returned false" });
+
+        // Find the newly-added item by diffing against the snapshot.
+        var imported = null;
+        for (var j = 0; j < root.children.numItems; j++) {
+            var cj = root.children[j];
+            var id = cj.nodeId || String(j) + "-" + cj.name;
+            if (!beforeIds[id]) { imported = cj; break; }
+        }
+        if (!imported) {
+            return JSON.stringify({
+                ok: false,
+                error: "Import ran but no new project item appeared. Folder: " +
+                       (new File(firstFramePath)).parent.fsName
+            });
+        }
+
+        // Move the new item into the CorridorKey bin (create if missing). If the move
+        // fails we leave it at the root — still visible to the user.
+        var ckBin = null;
+        for (var k = 0; k < root.children.numItems; k++) {
+            var kc = root.children[k];
+            if (kc.name === "CorridorKey" && kc.type === 2) { ckBin = kc; break; }
+        }
+        if (!ckBin) { try { ckBin = root.createBin("CorridorKey"); } catch (_) {} }
+        if (ckBin) { try { imported.moveBin(ckBin); } catch (_) {} }
+
+        // Ensure V2 exists, then overwrite onto it. +1 frame nudge matches the -1 in
+        // ppro_getFrameInfo for playhead-boundary compensation.
+        if (seq.videoTracks.numTracks < 2) { try { seq.videoTracks.addTracks(1); } catch (_) {} }
+        var v2 = seq.videoTracks[1];
+        if (!v2) return JSON.stringify({ ok: true, placed: false, note: "Imported but V2 unavailable" });
+
+        var placeSec = Number(startSeconds);
+        if (isNaN(placeSec) || placeSec < 0) placeSec = 0;
+        var nudge = 1.0 / Number(fps || 24);
+        try {
+            v2.overwriteClip(imported, placeSec + nudge);
+            return JSON.stringify({ ok: true, placed: true, binName: imported.name });
+        } catch (e) {
+            return JSON.stringify({ ok: true, placed: false, binName: imported.name,
+                note: "Imported into bin but overwriteClip failed: " + String(e) });
+        }
     } catch (e) { return JSON.stringify({ ok: false, error: String(e) }); }
 }
