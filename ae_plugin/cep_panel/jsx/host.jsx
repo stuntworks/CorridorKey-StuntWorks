@@ -1,3 +1,4 @@
+// Last modified: 2026-04-13 | Change: Fix Premiere one-frame-forward placement bug (half-frame nudge) | Full history: git log
 /**
  * CorridorKey - Host Script for After Effects and Premiere Pro
  * Handles communication between CEP panel and host app.
@@ -418,7 +419,10 @@ function ppro_getClipInfo() {
         var offsetInClip = playheadSec - clipStartSec;
         // Source media time = clip inPoint + offset
         var sourceTimeSec = clipInPointSec + offsetInClip;
-        var sourceFrame = Math.floor(sourceTimeSec * fps);
+        // DANGER ZONE FRAGILE: Premiere playhead reports time of the NEXT frame boundary
+        // breaks: extracted frame is 1 ahead of what's displayed / depends on: fps
+        // Subtract 1 frame so extracted content matches what Premiere shows at playhead
+        var sourceFrame = Math.max(0, Math.floor(sourceTimeSec * fps) - 1);
 
         var clipDurationSec = targetClip.end.seconds - targetClip.start.seconds;
         var totalFrames = Math.floor(clipDurationSec * fps);
@@ -528,22 +532,24 @@ function ppro_importFile(filePath) {
 
         if (!importedItem) return "success:bin_only";
 
-        // Insert on timeline V2 at playhead
+        // WHAT IT DOES: Places keyed PNG on V2 at playhead, trimmed to 1 frame
+        // DEPENDS-ON: importedItem (just imported), active sequence with 2+ video tracks
+        // AFFECTS: Timeline V2 — adds clip at playhead position
         var seq = app.project.activeSequence;
         if (seq) {
             var playerPos = seq.getPlayerPosition();
             var vTracks = seq.videoTracks;
             if (vTracks.numTracks >= 2) {
-                // Use overwriteClip instead of insertClip — doesn't push other clips
+                var fps = parseFloat(seq.getSettings().videoFrameRate) || 24;
+                var frameDuration = 1.0 / fps;
+
                 vTracks[1].overwriteClip(importedItem, playerPos.seconds);
 
                 // Find the clip we just inserted and trim to 1 frame
-                var fps = parseFloat(seq.getSettings().videoFrameRate) || 24;
-                var frameDuration = 1.0 / fps;
                 var track2 = vTracks[1];
                 for (var ci = 0; ci < track2.clips.numItems; ci++) {
                     var c = track2.clips[ci];
-                    if (Math.abs(c.start.seconds - playerPos.seconds) < 0.01) {
+                    if (Math.abs(c.start.seconds - playerPos.seconds) < frameDuration) {
                         c.end = c.start.seconds + frameDuration;
                         break;
                     }
@@ -597,14 +603,19 @@ function ppro_importSequence(folderPath, fps, clipStartSec, disableSource) {
             } catch (fpsErr) {}
         }
 
-        // Place on V2 at the source clip's exact timecode
+        // WHAT IT DOES: Places keyed PNG sequence on V2 at source clip's timecode
+        // DEPENDS-ON: importedItem, active sequence, clipStartSec from getWorkAreaInfo
+        // AFFECTS: Timeline V2 — adds sequence at source clip position
         var seq = app.project.activeSequence;
         if (seq) {
             var seqFps = parseFloat(seq.getSettings().videoFrameRate) || fps || 24;
             var vTracks = seq.videoTracks;
             if (vTracks.numTracks >= 2) {
                 var placeSec = (clipStartSec !== undefined && clipStartSec >= 0) ? clipStartSec : seq.getPlayerPosition().seconds;
-                vTracks[1].overwriteClip(importedItem, placeSec);
+                // DANGER ZONE FRAGILE: Batch sequence needs +1 frame nudge to align with V1
+                // breaks: sequence starts 1 frame early / depends on: fps
+                var batchNudge = 1.0 / seqFps;
+                vTracks[1].overwriteClip(importedItem, placeSec + batchNudge);
 
                 // Disable source clip on V1 if requested
                 if (disableSource) {
