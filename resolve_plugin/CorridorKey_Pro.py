@@ -8,7 +8,7 @@ the keyed result on Track 2. Supports single frame, frame range, SAM2 click-to-m
 live preview with despill/refiner sliders.
 
 DEPENDS-ON:
-  - CorridorKey engine at D:\New AI Projects\CorridorKey (neural keying model)
+  - CorridorKey engine at D:/New AI Projects/CorridorKey (neural keying model)
   - DaVinci Resolve running with a project and timeline open
   - Resolve's Fusion scripting environment (fu, fusionscript)
   - core/corridorkey_processor.py (ProcessingSettings, CorridorKeyProcessor)
