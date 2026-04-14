@@ -202,10 +202,12 @@ function ae_processCurrentFrame(settingsJson, previewOnly) {
         }
 
         // Calculate source frame number
+        // DANGER ZONE FRAGILE: comp.time reports NEXT frame boundary (same as Premiere)
+        // breaks: extracted frame is 1 ahead of display / depends on: fps
         var fps = comp.frameRate;
         var layerTimeInComp = comp.time - layer.startTime;
         var sourceTime = layerTimeInComp + layer.inPoint;
-        var frameNum = Math.floor(sourceTime * fps + 0.5);
+        var frameNum = Math.max(0, Math.floor(sourceTime * fps + 0.5) - 1);
 
         var safeSource = sanitizePath(sourceFile);
         var safeInput = sanitizePath(inputPath);
@@ -292,10 +294,12 @@ function ae_processWorkArea(settingsJson) {
         var endTime = startTime + duration;
 
         // Convert comp work area to source media frame numbers
+        // DANGER ZONE FRAGILE: AE work area times report NEXT frame boundary (same as comp.time)
+        // breaks: extracted frames are 1 ahead of display / depends on: fps
         var sourceStartTime = startTime - layer.startTime + layer.inPoint;
         var sourceEndTime = endTime - layer.startTime + layer.inPoint;
-        var startFrame = Math.floor(sourceStartTime * fps + 0.5);
-        var endFrame = Math.floor(sourceEndTime * fps + 0.5);
+        var startFrame = Math.max(0, Math.floor(sourceStartTime * fps + 0.5) - 1);
+        var endFrame = Math.max(0, Math.floor(sourceEndTime * fps + 0.5) - 1);
         if (endFrame <= startFrame) return "Error: Invalid frame range";
 
         var frameCount = endFrame - startFrame;
