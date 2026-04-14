@@ -3,30 +3,24 @@
 CorridorKey Fusion UIManager Panel
 Native DaVinci Resolve Studio UI panel.
 
-WHAT IT DOES:
-    Builds the CorridorKey neural keyer UI panel inside DaVinci Resolve using
-    Fusion's UIManager API. Provides controls for screen type, despill, refiner,
-    despeckle, gamma, output placement, and proxy generation. Runs processing
-    in background threads to keep the UI responsive.
+WHAT IT DOES: Builds the CorridorKey UI panel inside DaVinci Resolve using Fusion's UIManager API.
+    Provides controls for screen type, despill, refiner, despeckle, gamma, output placement, and
+    proxy generation. Runs processing in background threads with a thread-safe UI update queue.
 
-DEPENDS-ON:
-    - DaVinci Resolve's Fusion UIManager (fusion object passed at creation)
-    - fusionscript module from Resolve's Developer/Scripting/Modules directory
-    - on_process_callback (Callable) provided by the caller to do actual keying work
-
-AFFECTS:
-    - Any caller that imports create_corridorkey_panel (the sole public API of this module)
-    - Changing widget IDs breaks event wiring at the bottom of create_corridorkey_panel
-    - Changing the settings dict keys in get_settings breaks downstream process callbacks
+DEPENDS-ON: DaVinci Resolve Fusion UIManager, fusionscript module, threading, queue
+AFFECTS: Any caller that imports create_corridorkey_panel (the sole public API of this module)
 """
 import threading
+import queue
 from typing import Callable, Optional, Any
 
 
-# WHAT IT DOES: Builds the entire CorridorKey UI panel, wires events, and returns (window, dispatcher).
-# DEPENDS-ON: fusion (Resolve Fusion obj), on_process_callback (keying logic), fusionscript module on disk
-# AFFECTS: Everything — this is the only public function. Changing widget IDs, combo items, or settings keys ripples into all callers and the process callback contract.
-# DANGER ZONE FRAGILE/HIGH: Widget IDs are string-matched to event handlers at the bottom of this function. Renaming any ID silently breaks that handler.
+# WHAT IT DOES: Builds the entire CorridorKey UI panel, wires events, returns (window, dispatcher).
+# DEPENDS-ON: fusion (Resolve Fusion obj), on_process_callback (keying logic provided by caller)
+# AFFECTS: Everything — this is the only public function. Changing widget IDs or settings keys
+#   ripples into all callers and the process callback contract.
+# DANGER ZONE FRAGILE: Widget IDs are string-matched to event handlers at the bottom.
+#   Renaming any ID silently breaks its handler.
 def create_corridorkey_panel(fusion, on_process_callback: Callable):
     """Create CorridorKey panel using Fusion UIManager.
 
@@ -40,7 +34,8 @@ def create_corridorkey_panel(fusion, on_process_callback: Callable):
     ui = fusion.UIManager
 
     # Import dispatcher
-    # DANGER ZONE FRAGILE/HIGH: Hardcoded path to Resolve's scripting modules. Breaks if Resolve is installed to a non-default location or PROGRAMDATA env var is missing.
+    # DANGER ZONE FRAGILE: Hardcoded path to Resolve's scripting modules.
+    # breaks: if Resolve is installed to non-default location or PROGRAMDATA is missing
     import sys
     import os
     resolve_modules = os.path.join(
@@ -58,6 +53,30 @@ def create_corridorkey_panel(fusion, on_process_callback: Callable):
         "processing": False,
         "cancelled": False,
     }
+
+    # DANGER ZONE CRITICAL: Thread-safe UI update queue — background threads MUST NOT write
+    # to Fusion UI widgets directly. They enqueue lambdas here; main thread drains them.
+    # breaks: removing this queue causes race conditions and Resolve crashes
+    # depends on: every event handler calling _drain_ui_queue() before touching widgets
+    _ui_queue = queue.Queue()
+
+    # WHAT IT DOES: Puts a UI update function onto the queue for main-thread execution
+    def _enqueue_ui(fn):
+        """Schedule a UI update to run on the main thread."""
+        _ui_queue.put(fn)
+
+    # WHAT IT DOES: Runs all queued UI updates. MUST be called from main thread only.
+    # DEPENDS-ON: _ui_queue
+    def _drain_ui_queue():
+        """Process all pending UI updates. Call from main thread only."""
+        while not _ui_queue.empty():
+            try:
+                fn = _ui_queue.get_nowait()
+                fn()
+            except queue.Empty:
+                break
+            except Exception as e:
+                print(f"UI update error: {e}")
 
     # Create window
     win = disp.AddWindow({
@@ -256,53 +275,68 @@ def create_corridorkey_panel(fusion, on_process_callback: Callable):
     items["OutputMode"].AddItem("MediaPool Only")
     items["OutputMode"].AddItem("Replace Original")
 
-    # Helper functions
+    # --- Helper functions (all thread-safe via _enqueue_ui) ---
 
-    # WHAT IT DOES: Appends a message to the in-panel log widget and prints to console.
-    # ISOLATED: No external dependencies beyond the UI items dict.
+    # WHAT IT DOES: Writes a message to both console and in-panel log widget.
+    #   Thread-safe: checks if on main thread, queues if not.
+    # DEPENDS-ON: _enqueue_ui, _ui_queue, items["LogOutput"]
     def log(message: str):
-        """Add message to log output."""
+        """Add message to log output (thread-safe)."""
         print(f"LOG: {message}")  # Also print to console
-        try:
-            current = items["LogOutput"].PlainText or ""
-            items["LogOutput"].PlainText = current + message + "\n"
-        except Exception as e:
-            print(f"Log error: {e}")
-
-    # WHAT IT DOES: Updates the progress percentage and status label in the UI.
-    # ISOLATED: No external dependencies beyond the UI items dict.
-    def update_progress(current: int, total: int, message: str):
-        """Update progress display and status."""
-        if total > 0:
-            percent = int((current / total) * 100)
-            items["ProgressLabel"].Text = f"{percent}%"
+        def _do():
+            try:
+                current = items["LogOutput"].PlainText or ""
+                items["LogOutput"].PlainText = current + message + "\n"
+            except Exception as e:
+                print(f"Log error: {e}")
+        if threading.current_thread() is threading.main_thread():
+            _do()
         else:
-            items["ProgressLabel"].Text = ""
-        items["StatusLabel"].Text = message
+            _enqueue_ui(_do)
 
-    # WHAT IT DOES: Toggles all input widgets enabled/disabled during processing to prevent double-runs.
-    # DEPENDS-ON: Every widget ID in items dict — adding a new control means adding it here too.
-    # DANGER ZONE FRAGILE/HIGH: Missing a widget here lets users change settings mid-process / breaks: race conditions in callback
+    # WHAT IT DOES: Updates the progress percentage and status text. Thread-safe.
+    # DEPENDS-ON: _enqueue_ui, items["ProgressLabel"], items["StatusLabel"]
+    def update_progress(current: int, total: int, message: str):
+        """Update progress display and status (thread-safe)."""
+        def _do():
+            if total > 0:
+                percent = int((current / total) * 100)
+                items["ProgressLabel"].Text = f"{percent}%"
+            else:
+                items["ProgressLabel"].Text = ""
+            items["StatusLabel"].Text = message
+        if threading.current_thread() is threading.main_thread():
+            _do()
+        else:
+            _enqueue_ui(_do)
+
+    # WHAT IT DOES: Locks/unlocks all UI controls during processing. Thread-safe.
+    # DEPENDS-ON: _enqueue_ui, every widget ID in the panel
+    # AFFECTS: All buttons, sliders, combos, checkboxes — must list every widget here
     def set_processing(processing: bool):
-        """Enable/disable UI during processing."""
+        """Enable/disable UI during processing (thread-safe)."""
         state["processing"] = processing
-        items["PreviewBtn"].Enabled = not processing
-        items["ProcessBtn"].Enabled = not processing
-        items["ProcessAllBtn"].Enabled = not processing
-        items["CancelBtn"].Enabled = processing
-        items["ScreenType"].Enabled = not processing
-        items["DespillSlider"].Enabled = not processing
-        items["RefinerSlider"].Enabled = not processing
-        items["DespeckleCheck"].Enabled = not processing
-        items["DespeckleSize"].Enabled = not processing
-        items["InputGamma"].Enabled = not processing
-        items["OutputMode"].Enabled = not processing
-        items["GenerateProxy"].Enabled = not processing
+        def _do():
+            items["PreviewBtn"].Enabled = not processing
+            items["ProcessBtn"].Enabled = not processing
+            items["ProcessAllBtn"].Enabled = not processing
+            items["CancelBtn"].Enabled = processing
+            items["ScreenType"].Enabled = not processing
+            items["DespillSlider"].Enabled = not processing
+            items["RefinerSlider"].Enabled = not processing
+            items["DespeckleCheck"].Enabled = not processing
+            items["DespeckleSize"].Enabled = not processing
+            items["InputGamma"].Enabled = not processing
+            items["OutputMode"].Enabled = not processing
+            items["GenerateProxy"].Enabled = not processing
+        if threading.current_thread() is threading.main_thread():
+            _do()
+        else:
+            _enqueue_ui(_do)
 
-    # WHAT IT DOES: Reads all UI widget values and returns a normalized settings dict for the process callback.
-    # DEPENDS-ON: Widget IDs (ScreenType, DespillSlider, RefinerSlider, DespeckleCheck, DespeckleSize, InputGamma, OutputMode, GenerateProxy)
-    # AFFECTS: Downstream process callback expects these exact keys — changing a key name breaks processing.
-    # DANGER ZONE FRAGILE/HIGH: Dict keys are the contract with on_process_callback / breaks: all keying logic if renamed
+    # WHAT IT DOES: Reads all UI controls and returns a settings dict for the processor.
+    # DANGER ZONE HIGH: Dict keys are the API contract with on_process_callback.
+    #   Renaming a key here silently breaks the processor.
     def get_settings() -> dict:
         """Get current settings from UI."""
         return {
@@ -316,25 +350,25 @@ def create_corridorkey_panel(fusion, on_process_callback: Callable):
             "generate_proxy": items["GenerateProxy"].Checked,
         }
 
-    # Event handlers
+    # --- Event handlers (all drain the UI queue first) ---
 
-    # WHAT IT DOES: Syncs the despill label text when the slider moves.
-    # ISOLATED
+    # WHAT IT DOES: Updates despill label when slider moves
     def on_despill_changed(ev):
+        _drain_ui_queue()
         value = items["DespillSlider"].Value / 100.0
         items["DespillValue"].Text = f"{value:.2f}"
 
-    # WHAT IT DOES: Syncs the refiner label text when the slider moves.
-    # ISOLATED
+    # WHAT IT DOES: Updates refiner label when slider moves
     def on_refiner_changed(ev):
+        _drain_ui_queue()
         value = items["RefinerSlider"].Value / 100.0
         items["RefinerValue"].Text = f"{value:.2f}"
 
-    # WHAT IT DOES: Runs a single-frame preview at the playhead in a background thread.
-    # DEPENDS-ON: get_settings(), set_processing(), on_process_callback, state dict
-    # AFFECTS: Spawns a thread — if callback throws, error lands in log widget only.
+    # WHAT IT DOES: Keys one frame at the playhead and shows preview. Runs in background thread.
+    # DEPENDS-ON: get_settings(), set_processing(), on_process_callback, _drain_ui_queue()
     def on_preview_clicked(ev):
         """Preview single frame at playhead."""
+        _drain_ui_queue()
         # Immediate visual feedback
         items["StatusLabel"].Text = "CLICKED! Starting preview..."
         items["LogOutput"].PlainText = "Preview button clicked!\nPlease wait...\n"
@@ -372,9 +406,10 @@ def create_corridorkey_panel(fusion, on_process_callback: Callable):
         thread = threading.Thread(target=run_preview)
         thread.start()
 
-    # WHAT IT DOES: Processes selected timeline clips in a background thread.
-    # DEPENDS-ON: get_settings(), set_processing(), on_process_callback, state dict
+    # WHAT IT DOES: Keys selected clips on the timeline. Runs in background thread.
+    # DEPENDS-ON: get_settings(), set_processing(), on_process_callback
     def on_process_clicked(ev):
+        _drain_ui_queue()
         if state["processing"]:
             return
 
@@ -403,9 +438,10 @@ def create_corridorkey_panel(fusion, on_process_callback: Callable):
         thread = threading.Thread(target=run_process)
         thread.start()
 
-    # WHAT IT DOES: Processes all clips on track 1 in a background thread.
-    # DEPENDS-ON: get_settings(), set_processing(), on_process_callback, state dict
+    # WHAT IT DOES: Keys ALL clips on Track 1. Runs in background thread.
+    # DEPENDS-ON: get_settings(), set_processing(), on_process_callback
     def on_process_all_clicked(ev):
+        _drain_ui_queue()
         if state["processing"]:
             return
 
@@ -433,20 +469,19 @@ def create_corridorkey_panel(fusion, on_process_callback: Callable):
         thread = threading.Thread(target=run_process)
         thread.start()
 
-    # WHAT IT DOES: Sets the cancelled flag so background threads can check and abort gracefully.
-    # ISOLATED
+    # WHAT IT DOES: Sets cancel flag so background thread stops on next iteration
     def on_cancel_clicked(ev):
         state["cancelled"] = True
         log("Cancelling...")
 
-    # WHAT IT DOES: Cancels any running work and exits the UIManager event loop (closes the panel).
-    # DEPENDS-ON: state dict, disp (dispatcher)
+    # WHAT IT DOES: Cancels any running process and exits the Fusion event loop
     def on_close(ev):
         state["cancelled"] = True
         disp.ExitLoop()
 
+    # DANGER ZONE FRAGILE: Event wiring — widget IDs must exactly match the layout above.
+    # Adding a widget without wiring it here = dead button. Typo in ID = silent failure.
     # Connect events
-    # DANGER ZONE FRAGILE/CRITICAL: Widget IDs here must match the IDs in the UI layout above exactly. Renaming a widget ID without updating this block silently disconnects the handler.
     win.On.DespillSlider.SliderMoved = on_despill_changed
     win.On.RefinerSlider.SliderMoved = on_refiner_changed
     win.On.PreviewBtn.Clicked = on_preview_clicked
