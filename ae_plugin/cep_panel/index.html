@@ -246,9 +246,15 @@ document.getElementById('despill').oninput = function() {
 };
 document.getElementById('refiner').oninput = function() {
     document.getElementById('refinerVal').textContent = (this.value / 100).toFixed(2);
-    // Refiner is stage-1 (NN-internal) — does NOT live-update the viewer. A full
-    // re-key is required; user must click PREVIEW FRAME again to apply a new refiner
-    // value. See PLAN_LIVE_PREVIEW.md §6 Phase 1 discovery.
+    // Refiner is stage-1 (NN-internal). During drag we only update the value
+    // label — a full NN re-run happens on mouse release (onchange) so the user
+    // can drag freely without queuing multiple expensive re-keys.
+};
+document.getElementById('refiner').onchange = function() {
+    // Fired on mouse release. Re-runs stage-1 with the new refiner value and
+    // respawns the viewer against the updated session. No-op if no live
+    // preview is active.
+    rekeyWithCurrentSettings();
 };
 document.getElementById('despeckleSize').oninput = function() {
     document.getElementById('despeckleSizeVal').textContent = this.value;
@@ -371,6 +377,10 @@ function showPreview(filePath) {
 
 let VIEWER_PROC = null;
 let CURRENT_SESSION_DIR = null;
+// Path to the extracted source frame PNG. Kept at module scope so the refiner
+// re-key (stage-1 NN re-run) can reuse the same extracted frame instead of
+// pulling from the video source again.
+let LAST_FRAME_PNG = null;
 const SLIDER_DEBOUNCE_MS = 50;
 let sliderDebounceTimer = null;
 let sliderPendingState = null;
@@ -496,6 +506,47 @@ function scheduleViewerUpdate() {
     }, SLIDER_DEBOUNCE_MS);
 }
 
+// WHAT IT DOES: Re-runs stage-1 (neural net) with current slider values against
+//   the last extracted frame, overwriting fg.png + alpha.png in the active
+//   session dir. Then kills and respawns the viewer so it loads the fresh PNGs.
+//   Used by the refiner slider's onchange, since refiner is NN-internal and
+//   can't be applied to cached output.
+// DEPENDS-ON: LAST_FRAME_PNG from a prior PREVIEW FRAME click, CURRENT_SESSION_DIR,
+//   VIEWER_PROC. No-op if preview isn't active.
+// AFFECTS: rewrites fg.png + alpha.png in CURRENT_SESSION_DIR; kills and
+//   respawns VIEWER_PROC; writes live_params.json.
+function rekeyWithCurrentSettings() {
+    if (!LAST_FRAME_PNG || !CURRENT_SESSION_DIR || !VIEWER_PROC) return;
+    setBusy(true);
+    document.getElementById('progress-bar').classList.add('indeterminate');
+    status('Re-keying with new refiner...');
+    try {
+        const settings = getSettings();
+        const paramsPath = writeParamsFile(settings);
+        runPython(['cache', LAST_FRAME_PNG, CURRENT_SESSION_DIR, '--params', paramsPath]);
+        // Kill + respawn so viewer reloads fg.png / alpha.png from disk.
+        try { VIEWER_PROC.kill(); } catch (_) {}
+        VIEWER_PROC = null;
+        VIEWER_PROC = spawnViewer(CURRENT_SESSION_DIR);
+        setTimeout(() => {
+            sendToViewer({
+                cmd: 'update',
+                despill: settings.despill,
+                despeckle: settings.despeckle,
+                despeckleSize: settings.despeckleSize,
+                background: 'checker'
+            });
+        }, 400);
+        status('Live preview active — drag sliders to re-key');
+    } catch (e) {
+        logLine('refiner re-key failed: ' + e.message, true);
+        status('Re-key error');
+    } finally {
+        document.getElementById('progress-bar').classList.remove('indeterminate');
+        setBusy(false);
+    }
+}
+
 // WHAT IT DOES: Top-level handler for PREVIEW FRAME (LIVE). Extracts the current
 //   frame, runs stage-1 only (cache subcommand) to write fg.png + alpha.png into
 //   a fresh session directory, and spawns or reloads the persistent viewer with
@@ -529,6 +580,7 @@ function previewFrameLive() {
                 : ['extract', info.sourceFile, framePng, '--frame', String(info.sourceFrame)];
             runPython(extractArgs);
             if (!fs.existsSync(framePng)) throw new Error('Extract produced no output');
+            LAST_FRAME_PNG = framePng;
 
             // Step 2 — stage-1 only. Writes fg.png + alpha.png + meta.json to session dir.
             status('Running neural key (this can take a few seconds)...');
