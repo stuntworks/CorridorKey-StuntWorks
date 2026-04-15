@@ -82,11 +82,15 @@
         </div>
     </div>
 
-    <div class="checkbox-row">
-        <input type="checkbox" id="despeckle" checked>
-        <label for="despeckle" style="margin:0">Auto Despeckle</label>
-        <input type="number" id="despeckleSize" value="400" min="50" max="2000" style="width:60px">
-        <span>px</span>
+    <div class="section">
+        <div class="checkbox-row" style="margin-bottom:5px;">
+            <input type="checkbox" id="despeckle" checked>
+            <label for="despeckle" style="margin:0">Auto Despeckle</label>
+        </div>
+        <div class="slider-row">
+            <input type="range" id="despeckleSize" min="50" max="2000" value="400">
+            <span class="slider-value" id="despeckleSizeVal">400</span>
+        </div>
     </div>
 
     <div class="section">
@@ -234,8 +238,20 @@ document.getElementById('refiner').oninput = function() {
     // re-key is required; user must click PREVIEW FRAME again to apply a new refiner
     // value. See PLAN_LIVE_PREVIEW.md §6 Phase 1 discovery.
 };
-document.getElementById('despeckle').onchange = scheduleViewerUpdate;
-document.getElementById('despeckleSize').oninput = scheduleViewerUpdate;
+document.getElementById('despeckleSize').oninput = function() {
+    document.getElementById('despeckleSizeVal').textContent = this.value;
+    scheduleViewerUpdate();
+};
+// Grey out the size slider when despeckle is off so the UI makes it clear the
+// slider has no effect unless the checkbox is checked.
+document.getElementById('despeckle').onchange = function() {
+    const on = this.checked;
+    const slider = document.getElementById('despeckleSize');
+    slider.disabled = !on;
+    slider.style.opacity = on ? '1' : '0.4';
+    document.getElementById('despeckleSizeVal').style.opacity = on ? '1' : '0.4';
+    scheduleViewerUpdate();
+};
 
 // WHAT IT DOES: Collects the current UI state into a plain settings object.
 //   Validated here — Python receives the sanitized object via a JSON file.
