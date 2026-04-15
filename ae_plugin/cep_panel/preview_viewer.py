@@ -510,6 +510,20 @@ class PersistentWindow(QtWidgets.QWidget):
                 f"|  meanRGB=({mean_r:.1f},{mean_g:.1f},{mean_b:.1f})  "
                 f"|  render {dt_ms:.0f} ms"
             )
+            # Mirror meanRGB to stderr so the panel log proves whether pixel
+            # output is actually varying with slider changes. Identical numbers
+            # across different slider positions = post-proc math has no
+            # measurable effect on this shot. Different = the math works and
+            # the only remaining question is display/perception.
+            print(
+                f"[RENDER] mode={self._view_mode} "
+                f"despill={self._params['despill']:.2f} "
+                f"despeckleSize={self._params['despeckleSize']} "
+                f"meanRGB=({mean_r:.2f},{mean_g:.2f},{mean_b:.2f}) "
+                f"dt={dt_ms:.0f}ms",
+                file=sys.stderr,
+                flush=True,
+            )
         except Exception as e:
             self.status.setText(f"Render error: {e}")
         finally:
