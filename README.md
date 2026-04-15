@@ -24,6 +24,11 @@
 
 ---
 
+> **Which version should I download?**
+> For a verified, tested build use the latest **[release tag](https://github.com/stuntworks/CorridorKey-StuntWorks/releases)** (currently `v1.0.1-stable`). The `main` branch is active development and may include unfinished work. The `live-preview` branch is in-progress slider work.
+
+---
+
 ## Before / After
 
 | Before | Keyed | Composite |
