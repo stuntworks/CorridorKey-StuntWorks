@@ -537,14 +537,17 @@ function previewFrameLive() {
             paramsPath = writeParamsFile(settings);
             runPython(['cache', framePng, sessionDir, '--params', paramsPath]);
 
-            // Step 3 — spawn or reload the viewer.
+            // Step 3 — spawn the viewer. Kill any existing viewer first so the
+            // new one watches the correct session dir's live_params.json (the
+            // stdin reload path was unreliable; kill+respawn is deterministic
+            // and only costs ~500ms — viewer loads 2 PNGs, no torch).
             status('Opening live preview...');
             if (VIEWER_PROC) {
-                sendToViewer({ cmd: 'reload', sessionDir: sessionDir });
-            } else {
-                VIEWER_PROC = spawnViewer(sessionDir);
+                try { VIEWER_PROC.kill(); } catch (_) {}
+                VIEWER_PROC = null;
             }
             CURRENT_SESSION_DIR = sessionDir;
+            VIEWER_PROC = spawnViewer(sessionDir);
 
             // Send the initial settings after a small delay so the viewer has time to
             // show its window. (A missed initial update just means the user's first
