@@ -97,7 +97,7 @@
     <div class="section">
         <div class="checkbox-row" style="margin-bottom:5px;">
             <input type="checkbox" id="despeckle" checked>
-            <label for="despeckle" style="margin:0">Auto Despeckle</label>
+            <label for="despeckle" style="margin:0">Despeckle</label>
         </div>
         <div class="slider-row">
             <input type="range" id="despeckleSize" min="50" max="2000" value="400">
@@ -254,15 +254,16 @@ document.getElementById('despeckleSize').oninput = function() {
     document.getElementById('despeckleSizeVal').textContent = this.value;
     scheduleViewerUpdate();
 };
-// "Auto Despeckle" — checked means the plugin picks the size for you (slider
-// locked at the default so you can't fight it). Unchecked means manual — user
-// drives the slider. The size slider is editable only in MANUAL mode.
+// Despeckle — standard feature-toggle pattern. Checked = feature ON, slider
+// active (user picks size). Unchecked = feature OFF, slider greyed (no effect).
+// Earlier "Auto Despeckle" naming was ambiguous; dropped the "Auto" prefix so
+// the toggle means what it says.
 document.getElementById('despeckle').onchange = function() {
-    const autoOn = this.checked;
+    const on = this.checked;
     const slider = document.getElementById('despeckleSize');
-    slider.disabled = autoOn;                 // lock when in auto mode
-    slider.style.opacity = autoOn ? '0.4' : '1';
-    document.getElementById('despeckleSizeVal').style.opacity = autoOn ? '0.4' : '1';
+    slider.disabled = !on;
+    slider.style.opacity = on ? '1' : '0.4';
+    document.getElementById('despeckleSizeVal').style.opacity = on ? '1' : '0.4';
     scheduleViewerUpdate();
 };
 
