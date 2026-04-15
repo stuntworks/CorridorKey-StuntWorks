@@ -234,7 +234,10 @@ class PersistentWindow(QtWidgets.QWidget):
         self._painting = False
 
         h, w = session.shape_hw
-        self.scale = min(1.0, 720.0 / w, 540.0 / h)
+        # Default display scale picks a size that fits on a 1366x768 laptop with
+        # both panes + UI chrome — the window is resizable after launch so the
+        # user can drag it larger on a big monitor.
+        self.scale = min(1.0, 480.0 / w, 360.0 / h)
         self.disp_w = max(240, int(w * self.scale))
         self.disp_h = max(180, int(h * self.scale))
         self.original_u8 = np.clip(session.fg_rgb * 255.0, 0, 255).astype(np.uint8)
@@ -311,7 +314,9 @@ class PersistentWindow(QtWidgets.QWidget):
         )
         layout.addWidget(self.status)
 
-        self.setFixedSize(self.disp_w * 2 + 32, self.disp_h + 170)
+        # Resizable — laptops need small, big monitors get dragged larger.
+        self.resize(self.disp_w * 2 + 32, self.disp_h + 170)
+        self.setMinimumSize(540, 320)
 
     # ===== Commands from stdin =====
     # WHAT IT DOES: Merges incoming params into the live params dict, then schedules

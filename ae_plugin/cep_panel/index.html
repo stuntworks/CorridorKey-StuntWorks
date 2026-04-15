@@ -242,14 +242,15 @@ document.getElementById('despeckleSize').oninput = function() {
     document.getElementById('despeckleSizeVal').textContent = this.value;
     scheduleViewerUpdate();
 };
-// Grey out the size slider when despeckle is off so the UI makes it clear the
-// slider has no effect unless the checkbox is checked.
+// "Auto Despeckle" — checked means the plugin picks the size for you (slider
+// locked at the default so you can't fight it). Unchecked means manual — user
+// drives the slider. The size slider is editable only in MANUAL mode.
 document.getElementById('despeckle').onchange = function() {
-    const on = this.checked;
+    const autoOn = this.checked;
     const slider = document.getElementById('despeckleSize');
-    slider.disabled = !on;
-    slider.style.opacity = on ? '1' : '0.4';
-    document.getElementById('despeckleSizeVal').style.opacity = on ? '1' : '0.4';
+    slider.disabled = autoOn;                 // lock when in auto mode
+    slider.style.opacity = autoOn ? '0.4' : '1';
+    document.getElementById('despeckleSizeVal').style.opacity = autoOn ? '0.4' : '1';
     scheduleViewerUpdate();
 };
 
@@ -391,7 +392,11 @@ function spawnViewer(sessionDir) {
     const ckRoot = findCorridorkeyRoot();
     const python = findPythonExe(ckRoot);
     const viewer = findViewerScript();
-    const args = [viewer, '--persistent', '--session', sessionDir, '--parent-pid', String(process.pid)];
+    // -u forces unbuffered stdin/stdout on the Python side. Without it, Python
+    // block-buffers stdin when it's a pipe (not a tty), so the viewer's
+    // readline() won't see slider updates until ~4KB of JSON accumulates.
+    // That's the single reason sliders felt "dead" on the first live build.
+    const args = ['-u', viewer, '--persistent', '--session', sessionDir, '--parent-pid', String(process.pid)];
     logLine('spawn viewer: ' + args.join(' '));
     const proc = childProcess.spawn(python, args, {
         stdio: ['pipe', 'pipe', 'pipe'],
