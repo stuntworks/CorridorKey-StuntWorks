@@ -215,6 +215,10 @@ class PersistentWindow(QtWidgets.QWidget):
         self.session = session
         self.setWindowTitle("CorridorKey Live Preview")
         self.setStyleSheet(_DARK_STYLE)
+        # Stay above the NLE so the user never loses the preview behind the host
+        # window. Editors bounce between tools; a hidden preview window defeats
+        # the whole point of live slider feedback.
+        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
 
         self._view_mode = "Composite"
         self._params = {
@@ -565,6 +569,16 @@ def _run_persistent(session_dir: str, parent_pid: int):
     app = QtWidgets.QApplication(sys.argv)
     app.setStyle("Fusion")
     win = PersistentWindow(cu, session)
+    # Center on the primary screen — avoids the "spawned off-screen on a multi-
+    # monitor box / behind the NLE" failure mode.
+    screen = app.primaryScreen()
+    if screen is not None:
+        geo = screen.availableGeometry()
+        fr = win.frameGeometry()
+        win.move(
+            geo.left() + (geo.width() - fr.width()) // 2,
+            geo.top() + (geo.height() - fr.height()) // 2,
+        )
     win.show()
     win.raise_()
     win.activateWindow()
