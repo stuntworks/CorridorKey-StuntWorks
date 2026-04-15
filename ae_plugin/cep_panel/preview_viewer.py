@@ -324,6 +324,15 @@ class PersistentWindow(QtWidgets.QWidget):
         except Exception:
             # Partial write or transient — next tick will retry.
             return
+        # Log every detected change so we can prove in the panel log whether the
+        # file-watcher is firing. Goes to stderr → panel captures as "viewer:".
+        print(
+            f"[VIEWER] live_params changed mtime={mt:.2f} "
+            f"despill={params.get('despill')} "
+            f"despeckleSize={params.get('despeckleSize')}",
+            file=sys.stderr,
+            flush=True,
+        )
         self.on_update(params)
 
     def _build_ui(self):
