@@ -1,7 +1,9 @@
 <!DOCTYPE html>
-<!-- Last modified: 2026-04-14 | Change: Move all Python exec from ExtendScript to Node.js
-     panel side (child_process.execFileSync with argv array). Zero shell, zero injection.
-     Added real log file, crypto-random temp names, settings-via-JSON-file. -->
+<!-- Last modified: 2026-04-14 | Change: Phase 4 — live-preview viewer integration.
+     PREVIEW FRAME now runs the `cache` subcommand + spawns preview_viewer.py in
+     --persistent mode. Sliders debounce 50ms and write JSON lines to viewer
+     stdin for real-time stage-2 re-render. Commit path (KEY CURRENT FRAME,
+     PROCESS WORK AREA) untouched — frame alignment stays safe. -->
 <html>
 <head>
     <meta charset="UTF-8">
@@ -95,7 +97,7 @@
         </div>
     </div>
 
-    <button id="btn-preview" class="btn-preview" onclick="processFrame(true)">PREVIEW FRAME</button>
+    <button id="btn-preview" class="btn-preview" onclick="previewFrameLive()">PREVIEW FRAME (LIVE)</button>
     <button id="btn-process" class="btn-process" onclick="processFrame(false)">KEY CURRENT FRAME</button>
     <button id="btn-batch"   class="btn-batch"   onclick="processBatch()">PROCESS WORK AREA</button>
 
@@ -224,10 +226,16 @@ function browseOutput() {
 // ── UI ──────────────────────────────────────────────────────
 document.getElementById('despill').oninput = function() {
     document.getElementById('despillVal').textContent = (this.value / 100).toFixed(2);
+    scheduleViewerUpdate();
 };
 document.getElementById('refiner').oninput = function() {
     document.getElementById('refinerVal').textContent = (this.value / 100).toFixed(2);
+    // Refiner is stage-1 (NN-internal) — does NOT live-update the viewer. A full
+    // re-key is required; user must click PREVIEW FRAME again to apply a new refiner
+    // value. See PLAN_LIVE_PREVIEW.md §6 Phase 1 discovery.
 };
+document.getElementById('despeckle').onchange = scheduleViewerUpdate;
+document.getElementById('despeckleSize').oninput = scheduleViewerUpdate;
 
 // WHAT IT DOES: Collects the current UI state into a plain settings object.
 //   Validated here — Python receives the sanitized object via a JSON file.
@@ -321,6 +329,194 @@ function showPreview(filePath) {
     const matteUri = keyedUri.replace(/\.png$/i, '_matte.png');
     container.innerHTML = '<img src="' + keyedUri + '?' + ts + '" alt="Keyed" title="Keyed Result">' +
                           '<img src="' + matteUri + '?' + ts + '" alt="Matte" title="Alpha Matte">';
+}
+
+// ============================================================
+// LIVE PREVIEW VIEWER
+// ============================================================
+// Persistent child process running preview_viewer.py in --persistent mode.
+// Stage 1 (neural net) runs once per frame via the `cache` subcommand; sliders
+// then stream JSON lines over this process's stdin to trigger stage-2 re-renders
+// (~50-100ms each). The viewer owns its own Qt event loop and window.
+
+let VIEWER_PROC = null;
+let CURRENT_SESSION_DIR = null;
+const SLIDER_DEBOUNCE_MS = 50;
+let sliderDebounceTimer = null;
+let sliderPendingState = null;
+
+// WHAT IT DOES: Finds preview_viewer.py on disk. Looks next to ae_processor.py first
+//   (where install.py bundles it), then in the engine's resolve_plugin/ (legacy
+//   location for the Resolve one-shot flow), then in the plugin-repo root (dev mode).
+// DEPENDS-ON: PANEL_DIR constant, findCorridorkeyRoot() for the engine fallback.
+// AFFECTS: returns a string path. Throws if nothing found.
+function findViewerScript() {
+    const candidates = [
+        path.join(PANEL_DIR, 'preview_viewer.py'),
+        path.resolve(PANEL_DIR, '..', '..', 'preview_viewer.py')
+    ];
+    try {
+        const ckRoot = findCorridorkeyRoot();
+        candidates.push(path.join(ckRoot, 'resolve_plugin', 'preview_viewer.py'));
+    } catch (_) {}
+    for (const c of candidates) {
+        if (fs.existsSync(c)) return c;
+    }
+    throw new Error('preview_viewer.py not found. Tried:\n  ' + candidates.join('\n  '));
+}
+
+// WHAT IT DOES: Starts a persistent viewer subprocess. Keeps stdio pipes so we can
+//   stream slider updates over stdin. Wires exit/error logging so panel log captures
+//   viewer crashes. Does NOT call kill() — viewer self-terminates via {"cmd":"quit"}
+//   on stdin end OR when its parent-PID watchdog detects the panel is gone.
+// DEPENDS-ON: findViewerScript(), findPythonExe(), findCorridorkeyRoot().
+// AFFECTS: sets VIEWER_PROC to the new child_process handle.
+function spawnViewer(sessionDir) {
+    const ckRoot = findCorridorkeyRoot();
+    const python = findPythonExe(ckRoot);
+    const viewer = findViewerScript();
+    const args = [viewer, '--persistent', '--session', sessionDir, '--parent-pid', String(process.pid)];
+    logLine('spawn viewer: ' + args.join(' '));
+    const proc = childProcess.spawn(python, args, {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: false,       // viewer is a GUI window — let it show
+        env: Object.assign({}, process.env, { CORRIDORKEY_ROOT: ckRoot })
+    });
+    proc.stdout.on('data', () => { /* viewer is quiet on stdout; ignore by design */ });
+    proc.stderr.on('data', (d) => {
+        const s = String(d).trim();
+        if (s) logLine('viewer: ' + s, true);
+    });
+    proc.on('exit', (code) => {
+        logLine('viewer exited (code=' + code + ')');
+        if (VIEWER_PROC === proc) { VIEWER_PROC = null; CURRENT_SESSION_DIR = null; }
+    });
+    proc.on('error', (err) => {
+        logLine('viewer spawn error: ' + err.message, true);
+        if (VIEWER_PROC === proc) { VIEWER_PROC = null; CURRENT_SESSION_DIR = null; }
+    });
+    return proc;
+}
+
+// WHAT IT DOES: Writes one JSON object + newline to the viewer's stdin. Silently
+//   drops writes if the pipe is already closed (viewer may have exited between
+//   the caller's last check and now). Callers must not rely on delivery — the
+//   viewer is a display; a missed slider tick is acceptable.
+// DEPENDS-ON: VIEWER_PROC being set and its stdin stream being writable.
+// AFFECTS: writes to a pipe. No return value.
+function sendToViewer(obj) {
+    if (!VIEWER_PROC || !VIEWER_PROC.stdin || VIEWER_PROC.stdin.destroyed) return;
+    try {
+        VIEWER_PROC.stdin.write(JSON.stringify(obj) + '\n');
+    } catch (_) { /* broken pipe — viewer is shutting down */ }
+}
+
+// WHAT IT DOES: Sends {"cmd":"quit"} and closes stdin. The viewer exits cleanly on
+//   EOF even if the quit message is dropped. We do NOT send SIGKILL — the parent-
+//   PID watchdog inside the viewer is a belt-and-suspenders for the case where
+//   the panel itself crashes without firing beforeunload.
+// DEPENDS-ON: sendToViewer() for the quit message.
+// AFFECTS: VIEWER_PROC set to null. Viewer process terminates within ~1 second.
+function killViewer() {
+    if (!VIEWER_PROC) return;
+    try { sendToViewer({ cmd: 'quit' }); } catch (_) {}
+    try { VIEWER_PROC.stdin.end(); } catch (_) {}
+    VIEWER_PROC = null;
+    CURRENT_SESSION_DIR = null;
+}
+
+// WHAT IT DOES: Debounced slider → viewer update. Coalesces all slider movements
+//   inside a 50ms window into a single stdin write. "Drop-stale" policy — only
+//   the most recent slider state is sent; no queue backup during fast drags.
+// DEPENDS-ON: getSettings() for current UI values, sendToViewer() for delivery.
+// AFFECTS: may write one JSON line to viewer stdin after the debounce window.
+function scheduleViewerUpdate() {
+    if (!VIEWER_PROC) return;
+    const s = getSettings();
+    sliderPendingState = {
+        cmd: 'update',
+        despill: s.despill,
+        despeckle: s.despeckle,
+        despeckleSize: s.despeckleSize,
+        background: 'checker'   // Phase 4: checker only; Phase 4b adds bg UI
+    };
+    if (sliderDebounceTimer) return;  // timer already armed — latest state will ride it
+    sliderDebounceTimer = setTimeout(() => {
+        sliderDebounceTimer = null;
+        const state = sliderPendingState;
+        sliderPendingState = null;
+        if (state && VIEWER_PROC) sendToViewer(state);
+    }, SLIDER_DEBOUNCE_MS);
+}
+
+// WHAT IT DOES: Top-level handler for PREVIEW FRAME (LIVE). Extracts the current
+//   frame, runs stage-1 only (cache subcommand) to write fg.png + alpha.png into
+//   a fresh session directory, and spawns or reloads the persistent viewer with
+//   that session. Does NOT touch the timeline — commit path is KEY CURRENT FRAME.
+// DEPENDS-ON: host.jsx ppro_getFrameInfo / ae_getFrameInfo, ae_processor.py's
+//   `cache` subcommand, spawnViewer().
+// AFFECTS: creates %TEMP%\ck_session_<hex>\ with fg.png + alpha.png + meta.json,
+//   opens a preview window. Does NOT write to the timeline.
+function previewFrameLive() {
+    setBusy(true);
+    status('Caching frame for live preview...');
+
+    const infoFn = HOST_APP === 'ppro' ? 'ppro_getFrameInfo' : 'ae_getFrameInfo';
+    jsxCall(infoFn, [], (info) => {
+        if (!info.ok) { logLine('host error: ' + info.error, true); status('Error'); setBusy(false); return; }
+        let framePng = null;
+        let sessionDir = null;
+        let paramsPath = null;
+        try {
+            const settings = getSettings();
+
+            // Step 1 — extract single frame. Same code path Premiere/AE use for KEY
+            // CURRENT FRAME so there's zero chance of preview vs commit diverging.
+            framePng = randomTempPath('extract', '.png');
+            const extractArgs = (HOST_APP === 'ppro' && typeof info.sourceTimeSeconds === 'number')
+                ? ['extract', info.sourceFile, framePng, '--time', String(info.sourceTimeSeconds)]
+                : ['extract', info.sourceFile, framePng, '--frame', String(info.sourceFrame)];
+            runPython(extractArgs);
+            if (!fs.existsSync(framePng)) throw new Error('Extract produced no output');
+
+            // Step 2 — stage-1 only. Writes fg.png + alpha.png + meta.json to session dir.
+            sessionDir = randomTempPath('session', '');
+            fs.mkdirSync(sessionDir, { recursive: true });
+            paramsPath = writeParamsFile(settings);
+            runPython(['cache', framePng, sessionDir, '--params', paramsPath]);
+
+            // Step 3 — spawn or reload the viewer.
+            if (VIEWER_PROC) {
+                sendToViewer({ cmd: 'reload', sessionDir: sessionDir });
+            } else {
+                VIEWER_PROC = spawnViewer(sessionDir);
+            }
+            CURRENT_SESSION_DIR = sessionDir;
+
+            // Send the initial settings after a small delay so the viewer has time to
+            // show its window. (A missed initial update just means the user's first
+            // slider move paints the first frame — harmless.)
+            setTimeout(() => {
+                sendToViewer({
+                    cmd: 'update',
+                    despill: settings.despill,
+                    despeckle: settings.despeckle,
+                    despeckleSize: settings.despeckleSize,
+                    background: 'checker'
+                });
+            }, 400);
+
+            status('Live preview active — drag sliders to re-key');
+        } catch (e) {
+            logLine('fatal: ' + e.message, true);
+            status('Error');
+        } finally {
+            // Cleanup temp inputs; session dir lives until viewer exits so a reload can re-read it.
+            if (paramsPath) { try { fs.unlinkSync(paramsPath); } catch (_) {} }
+            if (framePng)   { try { fs.unlinkSync(framePng); }   catch (_) {} }
+            setBusy(false);
+        }
+    });
 }
 
 // ============================================================
@@ -466,7 +662,23 @@ cs.evalScript('getHostApp()', (host) => {
         logLine('SETUP: ' + e.message, true);
         status('Engine not found — see log');
     }
+    // Sanity-check the live viewer script so users find out at launch if preview_viewer.py
+    // was not bundled. Non-fatal — commit path (KEY / BATCH) still works without it.
+    try {
+        const v = findViewerScript();
+        logLine('Viewer: ' + v);
+    } catch (e) {
+        logLine('VIEWER: ' + e.message + ' (KEY and BATCH still work; LIVE PREVIEW disabled)', true);
+    }
 });
+
+// WHAT IT DOES: When the CEP panel is closing (user hides it, restarts Adobe, or closes
+//   the app), send a clean quit to the viewer and close its stdin. The viewer's parent-
+//   PID watchdog is the safety net if this fires too late or not at all.
+// DEPENDS-ON: killViewer().
+// AFFECTS: terminates the viewer subprocess within ~1 second.
+window.addEventListener('beforeunload', killViewer);
+window.addEventListener('unload', killViewer);
     </script>
 </body>
 </html>
