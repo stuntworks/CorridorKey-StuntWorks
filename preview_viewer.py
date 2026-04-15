@@ -292,20 +292,27 @@ class PersistentWindow(QtWidgets.QWidget):
         bg_row.addStretch()
         layout.addLayout(bg_row)
 
-        # Image panels
+        # Image panels — expand with the window. Size policy + stretch lets the
+        # labels grow; resizeEvent() re-scales the pixmaps so the image follows.
         pane_row = QtWidgets.QHBoxLayout()
         pane_row.setSpacing(8)
+        expanding = QtWidgets.QSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
         self.left_label = QtWidgets.QLabel()
         self.left_label.setAlignment(QtCore.Qt.AlignCenter)
-        self.left_label.setFixedSize(self.disp_w, self.disp_h)
+        self.left_label.setSizePolicy(expanding)
+        self.left_label.setMinimumSize(240, 180)
         self.right_label = QtWidgets.QLabel()
         self.right_label.setAlignment(QtCore.Qt.AlignCenter)
-        self.right_label.setFixedSize(self.disp_w, self.disp_h)
-        pane_row.addWidget(self.left_label)
-        pane_row.addWidget(self.right_label)
-        layout.addLayout(pane_row)
+        self.right_label.setSizePolicy(expanding)
+        self.right_label.setMinimumSize(240, 180)
+        pane_row.addWidget(self.left_label, 1)
+        pane_row.addWidget(self.right_label, 1)
+        layout.addLayout(pane_row, 1)
 
-        self.left_label.setPixmap(_np_to_qpixmap(self.original_scaled))
+        # Full-res arrays — kept around so resize events can rescale to any target
+        # size without recomputing stage-2 just for a window drag.
+        self._last_right_full = None   # filled by _render_now after each repaint
+        self._place_original()
 
         # Status bar
         self.status = QtWidgets.QLabel("Ready")
@@ -344,10 +351,8 @@ class PersistentWindow(QtWidgets.QWidget):
             self.status.setText(f"Reload failed: {e}")
             return
         self.session = new_session
-        h, w = new_session.shape_hw
         self.original_u8 = np.clip(new_session.fg_rgb * 255.0, 0, 255).astype(np.uint8)
-        self.original_scaled = cv2.resize(self.original_u8, (self.disp_w, self.disp_h))
-        self.left_label.setPixmap(_np_to_qpixmap(self.original_scaled))
+        self._place_original()
         self._render_now()
 
     # ===== Render =====
@@ -397,8 +402,10 @@ class PersistentWindow(QtWidgets.QWidget):
                     )
                 img = alpha_to_rgb_u8(alpha)
 
-            scaled = cv2.resize(img, (self.disp_w, self.disp_h))
-            self.right_label.setPixmap(_np_to_qpixmap(scaled))
+            # Cache the full-res result so window resizes can rescale without
+            # re-running stage-2. Then paint it at the current label size.
+            self._last_right_full = img
+            self._paint_right(img)
             dt_ms = (time.perf_counter() - t0) * 1000.0
             self.status.setText(
                 f"Mode: {self._view_mode}  |  despill={self._params['despill']:.2f}  "
@@ -416,6 +423,51 @@ class PersistentWindow(QtWidgets.QWidget):
                 self._params = next_params
                 # Defer through the event loop so UI stays responsive during drag.
                 QtCore.QTimer.singleShot(0, self._render_now)
+
+    # WHAT IT DOES: Scales a full-res uint8 RGB array to the current size of the
+    #   given label (respecting aspect ratio via a letterbox bounding box) and
+    #   installs it as the label's pixmap.
+    # DEPENDS-ON: cv2, _np_to_qpixmap. Label must be sized already (called after
+    #   layout has placed it).
+    # AFFECTS: the label's displayed pixmap.
+    def _paint_into(self, label, full_img):
+        if full_img is None:
+            return
+        lw = max(1, label.width())
+        lh = max(1, label.height())
+        ih, iw = full_img.shape[:2]
+        if iw == 0 or ih == 0:
+            return
+        aspect_src = iw / ih
+        aspect_dst = lw / lh
+        if aspect_src > aspect_dst:
+            tw = lw
+            th = max(1, int(lw / aspect_src))
+        else:
+            th = lh
+            tw = max(1, int(lh * aspect_src))
+        scaled = cv2.resize(full_img, (tw, th), interpolation=cv2.INTER_AREA)
+        label.setPixmap(_np_to_qpixmap(scaled))
+
+    def _paint_right(self, full_img):
+        self._paint_into(self.right_label, full_img)
+
+    def _place_original(self):
+        self._paint_into(self.left_label, self.original_u8)
+
+    # WHAT IT DOES: On every window resize, rescale the original and the last
+    #   rendered right-pane image to the new label sizes. No stage-2 re-render
+    #   is needed — both full-res sources are already in memory.
+    # DEPENDS-ON: _last_right_full being populated by the first _render_now call.
+    # AFFECTS: left_label and right_label pixmaps.
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Layout may not have placed children yet on the very first resize event
+        # fired by the constructor — guard against zero-size labels.
+        if self.left_label.width() > 1:
+            self._place_original()
+        if self._last_right_full is not None and self.right_label.width() > 1:
+            self._paint_right(self._last_right_full)
 
 
 # ===== Stdin reader thread =====
