@@ -279,6 +279,16 @@ class PersistentWindow(QtWidgets.QWidget):
         self._pending = None
         self._painting = False
 
+        # Zoom + pan state. Mouse wheel adjusts _zoom, drag-while-zoomed updates
+        # _pan_x/_pan_y (fractional 0..1 center point). _paint_into crops the
+        # full-res cached image to this window before scaling into the label.
+        self._zoom = 1.0
+        self._pan_x = 0.5
+        self._pan_y = 0.5
+        self._dragging = False
+        self._drag_start = None
+        self._drag_start_pan = (0.5, 0.5)
+
         h, w = session.shape_hw
         # Default display scale picks a size that fits on a 1366x768 laptop with
         # both panes + UI chrome — the window is resizable after launch so the
@@ -541,6 +551,12 @@ class PersistentWindow(QtWidgets.QWidget):
     # DEPENDS-ON: cv2, _np_to_qpixmap. Label must be sized already (called after
     #   layout has placed it).
     # AFFECTS: the label's displayed pixmap.
+    # WHAT IT DOES: Crops full_img to a zoom-and-pan window, then scales into the
+    #   given label preserving aspect ratio. Zoom 1.0 shows the whole image;
+    #   larger zoom crops to a smaller source region. Pan coords are fractional
+    #   (0.5 = centered) and represent the crop's center point.
+    # DEPENDS-ON: self._zoom, self._pan_x, self._pan_y (set on wheel/drag).
+    # AFFECTS: label's displayed pixmap only.
     def _paint_into(self, label, full_img):
         if full_img is None:
             return
@@ -549,7 +565,21 @@ class PersistentWindow(QtWidgets.QWidget):
         ih, iw = full_img.shape[:2]
         if iw == 0 or ih == 0:
             return
-        aspect_src = iw / ih
+        zoom = getattr(self, "_zoom", 1.0)
+        pan_x = getattr(self, "_pan_x", 0.5)
+        pan_y = getattr(self, "_pan_y", 0.5)
+        if zoom > 1.001:
+            cw = max(1, int(iw / zoom))
+            ch = max(1, int(ih / zoom))
+            cx = int(pan_x * iw)
+            cy = int(pan_y * ih)
+            x0 = max(0, min(iw - cw, cx - cw // 2))
+            y0 = max(0, min(ih - ch, cy - ch // 2))
+            src = full_img[y0:y0 + ch, x0:x0 + cw]
+        else:
+            src = full_img
+        sh, sw = src.shape[:2]
+        aspect_src = sw / sh
         aspect_dst = lw / lh
         if aspect_src > aspect_dst:
             tw = lw
@@ -557,7 +587,7 @@ class PersistentWindow(QtWidgets.QWidget):
         else:
             th = lh
             tw = max(1, int(lh * aspect_src))
-        scaled = cv2.resize(full_img, (tw, th), interpolation=cv2.INTER_AREA)
+        scaled = cv2.resize(src, (tw, th), interpolation=cv2.INTER_AREA)
         label.setPixmap(_np_to_qpixmap(scaled))
 
     def _paint_right(self, full_img):
@@ -565,6 +595,71 @@ class PersistentWindow(QtWidgets.QWidget):
 
     def _place_original(self):
         self._paint_into(self.left_label, self.original_u8)
+
+    # WHAT IT DOES: Re-paints both panes using current zoom/pan. Called after
+    #   wheel scrolls or drag pans. No stage-2 re-render — just re-crops the
+    #   cached full-res arrays.
+    def _repaint_both(self):
+        if self.left_label.width() > 1:
+            self._place_original()
+        if self._last_right_full is not None and self.right_label.width() > 1:
+            self._paint_right(self._last_right_full)
+
+    # WHAT IT DOES: Mouse wheel zooms in/out on the preview. Wheel up = zoom in.
+    #   Clamps 1.0..10.0. Re-paints both panes on change.
+    # DEPENDS-ON: Qt delivering wheelEvent to the window.
+    # AFFECTS: self._zoom, both label pixmaps.
+    def wheelEvent(self, event):
+        try:
+            delta = event.angleDelta().y()
+        except Exception:
+            delta = 0
+        if delta == 0:
+            return
+        # One notch (120 units) = 1.25x zoom step. Feels natural.
+        step = 1.25 if delta > 0 else 1.0 / 1.25
+        new_zoom = max(1.0, min(10.0, self._zoom * step))
+        if abs(new_zoom - self._zoom) < 1e-3:
+            return
+        self._zoom = new_zoom
+        if self._zoom <= 1.001:
+            # Snap pan back to center when fully zoomed out.
+            self._pan_x = 0.5
+            self._pan_y = 0.5
+        self._repaint_both()
+        event.accept()
+
+    # WHAT IT DOES: Start pan-drag on mouse press while zoomed in.
+    def mousePressEvent(self, event):
+        if self._zoom > 1.001 and event.button() == QtCore.Qt.LeftButton:
+            self._dragging = True
+            self._drag_start = event.pos()
+            self._drag_start_pan = (self._pan_x, self._pan_y)
+            self.setCursor(QtCore.Qt.ClosedHandCursor)
+        super().mousePressEvent(event)
+
+    # WHAT IT DOES: Update pan offset while dragging. Pan moves in image
+    #   coordinates proportional to the visible crop size so drag feel is
+    #   consistent across zoom levels.
+    def mouseMoveEvent(self, event):
+        if self._dragging and self._drag_start is not None:
+            dx = event.pos().x() - self._drag_start.x()
+            dy = event.pos().y() - self._drag_start.y()
+            # Inverted so dragging right shows content to the left of current view
+            # (like grabbing and pulling a photo).
+            w = max(1, self.right_label.width())
+            h = max(1, self.right_label.height())
+            self._pan_x = max(0.0, min(1.0, self._drag_start_pan[0] - dx / (w * self._zoom)))
+            self._pan_y = max(0.0, min(1.0, self._drag_start_pan[1] - dy / (h * self._zoom)))
+            self._repaint_both()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._dragging and event.button() == QtCore.Qt.LeftButton:
+            self._dragging = False
+            self._drag_start = None
+            self.setCursor(QtCore.Qt.ArrowCursor)
+        super().mouseReleaseEvent(event)
 
     # WHAT IT DOES: On every window resize, rescale the original and the last
     #   rendered right-pane image to the new label sizes. No stage-2 re-render
@@ -575,10 +670,7 @@ class PersistentWindow(QtWidgets.QWidget):
         super().resizeEvent(event)
         # Layout may not have placed children yet on the very first resize event
         # fired by the constructor — guard against zero-size labels.
-        if self.left_label.width() > 1:
-            self._place_original()
-        if self._last_right_full is not None and self.right_label.width() > 1:
-            self._paint_right(self._last_right_full)
+        self._repaint_both()
 
 
 # ===== Stdin reader thread =====
