@@ -40,8 +40,20 @@
         #preview-label { color: #666; font-size: 10px; padding: 12px; }
         #status { text-align: center; padding: 8px; margin-top: 8px; background: #1a1a1a;
             border-radius: 4px; color: #0ff; font-weight: bold; font-size: 11px; }
-        #progress-bar { margin-top: 6px; height: 6px; background: #111; border-radius: 3px; overflow: hidden; display: none; }
+        #progress-bar { margin-top: 6px; height: 6px; background: #111; border-radius: 3px; overflow: hidden; display: none; position: relative; }
         #progress-fill { height: 100%; width: 0%; background: #2196F3; transition: width 0.2s; }
+        /* Indeterminate mode — animated stripe for "something is happening" when
+           we don't have a percentage to show (PREVIEW FRAME cache phase). */
+        #progress-bar.indeterminate #progress-fill { display: none; }
+        #progress-bar.indeterminate::before {
+            content: ''; position: absolute; top: 0; left: -40%; height: 100%; width: 40%;
+            background: linear-gradient(90deg, transparent, #9C27B0, transparent);
+            animation: ck-indeterminate 1.2s infinite linear;
+        }
+        @keyframes ck-indeterminate {
+            0%   { left: -40%; }
+            100% { left: 100%; }
+        }
         #log { background: #111; color: #0f0; font-family: monospace; font-size: 10px;
             padding: 8px; margin-top: 8px; height: 80px; overflow-y: auto; border-radius: 4px; }
         .log-err { color: #f66; }
@@ -480,11 +492,14 @@ function scheduleViewerUpdate() {
 //   opens a preview window. Does NOT write to the timeline.
 function previewFrameLive() {
     setBusy(true);
-    status('Caching frame for live preview...');
+    // Indeterminate progress bar — we don't have a % number to show during the
+    // NN pass, so an animated stripe tells the user "something is happening."
+    document.getElementById('progress-bar').classList.add('indeterminate');
+    status('Reading timeline...');
 
     const infoFn = HOST_APP === 'ppro' ? 'ppro_getFrameInfo' : 'ae_getFrameInfo';
     jsxCall(infoFn, [], (info) => {
-        if (!info.ok) { logLine('host error: ' + info.error, true); status('Error'); setBusy(false); return; }
+        if (!info.ok) { logLine('host error: ' + info.error, true); status('Error'); document.getElementById('progress-bar').classList.remove('indeterminate'); setBusy(false); return; }
         let framePng = null;
         let sessionDir = null;
         let paramsPath = null;
@@ -493,6 +508,7 @@ function previewFrameLive() {
 
             // Step 1 — extract single frame. Same code path Premiere/AE use for KEY
             // CURRENT FRAME so there's zero chance of preview vs commit diverging.
+            status('Extracting frame...');
             framePng = randomTempPath('extract', '.png');
             const extractArgs = (HOST_APP === 'ppro' && typeof info.sourceTimeSeconds === 'number')
                 ? ['extract', info.sourceFile, framePng, '--time', String(info.sourceTimeSeconds)]
@@ -501,12 +517,14 @@ function previewFrameLive() {
             if (!fs.existsSync(framePng)) throw new Error('Extract produced no output');
 
             // Step 2 — stage-1 only. Writes fg.png + alpha.png + meta.json to session dir.
+            status('Running neural key (this can take a few seconds)...');
             sessionDir = randomTempPath('session', '');
             fs.mkdirSync(sessionDir, { recursive: true });
             paramsPath = writeParamsFile(settings);
             runPython(['cache', framePng, sessionDir, '--params', paramsPath]);
 
             // Step 3 — spawn or reload the viewer.
+            status('Opening live preview...');
             if (VIEWER_PROC) {
                 sendToViewer({ cmd: 'reload', sessionDir: sessionDir });
             } else {
@@ -535,6 +553,7 @@ function previewFrameLive() {
             // Cleanup temp inputs; session dir lives until viewer exits so a reload can re-read it.
             if (paramsPath) { try { fs.unlinkSync(paramsPath); } catch (_) {} }
             if (framePng)   { try { fs.unlinkSync(framePng); }   catch (_) {} }
+            document.getElementById('progress-bar').classList.remove('indeterminate');
             setBusy(false);
         }
     });
