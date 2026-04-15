@@ -37,6 +37,36 @@ import cv2
 import numpy as np
 from PySide6 import QtWidgets, QtGui, QtCore
 
+# WHAT IT DOES: Installs diagnostic crash / exception loggers as early as possible.
+#   faulthandler dumps Python tracebacks on native signals (SIGSEGV, stack overflow,
+#   access violations that Windows translates into exit code 0xC0000409 etc). The
+#   excepthook catches un-raised Python exceptions and writes them to a file in
+#   %TEMP%\corridorkey_viewer_crash.log so a post-mortem is possible without a
+#   debugger attached. This is what made the first stack-overrun crash traceable.
+# DEPENDS-ON: faulthandler (Python stdlib), write access to %TEMP%.
+# AFFECTS: on fatal errors, writes stderr-style traceback to the crash log.
+def _install_crash_diagnostics():
+    import faulthandler, tempfile, traceback
+    log_path = Path(tempfile.gettempdir()) / "corridorkey_viewer_crash.log"
+    try:
+        _fh = open(log_path, "a", buffering=1, encoding="utf-8")
+        _fh.write(f"\n===== preview_viewer start {__import__('datetime').datetime.now().isoformat()} =====\n")
+        faulthandler.enable(_fh)
+    except Exception:
+        faulthandler.enable()  # best-effort: at least dump to stderr
+    def _excepthook(exc_type, exc_value, exc_tb):
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"\n--- uncaught exception {__import__('datetime').datetime.now().isoformat()} ---\n")
+                traceback.print_exception(exc_type, exc_value, exc_tb, file=f)
+        except Exception:
+            pass
+        traceback.print_exception(exc_type, exc_value, exc_tb)
+    sys.excepthook = _excepthook
+
+
+_install_crash_diagnostics()
+
 
 # ===== Engine import =====
 # WHAT IT DOES: Imports the engine's color_utils module, trying a direct import first
@@ -78,10 +108,26 @@ def _import_color_utils():
 
 
 # ===== Image helpers =====
+# WHAT IT DOES: Converts a uint8 HxWx3 RGB numpy array into a fully Qt-owned QPixmap.
+#   The two-stage construction (tobytes -> QImage -> QImage.copy -> QPixmap.fromImage)
+#   is deliberate and solves two real bugs observed on Windows + PySide6:
+#     1) Passing numpy .data (a memoryview) to QImage() can leave stale bytes inside
+#        a .copy() in some PySide6 builds — the copy is marked deep but the source
+#        buffer lifetime still matters. Explicit tobytes() eliminates that class of
+#        bug entirely because the Python `buf` binding keeps bytes alive across the
+#        QImage.copy() call, and the deep copy then lives in Qt-managed memory.
+#     2) Non-contiguous arrays silently produce garbage pixmaps. ascontiguousarray
+#        guarantees C-order + tight stride that matches our `ch * w` bytesPerLine.
+# DEPENDS-ON: numpy, PySide6 QImage/QPixmap, uint8 RGB input.
+# AFFECTS: returns a QPixmap that can be safely assigned to any QLabel; source array
+#   can be freed immediately after this function returns.
 def _np_to_qpixmap(img_rgb_u8):
-    h, w, ch = img_rgb_u8.shape
-    qimg = QtGui.QImage(img_rgb_u8.data, w, h, ch * w, QtGui.QImage.Format_RGB888)
-    return QtGui.QPixmap.fromImage(qimg.copy())  # copy so buffer lifetime is safe
+    arr = np.ascontiguousarray(img_rgb_u8, dtype=np.uint8)
+    h, w, ch = arr.shape
+    buf = arr.tobytes()
+    qimg = QtGui.QImage(buf, w, h, ch * w, QtGui.QImage.Format_RGB888)
+    owned = qimg.copy()   # deep copy while `buf` is still alive in this frame
+    return QtGui.QPixmap.fromImage(owned)
 
 
 def _read_png_any_depth(path):
@@ -407,10 +453,18 @@ class PersistentWindow(QtWidgets.QWidget):
             self._last_right_full = img
             self._paint_right(img)
             dt_ms = (time.perf_counter() - t0) * 1000.0
+            # meanRGB is the cheapest possible proof that slider changes actually
+            # move pixels. If these three numbers don't change between slider
+            # positions, the render pipeline is broken (or the slider's effect is
+            # smaller than rounding error). If they change but the image looks the
+            # same, the display layer is broken. This is the first data point any
+            # debugger reaches for when "nothing seems to be happening."
+            mean_r, mean_g, mean_b = img.reshape(-1, 3).mean(axis=0)
             self.status.setText(
                 f"Mode: {self._view_mode}  |  despill={self._params['despill']:.2f}  "
                 f"despeckle={'on' if self._params['despeckle'] else 'off'}"
                 f"@{self._params['despeckleSize']}  bg={self._params['background']}  "
+                f"|  meanRGB=({mean_r:.1f},{mean_g:.1f},{mean_b:.1f})  "
                 f"|  render {dt_ms:.0f} ms"
             )
         except Exception as e:
