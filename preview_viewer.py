@@ -367,11 +367,17 @@ class PersistentWindow(QtWidgets.QWidget):
             if self._view_mode == "Composite":
                 img = render_composite(self.cu, self.session, self._params)
             elif self._view_mode == "Foreground":
-                # FG straight over the requested background using a pure-white alpha
-                # wouldn't be useful — instead, show the despilled FG over checker to
-                # match the legacy Resolve viewer's Foreground mode.
-                fg_params = dict(self._params, background="checker")
-                img = render_composite(self.cu, self.session, fg_params)
+                # Pure despilled RGB with NO alpha blend — shows what the colour
+                # data looks like independent of the matte. Use this to judge
+                # despill quality ("is the skin still green-tinted?") without
+                # the matte hiding problem areas.
+                fg_rgb = self.session.fg_rgb.copy()
+                despill_strength = float(self._params.get("despill", 1.0))
+                if despill_strength > 0:
+                    fg_rgb = self.cu.despill_opencv(
+                        fg_rgb, green_limit_mode="average", strength=despill_strength
+                    )
+                img = np.clip(fg_rgb * 255.0, 0, 255).astype(np.uint8)
             else:  # Matte
                 # Apply despeckle (matte is what it edits) and show as grayscale RGB
                 params_for_matte = dict(self._params)
