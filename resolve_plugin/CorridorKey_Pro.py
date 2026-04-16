@@ -138,9 +138,9 @@ winLayout = ui.VGroup({"Spacing": 14}, [
         ui.Label({"ID": "RefinerValue", "Text": "1.00", "Weight": 0}),
     ]),
     ui.HGroup({"Weight": 0, "Spacing": 5}, [
-        ui.CheckBox({"ID": "DespeckleCheck", "Text": "Auto Despeckle", "Checked": True, "Weight": 0}),
-        ui.SpinBox({"ID": "DespeckleSize", "Minimum": 50, "Maximum": 1000, "Value": 400, "SingleStep": 50, "Weight": 0}),
-        ui.Label({"Text": "px", "Weight": 0}),
+        ui.CheckBox({"ID": "DespeckleCheck", "Text": "Despeckle:", "Checked": True, "Weight": 0}),
+        ui.Slider({"ID": "DespeckleSize", "Minimum": 50, "Maximum": 2000, "Value": 400, "Orientation": "Horizontal", "Weight": 2}),
+        ui.Label({"ID": "DespeckleValue", "Text": "400", "Weight": 0}),
     ]),
     ui.HGroup({"Weight": 0, "Spacing": 5}, [
         ui.Label({"Text": "Export:", "Weight": 0}),
@@ -278,6 +278,10 @@ def on_despill_changed(ev):
 def on_refiner_changed(ev):
     items["RefinerValue"].Text = f"{items['RefinerSlider'].Value / 100.0:.2f}"
     if items["LivePreview"].Checked and cached_source["frame"] is not None: reprocess_with_cached()
+
+# WHAT IT DOES: Updates despeckle value label when slider moves
+def on_despeckle_changed(ev):
+    items["DespeckleValue"].Text = str(items["DespeckleSize"].Value)
 
 # WHAT IT DOES: Generates an alpha hint (rough matte) for the neural keyer to refine.
 #   Simple mode uses chroma difference; SAM2 mode uses click points from the SAM window.
@@ -798,6 +802,7 @@ def on_close(ev): disp.ExitLoop()
 
 win.On.DespillSlider.SliderMoved = on_despill_changed
 win.On.RefinerSlider.SliderMoved = on_refiner_changed
+win.On.DespeckleSize.SliderMoved = on_despeckle_changed
 win.On.SetInPoint.Clicked = on_set_in_point
 win.On.SetOutPoint.Clicked = on_set_out_point
 win.On.ClearRange.Clicked = on_clear_range
