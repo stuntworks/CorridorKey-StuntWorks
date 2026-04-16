@@ -139,51 +139,12 @@
         Plugin by Roberto Lopez / <a href="#" onclick="openURL('https://www.youtube.com/@stuntworksactioncinema')">StuntWorks Action Cinema</a>
     </div>
 
-    <div id="preview-container">
-        <span id="preview-label">Preview will appear here</span>
-    </div>
-
     <div class="section">
         <label>Screen</label>
         <select id="screenType">
             <option value="green">Green Screen</option>
             <option value="blue">Blue Screen</option>
         </select>
-    </div>
-
-    <div class="section">
-        <label>Despill</label>
-        <div class="slider-row">
-            <input type="range" id="despill" min="0" max="100" value="50">
-            <span class="slider-value" id="despillVal">0.50</span>
-        </div>
-    </div>
-
-    <div class="section">
-        <label>Refiner</label>
-        <div class="slider-row">
-            <input type="range" id="refiner" min="0" max="100" value="100">
-            <span class="slider-value" id="refinerVal">1.00</span>
-        </div>
-    </div>
-
-    <div class="section">
-        <div class="checkbox-row" style="margin-bottom:5px;">
-            <input type="checkbox" id="despeckle" checked>
-            <label for="despeckle" style="margin:0">Despeckle</label>
-        </div>
-        <div class="slider-row">
-            <input type="range" id="despeckleSize" min="50" max="2000" value="400">
-            <span class="slider-value" id="despeckleSizeVal">400</span>
-        </div>
-    </div>
-
-    <div class="section">
-        <label>Output</label>
-        <div style="display:flex;gap:5px;">
-            <input type="text" id="outputPath" readonly style="flex:1;padding:6px;background:#333;border:1px solid #444;color:#fff;border-radius:4px;font-size:11px;">
-            <button onclick="browseOutput()" style="width:auto;padding:6px 12px;margin:0;background:#555;font-size:11px;">Browse</button>
-        </div>
     </div>
 
     <button id="btn-preview" class="btn-preview" onclick="previewFrameLive()">PREVIEW FRAME (LIVE)</button>
@@ -313,57 +274,21 @@ function browseOutput() {
 }
 
 // ── UI ──────────────────────────────────────────────────────
-// WHAT IT DOES: Updates the CSS --fill custom property on a range input so the
-//   green fill track visually tracks the thumb position. Called on every input.
-function updateSliderFill(el) {
-    const pct = ((el.value - el.min) / (el.max - el.min)) * 100;
-    el.style.setProperty('--fill', pct + '%');
-}
-// Set initial fill on all sliders at startup
-document.querySelectorAll('input[type="range"]').forEach(updateSliderFill);
-
-document.getElementById('despill').oninput = function() {
-    document.getElementById('despillVal').textContent = (this.value / 100).toFixed(2);
-    updateSliderFill(this);
-    scheduleViewerUpdate();
-};
-document.getElementById('refiner').oninput = function() {
-    document.getElementById('refinerVal').textContent = (this.value / 100).toFixed(2);
-    updateSliderFill(this);
-};
-document.getElementById('refiner').onchange = function() {
-    rekeyWithCurrentSettings();
-};
-document.getElementById('despeckleSize').oninput = function() {
-    document.getElementById('despeckleSizeVal').textContent = this.value;
-    updateSliderFill(this);
-    scheduleViewerUpdate();
-};
-// Despeckle — standard feature-toggle pattern. Checked = feature ON, slider
-// active (user picks size). Unchecked = feature OFF, slider greyed (no effect).
-// Earlier "Auto Despeckle" naming was ambiguous; dropped the "Auto" prefix so
-// the toggle means what it says.
-document.getElementById('despeckle').onchange = function() {
-    const on = this.checked;
-    const slider = document.getElementById('despeckleSize');
-    slider.disabled = !on;
-    slider.style.opacity = on ? '1' : '0.4';
-    document.getElementById('despeckleSizeVal').style.opacity = on ? '1' : '0.4';
-    scheduleViewerUpdate();
-};
+// Sliders removed from panel — they now live in the viewer window.
+// The panel only keeps screen type + action buttons.
 
 // WHAT IT DOES: Collects the current UI state into a plain settings object.
 //   Validated here — Python receives the sanitized object via a JSON file.
+// WHAT IT DOES: Returns run settings. Sliders now live in the viewer — panel
+//   provides screen type and defaults for the initial cache run. Viewer-side
+//   sliders override these during live preview.
 function getSettings() {
-    const despill = parseFloat(document.getElementById('despill').value) / 100;
-    const refiner = parseFloat(document.getElementById('refiner').value) / 100;
-    const despeckleSize = parseInt(document.getElementById('despeckleSize').value, 10);
     return {
         screenType: document.getElementById('screenType').value === 'blue' ? 'blue' : 'green',
-        despill: isFinite(despill) && despill >= 0 && despill <= 1 ? despill : 0.5,
-        refiner: isFinite(refiner) && refiner >= 0 && refiner <= 1 ? refiner : 1.0,
-        despeckle: document.getElementById('despeckle').checked,
-        despeckleSize: isFinite(despeckleSize) && despeckleSize >= 50 && despeckleSize <= 2000 ? despeckleSize : 400
+        despill: 1.0,
+        refiner: 1.0,
+        despeckle: true,
+        despeckleSize: 400
     };
 }
 
