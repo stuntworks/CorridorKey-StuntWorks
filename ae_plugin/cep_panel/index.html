@@ -515,11 +515,21 @@ function scheduleViewerUpdate() {
 //   VIEWER_PROC. No-op if preview isn't active.
 // AFFECTS: rewrites fg.png + alpha.png in CURRENT_SESSION_DIR; kills and
 //   respawns VIEWER_PROC; writes live_params.json.
+let REKEY_BUSY = false;
+
 function rekeyWithCurrentSettings() {
     logLine('refiner onchange fired: LAST_FRAME_PNG=' + (LAST_FRAME_PNG ? 'set' : 'null') +
             ' CURRENT_SESSION_DIR=' + (CURRENT_SESSION_DIR ? 'set' : 'null') +
-            ' VIEWER_PROC=' + (VIEWER_PROC ? 'alive' : 'null'));
+            ' VIEWER_PROC=' + (VIEWER_PROC ? 'alive' : 'null') +
+            ' BUSY=' + REKEY_BUSY);
     if (!LAST_FRAME_PNG || !CURRENT_SESSION_DIR || !VIEWER_PROC) return;
+    if (REKEY_BUSY) {
+        // Drop overlapping releases — each re-key is an expensive NN pass and
+        // running multiple in parallel kills the viewer mid-render.
+        status('Re-key in progress, ignoring new refiner value');
+        return;
+    }
+    REKEY_BUSY = true;
     setBusy(true);
     document.getElementById('progress-bar').classList.add('indeterminate');
     status('Re-keying with new refiner...');
@@ -547,6 +557,7 @@ function rekeyWithCurrentSettings() {
     } finally {
         document.getElementById('progress-bar').classList.remove('indeterminate');
         setBusy(false);
+        REKEY_BUSY = false;
     }
 }
 
