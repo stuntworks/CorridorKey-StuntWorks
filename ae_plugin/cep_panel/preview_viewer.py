@@ -524,15 +524,31 @@ class PersistentWindow(QtWidgets.QWidget):
     # DEPENDS-ON: _render_now() for the actual work.
     # AFFECTS: self._params, self._pending, self._painting.
     @QtCore.Slot(dict)
+    def _tick_rekey_timer(self):
+        """Updates the overlay text with elapsed seconds during re-key."""
+        elapsed = time.perf_counter() - self._rekey_start
+        self._overlay.setText(f"Re-keying...  {elapsed:.1f}s")
+
     def on_update(self, params: dict):
         # Show/hide processing overlay for refiner re-key
         if params.get("rekeying") is True:
             self._overlay.setGeometry(0, 0, self.right_label.width(), self.right_label.height())
+            self._overlay.setText("Re-keying...")
             self._overlay.show()
             self._overlay.raise_()
+            self._rekey_start = time.perf_counter()
+            if not hasattr(self, '_rekey_timer'):
+                self._rekey_timer = QtCore.QTimer(self)
+                self._rekey_timer.setInterval(200)
+                self._rekey_timer.timeout.connect(self._tick_rekey_timer)
+            self._rekey_timer.start()
             return
         if params.get("rekeying") is False:
-            self._overlay.hide()
+            if hasattr(self, '_rekey_timer'):
+                self._rekey_timer.stop()
+            elapsed = time.perf_counter() - getattr(self, '_rekey_start', 0)
+            self._overlay.setText(f"Done  {elapsed:.1f}s")
+            QtCore.QTimer.singleShot(600, self._overlay.hide)
             # Panel signals cache is done — PNGs are fully written, safe to read.
             try:
                 self.session.reload_pngs()
