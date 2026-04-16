@@ -68,43 +68,85 @@ def _install_crash_diagnostics():
 _install_crash_diagnostics()
 
 
-# ===== Engine import =====
-# WHAT IT DOES: Imports the engine's color_utils module, trying a direct import first
-#   (assumes the launcher put the engine on sys.path) and falling back to resolving
-#   CORRIDORKEY_ROOT the same way CorridorKey_Pro.py does.
-# DEPENDS-ON: CORRIDORKEY_ROOT env var OR corridorkey_path.txt next to this script
-#   OR the sibling CorridorKey folder OR ~/CorridorKey.
-# AFFECTS: sys.path may gain the engine root.
+# ===== Lightweight color utils (no torch dependency) =====
+# WHAT IT DOES: Pure numpy/cv2 implementations of the 4 functions the viewer needs.
+#   Eliminates the 40-60 second torch import that happens when importing the engine's
+#   color_utils module. These are exact copies of the numpy code paths.
+# DEPENDS-ON: numpy, cv2 (already imported above).
+# AFFECTS: nothing — pure functions.
+class _ViewerColorUtils:
+    """Drop-in replacement for engine color_utils — numpy-only, zero torch."""
+
+    @staticmethod
+    def composite_straight(fg, bg, alpha):
+        """Composites straight FG over BG. Formula: FG * alpha + BG * (1 - alpha)."""
+        return fg * alpha + bg * (1.0 - alpha)
+
+    @staticmethod
+    def despill_opencv(image, green_limit_mode="average", strength=1.0):
+        """Removes green spill from an RGB float (0-1) image."""
+        if strength <= 0.0:
+            return image
+        r = image[..., 0]
+        g = image[..., 1]
+        b = image[..., 2]
+        if green_limit_mode == "max":
+            limit = np.maximum(r, b)
+        else:
+            limit = (r + b) / 2.0
+        spill_amount = np.maximum(g - limit, 0.0)
+        g_new = g - spill_amount
+        r_new = r + (spill_amount * 0.5)
+        b_new = b + (spill_amount * 0.5)
+        despilled = np.stack([r_new, g_new, b_new], axis=-1)
+        if strength < 1.0:
+            return image * (1.0 - strength) + despilled * strength
+        return despilled
+
+    @staticmethod
+    def clean_matte_opencv(alpha_np, area_threshold=300, dilation=15, blur_size=5):
+        """Removes small disconnected components from a predicted alpha matte."""
+        is_3d = False
+        if alpha_np.ndim == 3:
+            is_3d = True
+            alpha_np = alpha_np[:, :, 0]
+        mask_8u = (alpha_np > 0.5).astype(np.uint8) * 255
+        num_labels, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+            mask_8u, connectivity=8
+        )
+        cleaned_mask = np.zeros_like(mask_8u)
+        for i in range(1, num_labels):
+            if stats[i, cv2.CC_STAT_AREA] >= area_threshold:
+                cleaned_mask[labels == i] = 255
+        if dilation > 0:
+            kernel_size = int(dilation * 2 + 1)
+            kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)
+            )
+            cleaned_mask = cv2.dilate(cleaned_mask, kernel)
+        if blur_size > 0:
+            b_size = int(blur_size * 2 + 1)
+            cleaned_mask = cv2.GaussianBlur(cleaned_mask, (b_size, b_size), 0)
+        safe_zone = cleaned_mask.astype(np.float32) / 255.0
+        result_alpha = alpha_np * safe_zone
+        if is_3d:
+            result_alpha = result_alpha[:, :, np.newaxis]
+        return result_alpha
+
+    @staticmethod
+    def create_checkerboard(width, height, checker_size=64, color1=0.2, color2=0.4):
+        """Creates a linear grayscale checkerboard pattern. Returns [H,W,3] float."""
+        x_tiles = np.arange(width) // checker_size
+        y_tiles = np.arange(height) // checker_size
+        x_grid, y_grid = np.meshgrid(x_tiles, y_tiles)
+        checker = (x_grid + y_grid) % 2
+        bg_img = np.where(checker == 0, color1, color2).astype(np.float32)
+        return np.stack([bg_img, bg_img, bg_img], axis=-1)
+
+
 def _import_color_utils():
-    try:
-        from CorridorKeyModule.core import color_utils as cu  # type: ignore
-        return cu
-    except ImportError:
-        pass
-    script_dir = Path(__file__).parent
-    candidates = []
-    env_root = os.environ.get("CORRIDORKEY_ROOT")
-    if env_root:
-        candidates.append(Path(env_root))
-    for probe in (script_dir, script_dir.parent):
-        cfg = probe / "corridorkey_path.txt"
-        if cfg.exists():
-            try:
-                candidates.append(Path(cfg.read_text().strip()))
-            except Exception:
-                pass
-    candidates.append(script_dir.parent / "CorridorKey")
-    candidates.append(Path(r"D:\New AI Projects\CorridorKey"))
-    candidates.append(Path.home() / "CorridorKey")
-    for p in candidates:
-        if p and (p / "CorridorKeyModule" / "core" / "color_utils.py").is_file():
-            sys.path.insert(0, str(p))
-            from CorridorKeyModule.core import color_utils as cu  # type: ignore
-            return cu
-    raise ImportError(
-        "Could not locate CorridorKey engine. Set CORRIDORKEY_ROOT or place "
-        "corridorkey_path.txt next to preview_viewer.py."
-    )
+    """Returns lightweight viewer-local color utils. No torch import needed."""
+    return _ViewerColorUtils()
 
 
 # ===== Image helpers =====
@@ -464,80 +506,6 @@ class PersistentWindow(QtWidgets.QWidget):
         self._last_right_full = None
         self._place_original()
 
-        # ── Sliders — built into viewer so everything is one window ────
-        _slider_qss = (
-            "QSlider::groove:horizontal { height: 3px; background: #1e1e1e; "
-            "border-radius: 2px; } "
-            "QSlider::handle:horizontal { width: 12px; height: 12px; margin: -5px 0; "
-            "background: #00C853; border: 1px solid #333; border-radius: 6px; } "
-            "QSlider::sub-page:horizontal { background: #00C853; border-radius: 2px; } "
-            "QSlider::add-page:horizontal { background: #1e1e1e; border-radius: 2px; }"
-        )
-        _label_ss = "color: #888; border: none; background: transparent; font-size: 10px; font-weight: 600;"
-        _value_ss = ("color: #00C853; border: none; background: transparent; "
-                     "font-family: 'JetBrains Mono','SF Mono','Consolas',monospace; font-size: 11px;")
-
-        # Despill
-        ds_row = QtWidgets.QHBoxLayout()
-        ds_lbl = QtWidgets.QLabel("Despill")
-        ds_lbl.setStyleSheet(_label_ss)
-        ds_lbl.setFixedWidth(60)
-        self._despill_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self._despill_slider.setRange(0, 100)
-        self._despill_slider.setValue(int(self._params["despill"] * 100))
-        self._despill_slider.setStyleSheet(_slider_qss)
-        self._despill_val = QtWidgets.QLabel(f"{self._params['despill']:.2f}")
-        self._despill_val.setStyleSheet(_value_ss)
-        self._despill_val.setFixedWidth(36)
-        self._despill_val.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
-        ds_row.addWidget(ds_lbl)
-        ds_row.addWidget(self._despill_slider, 1)
-        ds_row.addWidget(self._despill_val)
-        layout.addLayout(ds_row)
-        self._despill_slider.valueChanged.connect(self._on_despill_changed)
-
-        # Refiner
-        rf_row = QtWidgets.QHBoxLayout()
-        rf_lbl = QtWidgets.QLabel("Refiner")
-        rf_lbl.setStyleSheet(_label_ss)
-        rf_lbl.setFixedWidth(60)
-        self._refiner_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self._refiner_slider.setRange(0, 100)
-        self._refiner_slider.setValue(100)
-        self._refiner_slider.setStyleSheet(_slider_qss)
-        self._refiner_val = QtWidgets.QLabel("1.00")
-        self._refiner_val.setStyleSheet(_value_ss)
-        self._refiner_val.setFixedWidth(36)
-        self._refiner_val.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
-        rf_row.addWidget(rf_lbl)
-        rf_row.addWidget(self._refiner_slider, 1)
-        rf_row.addWidget(self._refiner_val)
-        layout.addLayout(rf_row)
-        self._refiner_slider.valueChanged.connect(self._on_refiner_changed)
-        self._refiner_slider.sliderReleased.connect(self._on_refiner_released)
-
-        # Despeckle (checkbox + size slider)
-        dk_row = QtWidgets.QHBoxLayout()
-        self._despeckle_cb = QtWidgets.QCheckBox("Despeckle")
-        self._despeckle_cb.setChecked(bool(self._params.get("despeckle", True)))
-        self._despeckle_cb.setStyleSheet(
-            "color: #888; border: none; background: transparent; font-size: 10px; spacing: 4px;"
-        )
-        dk_row.addWidget(self._despeckle_cb)
-        self._despeckle_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self._despeckle_slider.setRange(50, 2000)
-        self._despeckle_slider.setValue(int(self._params.get("despeckleSize", 400)))
-        self._despeckle_slider.setStyleSheet(_slider_qss)
-        self._despeckle_val = QtWidgets.QLabel(str(int(self._params.get("despeckleSize", 400))))
-        self._despeckle_val.setStyleSheet(_value_ss)
-        self._despeckle_val.setFixedWidth(36)
-        self._despeckle_val.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
-        dk_row.addWidget(self._despeckle_slider, 1)
-        dk_row.addWidget(self._despeckle_val)
-        layout.addLayout(dk_row)
-        self._despeckle_slider.valueChanged.connect(self._on_despeckle_changed)
-        self._despeckle_cb.stateChanged.connect(self._on_despeckle_toggled)
-
         # Status bar — monospace readout
         self.status = QtWidgets.QLabel("Ready")
         self.status.setStyleSheet(
@@ -547,9 +515,9 @@ class PersistentWindow(QtWidgets.QWidget):
         )
         layout.addWidget(self.status)
 
-        # Default size — single pane, taller now with sliders
-        self.resize(self.disp_w + 24, self.disp_h + 220)
-        self.setMinimumSize(360, 380)
+        # Default size — single pane, compact
+        self.resize(self.disp_w + 24, self.disp_h + 140)
+        self.setMinimumSize(360, 300)
 
         # Highlight the default active mode button
         self._highlight_mode_button()
@@ -590,84 +558,6 @@ class PersistentWindow(QtWidgets.QWidget):
                 "border-radius: 12px; font-size: 10px;"
             )
         self._repaint_both()
-
-    # ===== Slider handlers (viewer-local, no IPC needed) =====
-    # WHAT IT DOES: Despill slider moved — update params + re-render instantly.
-    def _on_despill_changed(self, value):
-        v = value / 100.0
-        self._despill_val.setText(f"{v:.2f}")
-        self._params["despill"] = v
-        self._render_now()
-
-    # WHAT IT DOES: Refiner label updates during drag (no re-key until release).
-    def _on_refiner_changed(self, value):
-        self._refiner_val.setText(f"{value / 100.0:.2f}")
-
-    # WHAT IT DOES: Refiner released — runs full NN re-key via subprocess.
-    #   Uses source.png in session dir + current refiner value. Shows overlay.
-    # DEPENDS-ON: sys.executable, session_dir/source.png, ae_processor.py.
-    # AFFECTS: overwrites fg.png + alpha.png, reloads Session, hides overlay.
-    def _on_refiner_released(self):
-        source_png = self.session.session_dir / "source.png"
-        if not source_png.exists():
-            self.status.setText("No source.png — click PREVIEW FRAME first")
-            return
-        refiner_val = self._refiner_slider.value() / 100.0
-        # Show overlay
-        self._overlay.setGeometry(0, 0, self.right_label.width(), self.right_label.height())
-        self._overlay.setText("Re-keying...")
-        self._overlay.show()
-        self._overlay.raise_()
-        QtWidgets.QApplication.processEvents()
-        # Find ae_processor.py next to this script
-        script_dir = Path(__file__).resolve().parent
-        proc_script = script_dir / "ae_processor.py"
-        if not proc_script.exists():
-            self._overlay.hide()
-            self.status.setText(f"ae_processor.py not found at {script_dir}")
-            return
-        # Build params JSON
-        params = {
-            "screenType": "green",
-            "despill": self._params.get("despill", 1.0),
-            "refiner": refiner_val,
-            "despeckle": self._params.get("despeckle", True),
-            "despeckleSize": self._params.get("despeckleSize", 400),
-        }
-        params_path = self.session.session_dir / "rekey_params.json"
-        params_path.write_text(json.dumps(params), encoding="utf-8")
-        try:
-            import subprocess as _sp
-            _sp.run(
-                [sys.executable, str(proc_script), "cache",
-                 str(source_png), str(self.session.session_dir),
-                 "--params", str(params_path)],
-                check=True, capture_output=True,
-                env={**os.environ, "CORRIDORKEY_ROOT": os.environ.get("CORRIDORKEY_ROOT", "")},
-            )
-            self.session.reload_pngs()
-            self.original_u8 = np.clip(
-                self.session.fg_rgb * 255.0, 0, 255
-            ).astype(np.uint8)
-            self._place_original()
-            self._set_view_mode("Composite")
-        except Exception as e:
-            self.status.setText(f"Re-key failed: {e}")
-        finally:
-            self._overlay.hide()
-
-    # WHAT IT DOES: Despeckle size slider moved — update params + re-render.
-    def _on_despeckle_changed(self, value):
-        self._despeckle_val.setText(str(value))
-        self._params["despeckleSize"] = value
-        self._render_now()
-
-    # WHAT IT DOES: Despeckle checkbox toggled — update params + re-render.
-    def _on_despeckle_toggled(self, state):
-        on = state == QtCore.Qt.Checked.value if hasattr(QtCore.Qt.Checked, 'value') else bool(state)
-        self._params["despeckle"] = on
-        self._despeckle_slider.setEnabled(on)
-        self._render_now()
 
     # ===== Commands from stdin =====
     # WHAT IT DOES: Merges incoming params into the live params dict, then schedules
@@ -1072,21 +962,45 @@ class OneShotWindow(QtWidgets.QWidget):
 
 
 _DARK_STYLE = """
+/* ── CorridorKey Honeycomb Theme (Qt viewer) ── */
 QWidget {
-    background-color: #141414;
+    background-color: #000;
     color: #e8e8e8;
     font-family: 'Inter', 'SF Pro Display', 'Segoe UI', sans-serif;
+    font-size: 13px;
 }
 QPushButton {
-    border: none; border-radius: 12px; font-weight: 600;
-    font-size: 11px; padding: 5px 14px;
-    background-color: #1e1e1e; color: #888;
+    border: 1px solid rgba(0,255,255,0.2); border-radius: 6px;
+    font-weight: 600; font-size: 13px; padding: 6px 16px;
+    background-color: rgba(0,20,40,0.4); color: #0ff;
 }
-QPushButton:hover { background-color: #282828; color: #e8e8e8; }
-QPushButton[active="true"] { color: #fff; }
+QPushButton:hover {
+    background-color: rgba(0,255,255,0.15); color: #fff;
+    border-color: rgba(0,255,255,0.4);
+}
+QPushButton:checked, QPushButton[active="true"] {
+    background-color: rgba(0,255,255,0.25); color: #fff;
+    border-color: #0ff;
+}
 QLabel {
-    background-color: #000; border: 1px solid #1e1e1e;
+    background-color: #000; border: 1px solid rgba(0,255,255,0.08);
     border-radius: 2px;
+}
+QSlider::groove:horizontal {
+    height: 4px; background: rgba(0,20,40,0.5); border-radius: 2px;
+}
+QSlider::handle:horizontal {
+    width: 14px; height: 14px; margin: -5px 0;
+    background: #000; border: 2px solid #0ff; border-radius: 7px;
+}
+QSlider::handle:horizontal:hover {
+    border-color: #0ff;
+}
+QSlider::sub-page:horizontal {
+    background: #0ff; border-radius: 2px;
+}
+QSlider::add-page:horizontal {
+    background: rgba(0,20,40,0.5); border-radius: 2px;
 }
 """
 
