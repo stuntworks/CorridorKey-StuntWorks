@@ -9,41 +9,107 @@
     <meta charset="UTF-8">
     <title>CorridorKey StuntWorks</title>
     <style>
+        /* ── CorridorKey StuntWorks — Cinematic Dark Theme ──────────── */
         * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { font-family: 'Segoe UI', Arial, sans-serif; background: #232323; color: #e0e0e0;
-               padding: 15px; font-size: 12px; overflow-y: auto; }
-        h1 { color: #4CAF50; font-size: 16px; text-align: center; margin-bottom: 2px; }
-        .credit { text-align: center; font-size: 9px; color: #777; margin-bottom: 12px; }
-        .credit a { color: #999; text-decoration: none; }
-        .credit a:hover { color: #4CAF50; }
-        .section { margin-bottom: 12px; }
-        label { display: block; margin-bottom: 5px; color: #aaa; }
-        select, input[type="range"] { width: 100%; padding: 8px; background: #333;
-            border: 1px solid #444; color: #fff; border-radius: 4px; }
-        input[type="range"] { padding: 0; height: 20px; }
-        .slider-row { display: flex; align-items: center; gap: 10px; }
+        body {
+            font-family: 'Inter', 'SF Pro Display', 'Segoe UI', sans-serif;
+            background: #141414; color: #e8e8e8;
+            padding: 8px; font-size: 11px; overflow-y: auto;
+        }
+        h1 {
+            color: #00C853; font-size: 13px; text-align: center;
+            text-transform: uppercase; letter-spacing: 1.5px;
+            margin-bottom: 1px; font-weight: 700;
+        }
+        .credit { text-align: center; font-size: 8px; color: #555; margin-bottom: 8px; }
+        .credit a { color: #666; text-decoration: none; }
+        .credit a:hover { color: #00C853; }
+        .section { margin-bottom: 8px; }
+        label {
+            display: block; margin-bottom: 3px; color: #888;
+            font-size: 10px; font-weight: 600; letter-spacing: 0.3px;
+        }
+        select {
+            width: 100%; padding: 6px 8px; background: #1e1e1e;
+            border: 1px solid #333; color: #e8e8e8; border-radius: 4px;
+            font-size: 10px; outline: none;
+        }
+        select:focus { border-color: #00C853; }
+
+        /* ── Sliders — precision instrument look ───────────────────── */
+        input[type="range"] {
+            -webkit-appearance: none; appearance: none;
+            width: 100%; height: 14px; background: transparent;
+            margin: 2px 0; cursor: pointer;
+        }
+        input[type="range"]::-webkit-slider-runnable-track {
+            height: 3px; border-radius: 2px;
+            background: linear-gradient(to right, #00C853 0%, #00C853 var(--fill, 50%), #1e1e1e var(--fill, 50%), #1e1e1e 100%);
+        }
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none; appearance: none;
+            width: 12px; height: 12px; border-radius: 50%;
+            background: #00C853; border: 1px solid #333;
+            margin-top: -5px; transition: transform 0.1s, box-shadow 0.2s;
+        }
+        input[type="range"]:hover::-webkit-slider-thumb {
+            transform: scale(1.2);
+            box-shadow: 0 0 8px rgba(0,200,83,0.4);
+        }
+        input[type="range"]:active::-webkit-slider-thumb {
+            box-shadow: 0 0 12px rgba(0,200,83,0.6);
+        }
+        .slider-row { display: flex; align-items: center; gap: 6px; }
         .slider-row input { flex: 1; }
-        .slider-value { width: 40px; text-align: right; color: #4CAF50; }
-        .checkbox-row { display: flex; align-items: center; gap: 8px; margin: 10px 0; }
-        button { width: 100%; padding: 12px; margin: 5px 0; border: none; border-radius: 4px;
-            font-size: 13px; font-weight: bold; cursor: pointer; transition: background 0.2s; }
-        button:disabled { opacity: 0.5; cursor: not-allowed; }
-        .btn-process { background: #4CAF50; color: white; }
-        .btn-process:hover:enabled { background: #45a049; }
-        .btn-preview { background: #9C27B0; color: white; }
-        .btn-preview:hover:enabled { background: #7B1FA2; }
-        .btn-batch { background: #2196F3; color: white; }
-        .btn-batch:hover:enabled { background: #1976D2; }
-        #preview-container { margin-top: 10px; text-align: center; background: #1a1a1a;
-            border-radius: 4px; min-height: 40px; overflow: hidden; }
-        #preview-container img { width: 48%; display: inline-block; border-radius: 4px; margin: 1%; }
-        #preview-label { color: #666; font-size: 10px; padding: 12px; }
-        #status { text-align: center; padding: 8px; margin-top: 8px; background: #1a1a1a;
-            border-radius: 4px; color: #0ff; font-weight: bold; font-size: 11px; }
-        #progress-bar { margin-top: 6px; height: 6px; background: #111; border-radius: 3px; overflow: hidden; display: none; position: relative; }
-        #progress-fill { height: 100%; width: 0%; background: #2196F3; transition: width 0.2s; }
-        /* Indeterminate mode — animated stripe for "something is happening" when
-           we don't have a percentage to show (PREVIEW FRAME cache phase). */
+        .slider-value {
+            width: 36px; text-align: right; color: #00C853;
+            font-family: 'JetBrains Mono', 'SF Mono', 'Consolas', monospace;
+            font-size: 11px; font-weight: 500;
+        }
+        .checkbox-row { display: flex; align-items: center; gap: 6px; margin: 4px 0; }
+
+        /* ── Buttons — premium feel ────────────────────────────────── */
+        button {
+            width: 100%; padding: 8px; margin: 3px 0; border: none;
+            border-radius: 6px; font-size: 10px; font-weight: 700;
+            cursor: pointer; text-transform: uppercase; letter-spacing: 0.8px;
+            transition: all 0.15s ease;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+        }
+        button:hover:enabled { transform: translateY(-1px); box-shadow: 0 4px 8px rgba(0,0,0,0.4); }
+        button:active:enabled { transform: translateY(0); box-shadow: 0 1px 2px rgba(0,0,0,0.3); }
+        button:disabled { opacity: 0.35; cursor: not-allowed; transform: none; box-shadow: none; }
+        .btn-preview { background: #9C27B0; color: #fff; }
+        .btn-preview:hover:enabled { background: #AB47BC; box-shadow: 0 4px 12px rgba(156,39,176,0.3); }
+        .btn-process { background: #00C853; color: #141414; }
+        .btn-process:hover:enabled { background: #00E676; box-shadow: 0 4px 12px rgba(0,200,83,0.3); }
+        .btn-batch { background: #2979FF; color: #fff; }
+        .btn-batch:hover:enabled { background: #448AFF; box-shadow: 0 4px 12px rgba(41,121,255,0.3); }
+
+        /* ── Preview container ─────────────────────────────────────── */
+        #preview-container {
+            margin-top: 6px; text-align: center; background: #0a0a0a;
+            border-radius: 4px; min-height: 30px; overflow: hidden;
+            border: 1px solid #1e1e1e;
+        }
+        #preview-container img { width: 48%; display: inline-block; border-radius: 2px; margin: 1%; }
+        #preview-label { color: #444; font-size: 9px; padding: 10px; }
+
+        /* ── Status bar ────────────────────────────────────────────── */
+        #status {
+            text-align: center; padding: 4px; margin-top: 4px;
+            background: #0a0a0a; border: 1px solid #1e1e1e;
+            border-radius: 4px; color: #00C853; font-weight: 600;
+            font-family: 'JetBrains Mono', 'SF Mono', 'Consolas', monospace;
+            font-size: 9px; letter-spacing: 0.3px;
+        }
+
+        /* ── Progress bar ──────────────────────────────────────────── */
+        #progress-bar {
+            margin-top: 4px; height: 3px; background: #0a0a0a;
+            border-radius: 2px; overflow: hidden; display: none; position: relative;
+        }
+        #progress-fill { height: 100%; width: 0%; background: #00C853; transition: width 0.2s; }
         #progress-bar.indeterminate #progress-fill { display: none; }
         #progress-bar.indeterminate::before {
             content: ''; position: absolute; top: 0; left: -40%; height: 100%; width: 40%;
@@ -54,9 +120,16 @@
             0%   { left: -40%; }
             100% { left: 100%; }
         }
-        #log { background: #111; color: #0f0; font-family: monospace; font-size: 10px;
-            padding: 8px; margin-top: 8px; height: 80px; overflow-y: auto; border-radius: 4px; }
-        .log-err { color: #f66; }
+
+        /* ── Log ───────────────────────────────────────────────────── */
+        #log {
+            background: #0a0a0a; color: #00C853;
+            font-family: 'JetBrains Mono', 'SF Mono', 'Consolas', monospace;
+            font-size: 8px; padding: 6px; margin-top: 4px;
+            height: 54px; overflow-y: auto; border-radius: 4px;
+            border: 1px solid #1e1e1e;
+        }
+        .log-err { color: #FF3D00; }
     </style>
 </head>
 <body>
@@ -71,7 +144,7 @@
     </div>
 
     <div class="section">
-        <label>Screen Type</label>
+        <label>Screen</label>
         <select id="screenType">
             <option value="green">Green Screen</option>
             <option value="blue">Blue Screen</option>
@@ -87,7 +160,7 @@
     </div>
 
     <div class="section">
-        <label>Edge Refiner</label>
+        <label>Refiner</label>
         <div class="slider-row">
             <input type="range" id="refiner" min="0" max="100" value="100">
             <span class="slider-value" id="refinerVal">1.00</span>
@@ -106,7 +179,7 @@
     </div>
 
     <div class="section">
-        <label>Output Folder</label>
+        <label>Output</label>
         <div style="display:flex;gap:5px;">
             <input type="text" id="outputPath" readonly style="flex:1;padding:6px;background:#333;border:1px solid #444;color:#fff;border-radius:4px;font-size:11px;">
             <button onclick="browseOutput()" style="width:auto;padding:6px 12px;margin:0;background:#555;font-size:11px;">Browse</button>
@@ -518,10 +591,6 @@ function scheduleViewerUpdate() {
 let REKEY_BUSY = false;
 
 function rekeyWithCurrentSettings() {
-    logLine('refiner onchange fired: LAST_FRAME_PNG=' + (LAST_FRAME_PNG ? 'set' : 'null') +
-            ' CURRENT_SESSION_DIR=' + (CURRENT_SESSION_DIR ? 'set' : 'null') +
-            ' VIEWER_PROC=' + (VIEWER_PROC ? 'alive' : 'null') +
-            ' BUSY=' + REKEY_BUSY);
     if (!LAST_FRAME_PNG || !CURRENT_SESSION_DIR || !VIEWER_PROC) return;
     if (REKEY_BUSY) {
         // Drop overlapping releases — each re-key is an expensive NN pass and
@@ -536,13 +605,13 @@ function rekeyWithCurrentSettings() {
     try {
         const settings = getSettings();
         const paramsPath = writeParamsFile(settings);
+        // Signal viewer to show processing overlay before the NN runs.
+        sendToViewer({ cmd: 'update', rekeying: true });
         runPython(['cache', LAST_FRAME_PNG, CURRENT_SESSION_DIR, '--params', paramsPath]);
-        // Viewer has a fg.png mtime watcher — when cache finishes writing the
-        // new neural-net output, the viewer reloads Session in place and
-        // re-renders. No kill+respawn, no window flash. Also bump live_params
-        // so post-proc sliders apply to the refreshed fg/alpha.
+        // Viewer's fg.png mtime watcher reloads Session in place and hides
+        // the overlay. Also bump live_params so post-proc sliders apply.
         sendToViewer({
-            cmd: 'update',
+            cmd: 'update', rekeying: false,
             despill: settings.despill,
             despeckle: settings.despeckle,
             despeckleSize: settings.despeckleSize,
