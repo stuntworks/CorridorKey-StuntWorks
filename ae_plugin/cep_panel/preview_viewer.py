@@ -464,6 +464,80 @@ class PersistentWindow(QtWidgets.QWidget):
         self._last_right_full = None
         self._place_original()
 
+        # ── Sliders — built into viewer so everything is one window ────
+        _slider_qss = (
+            "QSlider::groove:horizontal { height: 3px; background: #1e1e1e; "
+            "border-radius: 2px; } "
+            "QSlider::handle:horizontal { width: 12px; height: 12px; margin: -5px 0; "
+            "background: #00C853; border: 1px solid #333; border-radius: 6px; } "
+            "QSlider::sub-page:horizontal { background: #00C853; border-radius: 2px; } "
+            "QSlider::add-page:horizontal { background: #1e1e1e; border-radius: 2px; }"
+        )
+        _label_ss = "color: #888; border: none; background: transparent; font-size: 10px; font-weight: 600;"
+        _value_ss = ("color: #00C853; border: none; background: transparent; "
+                     "font-family: 'JetBrains Mono','SF Mono','Consolas',monospace; font-size: 11px;")
+
+        # Despill
+        ds_row = QtWidgets.QHBoxLayout()
+        ds_lbl = QtWidgets.QLabel("Despill")
+        ds_lbl.setStyleSheet(_label_ss)
+        ds_lbl.setFixedWidth(60)
+        self._despill_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self._despill_slider.setRange(0, 100)
+        self._despill_slider.setValue(int(self._params["despill"] * 100))
+        self._despill_slider.setStyleSheet(_slider_qss)
+        self._despill_val = QtWidgets.QLabel(f"{self._params['despill']:.2f}")
+        self._despill_val.setStyleSheet(_value_ss)
+        self._despill_val.setFixedWidth(36)
+        self._despill_val.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        ds_row.addWidget(ds_lbl)
+        ds_row.addWidget(self._despill_slider, 1)
+        ds_row.addWidget(self._despill_val)
+        layout.addLayout(ds_row)
+        self._despill_slider.valueChanged.connect(self._on_despill_changed)
+
+        # Refiner
+        rf_row = QtWidgets.QHBoxLayout()
+        rf_lbl = QtWidgets.QLabel("Refiner")
+        rf_lbl.setStyleSheet(_label_ss)
+        rf_lbl.setFixedWidth(60)
+        self._refiner_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self._refiner_slider.setRange(0, 100)
+        self._refiner_slider.setValue(100)
+        self._refiner_slider.setStyleSheet(_slider_qss)
+        self._refiner_val = QtWidgets.QLabel("1.00")
+        self._refiner_val.setStyleSheet(_value_ss)
+        self._refiner_val.setFixedWidth(36)
+        self._refiner_val.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        rf_row.addWidget(rf_lbl)
+        rf_row.addWidget(self._refiner_slider, 1)
+        rf_row.addWidget(self._refiner_val)
+        layout.addLayout(rf_row)
+        self._refiner_slider.valueChanged.connect(self._on_refiner_changed)
+        self._refiner_slider.sliderReleased.connect(self._on_refiner_released)
+
+        # Despeckle (checkbox + size slider)
+        dk_row = QtWidgets.QHBoxLayout()
+        self._despeckle_cb = QtWidgets.QCheckBox("Despeckle")
+        self._despeckle_cb.setChecked(bool(self._params.get("despeckle", True)))
+        self._despeckle_cb.setStyleSheet(
+            "color: #888; border: none; background: transparent; font-size: 10px; spacing: 4px;"
+        )
+        dk_row.addWidget(self._despeckle_cb)
+        self._despeckle_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self._despeckle_slider.setRange(50, 2000)
+        self._despeckle_slider.setValue(int(self._params.get("despeckleSize", 400)))
+        self._despeckle_slider.setStyleSheet(_slider_qss)
+        self._despeckle_val = QtWidgets.QLabel(str(int(self._params.get("despeckleSize", 400))))
+        self._despeckle_val.setStyleSheet(_value_ss)
+        self._despeckle_val.setFixedWidth(36)
+        self._despeckle_val.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        dk_row.addWidget(self._despeckle_slider, 1)
+        dk_row.addWidget(self._despeckle_val)
+        layout.addLayout(dk_row)
+        self._despeckle_slider.valueChanged.connect(self._on_despeckle_changed)
+        self._despeckle_cb.stateChanged.connect(self._on_despeckle_toggled)
+
         # Status bar — monospace readout
         self.status = QtWidgets.QLabel("Ready")
         self.status.setStyleSheet(
@@ -473,9 +547,9 @@ class PersistentWindow(QtWidgets.QWidget):
         )
         layout.addWidget(self.status)
 
-        # Default size — single pane, compact
-        self.resize(self.disp_w + 24, self.disp_h + 140)
-        self.setMinimumSize(360, 300)
+        # Default size — single pane, taller now with sliders
+        self.resize(self.disp_w + 24, self.disp_h + 220)
+        self.setMinimumSize(360, 380)
 
         # Highlight the default active mode button
         self._highlight_mode_button()
@@ -516,6 +590,84 @@ class PersistentWindow(QtWidgets.QWidget):
                 "border-radius: 12px; font-size: 10px;"
             )
         self._repaint_both()
+
+    # ===== Slider handlers (viewer-local, no IPC needed) =====
+    # WHAT IT DOES: Despill slider moved — update params + re-render instantly.
+    def _on_despill_changed(self, value):
+        v = value / 100.0
+        self._despill_val.setText(f"{v:.2f}")
+        self._params["despill"] = v
+        self._render_now()
+
+    # WHAT IT DOES: Refiner label updates during drag (no re-key until release).
+    def _on_refiner_changed(self, value):
+        self._refiner_val.setText(f"{value / 100.0:.2f}")
+
+    # WHAT IT DOES: Refiner released — runs full NN re-key via subprocess.
+    #   Uses source.png in session dir + current refiner value. Shows overlay.
+    # DEPENDS-ON: sys.executable, session_dir/source.png, ae_processor.py.
+    # AFFECTS: overwrites fg.png + alpha.png, reloads Session, hides overlay.
+    def _on_refiner_released(self):
+        source_png = self.session.session_dir / "source.png"
+        if not source_png.exists():
+            self.status.setText("No source.png — click PREVIEW FRAME first")
+            return
+        refiner_val = self._refiner_slider.value() / 100.0
+        # Show overlay
+        self._overlay.setGeometry(0, 0, self.right_label.width(), self.right_label.height())
+        self._overlay.setText("Re-keying...")
+        self._overlay.show()
+        self._overlay.raise_()
+        QtWidgets.QApplication.processEvents()
+        # Find ae_processor.py next to this script
+        script_dir = Path(__file__).resolve().parent
+        proc_script = script_dir / "ae_processor.py"
+        if not proc_script.exists():
+            self._overlay.hide()
+            self.status.setText(f"ae_processor.py not found at {script_dir}")
+            return
+        # Build params JSON
+        params = {
+            "screenType": "green",
+            "despill": self._params.get("despill", 1.0),
+            "refiner": refiner_val,
+            "despeckle": self._params.get("despeckle", True),
+            "despeckleSize": self._params.get("despeckleSize", 400),
+        }
+        params_path = self.session.session_dir / "rekey_params.json"
+        params_path.write_text(json.dumps(params), encoding="utf-8")
+        try:
+            import subprocess as _sp
+            _sp.run(
+                [sys.executable, str(proc_script), "cache",
+                 str(source_png), str(self.session.session_dir),
+                 "--params", str(params_path)],
+                check=True, capture_output=True,
+                env={**os.environ, "CORRIDORKEY_ROOT": os.environ.get("CORRIDORKEY_ROOT", "")},
+            )
+            self.session.reload_pngs()
+            self.original_u8 = np.clip(
+                self.session.fg_rgb * 255.0, 0, 255
+            ).astype(np.uint8)
+            self._place_original()
+            self._set_view_mode("Composite")
+        except Exception as e:
+            self.status.setText(f"Re-key failed: {e}")
+        finally:
+            self._overlay.hide()
+
+    # WHAT IT DOES: Despeckle size slider moved — update params + re-render.
+    def _on_despeckle_changed(self, value):
+        self._despeckle_val.setText(str(value))
+        self._params["despeckleSize"] = value
+        self._render_now()
+
+    # WHAT IT DOES: Despeckle checkbox toggled — update params + re-render.
+    def _on_despeckle_toggled(self, state):
+        on = state == QtCore.Qt.Checked.value if hasattr(QtCore.Qt.Checked, 'value') else bool(state)
+        self._params["despeckle"] = on
+        self._despeckle_slider.setEnabled(on)
+        self._render_now()
 
     # ===== Commands from stdin =====
     # WHAT IT DOES: Merges incoming params into the live params dict, then schedules
