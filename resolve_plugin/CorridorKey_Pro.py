@@ -118,7 +118,7 @@ def _save_output_path(p):
     except: pass
 
 winLayout = ui.VGroup({"Spacing": 14}, [
-    ui.Label({"Text": "CorridorKey Pro", "Weight": 0, "Alignment": {"AlignHCenter": True}, "Font": ui.Font({"PixelSize": 16, "Bold": True}), "StyleSheet": "color: #4CAF50;"}),
+    ui.Label({"Text": "CorridorKey Pro", "Weight": 0, "Alignment": {"AlignHCenter": True}, "Font": ui.Font({"PixelSize": 16, "Bold": True}), "StyleSheet": "color: #6ab;"}),
     ui.HGroup({"Weight": 0, "Spacing": 5}, [
         ui.Label({"Text": "Alpha Method:", "Weight": 0}),
         ui.ComboBox({"ID": "AlphaMethod", "Weight": 2}),
@@ -156,39 +156,39 @@ winLayout = ui.VGroup({"Spacing": 14}, [
         ui.Button({"ID": "BrowseOutput", "Text": "...", "Weight": 0}),
     ]),
     ui.VGap(2),
-    ui.Label({"Text": "Frame Range:", "Weight": 0, "StyleSheet": "color: #FF9800; font-weight: bold;"}),
+    ui.Label({"Text": "Frame Range:", "Weight": 0, "StyleSheet": "color: #0ff; font-weight: bold;"}),
     ui.HGroup({"Weight": 0, "Spacing": 5}, [
-        ui.Button({"ID": "SetInPoint", "Text": "IN", "Weight": 1, "StyleSheet": "QPushButton { background-color: #2196F3; color: white; border-radius: 4px; padding: 4px; }"}),
-        ui.Label({"ID": "InPointLabel", "Text": "---", "Weight": 0, "StyleSheet": "color: #2196F3;"}),
-        ui.Button({"ID": "SetOutPoint", "Text": "OUT", "Weight": 1, "StyleSheet": "QPushButton { background-color: #2196F3; color: white; border-radius: 4px; padding: 4px; }"}),
-        ui.Label({"ID": "OutPointLabel", "Text": "---", "Weight": 0, "StyleSheet": "color: #2196F3;"}),
-        ui.Button({"ID": "ClearRange", "Text": "Clear", "Weight": 1, "StyleSheet": "QPushButton { background-color: #607D8B; color: white; border-radius: 4px; padding: 4px; }"}),
+        ui.Button({"ID": "SetInPoint", "Text": "IN", "Weight": 1, "StyleSheet": "QPushButton { background-color: #3a5a6a; color: #7ab; border-radius: 4px; padding: 4px; font-weight: bold; }"}),
+        ui.Label({"ID": "InPointLabel", "Text": "---", "Weight": 0, "StyleSheet": "color: #7ab;"}),
+        ui.Button({"ID": "SetOutPoint", "Text": "OUT", "Weight": 1, "StyleSheet": "QPushButton { background-color: #3a5a6a; color: #7ab; border-radius: 4px; padding: 4px; font-weight: bold; }"}),
+        ui.Label({"ID": "OutPointLabel", "Text": "---", "Weight": 0, "StyleSheet": "color: #7ab;"}),
+        ui.Button({"ID": "ClearRange", "Text": "Clear", "Weight": 1, "StyleSheet": "QPushButton { background-color: #222; color: #667; border-radius: 4px; padding: 4px; }"}),
     ]),
     ui.HGroup({"Weight": 0}, [
         ui.CheckBox({"ID": "DisableTrack1", "Text": "Disable source clip after processing", "Checked": True}),
     ]),
     ui.HGroup({"Weight": 0}, [
-        ui.CheckBox({"ID": "LivePreview", "Text": "Live Preview on slider change", "Checked": False, "StyleSheet": "color: #FF9800;"}),
+        ui.CheckBox({"ID": "LivePreview", "Text": "Live Preview on slider change", "Checked": False, "StyleSheet": "color: #0ff;"}),
     ]),
     ui.VGap(2),
     ui.Label({"ID": "Status", "Text": "Ready", "Weight": 0, "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #0FF; font-size: 14px; font-weight: bold;"}),
     ui.VGap(2),
     ui.HGroup({"Weight": 0, "Spacing": 5}, [
-        ui.Button({"ID": "SAMClickMask", "Text": "SAM MASK", "Weight": 1, "StyleSheet": "QPushButton { background-color: #E91E63; color: white; font-weight: bold; border-radius: 5px; padding: 6px; }"}),
-        ui.Button({"ID": "ShowPreview", "Text": "PREVIEW", "Weight": 1, "StyleSheet": "QPushButton { background-color: #9C27B0; color: white; font-weight: bold; border-radius: 5px; padding: 6px; }"}),
-        ui.Button({"ID": "ProcessFrame", "Text": "SINGLE FRAME", "Weight": 1, "StyleSheet": "QPushButton { background-color: #2196F3; color: white; font-weight: bold; border-radius: 5px; padding: 6px; }"}),
+        ui.Button({"ID": "SAMClickMask", "Text": "SAM MASK", "Weight": 1, "StyleSheet": "QPushButton { background-color: #4a3a1a; color: #da5; font-weight: bold; border-radius: 5px; padding: 6px; border: 1px solid #da5; }"}),
+        ui.Button({"ID": "ShowPreview", "Text": "PREVIEW", "Weight": 1, "StyleSheet": "QPushButton { background-color: #1a3a4a; color: #5df; font-weight: bold; border-radius: 5px; padding: 6px; border: 1px solid #5df; }"}),
+        ui.Button({"ID": "ProcessFrame", "Text": "SINGLE FRAME", "Weight": 1, "StyleSheet": "QPushButton { background-color: #1a3a5a; color: #5af; font-weight: bold; border-radius: 5px; padding: 6px; border: 1px solid #5af; }"}),
     ]),
     ui.VGap(2),
-    ui.Button({"ID": "ProcessRange", "Text": "PROCESS RANGE", "Weight": 0, "StyleSheet": "QPushButton { background-color: #4CAF50; color: white; font-size: 15px; font-weight: bold; border-radius: 6px; padding: 10px; }"}),
-    ui.Button({"ID": "Cancel", "Text": "CANCEL", "Weight": 0, "StyleSheet": "QPushButton { background-color: #f44336; color: white; font-weight: bold; border-radius: 5px; padding: 4px; }"}),
+    ui.Button({"ID": "ProcessRange", "Text": "PROCESS RANGE", "Weight": 0, "StyleSheet": "QPushButton { background-color: #1a4a2a; color: #5b5; font-size: 15px; font-weight: bold; border-radius: 6px; padding: 10px; border: 1px solid #5b5; }"}),
+    ui.Button({"ID": "Cancel", "Text": "CANCEL", "Weight": 0, "StyleSheet": "QPushButton { background-color: #4a1a1a; color: #f66; font-weight: bold; border-radius: 5px; padding: 4px; border: 1px solid #f66; }"}),
     ui.VGap(2),
     ui.HGroup({"Weight": 0, "Spacing": 5}, [
-        ui.Button({"ID": "ToggleTrack1", "Text": "TOGGLE TRACK 1", "Weight": 1, "StyleSheet": "QPushButton { background-color: #607D8B; color: white; border-radius: 4px; padding: 3px; }"}),
-        ui.Button({"ID": "OpenFusion", "Text": "OPEN FUSION", "Weight": 1, "StyleSheet": "QPushButton { background-color: #FF9800; color: white; border-radius: 4px; padding: 3px; }"}),
+        ui.Button({"ID": "ToggleTrack1", "Text": "TOGGLE TRACK 1", "Weight": 1, "StyleSheet": "QPushButton { background-color: #222; color: #667; border-radius: 4px; padding: 3px; }"}),
+        ui.Button({"ID": "OpenFusion", "Text": "OPEN FUSION", "Weight": 1, "StyleSheet": "QPushButton { background-color: #3a3a1a; color: #a85; border-radius: 4px; padding: 3px; border: 1px solid #a85; }"}),
     ]),
     ui.VGap(2),
-    ui.TextEdit({"ID": "Log", "ReadOnly": True, "Weight": 3, "StyleSheet": "background: #111; color: #0f0; font-family: monospace; font-size: 10px; border-radius: 4px;"}),
-    ui.Button({"ID": "AboutBtn", "Text": "About", "Weight": 0, "StyleSheet": "QPushButton { background-color: #333; color: #999; font-size: 11px; border-radius: 4px; padding: 2px; }"}),
+    ui.TextEdit({"ID": "Log", "ReadOnly": True, "Weight": 3, "StyleSheet": "background: #111; color: #0ff; font-family: monospace; font-size: 10px; border-radius: 4px; border: 1px solid #222;"}),
+    ui.Button({"ID": "AboutBtn", "Text": "About", "Weight": 0, "StyleSheet": "QPushButton { background-color: #222; color: #556; font-size: 11px; border-radius: 4px; padding: 2px; }"}),
 ])
 
 win = disp.AddWindow({"ID": "CK", "WindowTitle": "CorridorKey Pro", "Geometry": [100, 50, 500, 750]}, winLayout)
