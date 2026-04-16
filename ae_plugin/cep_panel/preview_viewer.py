@@ -187,6 +187,29 @@ class Session:
     def shape_hw(self):
         return self.fg_rgb.shape[:2]
 
+    # WHAT IT DOES: Re-reads fg.png + alpha.png from disk and updates self.fg_rgb
+    #   and self.alpha in place. Called when the panel re-runs stage-1 (refiner
+    #   change) so the viewer picks up the new neural-net output without a
+    #   process restart.
+    # DEPENDS-ON: session_dir/fg.png and alpha.png existing and being readable.
+    # AFFECTS: self.fg_rgb, self.alpha. Raises if files are missing or unreadable
+    #   (caller retries on next poll tick).
+    def reload_pngs(self):
+        fg_bgr = _read_png_any_depth(self.session_dir / "fg.png")
+        if fg_bgr is None:
+            raise IOError("fg.png unreadable")
+        fg_rgb = cv2.cvtColor(_to_float01(fg_bgr), cv2.COLOR_BGR2RGB)
+        alpha_img = _read_png_any_depth(self.session_dir / "alpha.png")
+        if alpha_img is None:
+            raise IOError("alpha.png unreadable")
+        if alpha_img.ndim == 3:
+            alpha_img = cv2.cvtColor(alpha_img, cv2.COLOR_BGR2GRAY)
+        alpha = _to_float01(alpha_img)
+        # Only assign after both reads succeed so a partial write doesn't leave
+        # the viewer in an inconsistent state.
+        self.fg_rgb = fg_rgb
+        self.alpha = alpha
+
 
 # ===== Post-processing pipeline =====
 # WHAT IT DOES: Applies stage-2 post-proc (despill + despeckle) against the cached
@@ -307,6 +330,11 @@ class PersistentWindow(QtWidgets.QWidget):
         # in Node's internal buffer and never reached the Python child).
         self._live_params_path = self.session.session_dir / "live_params.json"
         self._live_params_mtime = 0.0
+        self._fg_png_path = self.session.session_dir / "fg.png"
+        try:
+            self._fg_png_mtime = self._fg_png_path.stat().st_mtime
+        except OSError:
+            self._fg_png_mtime = 0.0
         self._live_watcher = QtCore.QTimer(self)
         self._live_watcher.setInterval(50)
         self._live_watcher.timeout.connect(self._poll_live_params)
@@ -319,6 +347,32 @@ class PersistentWindow(QtWidgets.QWidget):
     #   session_dir being the same one passed on --session.
     # AFFECTS: self._live_params_mtime, self._params (via on_update).
     def _poll_live_params(self):
+        # First check if stage-1 output changed (refiner re-key case) and reload
+        # the Session PNGs in place. No process restart = no window flash.
+        try:
+            fg_mt = self._fg_png_path.stat().st_mtime
+            if fg_mt != self._fg_png_mtime:
+                self._fg_png_mtime = fg_mt
+                try:
+                    self.session.reload_pngs()
+                    # Refresh the static Original pane with the new fg_rgb.
+                    self.original_u8 = np.clip(
+                        self.session.fg_rgb * 255.0, 0, 255
+                    ).astype(np.uint8)
+                    print(
+                        f"[VIEWER] fg.png reloaded (refiner re-key), re-rendering",
+                        file=sys.stderr, flush=True,
+                    )
+                    self._place_original()
+                    self._render_now()
+                except Exception:
+                    # Mid-write or bad file — retry on next tick (mtime will
+                    # change again when the writer finishes).
+                    self._fg_png_mtime = 0.0
+        except OSError:
+            pass
+
+        # Then the usual live_params.json check for despill/despeckle/bg.
         try:
             mt = self._live_params_path.stat().st_mtime
         except FileNotFoundError:

@@ -537,19 +537,17 @@ function rekeyWithCurrentSettings() {
         const settings = getSettings();
         const paramsPath = writeParamsFile(settings);
         runPython(['cache', LAST_FRAME_PNG, CURRENT_SESSION_DIR, '--params', paramsPath]);
-        // Kill + respawn so viewer reloads fg.png / alpha.png from disk.
-        try { VIEWER_PROC.kill(); } catch (_) {}
-        VIEWER_PROC = null;
-        VIEWER_PROC = spawnViewer(CURRENT_SESSION_DIR);
-        setTimeout(() => {
-            sendToViewer({
-                cmd: 'update',
-                despill: settings.despill,
-                despeckle: settings.despeckle,
-                despeckleSize: settings.despeckleSize,
-                background: 'checker'
-            });
-        }, 400);
+        // Viewer has a fg.png mtime watcher — when cache finishes writing the
+        // new neural-net output, the viewer reloads Session in place and
+        // re-renders. No kill+respawn, no window flash. Also bump live_params
+        // so post-proc sliders apply to the refreshed fg/alpha.
+        sendToViewer({
+            cmd: 'update',
+            despill: settings.despill,
+            despeckle: settings.despeckle,
+            despeckleSize: settings.despeckleSize,
+            background: 'checker'
+        });
         status('Live preview active — drag sliders to re-key');
     } catch (e) {
         logLine('refiner re-key failed: ' + e.message, true);
