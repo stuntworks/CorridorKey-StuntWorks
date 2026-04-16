@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>CorridorKey — Approach 8: Kodak 2383</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #1a1410; font-family: 'Inter', 'Segoe UI', sans-serif; display: flex; gap: 32px; padding: 32px; min-height: 100vh; align-items: flex-start; justify-content: center; }
+
+  /* ── LABEL ── */
+  .approach-label { position: fixed; top: 16px; left: 50%; transform: translateX(-50%); background: rgba(255,140,75,.12); border: 1px solid rgba(255,140,75,.3); color: #ff8c4b; font-size: 13px; font-weight: 700; letter-spacing: 2px; text-transform: uppercase; padding: 8px 24px; border-radius: 6px; z-index: 99; font-family: 'Inter', sans-serif; }
+
+  /* ══════════════════════════════════════════════════
+     CEP PANEL (left side — simulates 250px Adobe panel)
+     ══════════════════════════════════════════════════ */
+  .cep-panel {
+    width: 260px; min-height: 500px; border-radius: 8px; overflow: hidden;
+    border: 1px solid rgba(255,217,118,.12);
+    --base: #2a201d; --surf: #3e302c; --text: #e0d1c5; --text2: #a2948a; --accent: #ff8c4b; --hl: #ffd976;
+    background: var(--base); color: var(--text); padding: 10px 8px; font-size: 12px;
+  }
+  .cep-panel h1 { color: var(--hl); font-size: 14px; text-align: center; letter-spacing: 2px; text-transform: uppercase; font-weight: 700; margin-bottom: 2px; }
+  .cep-panel .credit { text-align: center; font-size: 9px; color: var(--text2); margin-bottom: 8px; }
+  .cep-panel .section { margin-bottom: 12px; padding-bottom: 6px; border-bottom: 1px solid rgba(255,217,118,.08); }
+  .cep-panel label { display: block; margin-bottom: 4px; color: var(--accent); font-size: 10px; font-weight: 600; letter-spacing: 1px; text-transform: uppercase; }
+  .cep-panel select { width: 100%; padding: 7px 10px; background: var(--surf); border: 1px solid rgba(255,217,118,.15); color: var(--text); border-radius: 4px; font-size: 10px; outline: none; }
+  .cep-panel select:focus { border-color: var(--hl); box-shadow: 0 0 8px rgba(255,217,118,.2); }
+
+  .cep-panel input[type="range"] { -webkit-appearance: none; width: 100%; height: 20px; background: transparent; margin: 2px 0; cursor: pointer; }
+  .cep-panel input[type="range"]::-webkit-slider-runnable-track { height: 4px; border-radius: 2px; background: linear-gradient(to right, var(--accent) 0%, var(--accent) 50%, rgba(0,0,0,.3) 50%, rgba(0,0,0,.3) 100%); }
+  .cep-panel input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 14px; height: 14px; border-radius: 50%; background: var(--base); border: 2px solid var(--accent); margin-top: -6px; box-shadow: 0 0 8px rgba(255,140,75,.4), 0 2px 6px rgba(0,0,0,.4); }
+  .cep-panel input[type="range"]:hover::-webkit-slider-thumb { transform: scale(1.25); }
+
+  .slider-row { display: flex; align-items: center; gap: 6px; }
+  .slider-value { width: 36px; text-align: right; color: var(--accent); font-family: 'JetBrains Mono', 'Consolas', monospace; font-size: 11px; font-weight: 500; }
+
+  .cep-panel button { width: 100%; padding: 10px; margin: 4px 0; font-size: 11px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; border-radius: 6px; border: none; cursor: pointer; transition: all .2s; }
+  .cep-panel button:hover { filter: brightness(1.15); }
+  .btn-preview { background: linear-gradient(135deg, rgba(255,140,75,.2), rgba(255,140,75,.15)); color: var(--accent); border: 1px solid rgba(255,140,75,.3) !important; }
+  .btn-process { background: linear-gradient(135deg, rgba(255,217,118,.25), rgba(255,217,118,.2)); color: var(--hl); border: 1px solid rgba(255,217,118,.3) !important; }
+  .btn-batch { background: linear-gradient(135deg, rgba(160,148,138,.2), rgba(160,148,138,.15)); color: var(--text2); border: 1px solid rgba(160,148,138,.3) !important; }
+
+  .cep-panel .status { text-align: center; padding: 5px; margin-top: 6px; background: rgba(255,217,118,.05); border: 1px solid rgba(255,217,118,.1); border-radius: 4px; color: var(--hl); font-weight: 600; font-family: 'JetBrains Mono', monospace; font-size: 8px; letter-spacing: .5px; }
+  .cep-panel .log { background: rgba(42,32,29,.8); color: var(--accent); font-family: 'JetBrains Mono', monospace; font-size: 8px; padding: 6px; margin-top: 4px; height: 54px; overflow-y: auto; border-radius: 4px; border: 1px solid var(--surf); }
+
+  /* ══════════════════════════════════════════════════
+     QT VIEWER (right side — simulates the standalone window)
+     ══════════════════════════════════════════════════ */
+  .qt-viewer {
+    width: 640px; min-height: 500px; border-radius: 8px; overflow: hidden;
+    background: #2a201d; color: #e0d1c5; font-family: 'Inter', sans-serif; font-size: 13px;
+    border: 1px solid rgba(255,217,118,.12); display: flex; flex-direction: column;
+  }
+  .qt-toolbar { display: flex; gap: 8px; padding: 10px 12px; background: #2a201d; border-bottom: 1px solid rgba(255,217,118,.08); flex-wrap: wrap; }
+  .qt-btn { background: #3e302c; border: 1px solid rgba(255,217,118,.25); border-radius: 6px; padding: 6px 16px; font-weight: 600; color: #e0d1c5; cursor: pointer; font-size: 12px; transition: all .15s; }
+  .qt-btn:hover { background: rgba(255,217,118,.15); }
+  .qt-btn.active { background: #ffd976; color: #2a201d; }
+
+  .qt-viewport { flex: 1; background: #1e1815; display: flex; align-items: center; justify-content: center; min-height: 300px; position: relative; }
+  .qt-viewport::after { content: ''; position: absolute; inset: 0; background: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(255,217,118,.015) 2px, rgba(255,217,118,.015) 4px); pointer-events: none; }
+  .qt-placeholder { color: #a2948a; font-size: 14px; letter-spacing: 1px; opacity: .6; }
+
+  .qt-sliders { padding: 10px 12px; background: #2a201d; border-top: 1px solid rgba(255,217,118,.08); }
+  .qt-slider-row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+  .qt-slider-label { width: 80px; font-size: 11px; color: #ff8c4b; font-weight: 600; text-transform: uppercase; letter-spacing: .5px; }
+  .qt-slider { flex: 1; -webkit-appearance: none; height: 4px; background: rgba(0,0,0,.3); border-radius: 2px; cursor: pointer; }
+  .qt-slider::-webkit-slider-thumb { -webkit-appearance: none; width: 14px; height: 14px; background: #2a201d; border: 2px solid #ff8c4b; border-radius: 7px; }
+  .qt-slider-val { width: 40px; text-align: right; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #ff8c4b; }
+
+  .qt-statusbar { padding: 4px 12px; background: #2a201d; border-top: 1px solid rgba(255,217,118,.06); font-size: 10px; color: #a2948a; display: flex; justify-content: space-between; }
+</style>
+</head>
+<body>
+  <div class="approach-label">Approach 8 — Kodak 2383</div>
+
+  <!-- CEP Panel -->
+  <div class="cep-panel">
+    <h1>CorridorKey</h1>
+    <div class="credit">AI Keyer by Niko Pueringer / Corridor Digital<br>Plugin by Roberto Lopez / StuntWorks</div>
+
+    <div class="section">
+      <label>Screen Type</label>
+      <select><option>Green Screen</option><option>Blue Screen</option></select>
+    </div>
+
+    <div class="section">
+      <label>Despill</label>
+      <div class="slider-row">
+        <input type="range" min="0" max="100" value="50">
+        <span class="slider-value">50</span>
+      </div>
+    </div>
+
+    <div class="section">
+      <label>Despeckle</label>
+      <div class="slider-row">
+        <input type="range" min="0" max="100" value="30">
+        <span class="slider-value">30</span>
+      </div>
+    </div>
+
+    <button class="btn-preview">Preview Frame</button>
+    <button class="btn-process">Key Current Frame</button>
+    <button class="btn-batch">Process Work Area</button>
+
+    <div class="status">Ready — CorridorKey v1.0</div>
+    <div class="log">[07:42] Engine loaded successfully<br>[07:42] GPU: NVIDIA RTX 4090<br>[07:42] Model: corridorkey_v1.pth</div>
+  </div>
+
+  <!-- Qt Viewer -->
+  <div class="qt-viewer">
+    <div class="qt-toolbar">
+      <div class="qt-btn active">Keyed</div>
+      <div class="qt-btn">Matte</div>
+      <div class="qt-btn">Composite</div>
+      <div class="qt-btn">Original</div>
+      <div style="flex:1"></div>
+      <div class="qt-btn">Split</div>
+    </div>
+    <div class="qt-viewport">
+      <span class="qt-placeholder">[ Kodak 2383 — Film Print Warmth ]</span>
+    </div>
+    <div class="qt-sliders">
+      <div class="qt-slider-row">
+        <span class="qt-slider-label">Despill</span>
+        <input type="range" class="qt-slider" min="0" max="100" value="50">
+        <span class="qt-slider-val">50</span>
+      </div>
+      <div class="qt-slider-row">
+        <span class="qt-slider-label">Despeckle</span>
+        <input type="range" class="qt-slider" min="0" max="100" value="30">
+        <span class="qt-slider-val">30</span>
+      </div>
+      <div class="qt-slider-row">
+        <span class="qt-slider-label">Refiner</span>
+        <input type="range" class="qt-slider" min="0" max="100" value="70">
+        <span class="qt-slider-val">70</span>
+      </div>
+    </div>
+    <div class="qt-statusbar">
+      <span>meanRGB: R 142 G 138 B 120</span>
+      <span>1920 x 1080 @ 23.976</span>
+    </div>
+  </div>
+</body>
+</html>

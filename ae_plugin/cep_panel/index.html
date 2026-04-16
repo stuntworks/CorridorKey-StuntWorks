@@ -92,6 +92,35 @@
             transform: translateY(1px);
         }
         button:disabled { opacity: 0.35; cursor: not-allowed; transform: none; }
+
+        /* ── Button working state — bold static change ──────────────
+             CEP's Chromium does NOT animate during spawnSync, even on the
+             compositor thread. So we use a dramatic static color inversion
+             instead of animation. The user sees a clear state change. ── */
+        button.btn-working {
+            background: linear-gradient(135deg, #0ff, #0ad) !important;
+            color: #000 !important;
+            border: 1px solid #0ff !important;
+            box-shadow: 0 0 20px rgba(0,255,255,0.5) !important;
+            opacity: 1 !important;
+            cursor: wait !important;
+            pointer-events: none;
+            font-weight: 900 !important;
+            letter-spacing: 2px !important;
+        }
+
+        /* ── Button error flash — red pulse then fades back ────────── */
+        .btn-error {
+            background: rgba(255,60,0,0.25) !important;
+            color: #FF3D00 !important; border: 1px solid rgba(255,60,0,0.5) !important;
+            opacity: 1 !important;
+            animation: btn-error-flash 0.4s ease-in-out 3;
+        }
+        @keyframes btn-error-flash {
+            0%, 100% { background-color: rgba(255,60,0,0.1); }
+            50%      { background-color: rgba(255,60,0,0.35); }
+        }
+
         .btn-preview {
             background: linear-gradient(135deg, rgba(0,255,255,0.2), rgba(0,200,255,0.15));
             color: #0ff; border: 1px solid rgba(0,255,255,0.3);
@@ -310,9 +339,25 @@ function logLine(msg, isErr) {
 
 function status(msg) { document.getElementById('status').textContent = msg; }
 
-function setBusy(busy) {
-    for (const id of ['btn-preview', 'btn-process', 'btn-batch']) {
-        document.getElementById(id).disabled = busy;
+// WHAT IT DOES: Toggles busy state. The preview button itself becomes an
+//   animated progress bar so the user sees activity on the control they clicked.
+//   Other buttons just disable. Old separate progress bar kept for batch %.
+function setBusy(busy, source) {
+    const previewBtn = document.getElementById('btn-preview');
+    // Disable process + batch buttons normally. Preview button stays enabled
+    // but gets pointer-events:none via .btn-working so the animation runs.
+    // (:disabled kills CSS animations in Chromium.)
+    document.getElementById('btn-process').disabled = busy;
+    document.getElementById('btn-batch').disabled = busy;
+    if (busy) {
+        previewBtn.disabled = false;  // keep enabled so animation works
+        previewBtn.classList.add('btn-working');
+        previewBtn._savedText = previewBtn.textContent;
+        previewBtn.textContent = source === 'batch' ? 'PROCESSING... PLEASE WAIT' : 'LOADING... PLEASE WAIT';
+    } else {
+        previewBtn.classList.remove('btn-working');
+        previewBtn.disabled = false;
+        if (previewBtn._savedText) previewBtn.textContent = previewBtn._savedText;
     }
     document.getElementById('progress-bar').style.display = busy ? 'block' : 'none';
     if (!busy) document.getElementById('progress-fill').style.width = '0%';
@@ -320,6 +365,22 @@ function setBusy(busy) {
 
 function setProgress(pct) {
     document.getElementById('progress-fill').style.width = Math.max(0, Math.min(100, pct)) + '%';
+}
+
+// WHAT IT DOES: Flashes a button red with an error message, then restores it
+//   after 3 seconds. Tells the user what went wrong on the thing they clicked.
+// DEPENDS-ON: .btn-error CSS class.
+// AFFECTS: button text + class, temporarily.
+function flashButtonError(btnId, msg) {
+    const btn = document.getElementById(btnId);
+    const saved = btn.textContent;
+    btn.textContent = msg;
+    btn.classList.add('btn-error');
+    btn.disabled = false;  // re-enable so it's visible (disabled = 35% opacity)
+    setTimeout(() => {
+        btn.classList.remove('btn-error');
+        btn.textContent = saved;
+    }, 3000);
 }
 
 function openURL(url) { cs.openURLInDefaultBrowser(url); }
@@ -669,14 +730,22 @@ function rekeyWithCurrentSettings() {
 //   opens a preview window. Does NOT write to the timeline.
 function previewFrameLive() {
     setBusy(true);
-    // Indeterminate progress bar — we don't have a % number to show during the
-    // NN pass, so an animated stripe tells the user "something is happening."
     document.getElementById('progress-bar').classList.add('indeterminate');
-    status('Reading timeline...');
+    status('Keying frame...');
 
     const infoFn = HOST_APP === 'ppro' ? 'ppro_getFrameInfo' : 'ae_getFrameInfo';
     jsxCall(infoFn, [], (info) => {
-        if (!info.ok) { logLine('host error: ' + info.error, true); status('Error'); document.getElementById('progress-bar').classList.remove('indeterminate'); setBusy(false); return; }
+        if (!info.ok) {
+            logLine('host error: ' + info.error, true);
+            document.getElementById('progress-bar').classList.remove('indeterminate');
+            setBusy(false);
+            flashButtonError('btn-preview', 'SELECT A LAYER');
+            return;
+        }
+        // setTimeout gives the browser a chance to PAINT the button state change
+        // before spawnSync freezes the thread. Without this, the "KEYING FRAME..."
+        // button never renders because JS never yields to the paint loop.
+        setTimeout(() => {
         let framePng = null;
         let sessionDir = null;
         let paramsPath = null;
@@ -743,6 +812,7 @@ function previewFrameLive() {
             document.getElementById('progress-bar').classList.remove('indeterminate');
             setBusy(false);
         }
+        }, 100);  // end setTimeout — 100ms lets browser paint before spawnSync blocks
     });
 }
 
@@ -757,7 +827,7 @@ function processFrame(previewOnly) {
 
     const infoFn = HOST_APP === 'ppro' ? 'ppro_getFrameInfo' : 'ae_getFrameInfo';
     jsxCall(infoFn, [], (info) => {
-        if (!info.ok) { logLine('host error: ' + info.error, true); status('Error'); setBusy(false); return; }
+        if (!info.ok) { logLine('host error: ' + info.error, true); setBusy(false); flashButtonError('btn-process', 'SELECT A LAYER'); return; }
         try {
             const settings = getSettings();
             const framePng = randomTempPath('extract', '.png');
@@ -812,12 +882,12 @@ function processFrame(previewOnly) {
 // BATCH FLOW
 // ============================================================
 function processBatch() {
-    setBusy(true);
+    setBusy(true, 'batch');
     status('Reading range...');
 
     const infoFn = HOST_APP === 'ppro' ? 'ppro_getInOutInfo' : 'ae_getWorkAreaInfo';
     jsxCall(infoFn, [], (info) => {
-        if (!info.ok) { logLine('host error: ' + info.error, true); status('Error'); setBusy(false); return; }
+        if (!info.ok) { logLine('host error: ' + info.error, true); setBusy(false); flashButtonError('btn-batch', 'SELECT A LAYER'); return; }
         try {
             const settings = getSettings();
             const outDir = path.join(savedOutput, 'ck_batch_' + crypto.randomBytes(6).toString('hex'));

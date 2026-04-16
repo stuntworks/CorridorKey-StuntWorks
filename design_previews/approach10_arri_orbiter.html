@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>CorridorKey — Approach 10: ARRI Orbiter</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #07080c; font-family: 'Inter', 'Segoe UI', sans-serif; display: flex; gap: 32px; padding: 32px; min-height: 100vh; align-items: flex-start; justify-content: center; }
+
+  /* ── LABEL ── */
+  .approach-label { position: fixed; top: 16px; left: 50%; transform: translateX(-50%); background: rgba(0,76,255,.1); border: 1px solid rgba(0,76,255,.3); color: #004cff; font-size: 13px; font-weight: 700; letter-spacing: 2px; text-transform: uppercase; padding: 8px 24px; border-radius: 16px; z-index: 99; font-family: 'Inter', sans-serif; }
+
+  /* ══════════════════════════════════════════════════
+     CEP PANEL
+     ══════════════════════════════════════════════════ */
+  .cep-panel {
+    width: 260px; min-height: 500px; border-radius: 12px; overflow: hidden;
+    border: 1px solid rgba(0,76,255,.1);
+    --space: #0b0d11; --graphite: #1f2229; --aluminium: #a1a6b3; --mist: #d0d5e0; --cobalt: #004cff;
+    background: var(--space); color: var(--mist); padding: 10px 8px; font-size: 12px;
+  }
+  .cep-panel h1 { color: var(--cobalt); font-size: 14px; text-align: center; letter-spacing: 2px; font-weight: 500; margin-bottom: 2px; }
+  .cep-panel .credit { font-size: 9px; color: var(--aluminium); text-align: center; margin-bottom: 8px; }
+  .cep-panel .section { margin-bottom: 12px; padding-bottom: 6px; border-bottom: 1px solid rgba(0,76,255,.06); }
+  .cep-panel label { display: block; margin-bottom: 4px; color: var(--cobalt); font-size: 10px; font-weight: 600; letter-spacing: 1px; text-transform: uppercase; }
+  .cep-panel select { width: 100%; padding: 7px 10px; background: var(--graphite); border: 1px solid rgba(0,76,255,.15); color: var(--mist); border-radius: 12px; font-size: 10px; outline: none; }
+  .cep-panel select:focus { border-color: var(--cobalt); box-shadow: 0 0 8px rgba(0,76,255,.2); }
+
+  .cep-panel input[type="range"] { -webkit-appearance: none; width: 100%; height: 20px; background: transparent; margin: 2px 0; cursor: pointer; }
+  .cep-panel input[type="range"]::-webkit-slider-runnable-track { height: 4px; border-radius: 2px; background: linear-gradient(to right, var(--cobalt) 0%, var(--cobalt) 50%, rgba(0,0,0,.4) 50%, rgba(0,0,0,.4) 100%); }
+  .cep-panel input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 16px; height: 16px; border-radius: 50%; background: var(--space); border: 3px solid var(--cobalt); margin-top: -6px; box-shadow: 0 0 10px rgba(0,76,255,.5); }
+  .cep-panel input[type="range"]:hover::-webkit-slider-thumb { transform: scale(1.15); }
+
+  .slider-row { display: flex; align-items: center; gap: 6px; }
+  .slider-value { width: 36px; text-align: right; color: var(--cobalt); font-family: 'JetBrains Mono', 'Consolas', monospace; font-size: 11px; font-weight: 500; }
+
+  .cep-panel button { width: 100%; padding: 10px; margin: 4px 0; font-size: 11px; font-weight: 600; border-radius: 16px; border: none; cursor: pointer; transition: all .2s; letter-spacing: .5px; }
+  .cep-panel button:hover { filter: brightness(1.2); }
+  .btn-preview { background: radial-gradient(circle at center, rgba(0,76,255,.25), rgba(0,76,255,.15)); color: var(--cobalt); box-shadow: 0 2px 8px rgba(0,76,255,.15); }
+  .btn-process { background: radial-gradient(circle at center, rgba(161,166,179,.25), rgba(161,166,179,.15)); color: var(--aluminium); }
+  .btn-batch { background: radial-gradient(circle at center, rgba(208,213,224,.2), rgba(208,213,224,.1)); color: var(--mist); }
+
+  .cep-panel .status { text-align: center; padding: 5px; margin-top: 6px; background: rgba(0,76,255,.05); border: 1px solid rgba(0,76,255,.1); border-radius: 12px; color: var(--cobalt); font-weight: 600; font-family: 'JetBrains Mono', monospace; font-size: 8px; letter-spacing: .5px; }
+  .cep-panel .log { background: rgba(11,13,17,.8); color: var(--cobalt); font-family: 'JetBrains Mono', monospace; font-size: 8px; padding: 6px; margin-top: 4px; height: 54px; overflow-y: auto; border-radius: 4px; border: 1px solid var(--graphite); }
+
+  /* Cobalt status dot */
+  .status-dot { display: inline-block; width: 6px; height: 6px; background: var(--cobalt); border-radius: 50%; box-shadow: 0 0 6px var(--cobalt); margin-right: 6px; vertical-align: middle; animation: pulse 2s infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .5; } }
+
+  /* ══════════════════════════════════════════════════
+     QT VIEWER
+     ══════════════════════════════════════════════════ */
+  .qt-viewer {
+    width: 640px; min-height: 500px; border-radius: 12px; overflow: hidden;
+    background: #0b0d11; color: #d0d5e0; font-family: 'Inter', sans-serif; font-size: 13px;
+    border: 1px solid rgba(0,76,255,.1); display: flex; flex-direction: column;
+  }
+  .qt-toolbar { display: flex; gap: 8px; padding: 10px 12px; background: #0b0d11; border-bottom: 1px solid rgba(0,76,255,.06); flex-wrap: wrap; }
+  .qt-btn { background: #1f2229; border: 2px solid #004cff; border-radius: 14px; padding: 8px 18px; font-weight: 600; color: #d0d5e0; cursor: pointer; font-size: 12px; transition: all .15s; }
+  .qt-btn:hover { background: rgba(0,76,255,.2); }
+  .qt-btn.active { background: #004cff; color: #0b0d11; }
+
+  .qt-viewport { flex: 1; background: #080a0e; display: flex; align-items: center; justify-content: center; min-height: 300px; margin: 8px; border-radius: 8px; border: 2px solid #1f2229; position: relative; }
+  /* LED ring glow */
+  .qt-viewport::before { content: ''; position: absolute; inset: -2px; border-radius: 10px; border: 2px solid rgba(0,76,255,.15); box-shadow: 0 0 20px rgba(0,76,255,.08), inset 0 0 20px rgba(0,76,255,.03); pointer-events: none; }
+  .qt-placeholder { color: #a1a6b3; font-size: 14px; letter-spacing: 1px; opacity: .5; }
+
+  .qt-sliders { padding: 10px 12px; background: #0b0d11; border-top: 1px solid rgba(0,76,255,.06); }
+  .qt-slider-row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+  .qt-slider-label { width: 80px; font-size: 11px; color: #004cff; font-weight: 600; text-transform: uppercase; letter-spacing: .5px; }
+  .qt-slider { flex: 1; -webkit-appearance: none; height: 4px; background: rgba(0,0,0,.6); border-radius: 2px; cursor: pointer; }
+  .qt-slider::-webkit-slider-thumb { -webkit-appearance: none; width: 16px; height: 16px; background: #0b0d11; border: 3px solid #004cff; border-radius: 8px; box-shadow: 0 0 8px rgba(0,76,255,.3); }
+  .qt-slider-val { width: 40px; text-align: right; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #004cff; }
+
+  .qt-statusbar { padding: 4px 12px; background: #0b0d11; border-top: 1px solid rgba(0,76,255,.04); font-size: 10px; color: #a1a6b3; display: flex; justify-content: space-between; }
+</style>
+</head>
+<body>
+  <div class="approach-label">Approach 10 — ARRI Orbiter</div>
+
+  <!-- CEP Panel -->
+  <div class="cep-panel">
+    <h1>CorridorKey</h1>
+    <div class="credit">AI Keyer by Niko Pueringer / Corridor Digital<br>Plugin by Roberto Lopez / StuntWorks</div>
+
+    <div class="section">
+      <label>Screen Type</label>
+      <select><option>Green Screen</option><option>Blue Screen</option></select>
+    </div>
+
+    <div class="section">
+      <label>Despill</label>
+      <div class="slider-row">
+        <input type="range" min="0" max="100" value="50">
+        <span class="slider-value">50</span>
+      </div>
+    </div>
+
+    <div class="section">
+      <label>Despeckle</label>
+      <div class="slider-row">
+        <input type="range" min="0" max="100" value="30">
+        <span class="slider-value">30</span>
+      </div>
+    </div>
+
+    <button class="btn-preview">Preview Frame</button>
+    <button class="btn-process">Key Current Frame</button>
+    <button class="btn-batch">Process Work Area</button>
+
+    <div class="status"><span class="status-dot"></span>Ready — CorridorKey v1.0</div>
+    <div class="log">[07:42] Engine loaded successfully<br>[07:42] GPU: NVIDIA RTX 4090<br>[07:42] Model: corridorkey_v1.pth</div>
+  </div>
+
+  <!-- Qt Viewer -->
+  <div class="qt-viewer">
+    <div class="qt-toolbar">
+      <div class="qt-btn active">Keyed</div>
+      <div class="qt-btn">Matte</div>
+      <div class="qt-btn">Composite</div>
+      <div class="qt-btn">Original</div>
+      <div style="flex:1"></div>
+      <div class="qt-btn">Split</div>
+    </div>
+    <div class="qt-viewport">
+      <span class="qt-placeholder">[ ARRI Orbiter — Surgical Precision ]</span>
+    </div>
+    <div class="qt-sliders">
+      <div class="qt-slider-row">
+        <span class="qt-slider-label">Despill</span>
+        <input type="range" class="qt-slider" min="0" max="100" value="50">
+        <span class="qt-slider-val">50</span>
+      </div>
+      <div class="qt-slider-row">
+        <span class="qt-slider-label">Despeckle</span>
+        <input type="range" class="qt-slider" min="0" max="100" value="30">
+        <span class="qt-slider-val">30</span>
+      </div>
+      <div class="qt-slider-row">
+        <span class="qt-slider-label">Refiner</span>
+        <input type="range" class="qt-slider" min="0" max="100" value="70">
+        <span class="qt-slider-val">70</span>
+      </div>
+    </div>
+    <div class="qt-statusbar">
+      <span>meanRGB: R 142 G 138 B 120</span>
+      <span>1920 x 1080 @ 23.976</span>
+    </div>
+  </div>
+</body>
+</html>

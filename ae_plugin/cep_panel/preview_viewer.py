@@ -414,7 +414,7 @@ class PersistentWindow(QtWidgets.QWidget):
         title = QtWidgets.QLabel("CORRIDORKEY LIVE PREVIEW")
         title.setAlignment(QtCore.Qt.AlignCenter)
         title.setStyleSheet(
-            "color: #00C853; font-size: 14px; font-weight: 700; "
+            "color: #6ab; font-size: 16px; font-weight: 700; "
             "letter-spacing: 1.5px; border: none; background: transparent;"
         )
         layout.addWidget(title)
@@ -422,18 +422,20 @@ class PersistentWindow(QtWidgets.QWidget):
         # View mode — pill buttons with mode colors when active
         mode_row = QtWidgets.QHBoxLayout()
         mode_row.setSpacing(4)
+        # Each mode gets its own color — muted so it doesn't
+        # compete with the footage, bright enough to read.
         self._mode_colors = {
-            "Original": "#607D8B",
-            "Composite": "#9C27B0",
-            "Foreground": "#2979FF",
-            "Matte": "#FF9100",
+            "Original": ("#3a5a6a", "#7ab"),    # slate blue (neutral/source)
+            "Composite": ("#1a4a2a", "#5b5"),    # muted green (result)
+            "Foreground": ("#1a3a5a", "#5af"),   # steel blue (extracted)
+            "Matte": ("#4a3a1a", "#da5"),         # amber (technical)
         }
         self.mode_buttons = {}
-        for mode, color in self._mode_colors.items():
+        for mode, (bg, fg) in self._mode_colors.items():
             btn = QtWidgets.QPushButton(mode)
             btn.setStyleSheet(
-                "background-color: #1e1e1e; color: #888; padding: 5px 12px; "
-                "border-radius: 12px; font-size: 11px; font-weight: 600;"
+                f"background-color: #111; color: #667; padding: 6px 14px; "
+                f"border: 1px solid {fg}; border-radius: 12px; font-size: 13px; font-weight: 600;"
             )
             btn.clicked.connect(lambda _=False, m=mode: self._set_view_mode(m))
             mode_row.addWidget(btn)
@@ -442,8 +444,8 @@ class PersistentWindow(QtWidgets.QWidget):
         self._split_btn = QtWidgets.QPushButton("Split")
         self._split_btn.setCheckable(True)
         self._split_btn.setStyleSheet(
-            "background-color: #1e1e1e; color: #555; padding: 5px 10px; "
-            "border-radius: 12px; font-size: 10px;"
+            "background-color: #111; color: #667; padding: 6px 12px; "
+            "border: 1px solid #2a2a2a; border-radius: 12px; font-size: 12px;"
         )
         self._split_btn.clicked.connect(self._toggle_split)
         mode_row.addWidget(self._split_btn)
@@ -454,16 +456,24 @@ class PersistentWindow(QtWidgets.QWidget):
         bg_row.setSpacing(3)
         bg_label = QtWidgets.QLabel("BG:")
         bg_label.setStyleSheet(
-            "color: #555; border: none; background: transparent; font-size: 10px;"
+            "color: #556; border: none; background: transparent; font-size: 12px;"
         )
         bg_row.addWidget(bg_label)
         self.bg_buttons = {}
+        # Dimmer versions of distinct colors for BG buttons
+        bg_colors = {
+            "checker": "#596",   # muted teal-green
+            "black":   "#667",   # neutral gray
+            "white":   "#887",   # warm gray
+            "v1":      "#768",   # cool slate
+        }
         for bg_name in ("checker", "black", "white", "v1"):
             btn = QtWidgets.QPushButton(bg_name.upper())
             btn.setCheckable(True)
+            c = bg_colors[bg_name]
             btn.setStyleSheet(
-                "background-color: #1e1e1e; color: #666; padding: 3px 8px; "
-                "border-radius: 10px; font-size: 9px;"
+                f"background-color: #111; color: #556; padding: 4px 10px; "
+                f"border: 1px solid {c}; border-radius: 10px; font-size: 12px;"
             )
             btn.clicked.connect(lambda _=False, n=bg_name: self._set_background(n))
             bg_row.addWidget(btn)
@@ -482,13 +492,13 @@ class PersistentWindow(QtWidgets.QWidget):
         self.left_label.setAlignment(QtCore.Qt.AlignCenter)
         self.left_label.setSizePolicy(expanding)
         self.left_label.setMinimumSize(200, 150)
-        self.left_label.setStyleSheet("background-color: #000; border: 1px solid #1e1e1e;")
+        self.left_label.setStyleSheet("background-color: #000; border: 1px solid rgba(0,255,255,0.08);")
         self.left_label.hide()
         self.right_label = QtWidgets.QLabel()
         self.right_label.setAlignment(QtCore.Qt.AlignCenter)
         self.right_label.setSizePolicy(expanding)
         self.right_label.setMinimumSize(320, 240)
-        self.right_label.setStyleSheet("background-color: #000; border: 1px solid #1e1e1e;")
+        self.right_label.setStyleSheet("background-color: #000; border: 1px solid rgba(0,255,255,0.08);")
         self._pane_row.addWidget(self.left_label, 1)
         self._pane_row.addWidget(self.right_label, 1)
         layout.addLayout(self._pane_row, 1)
@@ -497,7 +507,7 @@ class PersistentWindow(QtWidgets.QWidget):
         self._overlay = QtWidgets.QLabel("Re-keying...", self.right_label)
         self._overlay.setAlignment(QtCore.Qt.AlignCenter)
         self._overlay.setStyleSheet(
-            "background-color: rgba(0,0,0,180); color: #00C853; "
+            "background-color: rgba(0,0,0,180); color: #0ff; "
             "font-size: 22px; font-weight: 700; border: none; border-radius: 2px;"
         )
         self._overlay.hide()
@@ -509,9 +519,9 @@ class PersistentWindow(QtWidgets.QWidget):
         # Status bar — monospace readout
         self.status = QtWidgets.QLabel("Ready")
         self.status.setStyleSheet(
-            "color: #555; border: none; background: transparent; "
+            "color: #556; border: none; background: transparent; "
             "font-family: 'JetBrains Mono', 'SF Mono', 'Consolas', monospace; "
-            "font-size: 10px;"
+            "font-size: 12px;"
         )
         layout.addWidget(self.status)
 
@@ -528,16 +538,16 @@ class PersistentWindow(QtWidgets.QWidget):
     # AFFECTS: button stylesheets only.
     def _highlight_mode_button(self):
         for mode, btn in self.mode_buttons.items():
-            color = self._mode_colors[mode]
+            bg, fg = self._mode_colors[mode]
             if mode == self._view_mode:
                 btn.setStyleSheet(
-                    f"background-color: {color}; color: #fff; padding: 5px 12px; "
-                    f"border-radius: 12px; font-size: 11px; font-weight: 600;"
+                    f"background-color: {bg}; color: {fg}; padding: 6px 14px; "
+                    f"border: 1px solid {fg}; border-radius: 12px; font-size: 13px; font-weight: 600;"
                 )
             else:
                 btn.setStyleSheet(
-                    "background-color: #1e1e1e; color: #888; padding: 5px 12px; "
-                    "border-radius: 12px; font-size: 11px; font-weight: 600;"
+                    f"background-color: #111; color: #667; padding: 6px 14px; "
+                    f"border: 1px solid {fg}; border-radius: 12px; font-size: 13px; font-weight: 600;"
                 )
 
     # WHAT IT DOES: Toggles between single-pane (default) and two-up split view.
@@ -547,15 +557,15 @@ class PersistentWindow(QtWidgets.QWidget):
         if checked:
             self.left_label.show()
             self._split_btn.setStyleSheet(
-                "background-color: #333; color: #e8e8e8; padding: 5px 10px; "
-                "border-radius: 12px; font-size: 10px;"
+                "background-color: #1a3a4a; color: #8cf; padding: 6px 12px; "
+                "border: 1px solid #3a6a7a; border-radius: 12px; font-size: 12px;"
             )
             self.resize(self.width() + self.disp_w, self.height())
         else:
             self.left_label.hide()
             self._split_btn.setStyleSheet(
-                "background-color: #1e1e1e; color: #555; padding: 5px 10px; "
-                "border-radius: 12px; font-size: 10px;"
+                "background-color: #111; color: #667; padding: 6px 12px; "
+                "border: 1px solid #2a2a2a; border-radius: 12px; font-size: 12px;"
             )
         self._repaint_both()
 
@@ -955,7 +965,7 @@ class OneShotWindow(QtWidgets.QWidget):
             row.addWidget(lbl)
         layout.addLayout(row)
         close = QtWidgets.QPushButton("Close")
-        close.setStyleSheet("background-color: #f44336; color: white; padding: 10px 30px;")
+        close.setStyleSheet("background-color: rgba(0,255,255,0.2); color: #0ff; border: 1px solid rgba(0,255,255,0.3); border-radius: 6px; padding: 10px 30px;")
         close.clicked.connect(self.close)
         layout.addWidget(close, alignment=QtCore.Qt.AlignRight)
         self.setFixedSize(dw * 2 + 32, dh + 80)
@@ -967,19 +977,19 @@ QWidget {
     background-color: #000;
     color: #e8e8e8;
     font-family: 'Inter', 'SF Pro Display', 'Segoe UI', sans-serif;
-    font-size: 13px;
+    font-size: 15px;
 }
 QPushButton {
-    border: 1px solid rgba(0,255,255,0.2); border-radius: 6px;
-    font-weight: 600; font-size: 13px; padding: 6px 16px;
-    background-color: rgba(0,20,40,0.4); color: #0ff;
+    border: 1px solid #1a6a7a; border-radius: 6px;
+    font-weight: 600; font-size: 14px; padding: 7px 18px;
+    background-color: #0a2a3a; color: #0ff;
 }
 QPushButton:hover {
-    background-color: rgba(0,255,255,0.15); color: #fff;
-    border-color: rgba(0,255,255,0.4);
+    background-color: #104050; color: #fff;
+    border-color: #2af;
 }
 QPushButton:checked, QPushButton[active="true"] {
-    background-color: rgba(0,255,255,0.25); color: #fff;
+    background-color: #0ff; color: #000;
     border-color: #0ff;
 }
 QLabel {
@@ -987,11 +997,11 @@ QLabel {
     border-radius: 2px;
 }
 QSlider::groove:horizontal {
-    height: 4px; background: rgba(0,20,40,0.5); border-radius: 2px;
+    height: 5px; background: rgba(0,20,40,0.5); border-radius: 2px;
 }
 QSlider::handle:horizontal {
-    width: 14px; height: 14px; margin: -5px 0;
-    background: #000; border: 2px solid #0ff; border-radius: 7px;
+    width: 18px; height: 18px; margin: -7px 0;
+    background: #000; border: 2px solid #0ff; border-radius: 9px;
 }
 QSlider::handle:horizontal:hover {
     border-color: #0ff;
