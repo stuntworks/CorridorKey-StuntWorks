@@ -98,6 +98,7 @@ cached_source = {"frame": None, "file_path": None, "frame_num": None}
 cached_processor = {"proc": None}  # Holds loaded AI model to avoid reloading every frame
 sam_points = {"positive": [], "negative": [], "frame": None}
 frame_range = {"in_frame": None, "out_frame": None}
+_viewer_proc = None  # Tracks preview viewer subprocess — killed on plugin close
 
 # Persistent settings — saved to temp folder so output path survives between sessions
 _config_path = Path(tempfile.gettempdir()) / "corridorkey_config.txt"
@@ -491,9 +492,16 @@ def show_preview_window(orig_bgr, keyed_rgb, alpha):
         cv2.imwrite(paths["background"], bg_frame)
         log("Background plate saved for composite")
     # Launch preview as separate process — no event loop conflicts
+    # DANGER ZONE: Must track this process and kill on plugin close, or Resolve
+    # can't restart (orphaned Python holds GPU/CUDA context open).
+    global _viewer_proc
+    if _viewer_proc is not None:
+        try: _viewer_proc.kill()
+        except: pass
+        _viewer_proc = None
     viewer_script = str(CK_ROOT / "resolve_plugin" / "preview_viewer.py")
     python_exe = str(CK_PYTHON)
-    subprocess.Popen(
+    _viewer_proc = subprocess.Popen(
         [python_exe, viewer_script, json.dumps(paths)],
         creationflags=subprocess.CREATE_NO_WINDOW
     )
@@ -798,7 +806,15 @@ def on_open_fusion(ev):
     except: pass
 
 # WHAT IT DOES: Exits the Fusion UIDispatcher event loop, closing the plugin window
-def on_close(ev): disp.ExitLoop()
+# WHAT IT DOES: Kills any running preview viewer, then exits the Fusion event loop.
+#   Without this, the orphaned Python viewer holds GPU/CUDA open and Resolve can't restart.
+def on_close(ev):
+    global _viewer_proc
+    if _viewer_proc is not None:
+        try: _viewer_proc.kill()
+        except: pass
+        _viewer_proc = None
+    disp.ExitLoop()
 
 win.On.DespillSlider.SliderMoved = on_despill_changed
 win.On.RefinerSlider.SliderMoved = on_refiner_changed
