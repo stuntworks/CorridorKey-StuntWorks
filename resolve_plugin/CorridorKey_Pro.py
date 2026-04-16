@@ -413,14 +413,18 @@ def composite_over_checker(fg, alpha, sz=20):
 # DEPENDS-ON: timeline, get_current_frame_info(), OpenCV
 # AFFECTS: nothing — read-only, returns a frame or None
 def grab_background_frame():
-    """Try to grab a frame from the track below the green screen for composite background."""
+    """Try to grab a frame from tracks BELOW the green screen for composite background.
+    DEPENDS-ON: timeline, get_current_frame_info()
+    AFFECTS: nothing — read-only, returns a frame or None
+    DANGER ZONE: Skips V1 (assumed green screen source). If user has green screen
+      on V2+, this won't find the right background. Future: pass source track index."""
     import cv2
     try:
         cf, fps = get_current_frame_info()
-        # Check tracks below the source (V1 has green screen, check V2+ for bg plates
-        # OR if green screen is on V2+, check V1)
+        # Start from V2 — V1 is the green screen source. Grabbing V1 as background
+        # creates a double image in the composite (keyed fg over original = ghost).
         track_count = timeline.GetTrackCount("video")
-        for track_idx in range(1, track_count + 1):
+        for track_idx in range(2, track_count + 1):
             clips = timeline.GetItemListInTrack("video", track_idx) or []
             for c in clips:
                 if c.GetStart() <= cf < c.GetEnd():
