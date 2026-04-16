@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+body {
+  margin: 0;
+  background: #000;
+  font-family: 'Arial', sans-serif;
+  overflow-x: auto;
+  overflow-y: hidden;
+  min-width: 950px;
+}
+</style>
+</head>
+<body>
+
+<!-- DESIGN A: ORBITAL RING interface -->
+<div style="position: absolute; top: 50px; left: 50px; width: 250px; height: 500px; background: linear-gradient(135deg, #0a0a0a 0%, #111 100%); border-radius: 20px; padding: 20px; box-shadow: 0 0 50px rgba(0,255,150,0.3);">
+  <div style="position: relative; width: 100%; height: 100%;">
+    <div style="position: absolute; top: 0; left: 50%; transform: translateX(-50%); color: #0ff; font-size: 14px; text-align: center; letter-spacing: 3px; text-shadow: 0 0 10px #0ff;">CORRIDORKEY</div>
+    <div style="position:absolute;top:8px;right:0;color:#555;font-size:8px;">A: ORBITAL</div>
+
+    <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 180px; height: 180px;">
+      <svg width="180" height="180">
+        <circle cx="90" cy="90" r="80" fill="none" stroke="rgba(0,255,150,0.2)" stroke-width="1"/>
+        <circle cx="90" cy="90" r="60" fill="none" stroke="rgba(0,255,150,0.15)" stroke-width="1"/>
+        <circle cx="90" cy="90" r="40" fill="none" stroke="rgba(0,255,150,0.1)" stroke-width="1"/>
+        <circle cx="90" cy="90" r="20" fill="rgba(0,255,150,0.05)" stroke="rgba(0,255,150,0.2)" stroke-width="1"/>
+      </svg>
+
+      <div style="position: absolute; top: 5px; left: 50%; transform: translateX(-50%); width: 36px; height: 36px; background: linear-gradient(45deg, #0f0, #0a0); border-radius: 50%; cursor: pointer; transition: all 0.3s; box-shadow: 0 0 20px #0f0; display:flex;align-items:center;justify-content:center;color:#000;font-size:8px;font-weight:bold;" onmouseover="this.style.transform='translateX(-50%) scale(1.2)'" onmouseout="this.style.transform='translateX(-50%) scale(1)'" id="screenOrb">GRN</div>
+
+      <div style="position:absolute;top:55px;left:10px;color:#0ff;font-size:7px;">DESPILL</div>
+      <input type="range" style="position: absolute; top: 65px; left: 5px; width: 70px; accent-color:#0f0;" min="0" max="100" value="50" oninput="document.getElementById('ov1').textContent=this.value">
+      <span id="ov1" style="position:absolute;top:55px;right:35px;color:#0f0;font-size:9px;">50</span>
+
+      <div style="position:absolute;top:95px;left:10px;color:#0ff;font-size:7px;">REFINER</div>
+      <input type="range" style="position: absolute; top: 105px; left: 5px; width: 70px; accent-color:#0f0;" min="0" max="100" value="75" oninput="document.getElementById('ov2').textContent=this.value">
+      <span id="ov2" style="position:absolute;top:95px;right:35px;color:#0f0;font-size:9px;">75</span>
+
+      <div style="position:absolute;top:135px;left:10px;color:#0ff;font-size:7px;">DSPECKLE</div>
+      <input type="range" style="position: absolute; top: 145px; left: 5px; width: 70px; accent-color:#0f0;" min="50" max="2000" value="400" oninput="document.getElementById('ov3').textContent=this.value">
+      <span id="ov3" style="position:absolute;top:135px;right:30px;color:#0f0;font-size:9px;">400</span>
+    </div>
+
+    <div style="position: absolute; bottom: 100px; left: 50%; transform: translateX(-50%); display: flex; gap: 10px;">
+      <div style="width: 55px; height: 30px; background: rgba(0,255,150,0.15); border-radius: 15px; cursor: pointer; transition: all 0.3s; display:flex;align-items:center;justify-content:center;color:#0ff;font-size:7px;border:1px solid rgba(0,255,150,0.3);" onmouseover="this.style.background='rgba(0,255,150,0.4)'" onmouseout="this.style.background='rgba(0,255,150,0.15)'">PREV</div>
+      <div style="width: 55px; height: 30px; background: rgba(0,255,150,0.15); border-radius: 15px; cursor: pointer; transition: all 0.3s; display:flex;align-items:center;justify-content:center;color:#0ff;font-size:7px;border:1px solid rgba(0,255,150,0.3);" onmouseover="this.style.background='rgba(0,255,150,0.4)'" onmouseout="this.style.background='rgba(0,255,150,0.15)'">KEY</div>
+      <div style="width: 55px; height: 30px; background: rgba(0,255,150,0.15); border-radius: 15px; cursor: pointer; transition: all 0.3s; display:flex;align-items:center;justify-content:center;color:#0ff;font-size:7px;border:1px solid rgba(0,255,150,0.3);" onmouseover="this.style.background='rgba(0,255,150,0.4)'" onmouseout="this.style.background='rgba(0,255,150,0.15)'">BATCH</div>
+    </div>
+
+    <div style="position: absolute; bottom: 60px; left: 50%; transform: translateX(-50%); color: #0ff; font-size: 9px; text-align: center;">STATUS: IDLE</div>
+    <div style="position: absolute; bottom: 10px; left:10px;right:10px; color: #555; font-size: 8px; background:rgba(0,255,150,0.05);padding:6px;border-radius:6px;font-family:monospace;">Ready.<br>StuntWorks 2026</div>
+  </div>
+</div>
+
+<!-- DESIGN B: FLIPPABLE CARD interface -->
+<div style="position: absolute; top: 50px; left: 350px; width: 250px; height: 500px; perspective: 1000px;">
+  <div id="card" style="position: relative; width: 100%; height: 100%; transform-style: preserve-3d; transition: transform 0.8s cubic-bezier(0.4,0,0.2,1); cursor:pointer;" onclick="this.style.transform=(this.style.transform==='rotateY(180deg)'?'':'rotateY(180deg)')">
+    <!-- FRONT -->
+    <div style="position: absolute; width: 100%; height: 100%; backface-visibility: hidden; background: linear-gradient(145deg, #001 0%, #003 100%); border-radius:20px; display: flex; flex-direction: column; align-items: center; justify-content: center; box-shadow: 0 0 30px rgba(0,255,255,0.3);">
+      <div style="position:absolute;top:15px;right:15px;color:#555;font-size:8px;">B: FLIP CARD</div>
+      <div style="color: #0ff; font-size: 20px; margin-bottom: 30px; text-shadow: 0 0 20px #0ff; letter-spacing:3px;">CORRIDORKEY</div>
+      <div style="width: 120px; height: 120px; background: radial-gradient(circle, #0f0 0%, #000 70%); border-radius: 50%; box-shadow: 0 0 40px #0f0; animation: pulse 3s ease-in-out infinite;"></div>
+      <div style="color: #0ff; font-size: 10px; margin-top: 30px; letter-spacing:2px;">CLICK TO CONFIGURE</div>
+      <div style="color: #555; font-size: 8px; margin-top: 10px;">StuntWorks 2026</div>
+    </div>
+    <!-- BACK -->
+    <div style="position: absolute; width: 100%; height: 100%; backface-visibility: hidden; background: linear-gradient(145deg, #000 0%, #002 100%); transform: rotateY(180deg); padding: 24px; box-sizing: border-box; border-radius:20px; box-shadow: 0 0 30px rgba(0,255,255,0.3);">
+      <div style="color:#0ff;font-size:12px;text-align:center;margin-bottom:20px;letter-spacing:2px;">CONTROLS</div>
+      <div style="display: flex; justify-content: center; gap:15px; margin-bottom: 20px;">
+        <div style="width: 50px; height: 50px; background: rgba(0,255,0,0.2); border-radius: 50%; display:flex;align-items:center;justify-content:center;color:#0f0;font-size:9px;border:1px solid rgba(0,255,0,0.4);" onclick="event.stopPropagation()">GREEN</div>
+        <div style="width: 50px; height: 50px; background: rgba(0,100,255,0.2); border-radius: 50%; display:flex;align-items:center;justify-content:center;color:#08f;font-size:9px;border:1px solid rgba(0,100,255,0.4);" onclick="event.stopPropagation()">BLUE</div>
+      </div>
+      <div style="margin-bottom: 15px;" onclick="event.stopPropagation()">
+        <div style="color: #0ff; font-size: 9px; margin-bottom: 5px; display:flex;justify-content:space-between;"><span>DESPILL</span><span id="fv1">50</span></div>
+        <input type="range" style="width: 100%; accent-color:#0ff;" max="100" value="50" oninput="document.getElementById('fv1').textContent=this.value" onclick="event.stopPropagation()">
+      </div>
+      <div style="margin-bottom: 15px;" onclick="event.stopPropagation()">
+        <div style="color: #0ff; font-size: 9px; margin-bottom: 5px; display:flex;justify-content:space-between;"><span>REFINER</span><span id="fv2">75</span></div>
+        <input type="range" style="width: 100%; accent-color:#0ff;" max="100" value="75" oninput="document.getElementById('fv2').textContent=this.value" onclick="event.stopPropagation()">
+      </div>
+      <div style="margin-bottom: 15px;" onclick="event.stopPropagation()">
+        <div style="color: #0ff; font-size: 9px; margin-bottom: 5px; display:flex;justify-content:space-between;"><span>DESPECKLE SIZE</span><span id="fv3">400</span></div>
+        <input type="range" style="width: 100%; accent-color:#0ff;" min="50" max="2000" value="400" oninput="document.getElementById('fv3').textContent=this.value" onclick="event.stopPropagation()">
+      </div>
+      <div style="display: flex; flex-direction:column; gap: 8px; margin-top: 15px;" onclick="event.stopPropagation()">
+        <div style="height: 32px; background: linear-gradient(135deg,rgba(0,255,150,0.3),rgba(0,150,255,0.3)); border-radius: 8px; cursor: pointer; display:flex;align-items:center;justify-content:center;color:#fff;font-size:9px;letter-spacing:1px;">PREVIEW FRAME</div>
+        <div style="height: 32px; background: linear-gradient(135deg,rgba(255,150,0,0.5),rgba(255,80,0,0.5)); border-radius: 8px; cursor: pointer; display:flex;align-items:center;justify-content:center;color:#fff;font-size:9px;letter-spacing:1px;">KEY CURRENT FRAME</div>
+        <div style="height: 32px; background: linear-gradient(135deg,rgba(0,255,100,0.5),rgba(0,200,80,0.5)); border-radius: 8px; cursor: pointer; display:flex;align-items:center;justify-content:center;color:#000;font-size:9px;letter-spacing:1px;">PROCESS WORK AREA</div>
+      </div>
+      <div style="color:#555;font-size:8px;text-align:center;margin-top:10px;">CLICK CARD TO FLIP BACK</div>
+    </div>
+  </div>
+</div>
+
+<!-- DESIGN C: HEXAGONAL HONEYCOMB interface -->
+<div style="position: absolute; top: 50px; left: 650px; width: 250px; height: 500px; background: linear-gradient(180deg, #000 0%, #001 100%); border-radius: 20px; padding: 20px; box-sizing: border-box; box-shadow: 0 0 40px rgba(0,255,255,0.2);">
+  <div style="position: relative; width: 100%; height: 100%;">
+    <div style="position:absolute;top:0;right:0;color:#555;font-size:8px;">C: HONEYCOMB</div>
+    <div style="text-align:center; color: #0ff; font-size: 14px; letter-spacing: 2px; text-shadow: 0 0 15px #0ff; margin-bottom:15px;">CORRIDORKEY</div>
+
+    <!-- Hex screen toggle -->
+    <div style="display:flex;justify-content:center;gap:8px;margin-bottom:15px;">
+      <div style="width: 60px; height: 52px; background: rgba(0,255,0,0.15); clip-path: polygon(25% 0%, 75% 0%, 100% 50%, 75% 100%, 25% 100%, 0% 50%); cursor: pointer; display:flex;align-items:center;justify-content:center;color:#0f0;font-size:9px;font-weight:bold;border:none;" onmouseover="this.style.background='rgba(0,255,0,0.4)'" onmouseout="this.style.background='rgba(0,255,0,0.15)'">GREEN</div>
+      <div style="width: 60px; height: 52px; background: rgba(0,100,255,0.15); clip-path: polygon(25% 0%, 75% 0%, 100% 50%, 75% 100%, 25% 100%, 0% 50%); cursor: pointer; display:flex;align-items:center;justify-content:center;color:#08f;font-size:9px;font-weight:bold;" onmouseover="this.style.background='rgba(0,100,255,0.4)'" onmouseout="this.style.background='rgba(0,100,255,0.15)'">BLUE</div>
+    </div>
+
+    <!-- Sliders with hex labels -->
+    <div style="margin-bottom:12px;">
+      <div style="display:flex;justify-content:space-between;color:#0ff;font-size:8px;margin-bottom:4px;"><span>DESPILL</span><span id="hv1">50</span></div>
+      <input type="range" style="width:100%;accent-color:#0ff;" min="0" max="100" value="50" oninput="document.getElementById('hv1').textContent=this.value">
+    </div>
+    <div style="margin-bottom:12px;">
+      <div style="display:flex;justify-content:space-between;color:#0ff;font-size:8px;margin-bottom:4px;"><span>REFINER</span><span id="hv2">75</span></div>
+      <input type="range" style="width:100%;accent-color:#0ff;" min="0" max="100" value="75" oninput="document.getElementById('hv2').textContent=this.value">
+    </div>
+    <div style="margin-bottom:12px;">
+      <div style="display:flex;align-items:center;gap:8px;color:#0ff;font-size:8px;margin-bottom:4px;">
+        <span>DESPECKLE</span>
+        <div style="width:30px;height:16px;background:rgba(0,255,150,0.3);border-radius:8px;cursor:pointer;position:relative;" id="hexToggle" onclick="this.classList.toggle('on');this.querySelector('div').style.transform=this.classList.contains('on')?'translateX(14px)':'translateX(0)'">
+          <div style="width:14px;height:14px;background:#0ff;border-radius:50%;position:absolute;top:1px;left:1px;transition:transform 0.3s;"></div>
+        </div>
+        <span id="hv3">400</span>
+      </div>
+      <input type="range" style="width:100%;accent-color:#0ff;" min="50" max="2000" value="400" oninput="document.getElementById('hv3').textContent=this.value">
+    </div>
+
+    <!-- Hex action buttons -->
+    <div style="display:flex;flex-direction:column;gap:8px;margin-top:15px;">
+      <div style="height:36px;background:rgba(0,255,150,0.1);clip-path:polygon(3% 0%,97% 0%,100% 50%,97% 100%,3% 100%,0% 50%);cursor:pointer;display:flex;align-items:center;justify-content:center;color:#0ff;font-size:9px;letter-spacing:1px;transition:all 0.3s;" onmouseover="this.style.background='rgba(0,255,150,0.3)'" onmouseout="this.style.background='rgba(0,255,150,0.1)'">PREVIEW FRAME</div>
+      <div style="height:36px;background:rgba(255,150,0,0.15);clip-path:polygon(3% 0%,97% 0%,100% 50%,97% 100%,3% 100%,0% 50%);cursor:pointer;display:flex;align-items:center;justify-content:center;color:#fa0;font-size:9px;letter-spacing:1px;transition:all 0.3s;" onmouseover="this.style.background='rgba(255,150,0,0.35)'" onmouseout="this.style.background='rgba(255,150,0,0.15)'">KEY CURRENT FRAME</div>
+      <div style="height:36px;background:rgba(0,255,100,0.15);clip-path:polygon(3% 0%,97% 0%,100% 50%,97% 100%,3% 100%,0% 50%);cursor:pointer;display:flex;align-items:center;justify-content:center;color:#0f8;font-size:9px;letter-spacing:1px;transition:all 0.3s;" onmouseover="this.style.background='rgba(0,255,100,0.35)'" onmouseout="this.style.background='rgba(0,255,100,0.15)'">PROCESS WORK AREA</div>
+    </div>
+
+    <div style="margin-top:12px;color:#0ff;font-size:8px;text-align:center;">STATUS: READY</div>
+    <div style="margin-top:6px;padding:6px;background:rgba(0,255,150,0.05);border-radius:6px;font-size:8px;color:#555;font-family:monospace;height:50px;overflow-y:auto;">CorridorKey initialized<br>StuntWorks 2026</div>
+  </div>
+</div>
+
+<style>
+@keyframes pulse {
+  0%, 100% { box-shadow: 0 0 40px #0f0; }
+  50% { box-shadow: 0 0 60px #0f0, 0 0 80px rgba(0,255,0,0.3); }
+}
+</style>
+
+</body>
+</html>

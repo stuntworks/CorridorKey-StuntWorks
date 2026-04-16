@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>CorridorKey — Approach 9: Sony BVM-D9</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #060806; font-family: 'SF Mono', 'Consolas', monospace; display: flex; gap: 32px; padding: 32px; min-height: 100vh; align-items: flex-start; justify-content: center; }
+
+  /* ── LABEL ── */
+  .approach-label { position: fixed; top: 16px; left: 50%; transform: translateX(-50%); background: rgba(0,255,65,.08); border: 1px solid rgba(0,255,65,.3); color: #00ff41; font-size: 13px; font-weight: 700; letter-spacing: 2px; text-transform: uppercase; padding: 8px 24px; border-radius: 0; z-index: 99; font-family: 'SF Mono', monospace; text-shadow: 0 0 6px rgba(0,255,65,.4); }
+
+  /* ══════════════════════════════════════════════════
+     CEP PANEL
+     ══════════════════════════════════════════════════ */
+  .cep-panel {
+    width: 260px; min-height: 500px; overflow: hidden;
+    border: 1px solid rgba(0,255,65,.15);
+    --crt: #0f100f; --bezel: #1a1b1a; --phos: #00ff41; --dim: #5d635d; --glint: #ffffff;
+    background: var(--crt); color: var(--phos); padding: 10px 8px; font-size: 11px;
+  }
+  .cep-panel h1 { color: var(--phos); font-size: 13px; text-align: center; letter-spacing: 3px; text-transform: uppercase; font-weight: 400; margin-bottom: 2px; text-shadow: 0 0 8px var(--phos); }
+  .cep-panel .credit { font-size: 8px; color: var(--dim); margin-bottom: 8px; text-align: center; }
+  .cep-panel .section { margin-bottom: 12px; border-bottom: 1px solid rgba(0,255,65,.06); padding-bottom: 6px; }
+  .cep-panel label { display: block; margin-bottom: 4px; color: var(--phos); font-size: 9px; font-weight: 600; letter-spacing: 1px; }
+  .cep-panel select { width: 100%; padding: 6px 8px; background: var(--bezel); border: 1px solid rgba(0,255,65,.2); color: var(--phos); border-radius: 0; font-size: 9px; outline: none; font-family: inherit; }
+
+  .cep-panel input[type="range"] { -webkit-appearance: none; width: 100%; height: 18px; background: transparent; margin: 2px 0; cursor: pointer; }
+  .cep-panel input[type="range"]::-webkit-slider-runnable-track { height: 3px; background: linear-gradient(to right, var(--phos) 0%, var(--phos) 50%, rgba(0,0,0,.4) 50%, rgba(0,0,0,.4) 100%); }
+  .cep-panel input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 12px; height: 12px; background: var(--crt); border: 2px solid var(--phos); border-radius: 0; margin-top: -5px; box-shadow: 0 0 6px var(--phos); }
+
+  .slider-row { display: flex; align-items: center; gap: 6px; }
+  .slider-value { width: 34px; text-align: right; color: var(--phos); font-size: 10px; }
+
+  .cep-panel button { width: 100%; padding: 8px; margin: 4px 0; background: var(--bezel); border: 1px solid rgba(0,255,65,.3); color: var(--phos); font-size: 10px; font-weight: 600; text-transform: uppercase; border-radius: 0; cursor: pointer; transition: all .15s; font-family: inherit; letter-spacing: 1px; }
+  .cep-panel button:hover { background: rgba(0,255,65,.15); box-shadow: 0 0 10px rgba(0,255,65,.35); }
+  .btn-preview { border-color: rgba(0,255,65,.4) !important; }
+  .btn-process { border-color: rgba(255,255,255,.25) !important; color: #ffffff !important; }
+  .btn-batch { border-color: rgba(93,99,93,.4) !important; color: var(--dim) !important; }
+
+  .cep-panel .status { background: rgba(0,255,65,.05); border: 1px solid rgba(0,255,65,.1); color: var(--phos); font-size: 8px; padding: 5px; margin-top: 6px; text-align: center; letter-spacing: .5px; }
+  .cep-panel .log { background: var(--crt); border: 1px solid var(--bezel); color: var(--phos); font-size: 8px; height: 54px; margin-top: 4px; padding: 6px; overflow-y: auto; }
+
+  /* Scanline overlay for CRT feel */
+  .cep-panel::after { content: ''; position: absolute; inset: 0; pointer-events: none; background: repeating-linear-gradient(0deg, transparent, transparent 1px, rgba(0,0,0,.12) 1px, rgba(0,0,0,.12) 2px); }
+  .cep-panel { position: relative; }
+
+  /* ══════════════════════════════════════════════════
+     QT VIEWER
+     ══════════════════════════════════════════════════ */
+  .qt-viewer {
+    width: 640px; min-height: 500px; overflow: hidden;
+    background: #0f100f; color: #00ff41; font-family: 'SF Mono', 'Consolas', monospace; font-size: 12px;
+    border: 1px solid rgba(0,255,65,.15); display: flex; flex-direction: column; position: relative;
+  }
+  /* Scanline overlay */
+  .qt-viewer::after { content: ''; position: absolute; inset: 0; pointer-events: none; background: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,0,0,.08) 2px, rgba(0,0,0,.08) 4px); z-index: 10; }
+
+  .qt-toolbar { display: flex; gap: 8px; padding: 10px 12px; background: #0f100f; border-bottom: 1px solid rgba(0,255,65,.08); flex-wrap: wrap; }
+  .qt-btn { background: #1a1b1a; border: 1px solid rgba(0,255,65,.35); padding: 6px 14px; font-weight: 600; color: #00ff41; cursor: pointer; font-size: 11px; transition: all .15s; border-radius: 0; font-family: inherit; }
+  .qt-btn:hover { background: rgba(0,255,65,.15); }
+  .qt-btn.active { background: #00ff41; color: #0f100f; }
+
+  .qt-viewport { flex: 1; background: #080908; display: flex; align-items: center; justify-content: center; min-height: 300px; border: 2px solid #1a1b1a; margin: 8px; }
+  .qt-placeholder { color: #5d635d; font-size: 13px; letter-spacing: 2px; text-shadow: 0 0 4px rgba(0,255,65,.2); }
+
+  .qt-sliders { padding: 10px 12px; background: #0f100f; border-top: 1px solid rgba(0,255,65,.08); }
+  .qt-slider-row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+  .qt-slider-label { width: 80px; font-size: 10px; color: #00ff41; font-weight: 600; letter-spacing: .5px; }
+  .qt-slider { flex: 1; -webkit-appearance: none; height: 3px; background: rgba(0,0,0,.5); cursor: pointer; }
+  .qt-slider::-webkit-slider-thumb { -webkit-appearance: none; width: 12px; height: 12px; background: #0f100f; border: 2px solid #00ff41; border-radius: 0; box-shadow: 0 0 4px rgba(0,255,65,.3); }
+  .qt-slider-val { width: 40px; text-align: right; font-size: 10px; color: #00ff41; }
+
+  .qt-statusbar { padding: 4px 12px; background: #0f100f; border-top: 1px solid rgba(0,255,65,.06); font-size: 9px; color: #5d635d; display: flex; justify-content: space-between; }
+</style>
+</head>
+<body>
+  <div class="approach-label">Approach 9 — Sony BVM-D9</div>
+
+  <!-- CEP Panel -->
+  <div class="cep-panel">
+    <h1>CorridorKey</h1>
+    <div class="credit">AI Keyer by Niko Pueringer / Corridor Digital<br>Plugin by Roberto Lopez / StuntWorks</div>
+
+    <div class="section">
+      <label>SCREEN TYPE</label>
+      <select><option>GREEN SCREEN</option><option>BLUE SCREEN</option></select>
+    </div>
+
+    <div class="section">
+      <label>DESPILL</label>
+      <div class="slider-row">
+        <input type="range" min="0" max="100" value="50">
+        <span class="slider-value">50</span>
+      </div>
+    </div>
+
+    <div class="section">
+      <label>DESPECKLE</label>
+      <div class="slider-row">
+        <input type="range" min="0" max="100" value="30">
+        <span class="slider-value">30</span>
+      </div>
+    </div>
+
+    <button class="btn-preview">▶ Preview Frame</button>
+    <button class="btn-process">● Key Current Frame</button>
+    <button class="btn-batch">■ Process Work Area</button>
+
+    <div class="status">■ SIGNAL LOCK — CorridorKey v1.0</div>
+    <div class="log">&gt; engine loaded<br>&gt; gpu: rtx 4090 [24576mb]<br>&gt; model: corridorkey_v1.pth<br>&gt; ready_</div>
+  </div>
+
+  <!-- Qt Viewer -->
+  <div class="qt-viewer">
+    <div class="qt-toolbar">
+      <div class="qt-btn active">KEYED</div>
+      <div class="qt-btn">MATTE</div>
+      <div class="qt-btn">COMP</div>
+      <div class="qt-btn">ORIG</div>
+      <div style="flex:1"></div>
+      <div class="qt-btn">SPLIT</div>
+    </div>
+    <div class="qt-viewport">
+      <span class="qt-placeholder">[ SONY BVM-D9 — PHOSPHOR MONITOR ]</span>
+    </div>
+    <div class="qt-sliders">
+      <div class="qt-slider-row">
+        <span class="qt-slider-label">DESPILL</span>
+        <input type="range" class="qt-slider" min="0" max="100" value="50">
+        <span class="qt-slider-val">50</span>
+      </div>
+      <div class="qt-slider-row">
+        <span class="qt-slider-label">DESPECKLE</span>
+        <input type="range" class="qt-slider" min="0" max="100" value="30">
+        <span class="qt-slider-val">30</span>
+      </div>
+      <div class="qt-slider-row">
+        <span class="qt-slider-label">REFINER</span>
+        <input type="range" class="qt-slider" min="0" max="100" value="70">
+        <span class="qt-slider-val">70</span>
+      </div>
+    </div>
+    <div class="qt-statusbar">
+      <span>&gt; meanRGB: 142 138 120</span>
+      <span>1920x1080 @ 23.976</span>
+    </div>
+  </div>
+</body>
+</html>

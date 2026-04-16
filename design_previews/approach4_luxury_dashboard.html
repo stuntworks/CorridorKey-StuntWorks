@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>CorridorKey – Approach 4: Luxury Dashboard</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0a0a0a;color:#fff;width:250px;padding:20px;overflow-x:hidden;}
+.dashboard{background:linear-gradient(145deg,#1a1a1a 0%,#0d0d0d 100%);border-radius:24px;padding:24px;
+  box-shadow:inset 0 2px 4px rgba(255,255,255,0.05),inset 0 -2px 4px rgba(0,0,0,0.5),0 8px 32px rgba(0,0,0,0.8);}
+.screen-selector{display:flex;gap:8px;margin-bottom:24px;}
+.screen-btn{flex:1;padding:12px;border:1px solid #333;border-radius:12px;background:linear-gradient(145deg,#222 0%,#111 100%);
+  color:#888;font-size:11px;font-weight:500;cursor:pointer;transition:all 0.3s;}
+.screen-btn.active{background:linear-gradient(145deg,#00ff88 0%,#00cc66 100%);color:#000;border-color:#00ff88;box-shadow:0 0 20px rgba(0,255,136,0.3);}
+.control-group{margin-bottom:24px;}
+.label{font-size:10px;color:#666;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px;}
+.slider-row{display:flex;align-items:center;gap:8px;margin:4px 0;}
+.value-display{font-size:12px;color:#00ff88;font-weight:500;min-width:32px;text-align:right;}
+input[type=range]{-webkit-appearance:none;flex:1;height:4px;background:#111;border-radius:2px;outline:none;}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;height:20px;
+  background:radial-gradient(circle,#fff 0%,#ccc 100%);border-radius:50%;cursor:grab;box-shadow:0 2px 8px rgba(0,0,0,0.5);}
+input[type=range]::-webkit-slider-thumb:active{transform:scale(1.2);}
+.toggle-container{display:flex;align-items:center;gap:12px;margin-bottom:16px;}
+.toggle-switch{width:44px;height:24px;background:#111;border-radius:12px;position:relative;cursor:pointer;transition:background 0.3s;}
+.toggle-switch.on{background:#00ff88;}
+.toggle-knob{width:20px;height:20px;background:#fff;border-radius:50%;position:absolute;top:2px;left:2px;
+  transition:transform 0.3s;box-shadow:0 2px 4px rgba(0,0,0,0.3);}
+.toggle-switch.on .toggle-knob{transform:translateX(20px);}
+.action-buttons{display:flex;flex-direction:column;gap:8px;margin-top:24px;}
+.action-btn{padding:14px;border-radius:12px;border:none;font-size:11px;font-weight:600;
+  text-transform:uppercase;letter-spacing:0.5px;cursor:pointer;transition:all 0.3s;font-family:inherit;}
+.btn-preview{background:linear-gradient(145deg,#2a2a2a 0%,#1a1a1a 100%);color:#ccc;border:1px solid #333;}
+.btn-preview:hover{border-color:#00ff88;color:#fff;}
+.btn-key{background:linear-gradient(145deg,#ff9500 0%,#ff6b00 100%);color:#000;box-shadow:0 4px 16px rgba(255,149,0,0.3);}
+.btn-key:hover{box-shadow:0 6px 24px rgba(255,149,0,0.4);transform:translateY(-1px);}
+.btn-process{background:linear-gradient(145deg,#00ff88 0%,#00cc66 100%);color:#000;box-shadow:0 4px 16px rgba(0,255,136,0.3);}
+.btn-process:hover{box-shadow:0 6px 24px rgba(0,255,136,0.4);transform:translateY(-1px);}
+.status{margin-top:24px;padding:12px;background:#111;border-radius:8px;font-size:10px;color:#666;}
+.log-area{margin-top:8px;padding:8px;background:#0a0a0a;border-radius:6px;font-size:9px;color:#444;
+  height:60px;overflow-y:auto;font-family:'Courier New',monospace;}
+.tag{position:fixed;top:8px;right:8px;background:#00ff88;color:#000;padding:4px 10px;border-radius:8px;font-weight:700;font-size:11px;}
+</style>
+</head>
+<body>
+<div class="tag">4: LUXURY DASHBOARD</div>
+<div class="dashboard">
+  <div class="screen-selector">
+    <button class="screen-btn active" onclick="this.parentNode.querySelectorAll('.screen-btn').forEach(b=>b.classList.remove('active'));this.classList.add('active')">GREEN</button>
+    <button class="screen-btn" onclick="this.parentNode.querySelectorAll('.screen-btn').forEach(b=>b.classList.remove('active'));this.classList.add('active')">BLUE</button>
+  </div>
+  <div class="control-group">
+    <div class="label">Despill</div>
+    <div class="slider-row"><input type="range" min="0" max="100" value="50" oninput="this.nextElementSibling.textContent=this.value"><span class="value-display">50</span></div>
+  </div>
+  <div class="control-group">
+    <div class="label">Refiner</div>
+    <div class="slider-row"><input type="range" min="0" max="100" value="75" oninput="this.nextElementSibling.textContent=this.value"><span class="value-display">75</span></div>
+  </div>
+  <div class="control-group">
+    <div class="toggle-container">
+      <div class="label" style="margin:0">Despeckle</div>
+      <div class="toggle-switch on" onclick="this.classList.toggle('on')"><div class="toggle-knob"></div></div>
+    </div>
+    <div class="slider-row"><input type="range" min="50" max="2000" value="500" oninput="this.nextElementSibling.textContent=this.value"><span class="value-display">500</span></div>
+  </div>
+  <div class="action-buttons">
+    <button class="action-btn btn-preview">Preview Frame</button>
+    <button class="action-btn btn-key">Key Current Frame</button>
+    <button class="action-btn btn-process">Process Work Area</button>
+  </div>
+  <div class="status">
+    <div>Ready</div>
+    <div class="log-area">> CorridorKey initialized<br>> AI model loaded<br>> Awaiting input...</div>
+  </div>
+</div>
+</body>
+</html>
