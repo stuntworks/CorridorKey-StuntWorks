@@ -7,7 +7,7 @@ We created a Python script (`kimi_design.py`) that sends the CorridorKey plugin'
 **To run it again anytime:**
 ```
 cd "D:\New AI Projects\CorridorKey-Plugin"
-set KIMI_API_KEY=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
+set KIMI_API_KEY=your-openrouter-key-here
 python kimi_design.py
 ```
 Add `--prompt "your specific question"` to focus on one area.
