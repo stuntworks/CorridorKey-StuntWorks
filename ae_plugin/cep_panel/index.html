@@ -516,6 +516,9 @@ function scheduleViewerUpdate() {
 // AFFECTS: rewrites fg.png + alpha.png in CURRENT_SESSION_DIR; kills and
 //   respawns VIEWER_PROC; writes live_params.json.
 function rekeyWithCurrentSettings() {
+    logLine('refiner onchange fired: LAST_FRAME_PNG=' + (LAST_FRAME_PNG ? 'set' : 'null') +
+            ' CURRENT_SESSION_DIR=' + (CURRENT_SESSION_DIR ? 'set' : 'null') +
+            ' VIEWER_PROC=' + (VIEWER_PROC ? 'alive' : 'null'));
     if (!LAST_FRAME_PNG || !CURRENT_SESSION_DIR || !VIEWER_PROC) return;
     setBusy(true);
     document.getElementById('progress-bar').classList.add('indeterminate');
