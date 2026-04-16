@@ -313,24 +313,30 @@ function browseOutput() {
 }
 
 // ── UI ──────────────────────────────────────────────────────
+// WHAT IT DOES: Updates the CSS --fill custom property on a range input so the
+//   green fill track visually tracks the thumb position. Called on every input.
+function updateSliderFill(el) {
+    const pct = ((el.value - el.min) / (el.max - el.min)) * 100;
+    el.style.setProperty('--fill', pct + '%');
+}
+// Set initial fill on all sliders at startup
+document.querySelectorAll('input[type="range"]').forEach(updateSliderFill);
+
 document.getElementById('despill').oninput = function() {
     document.getElementById('despillVal').textContent = (this.value / 100).toFixed(2);
+    updateSliderFill(this);
     scheduleViewerUpdate();
 };
 document.getElementById('refiner').oninput = function() {
     document.getElementById('refinerVal').textContent = (this.value / 100).toFixed(2);
-    // Refiner is stage-1 (NN-internal). During drag we only update the value
-    // label — a full NN re-run happens on mouse release (onchange) so the user
-    // can drag freely without queuing multiple expensive re-keys.
+    updateSliderFill(this);
 };
 document.getElementById('refiner').onchange = function() {
-    // Fired on mouse release. Re-runs stage-1 with the new refiner value and
-    // respawns the viewer against the updated session. No-op if no live
-    // preview is active.
     rekeyWithCurrentSettings();
 };
 document.getElementById('despeckleSize').oninput = function() {
     document.getElementById('despeckleSizeVal').textContent = this.value;
+    updateSliderFill(this);
     scheduleViewerUpdate();
 };
 // Despeckle — standard feature-toggle pattern. Checked = feature ON, slider
