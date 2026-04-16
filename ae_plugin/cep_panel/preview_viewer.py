@@ -359,12 +359,11 @@ class PersistentWindow(QtWidgets.QWidget):
                     self.original_u8 = np.clip(
                         self.session.fg_rgb * 255.0, 0, 255
                     ).astype(np.uint8)
-                    print(
-                        f"[VIEWER] fg.png reloaded (refiner re-key), re-rendering",
-                        file=sys.stderr, flush=True,
-                    )
                     self._place_original()
-                    self._render_now()
+                    # Auto-switch to Composite so the user sees the refiner result.
+                    self._set_view_mode("Composite")
+                    # Hide processing overlay — re-key complete.
+                    self._overlay.hide()
                 except Exception:
                     # Mid-write or bad file — retry on next tick (mtime will
                     # change again when the writer finishes).
@@ -388,55 +387,67 @@ class PersistentWindow(QtWidgets.QWidget):
         except Exception:
             # Partial write or transient — next tick will retry.
             return
-        # Log every detected change so we can prove in the panel log whether the
-        # file-watcher is firing. Goes to stderr → panel captures as "viewer:".
-        print(
-            f"[VIEWER] live_params changed mtime={mt:.2f} "
-            f"despill={params.get('despill')} "
-            f"despeckleSize={params.get('despeckleSize')}",
-            file=sys.stderr,
-            flush=True,
-        )
         self.on_update(params)
 
     def _build_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setSpacing(8)
-        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(6)
+        layout.setContentsMargins(10, 8, 10, 8)
 
-        title = QtWidgets.QLabel("CorridorKey Live Preview")
+        # Title
+        title = QtWidgets.QLabel("CORRIDORKEY LIVE PREVIEW")
         title.setAlignment(QtCore.Qt.AlignCenter)
         title.setStyleSheet(
-            "color: #4CAF50; font-size: 18px; font-weight: bold; "
-            "border: none; background: transparent;"
+            "color: #00C853; font-size: 14px; font-weight: 700; "
+            "letter-spacing: 1.5px; border: none; background: transparent;"
         )
         layout.addWidget(title)
 
-        # View mode
+        # View mode — pill buttons with mode colors when active
         mode_row = QtWidgets.QHBoxLayout()
-        mode_row.setSpacing(6)
-        colors = {"Composite": "#9C27B0", "Foreground": "#2196F3", "Matte": "#FF9800"}
+        mode_row.setSpacing(4)
+        self._mode_colors = {
+            "Original": "#607D8B",
+            "Composite": "#9C27B0",
+            "Foreground": "#2979FF",
+            "Matte": "#FF9100",
+        }
         self.mode_buttons = {}
-        for mode, color in colors.items():
+        for mode, color in self._mode_colors.items():
             btn = QtWidgets.QPushButton(mode)
-            btn.setStyleSheet(f"background-color: {color}; color: white; padding: 8px 16px;")
+            btn.setStyleSheet(
+                "background-color: #1e1e1e; color: #888; padding: 5px 12px; "
+                "border-radius: 12px; font-size: 11px; font-weight: 600;"
+            )
             btn.clicked.connect(lambda _=False, m=mode: self._set_view_mode(m))
             mode_row.addWidget(btn)
             self.mode_buttons[mode] = btn
+        # Split toggle
+        self._split_btn = QtWidgets.QPushButton("Split")
+        self._split_btn.setCheckable(True)
+        self._split_btn.setStyleSheet(
+            "background-color: #1e1e1e; color: #555; padding: 5px 10px; "
+            "border-radius: 12px; font-size: 10px;"
+        )
+        self._split_btn.clicked.connect(self._toggle_split)
+        mode_row.addWidget(self._split_btn)
         layout.addLayout(mode_row)
 
-        # Background
+        # Background — smaller pills
         bg_row = QtWidgets.QHBoxLayout()
-        bg_row.setSpacing(6)
+        bg_row.setSpacing(3)
         bg_label = QtWidgets.QLabel("BG:")
-        bg_label.setStyleSheet("color: #aaa; border: none; background: transparent;")
+        bg_label.setStyleSheet(
+            "color: #555; border: none; background: transparent; font-size: 10px;"
+        )
         bg_row.addWidget(bg_label)
         self.bg_buttons = {}
         for bg_name in ("checker", "black", "white", "v1"):
             btn = QtWidgets.QPushButton(bg_name.upper())
             btn.setCheckable(True)
             btn.setStyleSheet(
-                "background-color: #444; color: white; padding: 4px 10px; font-size: 11px;"
+                "background-color: #1e1e1e; color: #666; padding: 3px 8px; "
+                "border-radius: 10px; font-size: 9px;"
             )
             btn.clicked.connect(lambda _=False, n=bg_name: self._set_background(n))
             bg_row.addWidget(btn)
@@ -445,38 +456,92 @@ class PersistentWindow(QtWidgets.QWidget):
         bg_row.addStretch()
         layout.addLayout(bg_row)
 
-        # Image panels — expand with the window. Size policy + stretch lets the
-        # labels grow; resizeEvent() re-scales the pixmaps so the image follows.
-        pane_row = QtWidgets.QHBoxLayout()
-        pane_row.setSpacing(8)
-        expanding = QtWidgets.QSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        # Image panes — single pane default, left_label hidden until Split on
+        expanding = QtWidgets.QSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding
+        )
+        self._pane_row = QtWidgets.QHBoxLayout()
+        self._pane_row.setSpacing(4)
         self.left_label = QtWidgets.QLabel()
         self.left_label.setAlignment(QtCore.Qt.AlignCenter)
         self.left_label.setSizePolicy(expanding)
-        self.left_label.setMinimumSize(240, 180)
+        self.left_label.setMinimumSize(200, 150)
+        self.left_label.setStyleSheet("background-color: #000; border: 1px solid #1e1e1e;")
+        self.left_label.hide()
         self.right_label = QtWidgets.QLabel()
         self.right_label.setAlignment(QtCore.Qt.AlignCenter)
         self.right_label.setSizePolicy(expanding)
-        self.right_label.setMinimumSize(240, 180)
-        pane_row.addWidget(self.left_label, 1)
-        pane_row.addWidget(self.right_label, 1)
-        layout.addLayout(pane_row, 1)
+        self.right_label.setMinimumSize(320, 240)
+        self.right_label.setStyleSheet("background-color: #000; border: 1px solid #1e1e1e;")
+        self._pane_row.addWidget(self.left_label, 1)
+        self._pane_row.addWidget(self.right_label, 1)
+        layout.addLayout(self._pane_row, 1)
 
-        # Full-res arrays — kept around so resize events can rescale to any target
-        # size without recomputing stage-2 just for a window drag.
-        self._last_right_full = None   # filled by _render_now after each repaint
+        # Processing overlay — shown during refiner re-key
+        self._overlay = QtWidgets.QLabel("Re-keying...", self.right_label)
+        self._overlay.setAlignment(QtCore.Qt.AlignCenter)
+        self._overlay.setStyleSheet(
+            "background-color: rgba(0,0,0,180); color: #00C853; "
+            "font-size: 22px; font-weight: 700; border: none; border-radius: 2px;"
+        )
+        self._overlay.hide()
+
+        # Full-res arrays for resize re-scaling without stage-2 re-render
+        self._last_right_full = None
         self._place_original()
 
-        # Status bar
+        # Status bar — monospace readout
         self.status = QtWidgets.QLabel("Ready")
         self.status.setStyleSheet(
-            "color: #888; border: none; background: transparent; font-size: 11px;"
+            "color: #555; border: none; background: transparent; "
+            "font-family: 'JetBrains Mono', 'SF Mono', 'Consolas', monospace; "
+            "font-size: 10px;"
         )
         layout.addWidget(self.status)
 
-        # Resizable — laptops need small, big monitors get dragged larger.
-        self.resize(self.disp_w * 2 + 32, self.disp_h + 170)
-        self.setMinimumSize(540, 320)
+        # Default size — single pane, compact
+        self.resize(self.disp_w + 24, self.disp_h + 140)
+        self.setMinimumSize(360, 300)
+
+        # Highlight the default active mode button
+        self._highlight_mode_button()
+
+    # WHAT IT DOES: Updates mode button styles — active button gets its mode
+    #   color, inactive buttons revert to default dark surface.
+    # DEPENDS-ON: self._mode_colors, self._view_mode.
+    # AFFECTS: button stylesheets only.
+    def _highlight_mode_button(self):
+        for mode, btn in self.mode_buttons.items():
+            color = self._mode_colors[mode]
+            if mode == self._view_mode:
+                btn.setStyleSheet(
+                    f"background-color: {color}; color: #fff; padding: 5px 12px; "
+                    f"border-radius: 12px; font-size: 11px; font-weight: 600;"
+                )
+            else:
+                btn.setStyleSheet(
+                    "background-color: #1e1e1e; color: #888; padding: 5px 12px; "
+                    "border-radius: 12px; font-size: 11px; font-weight: 600;"
+                )
+
+    # WHAT IT DOES: Toggles between single-pane (default) and two-up split view.
+    # DEPENDS-ON: self.left_label visibility state.
+    # AFFECTS: left_label visibility, window width, split button style.
+    def _toggle_split(self, checked):
+        if checked:
+            self.left_label.show()
+            self._split_btn.setStyleSheet(
+                "background-color: #333; color: #e8e8e8; padding: 5px 10px; "
+                "border-radius: 12px; font-size: 10px;"
+            )
+            self.resize(self.width() + self.disp_w, self.height())
+        else:
+            self.left_label.hide()
+            self._split_btn.setStyleSheet(
+                "background-color: #1e1e1e; color: #555; padding: 5px 10px; "
+                "border-radius: 12px; font-size: 10px;"
+            )
+        self._repaint_both()
 
     # ===== Commands from stdin =====
     # WHAT IT DOES: Merges incoming params into the live params dict, then schedules
@@ -486,6 +551,14 @@ class PersistentWindow(QtWidgets.QWidget):
     # AFFECTS: self._params, self._pending, self._painting.
     @QtCore.Slot(dict)
     def on_update(self, params: dict):
+        # Show/hide processing overlay for refiner re-key
+        if params.get("rekeying") is True:
+            self._overlay.setGeometry(0, 0, self.right_label.width(), self.right_label.height())
+            self._overlay.show()
+            self._overlay.raise_()
+            return
+        if params.get("rekeying") is False:
+            self._overlay.hide()
         merged = dict(self._params)
         for k, v in params.items():
             if k in ("despill", "despeckle", "despeckleSize", "background"):
@@ -511,9 +584,7 @@ class PersistentWindow(QtWidgets.QWidget):
     # ===== Render =====
     def _set_view_mode(self, mode):
         self._view_mode = mode
-        for m, btn in self.mode_buttons.items():
-            base = btn.styleSheet().split("; border")[0]
-            btn.setStyleSheet(base + ("; border: 2px solid white;" if m == mode else ";"))
+        self._highlight_mode_button()
         self._render_now()
 
     def _set_background(self, bg_name):
@@ -531,7 +602,9 @@ class PersistentWindow(QtWidgets.QWidget):
         self._painting = True
         t0 = time.perf_counter()
         try:
-            if self._view_mode == "Composite":
+            if self._view_mode == "Original":
+                img = self.original_u8.copy()
+            elif self._view_mode == "Composite":
                 img = render_composite(self.cu, self.session, self._params)
             elif self._view_mode == "Foreground":
                 # Pure despilled RGB with NO alpha blend — shows what the colour
@@ -573,20 +646,6 @@ class PersistentWindow(QtWidgets.QWidget):
                 f"@{self._params['despeckleSize']}  bg={self._params['background']}  "
                 f"|  meanRGB=({mean_r:.1f},{mean_g:.1f},{mean_b:.1f})  "
                 f"|  render {dt_ms:.0f} ms"
-            )
-            # Mirror meanRGB to stderr so the panel log proves whether pixel
-            # output is actually varying with slider changes. Identical numbers
-            # across different slider positions = post-proc math has no
-            # measurable effect on this shot. Different = the math works and
-            # the only remaining question is display/perception.
-            print(
-                f"[RENDER] mode={self._view_mode} "
-                f"despill={self._params['despill']:.2f} "
-                f"despeckleSize={self._params['despeckleSize']} "
-                f"meanRGB=({mean_r:.2f},{mean_g:.2f},{mean_b:.2f}) "
-                f"dt={dt_ms:.0f}ms",
-                file=sys.stderr,
-                flush=True,
             )
         except Exception as e:
             self.status.setText(f"Render error: {e}")
@@ -648,13 +707,15 @@ class PersistentWindow(QtWidgets.QWidget):
         self._paint_into(self.right_label, full_img)
 
     def _place_original(self):
-        self._paint_into(self.left_label, self.original_u8)
+        if self.left_label.isVisible():
+            self._paint_into(self.left_label, self.original_u8)
 
     # WHAT IT DOES: Re-paints both panes using current zoom/pan. Called after
     #   wheel scrolls or drag pans. No stage-2 re-render — just re-crops the
-    #   cached full-res arrays.
+    #   cached full-res arrays. Guards left_label on visibility (hidden in
+    #   single-pane mode).
     def _repaint_both(self):
-        if self.left_label.width() > 1:
+        if self.left_label.isVisible() and self.left_label.width() > 1:
             self._place_original()
         if self._last_right_full is not None and self.right_label.width() > 1:
             self._paint_right(self._last_right_full)
@@ -722,9 +783,12 @@ class PersistentWindow(QtWidgets.QWidget):
     # AFFECTS: left_label and right_label pixmaps.
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        # Layout may not have placed children yet on the very first resize event
-        # fired by the constructor — guard against zero-size labels.
         self._repaint_both()
+        # Keep overlay sized to image pane during window resize.
+        if hasattr(self, '_overlay'):
+            self._overlay.setGeometry(
+                0, 0, self.right_label.width(), self.right_label.height()
+            )
 
 
 # ===== Stdin reader thread =====
@@ -870,9 +934,22 @@ class OneShotWindow(QtWidgets.QWidget):
 
 
 _DARK_STYLE = """
-QWidget { background-color: #1a1a1a; color: #e0e0e0; }
-QPushButton { border: none; border-radius: 4px; font-weight: bold; font-size: 12px; }
-QLabel { background-color: #111; border: 1px solid #333; }
+QWidget {
+    background-color: #141414;
+    color: #e8e8e8;
+    font-family: 'Inter', 'SF Pro Display', 'Segoe UI', sans-serif;
+}
+QPushButton {
+    border: none; border-radius: 12px; font-weight: 600;
+    font-size: 11px; padding: 5px 14px;
+    background-color: #1e1e1e; color: #888;
+}
+QPushButton:hover { background-color: #282828; color: #e8e8e8; }
+QPushButton[active="true"] { color: #fff; }
+QLabel {
+    background-color: #000; border: 1px solid #1e1e1e;
+    border-radius: 2px;
+}
 """
 
 
