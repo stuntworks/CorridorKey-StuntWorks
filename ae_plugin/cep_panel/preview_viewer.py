@@ -330,11 +330,6 @@ class PersistentWindow(QtWidgets.QWidget):
         # in Node's internal buffer and never reached the Python child).
         self._live_params_path = self.session.session_dir / "live_params.json"
         self._live_params_mtime = 0.0
-        self._fg_png_path = self.session.session_dir / "fg.png"
-        try:
-            self._fg_png_mtime = self._fg_png_path.stat().st_mtime
-        except OSError:
-            self._fg_png_mtime = 0.0
         self._live_watcher = QtCore.QTimer(self)
         self._live_watcher.setInterval(50)
         self._live_watcher.timeout.connect(self._poll_live_params)
@@ -347,31 +342,10 @@ class PersistentWindow(QtWidgets.QWidget):
     #   session_dir being the same one passed on --session.
     # AFFECTS: self._live_params_mtime, self._params (via on_update).
     def _poll_live_params(self):
-        # First check if stage-1 output changed (refiner re-key case) and reload
-        # the Session PNGs in place. No process restart = no window flash.
-        try:
-            fg_mt = self._fg_png_path.stat().st_mtime
-            if fg_mt != self._fg_png_mtime:
-                self._fg_png_mtime = fg_mt
-                try:
-                    self.session.reload_pngs()
-                    # Refresh the static Original pane with the new fg_rgb.
-                    self.original_u8 = np.clip(
-                        self.session.fg_rgb * 255.0, 0, 255
-                    ).astype(np.uint8)
-                    self._place_original()
-                    # Auto-switch to Composite so the user sees the refiner result.
-                    self._set_view_mode("Composite")
-                    # Hide processing overlay — re-key complete.
-                    self._overlay.hide()
-                except Exception:
-                    # Mid-write or bad file — retry on next tick (mtime will
-                    # change again when the writer finishes).
-                    self._fg_png_mtime = 0.0
-        except OSError:
-            pass
-
-        # Then the usual live_params.json check for despill/despeckle/bg.
+        # Check live_params.json for slider updates + rekeying completion.
+        # NOTE: fg.png mtime polling was removed — reading a partially-written
+        # PNG caused libpng crashes. Instead, the panel sends rekeying:false
+        # AFTER cache finishes, so PNGs are guaranteed complete when we reload.
         try:
             mt = self._live_params_path.stat().st_mtime
         except FileNotFoundError:
@@ -559,6 +533,16 @@ class PersistentWindow(QtWidgets.QWidget):
             return
         if params.get("rekeying") is False:
             self._overlay.hide()
+            # Panel signals cache is done — PNGs are fully written, safe to read.
+            try:
+                self.session.reload_pngs()
+                self.original_u8 = np.clip(
+                    self.session.fg_rgb * 255.0, 0, 255
+                ).astype(np.uint8)
+                self._place_original()
+                self._set_view_mode("Composite")
+            except Exception:
+                pass  # PNGs unreadable — stale view is better than a crash
         merged = dict(self._params)
         for k, v in params.items():
             if k in ("despill", "despeckle", "despeckleSize", "background"):
