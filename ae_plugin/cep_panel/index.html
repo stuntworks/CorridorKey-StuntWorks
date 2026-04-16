@@ -583,12 +583,18 @@ function previewFrameLive() {
                 : ['extract', info.sourceFile, framePng, '--frame', String(info.sourceFrame)];
             runPython(extractArgs);
             if (!fs.existsSync(framePng)) throw new Error('Extract produced no output');
-            LAST_FRAME_PNG = framePng;
 
             // Step 2 — stage-1 only. Writes fg.png + alpha.png + meta.json to session dir.
             status('Running neural key (this can take a few seconds)...');
             sessionDir = randomTempPath('session', '');
             fs.mkdirSync(sessionDir, { recursive: true });
+            // Copy the extracted frame INTO the session dir. %TEMP% gets cleaned
+            // aggressively by Windows, which was eating the extract PNG before
+            // refiner onchange could reuse it for a re-key. Session dir lifetime
+            // is ours to manage — safe to point LAST_FRAME_PNG at.
+            const stableFramePng = path.join(sessionDir, 'source.png');
+            fs.copyFileSync(framePng, stableFramePng);
+            LAST_FRAME_PNG = stableFramePng;
             paramsPath = writeParamsFile(settings);
             runPython(['cache', framePng, sessionDir, '--params', paramsPath]);
 
