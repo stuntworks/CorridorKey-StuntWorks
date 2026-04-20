@@ -152,14 +152,14 @@ def _load_output_path():
     try:
         if _config_path.exists():
             return _config_path.read_text().strip()
-    except: pass
+    except Exception: pass
     return str(Path.home() / "Documents" / "CorridorKey")
 
 # WHAT IT DOES: Saves the user's chosen output folder to a config file in temp
 # ISOLATED: no dependencies, silently fails if temp folder is locked
 def _save_output_path(p):
     try: _config_path.write_text(p)
-    except: pass
+    except Exception: pass
 
 winLayout = ui.VGroup({"Spacing": 14}, [
     ui.HGroup({"Weight": 0, "Spacing": 0}, [
@@ -305,7 +305,7 @@ def get_current_frame_info():
             h, m, s, f = [int(p) for p in parts]
             return int(h * 3600 * fps + m * 60 * fps + s * fps + f), fps
         return 0, fps
-    except: return 0, 24.0
+    except Exception: return 0, 24.0
 
 # --- Frame Range UI Callbacks ---
 # WHAT IT DOES: Sets IN point to current playhead frame for range processing
@@ -724,7 +724,7 @@ def process_current_frame(preview_only=False):
             try:
                 imp[0].SetClipProperty("In", "00:00:00:00")
                 imp[0].SetClipProperty("Out", "00:00:00:00")
-            except: pass
+            except Exception: pass
             # Try recordFrame with constrained clip first
             target_frame = cf + 1
             log(f"[v1.2] Track 2, recordFrame={target_frame}")
@@ -867,12 +867,19 @@ def on_process_range(ev):
             if f.GetName() == "CorridorKey": ckb = f; break
         if not ckb: ckb = media_pool.AddSubFolder(root, "CorridorKey")
         media_pool.SetCurrentFolder(ckb)
-        imp = media_pool.ImportMedia(ofs)
+        # DANGER ZONE: ImportMedia([list-of-numbered-PNGs]) auto-detects an image sequence
+        # and returns 1 item, not N. Import one-at-a-time forces individual still frames.
+        imp = []
+        for png_path in ofs:
+            result = media_pool.ImportMedia([png_path])
+            if result:
+                imp.extend(result)
         if not imp: status("Import failed"); return
         log(f"Imported {len(imp)} items to MediaPool")
         if settings["output_mode"] in [0, 2]:
-            ci = {"mediaPoolItem": imp[0], "startFrame": 0, "endFrame": len(ofs), "trackIndex": 2, "recordFrame": inf, "mediaType": 1}
-            if media_pool.AppendToTimeline([ci]):
+            # recordFrame=inf on each item → Resolve appends sequentially at end of timeline
+            ci_list = [{"mediaPoolItem": item, "startFrame": 0, "endFrame": 0, "trackIndex": 2, "recordFrame": inf, "mediaType": 1} for item in imp]
+            if media_pool.AppendToTimeline(ci_list):
                 if items["DisableTrack1"].Checked: timeline.SetTrackEnable("video", 1, False)
                 status(f"DONE! {len(ofs)} frames")
             else: status("MediaPool only")
@@ -894,12 +901,12 @@ def on_toggle_track1(ev):
             cur = timeline.GetIsTrackEnabled("video", 1)
             timeline.SetTrackEnable("video", 1, not cur)
             status(f"Track 1 {'enabled' if not cur else 'disabled'}")
-    except: pass
+    except Exception: pass
 
 # WHAT IT DOES: Switches Resolve to the Fusion page for manual compositing
 def on_open_fusion(ev):
     try: resolve.OpenPage("fusion"); status("Fusion opened")
-    except: pass
+    except Exception: pass
 
 # WHAT IT DOES: Exits the Fusion UIDispatcher event loop, closing the plugin window
 # WHAT IT DOES: Kills any running preview viewer, then exits the Fusion event loop.
@@ -908,7 +915,7 @@ def on_close(ev):
     global _viewer_proc
     if _viewer_proc is not None:
         try: _viewer_proc.kill()
-        except: pass
+        except Exception: pass
         _viewer_proc = None
     # BLOCKER FIX: explicit cleanup here (atexit may not fire inside Fusion's embedded
     # Python). Without this, the cached processor keeps CUDA open and Resolve can't
