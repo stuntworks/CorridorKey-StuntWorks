@@ -19,8 +19,15 @@ DEPENDS-ON:
 AFFECTS: Timeline Track 2 (writes keyed frames), MediaPool (creates CorridorKey bin),
   source clip on Track 1 (optionally disabled after processing)
 """
-import sys, os, site, tempfile, math, queue, threading
+import sys, os, site, tempfile, math, queue, threading, io
 from pathlib import Path
+
+# DANGER ZONE FRAGILE: Resolve's embedded Python sets sys.stdout/stderr to None for
+# background threads. Any print() call in a daemon thread crashes silently, killing
+# the thread before it runs a single line. Patch them here before any threads start.
+# breaks: if removed, all background thread log output silently disappears
+if sys.stdout is None: sys.stdout = io.StringIO()
+if sys.stderr is None: sys.stderr = io.StringIO()
 
 # WHAT IT DOES: Finds the CorridorKey engine folder (neural-net code + .venv + model weights)
 #   by checking in order: 1) CORRIDORKEY_ROOT env var, 2) corridorkey_path.txt in the script
@@ -103,6 +110,14 @@ pm = resolve.GetProjectManager()
 project = pm.GetCurrentProject()
 media_pool = project.GetMediaPool() if project else None
 timeline = project.GetCurrentTimeline() if project else None
+
+# Pre-import cv2 on the main thread so FFMPEG/COM initializes here, not in a daemon thread.
+# On Windows, cv2's FFMPEG backend touches COM objects that require a main-thread message pump.
+# If cv2 first imports inside a background thread, VideoCapture can hang indefinitely.
+try:
+    import cv2 as _cv2_preload
+except Exception:
+    pass
 
 # Thread-safe queues — background thread posts UI updates and import tasks here;
 # the main-thread timer drains them so Resolve's UIDispatcher stays safe.
@@ -253,7 +268,8 @@ except Exception:
 # AFFECTS: Log TextEdit widget, _ck_debug_log file
 _ck_debug_log = Path(tempfile.gettempdir()) / "corridorkey_debug.txt"
 def log(msg):
-    print(msg)
+    try: print(msg)  # sys.stdout is None in Resolve background threads — must guard
+    except Exception: pass
     try: items["Log"].PlainText = (items["Log"].PlainText or "") + msg + "\n"
     except Exception: pass
     try:
