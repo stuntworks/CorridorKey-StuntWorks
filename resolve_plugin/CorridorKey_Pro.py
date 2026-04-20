@@ -914,7 +914,7 @@ def on_process_range(ev):
     #   live and the Cancel button works between frames.
     # DEPENDS-ON: timeline, media_pool, cached_processor, frame_range globals.
     # AFFECTS: Disk (PNGs), MediaPool (sequence), Timeline (places on V above source).
-    global processing_cancelled, timeline, media_pool, _range_running
+    global processing_cancelled, timeline, media_pool, _range_running, _viewer_proc
     if _range_running:
         status("Already running — hit CANCEL first"); return
     processing_cancelled = False
