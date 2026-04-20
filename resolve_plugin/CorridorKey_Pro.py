@@ -248,22 +248,22 @@ try:
 except Exception:
     pass
 
-# WHAT IT DOES: Writes a message to the log — thread-safe.
-#   Main thread writes directly; background threads post to _ui_queue (drained by timer).
-# AFFECTS: Log TextEdit widget in the UI panel
+# WHAT IT DOES: Writes a message to both the console and the in-panel log window.
+#   Also writes to a debug log file so background thread output is always recoverable.
+# AFFECTS: Log TextEdit widget, _ck_debug_log file
+_ck_debug_log = Path(tempfile.gettempdir()) / "corridorkey_debug.txt"
 def log(msg):
     print(msg)
-    if threading.get_ident() == _main_thread_id:
-        items["Log"].PlainText = (items["Log"].PlainText or "") + msg + "\n"
-    else:
-        _ui_queue.put(("log", msg))
+    try: items["Log"].PlainText = (items["Log"].PlainText or "") + msg + "\n"
+    except Exception: pass
+    try:
+        with open(_ck_debug_log, "a", encoding="utf-8") as f: f.write(msg + "\n")
+    except Exception: pass
 
-# WHAT IT DOES: Updates the cyan status label — thread-safe (same queue pattern as log)
+# WHAT IT DOES: Updates the cyan status label at the center of the panel
 def status(msg):
-    if threading.get_ident() == _main_thread_id:
-        items["Status"].Text = msg
-    else:
-        _ui_queue.put(("status", msg))
+    try: items["Status"].Text = msg
+    except Exception: pass
 
 # WHAT IT DOES: Reads all UI controls and returns a dict of current processing settings.
 #   Despill/refiner/despeckle defaults are used here; _merge_live_params() overrides them
@@ -1064,14 +1064,41 @@ def on_process_range(ev):
         if not ofs or processing_cancelled: return
         log(f"Done: {len(ofs)} frames in {time.time()-st:.1f}s")
         status("Importing to MediaPool...")
-        # Hand off to main thread via queue — MediaPool/Timeline API must run on main thread
-        _import_queue.put({
-            "ofs": ofs,
-            "output_track": output_track,
-            "source_track": source_track,
-            "in_f": in_f,
-            "settings": settings,
-        })
+        try:
+            root = media_pool.GetRootFolder()
+            ckb = None
+            for f in root.GetSubFolderList():
+                if f.GetName() == "CorridorKey": ckb = f; break
+            if not ckb: ckb = media_pool.AddSubFolder(root, "CorridorKey")
+            media_pool.SetCurrentFolder(ckb)
+            imp = media_pool.ImportMedia(ofs)
+            if not imp: status("Import failed — check MediaPool bin"); return
+            log(f"Imported {len(imp)} items to MediaPool")
+            if settings["output_mode"] in [0, 2]:
+                current_tracks = timeline.GetTrackCount("video")
+                while current_tracks < output_track:
+                    timeline.AddTrack("video")
+                    current_tracks += 1
+                    log(f"Added video track V{current_tracks}")
+                seq_item = imp[0]
+                log(f"Placing on V{output_track} — frames 0-{len(ofs)-1}")
+                ci_list = [{"mediaPoolItem": seq_item, "startFrame": 0, "endFrame": len(ofs) - 1,
+                            "trackIndex": output_track, "recordFrame": int(in_f), "mediaType": 1}]
+                result = media_pool.AppendToTimeline(ci_list)
+                log(f"AppendToTimeline result: {result}")
+                if result:
+                    if items["DisableTrack1"].Checked:
+                        timeline.SetTrackEnable("video", source_track, False)
+                    status(f"DONE! {len(ofs)} frames on V{output_track}")
+                else:
+                    status("Timeline place failed — clips are in MediaPool")
+            else:
+                status(f"{len(ofs)} frames in MediaPool")
+        except Exception as e:
+            import traceback
+            status("Import ERROR!")
+            log(f"Import error: {e}")
+            log(traceback.format_exc())
 
     threading.Thread(target=_run, daemon=True).start()
 
