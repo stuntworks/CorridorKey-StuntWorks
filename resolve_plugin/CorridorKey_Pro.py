@@ -1011,18 +1011,15 @@ def on_process_range(ev):
                             despeckle_size=settings["despeckle_size"])
     log(f"Settings: despill={ps.despill_strength} refiner={ps.refiner_strength} despeckle={ps.despeckle_enabled}")
 
-    def _run():
-        global _range_running
-        _range_running = True
-        ofs = []
-        pr = 0
-
-        # --- SAM2 video propagation (runs ONCE before the per-frame loop) ---
-        # If the user has placed SAM2 click points and selected SAM2 mode, we run
-        # the video predictor across the entire range up front. This gives us one
-        # mask per frame instead of re-running SAM2 per frame (which was the bug).
-        # Falls back to per-frame generate_alpha_hint if propagation fails or if
-        # the user is in Simple Chroma mode (alpha_method != 1).
+    # DANGER ZONE HIGH: Runs on the main thread — UI freezes during processing.
+    # Background threading was attempted but Resolve's embedded Python kills daemon threads
+    # silently (sys.stdout=None crashes print() before any code runs). Synchronous is reliable.
+    # breaks: do not move back to threading.Thread without solving the Resolve stdout issue
+    _range_running = True
+    ofs = []
+    pr = 0
+    try:
+        # SAM2 video propagation — runs once up front, produces one mask per frame
         sam2_video_masks = {}
         if (settings.get("alpha_method") == 1 and
                 (sam_points.get("positive") or sam_points.get("negative"))):
@@ -1034,91 +1031,82 @@ def on_process_range(ev):
                 sam_points.get("frame"),
             )
             if sam2_video_masks:
-                log(f"SAM2 video: {len(sam2_video_masks)} masks ready — using for all frames")
+                log(f"SAM2 video: {len(sam2_video_masks)} masks ready")
             else:
-                log("SAM2 video propagation returned no masks — falling back to per-frame hint")
+                log("SAM2 propagation returned no masks — falling back to chroma hint")
 
-        log(f"Opening video: {fp}")
         cap = cv2.VideoCapture(fp)
-        log(f"Video opened OK: {cap.isOpened()}")
-        try:
-            if not cap.isOpened(): status("Cannot open video"); return
-            st = time.time()
-            for tf in range(in_f, out_f):
-                if processing_cancelled:
-                    log(f"Cancelled at frame {pr}/{dur}")
-                    status(f"CANCELLED — {pr} frames saved")
-                    break
-                sf = ss + (tf - cs)
-                cap.set(cv2.CAP_PROP_POS_FRAMES, sf)
-                ret, frame = cap.read()
-                if not ret: continue
-                # Use the pre-computed SAM2 video mask if we have one for this frame,
-                # otherwise fall back to the per-frame alpha hint (chroma or single-frame SAM2).
-                range_idx = tf - in_f
-                if sam2_video_masks and range_idx in sam2_video_masks:
-                    ah = sam2_video_masks[range_idx]
-                else:
-                    ah = generate_alpha_hint(frame, settings)
-                fr = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-                ah = ah.astype(np.float32) / 255.0 if ah.dtype == np.uint8 else ah
-                res = proc.process_frame(fr, ah, ps)
-                fg, mt = res.get("fg"), res.get("alpha")
-                if fg is not None and mt is not None:
-                    op = od / f"CK_{cn}_{pr:06d}.png"
-                    save_output(fg, mt, op, settings["export_format"])
-                    ofs.append(str(op))
-                    pr += 1
-                    el = time.time() - st
-                    fpsr = pr / el if el > 0 else 0
-                    rem = (dur - pr) / fpsr if fpsr > 0 else 0
-                    status(f"{pr}/{dur} ({fpsr:.1f}fps, {rem:.0f}s left)")
-                    if pr % 10 == 0: log(f"{pr}/{dur}")
-        finally:
-            try: cap.release()
-            except Exception: pass
-            _range_running = False
+        if not cap.isOpened(): status("Cannot open video"); return
+        st = time.time()
+        for tf in range(in_f, out_f):
+            if processing_cancelled:
+                log(f"Cancelled at frame {pr}/{dur}")
+                status(f"CANCELLED — {pr} frames saved")
+                break
+            sf = ss + (tf - cs)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, sf)
+            ret, frame = cap.read()
+            if not ret: continue
+            range_idx = tf - in_f
+            if sam2_video_masks and range_idx in sam2_video_masks:
+                ah = sam2_video_masks[range_idx]
+            else:
+                ah = generate_alpha_hint(frame, settings)
+            fr = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+            ah = ah.astype(np.float32) / 255.0 if ah.dtype == np.uint8 else ah
+            res = proc.process_frame(fr, ah, ps)
+            fg, mt = res.get("fg"), res.get("alpha")
+            if fg is not None and mt is not None:
+                op = od / f"CK_{cn}_{pr:06d}.png"
+                save_output(fg, mt, op, settings["export_format"])
+                ofs.append(str(op))
+                pr += 1
+                el = time.time() - st
+                fpsr = pr / el if el > 0 else 0
+                rem = (dur - pr) / fpsr if fpsr > 0 else 0
+                status(f"{pr}/{dur} ({fpsr:.1f}fps, {rem:.0f}s left)")
+                if pr % 10 == 0: log(f"{pr}/{dur}")
+        cap.release()
 
         if not ofs or processing_cancelled: return
         log(f"Done: {len(ofs)} frames in {time.time()-st:.1f}s")
         status("Importing to MediaPool...")
-        try:
-            root = media_pool.GetRootFolder()
-            ckb = None
-            for f in root.GetSubFolderList():
-                if f.GetName() == "CorridorKey": ckb = f; break
-            if not ckb: ckb = media_pool.AddSubFolder(root, "CorridorKey")
-            media_pool.SetCurrentFolder(ckb)
-            imp = media_pool.ImportMedia(ofs)
-            if not imp: status("Import failed — check MediaPool bin"); return
-            log(f"Imported {len(imp)} items to MediaPool")
-            if settings["output_mode"] in [0, 2]:
-                current_tracks = timeline.GetTrackCount("video")
-                while current_tracks < output_track:
-                    timeline.AddTrack("video")
-                    current_tracks += 1
-                    log(f"Added video track V{current_tracks}")
-                seq_item = imp[0]
-                log(f"Placing on V{output_track} — frames 0-{len(ofs)-1}")
-                ci_list = [{"mediaPoolItem": seq_item, "startFrame": 0, "endFrame": len(ofs) - 1,
-                            "trackIndex": output_track, "recordFrame": int(in_f), "mediaType": 1}]
-                result = media_pool.AppendToTimeline(ci_list)
-                log(f"AppendToTimeline result: {result}")
-                if result:
-                    if items["DisableTrack1"].Checked:
-                        timeline.SetTrackEnable("video", source_track, False)
-                    status(f"DONE! {len(ofs)} frames on V{output_track}")
-                else:
-                    status("Timeline place failed — clips are in MediaPool")
+        root = media_pool.GetRootFolder()
+        ckb = None
+        for f in root.GetSubFolderList():
+            if f.GetName() == "CorridorKey": ckb = f; break
+        if not ckb: ckb = media_pool.AddSubFolder(root, "CorridorKey")
+        media_pool.SetCurrentFolder(ckb)
+        imp = media_pool.ImportMedia(ofs)
+        if not imp: status("Import failed — check MediaPool bin"); return
+        log(f"Imported {len(imp)} items to MediaPool")
+        if settings["output_mode"] in [0, 2]:
+            current_tracks = timeline.GetTrackCount("video")
+            while current_tracks < output_track:
+                timeline.AddTrack("video")
+                current_tracks += 1
+                log(f"Added video track V{current_tracks}")
+            seq_item = imp[0]
+            log(f"Placing on V{output_track} — frames 0-{len(ofs)-1}")
+            ci_list = [{"mediaPoolItem": seq_item, "startFrame": 0, "endFrame": len(ofs) - 1,
+                        "trackIndex": output_track, "recordFrame": int(in_f), "mediaType": 1}]
+            result = media_pool.AppendToTimeline(ci_list)
+            log(f"AppendToTimeline result: {result}")
+            if result:
+                if items["DisableTrack1"].Checked:
+                    timeline.SetTrackEnable("video", source_track, False)
+                status(f"DONE! {len(ofs)} frames on V{output_track}")
             else:
-                status(f"{len(ofs)} frames in MediaPool")
-        except Exception as e:
-            import traceback
-            status("Import ERROR!")
-            log(f"Import error: {e}")
-            log(traceback.format_exc())
-
-    threading.Thread(target=_run, daemon=True).start()
+                status("Timeline place failed — clips are in MediaPool")
+        else:
+            status(f"{len(ofs)} frames in MediaPool")
+    except Exception as e:
+        import traceback
+        status("ERROR!")
+        log(f"Range error: {e}")
+        log(traceback.format_exc())
+    finally:
+        _range_running = False
 
 # WHAT IT DOES: Sets the cancel flag so the range processing loop stops on next iteration
 def on_cancel(ev):
