@@ -1022,7 +1022,9 @@ def on_process_range(ev):
             else:
                 log("SAM2 video propagation returned no masks — falling back to per-frame hint")
 
+        log(f"Opening video: {fp}")
         cap = cv2.VideoCapture(fp)
+        log(f"Video opened OK: {cap.isOpened()}")
         try:
             if not cap.isOpened(): status("Cannot open video"); return
             st = time.time()
