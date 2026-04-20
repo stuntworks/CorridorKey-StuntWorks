@@ -19,7 +19,7 @@ DEPENDS-ON:
 AFFECTS: Timeline Track 2 (writes keyed frames), MediaPool (creates CorridorKey bin),
   source clip on Track 1 (optionally disabled after processing)
 """
-import sys, os, site, tempfile
+import sys, os, site, tempfile, math
 from pathlib import Path
 
 # WHAT IT DOES: Finds the CorridorKey engine folder (neural-net code + .venv + model weights)
@@ -29,7 +29,12 @@ from pathlib import Path
 # DEPENDS-ON: nothing — pure filesystem probe.
 # AFFECTS: returns a pathlib.Path. Does not modify sys.path itself.
 def find_corridorkey_root():
-    script_dir = Path(__file__).parent
+    # Fusion's script runner doesn't always define __file__ — fall back to the known
+    # install location so the plugin doesn't silent-fail at startup.
+    try:
+        script_dir = Path(__file__).parent
+    except NameError:
+        script_dir = Path(r"C:\ProgramData\Blackmagic Design\DaVinci Resolve\Fusion\Scripts\Utility")
     candidates = []
     env_root = os.environ.get("CORRIDORKEY_ROOT")
     if env_root:
@@ -71,18 +76,17 @@ CK_ROOT = find_corridorkey_root()
 CK_VENV = CK_ROOT / ".venv"
 CK_PYTHON = CK_VENV / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
 
+# Session dir for v2 viewer IPC — one per plugin process, lives in %TEMP%.
+# Holds fg.png, alpha.png, meta.json, optional v1_underlay.png, and live_params.json.
+# The v2 viewer polls live_params.json for slider state (viewer writes it too) and
+# reloads fg/alpha PNGs when the panel signals "rekeying:false" in that same JSON.
+# A single atomic .tmp→os.replace pattern is used for every write.
+SESSION_DIR = Path(tempfile.gettempdir()) / f"corridorkey_session_{os.getpid()}"
+
 venv_packages = str(find_venv_site_packages(CK_VENV))
 site.addsitedir(venv_packages)
 sys.path.insert(0, venv_packages)
-# Resolve scripting modules — resolve the base via %PROGRAMDATA% (Windows) / standard install
-# path (mac/linux) so the plugin works on machines that don't have C: as ProgramData.
-if sys.platform == "win32":
-    _resolve_sdk = Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData")) / "Blackmagic Design" / "DaVinci Resolve" / "Support" / "Developer" / "Scripting" / "Modules"
-elif sys.platform == "darwin":
-    _resolve_sdk = Path("/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/Modules")
-else:
-    _resolve_sdk = Path("/opt/resolve/Developer/Scripting/Modules")
-sys.path.insert(0, str(_resolve_sdk))
+sys.path.insert(0, r"C:\ProgramData\Blackmagic Design\DaVinci Resolve\Support\Developer\Scripting\Modules")
 sys.path.insert(0, str(CK_ROOT))
 sys.path.insert(0, str(CK_ROOT / "resolve_plugin"))
 
@@ -106,6 +110,30 @@ cached_source = {"frame": None, "file_path": None, "frame_num": None}
 cached_processor = {"proc": None}  # Holds loaded AI model to avoid reloading every frame
 sam_points = {"positive": [], "negative": [], "frame": None}
 frame_range = {"in_frame": None, "out_frame": None}
+_viewer_proc = None  # Tracks preview viewer subprocess — killed on plugin close
+
+# WHAT IT DOES: Guarantees cleanup when Resolve shuts down — kills the preview viewer
+#   subprocess and releases the CUDA context held by the cached neural-net model.
+#   Without this, Resolve hangs and the user has to kill a stale python.exe in Task
+#   Manager before Resolve will restart (the orphaned Python holds GPU/CUDA open).
+# DEPENDS-ON: atexit (stdlib) — Python calls this on ANY exit (normal or signal).
+# AFFECTS: Terminates _viewer_proc, clears cached_processor, frees CUDA memory.
+import atexit
+def _cleanup_on_exit():
+    # WHAT IT DOES: Kills the viewer subprocess on Resolve exit. That's all.
+    #   proc.cleanup() and torch.cuda.empty_cache() were here but caused Resolve
+    #   to hang on shutdown — CUDA unload blocked the Python interpreter.
+    #   Windows reclaims GPU memory automatically when the process exits.
+    # DEPENDS-ON: atexit (stdlib).
+    # AFFECTS: terminates _viewer_proc only.
+    global _viewer_proc
+    try:
+        if _viewer_proc is not None and _viewer_proc.poll() is None:
+            _viewer_proc.kill()
+            _viewer_proc = None
+    except Exception:
+        pass
+atexit.register(_cleanup_on_exit)
 
 # Persistent settings — saved to temp folder so output path survives between sessions
 _config_path = Path(tempfile.gettempdir()) / "corridorkey_config.txt"
@@ -126,29 +154,16 @@ def _save_output_path(p):
     except: pass
 
 winLayout = ui.VGroup({"Spacing": 14}, [
-    ui.Label({"Text": "CorridorKey Pro", "Weight": 0, "Alignment": {"AlignHCenter": True}, "Font": ui.Font({"PixelSize": 16, "Bold": True}), "StyleSheet": "color: #4CAF50;"}),
-    ui.HGroup({"Weight": 0, "Spacing": 5}, [
-        ui.Label({"Text": "Alpha Method:", "Weight": 0}),
+    ui.HGroup({"Weight": 0, "Spacing": 0}, [
+        ui.Button({"ID": "HeaderCK", "Text": "CorridorKey Pro", "Weight": 1, "StyleSheet": "QPushButton { background: transparent; color: #0ff; font-size: 14px; font-weight: bold; border: none; padding: 2px; } QPushButton:hover { color: #5ff; }"}),
+        ui.Label({"Text": "—", "Weight": 0, "StyleSheet": "color: #0ff; font-size: 14px; font-weight: bold;"}),
+        ui.Button({"ID": "HeaderSW", "Text": "StuntWorks Action Cinema", "Weight": 1, "StyleSheet": "QPushButton { background: transparent; color: #0ff; font-size: 14px; font-weight: bold; border: none; padding: 2px; } QPushButton:hover { color: #5ff; }"}),
+    ]),
+    ui.HGroup({"Weight": 0, "Spacing": 8}, [
+        ui.Label({"Text": "Alpha:", "Weight": 0}),
         ui.ComboBox({"ID": "AlphaMethod", "Weight": 2}),
-    ]),
-    ui.HGroup({"Weight": 0, "Spacing": 5}, [
-        ui.Label({"Text": "Screen Type:", "Weight": 0}),
+        ui.Label({"Text": "Screen:", "Weight": 0}),
         ui.ComboBox({"ID": "ScreenType", "Weight": 2}),
-    ]),
-    ui.HGroup({"Weight": 0, "Spacing": 5}, [
-        ui.Label({"Text": "Despill:", "Weight": 0}),
-        ui.Slider({"ID": "DespillSlider", "Minimum": 0, "Maximum": 100, "Value": 50, "Orientation": "Horizontal", "Weight": 2}),
-        ui.Label({"ID": "DespillValue", "Text": "0.50", "Weight": 0}),
-    ]),
-    ui.HGroup({"Weight": 0, "Spacing": 5}, [
-        ui.Label({"Text": "Refiner:", "Weight": 0}),
-        ui.Slider({"ID": "RefinerSlider", "Minimum": 0, "Maximum": 100, "Value": 100, "Orientation": "Horizontal", "Weight": 2}),
-        ui.Label({"ID": "RefinerValue", "Text": "1.00", "Weight": 0}),
-    ]),
-    ui.HGroup({"Weight": 0, "Spacing": 5}, [
-        ui.CheckBox({"ID": "DespeckleCheck", "Text": "Auto Despeckle", "Checked": True, "Weight": 0}),
-        ui.SpinBox({"ID": "DespeckleSize", "Minimum": 50, "Maximum": 1000, "Value": 400, "SingleStep": 50, "Weight": 0}),
-        ui.Label({"Text": "px", "Weight": 0}),
     ]),
     ui.HGroup({"Weight": 0, "Spacing": 5}, [
         ui.Label({"Text": "Export:", "Weight": 0}),
@@ -164,39 +179,48 @@ winLayout = ui.VGroup({"Spacing": 14}, [
         ui.Button({"ID": "BrowseOutput", "Text": "...", "Weight": 0}),
     ]),
     ui.VGap(2),
-    ui.Label({"Text": "Frame Range:", "Weight": 0, "StyleSheet": "color: #FF9800; font-weight: bold;"}),
+    ui.Label({"Text": "Frame Range:", "Weight": 0, "StyleSheet": "color: #0ff; font-weight: bold;"}),
     ui.HGroup({"Weight": 0, "Spacing": 5}, [
-        ui.Button({"ID": "SetInPoint", "Text": "IN", "Weight": 1, "StyleSheet": "QPushButton { background-color: #2196F3; color: white; border-radius: 4px; padding: 4px; }"}),
-        ui.Label({"ID": "InPointLabel", "Text": "---", "Weight": 0, "StyleSheet": "color: #2196F3;"}),
-        ui.Button({"ID": "SetOutPoint", "Text": "OUT", "Weight": 1, "StyleSheet": "QPushButton { background-color: #2196F3; color: white; border-radius: 4px; padding: 4px; }"}),
-        ui.Label({"ID": "OutPointLabel", "Text": "---", "Weight": 0, "StyleSheet": "color: #2196F3;"}),
-        ui.Button({"ID": "ClearRange", "Text": "Clear", "Weight": 1, "StyleSheet": "QPushButton { background-color: #607D8B; color: white; border-radius: 4px; padding: 4px; }"}),
+        ui.Button({"ID": "SetInPoint", "Text": "IN", "Weight": 1, "StyleSheet": "QPushButton { background-color: #3a5a6a; color: #7ab; border-radius: 4px; padding: 4px; font-weight: bold; }"}),
+        ui.Label({"ID": "InPointLabel", "Text": "---", "Weight": 0, "StyleSheet": "color: #7ab;"}),
+        ui.Button({"ID": "SetOutPoint", "Text": "OUT", "Weight": 1, "StyleSheet": "QPushButton { background-color: #3a5a6a; color: #7ab; border-radius: 4px; padding: 4px; font-weight: bold; }"}),
+        ui.Label({"ID": "OutPointLabel", "Text": "---", "Weight": 0, "StyleSheet": "color: #7ab;"}),
+        ui.Button({"ID": "ClearRange", "Text": "Clear", "Weight": 1, "StyleSheet": "QPushButton { background-color: #222; color: #667; border-radius: 4px; padding: 4px; }"}),
     ]),
     ui.HGroup({"Weight": 0}, [
         ui.CheckBox({"ID": "DisableTrack1", "Text": "Disable source clip after processing", "Checked": True}),
     ]),
-    ui.HGroup({"Weight": 0}, [
-        ui.CheckBox({"ID": "LivePreview", "Text": "Live Preview on slider change", "Checked": False, "StyleSheet": "color: #FF9800;"}),
-    ]),
+
     ui.VGap(2),
     ui.Label({"ID": "Status", "Text": "Ready", "Weight": 0, "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #0FF; font-size: 14px; font-weight: bold;"}),
     ui.VGap(2),
     ui.HGroup({"Weight": 0, "Spacing": 5}, [
-        ui.Button({"ID": "SAMClickMask", "Text": "SAM MASK", "Weight": 1, "StyleSheet": "QPushButton { background-color: #E91E63; color: white; font-weight: bold; border-radius: 5px; padding: 6px; }"}),
-        ui.Button({"ID": "ShowPreview", "Text": "PREVIEW", "Weight": 1, "StyleSheet": "QPushButton { background-color: #9C27B0; color: white; font-weight: bold; border-radius: 5px; padding: 6px; }"}),
-        ui.Button({"ID": "ProcessFrame", "Text": "SINGLE FRAME", "Weight": 1, "StyleSheet": "QPushButton { background-color: #2196F3; color: white; font-weight: bold; border-radius: 5px; padding: 6px; }"}),
+        ui.Button({"ID": "ShowPreview", "Text": "PREVIEW", "Weight": 1, "StyleSheet": "QPushButton { background-color: #1a3a4a; color: #5df; font-weight: bold; border-radius: 5px; padding: 6px; border: 1px solid #5df; }"}),
+        ui.Button({"ID": "ProcessFrame", "Text": "SINGLE FRAME", "Weight": 1, "StyleSheet": "QPushButton { background-color: #1a3a5a; color: #5af; font-weight: bold; border-radius: 5px; padding: 6px; border: 1px solid #5af; }"}),
     ]),
     ui.VGap(2),
-    ui.Button({"ID": "ProcessRange", "Text": "PROCESS RANGE", "Weight": 0, "StyleSheet": "QPushButton { background-color: #4CAF50; color: white; font-size: 15px; font-weight: bold; border-radius: 6px; padding: 10px; }"}),
-    ui.Button({"ID": "Cancel", "Text": "CANCEL", "Weight": 0, "StyleSheet": "QPushButton { background-color: #f44336; color: white; font-weight: bold; border-radius: 5px; padding: 4px; }"}),
+    ui.Button({"ID": "ProcessRange", "Text": "PROCESS RANGE", "Weight": 0, "StyleSheet": "QPushButton { background-color: #1a4a2a; color: #5b5; font-size: 15px; font-weight: bold; border-radius: 6px; padding: 10px; border: 1px solid #5b5; }"}),
+    ui.Button({"ID": "Cancel", "Text": "CANCEL", "Weight": 0, "StyleSheet": "QPushButton { background-color: #4a1a1a; color: #f66; font-weight: bold; border-radius: 5px; padding: 4px; border: 1px solid #f66; }"}),
     ui.VGap(2),
     ui.HGroup({"Weight": 0, "Spacing": 5}, [
-        ui.Button({"ID": "ToggleTrack1", "Text": "TOGGLE TRACK 1", "Weight": 1, "StyleSheet": "QPushButton { background-color: #607D8B; color: white; border-radius: 4px; padding: 3px; }"}),
-        ui.Button({"ID": "OpenFusion", "Text": "OPEN FUSION", "Weight": 1, "StyleSheet": "QPushButton { background-color: #FF9800; color: white; border-radius: 4px; padding: 3px; }"}),
+        ui.Button({"ID": "ToggleTrack1", "Text": "TOGGLE TRACK 1", "Weight": 1, "StyleSheet": "QPushButton { background-color: #222; color: #667; border-radius: 4px; padding: 3px; }"}),
+        ui.Button({"ID": "OpenFusion", "Text": "OPEN FUSION", "Weight": 1, "StyleSheet": "QPushButton { background-color: #3a3a1a; color: #a85; border-radius: 4px; padding: 3px; border: 1px solid #a85; }"}),
     ]),
     ui.VGap(2),
-    ui.TextEdit({"ID": "Log", "ReadOnly": True, "Weight": 3, "StyleSheet": "background: #111; color: #0f0; font-family: monospace; font-size: 10px; border-radius: 4px;"}),
-    ui.Button({"ID": "AboutBtn", "Text": "About", "Weight": 0, "StyleSheet": "QPushButton { background-color: #333; color: #999; font-size: 11px; border-radius: 4px; padding: 2px; }"}),
+    ui.TextEdit({"ID": "Log", "ReadOnly": True, "Weight": 3, "StyleSheet": "background: #111; color: #0ff; font-family: monospace; font-size: 10px; border-radius: 4px; border: 1px solid #222;"}),
+    ui.HGroup({"Weight": 0, "Spacing": 6}, [
+        ui.Button({"ID": "YouTubeBtn", "Text": "▶ YouTube", "Weight": 1, "StyleSheet": "QPushButton { background-color: #1a1a1a; color: #cc3300; font-size: 11px; font-weight: bold; border-radius: 4px; padding: 3px; border: 1px solid #cc3300; }"}),
+        ui.Button({"ID": "KofiBtn", "Text": "☕ Ko-fi", "Weight": 1, "StyleSheet": "QPushButton { background-color: #1a1a1a; color: #FF5E5B; font-size: 11px; font-weight: bold; border-radius: 4px; padding: 3px; border: 1px solid #FF5E5B; }"}),
+        ui.Button({"ID": "AboutBtn", "Text": "About", "Weight": 1, "StyleSheet": "QPushButton { background-color: #1a1a1a; color: #556; font-size: 11px; border-radius: 4px; padding: 3px; }"}),
+    ]),
+    ui.Label({"Text": "AI: Niko Pueringer / Corridor Digital  •  Plugin: Roberto & Elvis Lopez / StuntWorks", "Weight": 0, "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #334; font-size: 10px;"}),
+    ui.VGap(4),
+    ui.HGroup({"Weight": 0, "Spacing": 8}, [
+        ui.Button({"ID": "KillViewer", "Text": "KILL VIEWER", "Weight": 1,
+                   "StyleSheet": "background-color: #3a1a1a; color: #f55; padding: 5px 14px; border: 1px solid #f55; border-radius: 12px; font-size: 12px; font-weight: 600;"}),
+        ui.Button({"ID": "ClosePanel", "Text": "CLOSE PANEL", "Weight": 1,
+                   "StyleSheet": "background-color: #2a2a2a; color: #aaa; padding: 5px 14px; border: 1px solid #555; border-radius: 12px; font-size: 12px; font-weight: 600;"}),
+    ]),
 ])
 
 win = disp.AddWindow({"ID": "CK", "WindowTitle": "CorridorKey Pro", "Geometry": [100, 50, 500, 750]}, winLayout)
@@ -222,13 +246,50 @@ def log(msg):
 # WHAT IT DOES: Updates the cyan status label at the center of the panel
 def status(msg): items["Status"].Text = msg
 
-# WHAT IT DOES: Reads all UI controls and returns a dict of current processing settings
-# DEPENDS-ON: All combo boxes, sliders, and checkboxes in the panel
+# WHAT IT DOES: Reads all UI controls and returns a dict of current processing settings.
+#   Despill/refiner/despeckle defaults are used here; _merge_live_params() overrides them
+#   with whatever the user has dialed in the viewer's live sliders.
+# DEPENDS-ON: Combo boxes and checkboxes in the panel
 def get_settings():
-    return {"alpha_method": items["AlphaMethod"].CurrentIndex, "screen_type": "green" if items["ScreenType"].CurrentIndex == 0 else "blue",
-            "despill_strength": items["DespillSlider"].Value / 100.0, "refiner_strength": items["RefinerSlider"].Value / 100.0,
-            "despeckle_enabled": items["DespeckleCheck"].Checked, "despeckle_size": items["DespeckleSize"].Value,
-            "export_format": items["ExportFormat"].CurrentIndex, "output_mode": items["OutputMode"].CurrentIndex}
+    return {
+        "alpha_method": items["AlphaMethod"].CurrentIndex,
+        "screen_type": "green" if items["ScreenType"].CurrentIndex == 0 else "blue",
+        "despill_strength": 0.5,    # viewer-owned; overridden by _merge_live_params
+        "refiner_strength": 1.0,    # viewer-owned; overridden by _merge_live_params
+        "despeckle_enabled": False, # viewer-owned; overridden by _merge_live_params
+        "despeckle_size": 400,      # viewer-owned; overridden by _merge_live_params
+        "export_format": items["ExportFormat"].CurrentIndex,
+        "output_mode": items["OutputMode"].CurrentIndex,
+    }
+
+# WHAT IT DOES: Overrides panel's despill / despeckle settings with the v2 viewer's
+#   slider state (if the viewer has been opened and written live_params.json). The
+#   viewer is the source of truth for visual params once opened — so PROCESS RANGE
+#   uses the values the user dialed in live, not the stale LineEdit values.
+#   Refiner is NOT merged — it's a full-re-key parameter owned by the panel.
+# DEPENDS-ON: SESSION_DIR, live_params.json format written by preview_viewer_v2.py.
+# AFFECTS: returns a new settings dict with viewer overrides applied (or original
+#   settings if the viewer hasn't written yet or JSON is unreadable).
+def _merge_live_params(settings):
+    try:
+        import json
+        lp_path = SESSION_DIR / "live_params.json"
+        if not lp_path.exists():
+            return settings
+        with open(lp_path, "r", encoding="utf-8") as f:
+            lp = json.load(f)
+        out = dict(settings)
+        if "despill" in lp:
+            try: out["despill_strength"] = max(0.0, min(1.0, float(lp["despill"])))
+            except (ValueError, TypeError): pass
+        if "despeckle" in lp:
+            out["despeckle_enabled"] = bool(lp["despeckle"])
+        if "despeckleSize" in lp:
+            try: out["despeckle_size"] = max(50, min(2000, int(lp["despeckleSize"])))
+            except (ValueError, TypeError): pass
+        return out
+    except Exception:
+        return settings
 
 # WHAT IT DOES: Gets the current playhead position as a frame number and the timeline fps
 # DEPENDS-ON: Resolve project settings for frame rate, timeline for timecode
@@ -275,17 +336,6 @@ def on_browse_output(ev):
         _save_output_path(str(folder))
         log(f"Output: {folder}")
 
-# WHAT IT DOES: Updates despill value label; if Live Preview is on, re-keys with new setting
-# DEPENDS-ON: cached_source (must have a frame loaded), reprocess_with_cached()
-def on_despill_changed(ev):
-    items["DespillValue"].Text = f"{items['DespillSlider'].Value / 100.0:.2f}"
-    if items["LivePreview"].Checked and cached_source["frame"] is not None: reprocess_with_cached()
-
-# WHAT IT DOES: Updates refiner value label; if Live Preview is on, re-keys with new setting
-# DEPENDS-ON: cached_source (must have a frame loaded), reprocess_with_cached()
-def on_refiner_changed(ev):
-    items["RefinerValue"].Text = f"{items['RefinerSlider'].Value / 100.0:.2f}"
-    if items["LivePreview"].Checked and cached_source["frame"] is not None: reprocess_with_cached()
 
 # WHAT IT DOES: Generates an alpha hint (rough matte) for the neural keyer to refine.
 #   Simple mode uses chroma difference; SAM2 mode uses click points from the SAM window.
@@ -332,69 +382,111 @@ def generate_sam2_mask(frame, pos_pts, neg_pts):
         from core.alpha_hint_generator import AlphaHintGenerator
         return AlphaHintGenerator(screen_type="green").generate_hint(frame)
 
-# WHAT IT DOES: Opens a tkinter window showing the current frame. User left-clicks to mark
-#   subject (include), right-clicks to mark background (exclude). Points feed into SAM2.
-# DEPENDS-ON: tkinter, PIL, cv2, timeline clip on Track 1
-# AFFECTS: sam_points global dict (stores click coordinates for generate_sam2_mask)
-# DANGER ZONE FRAGILE: Runs tkinter in a daemon thread — Resolve's event loop can conflict.
-# breaks: if tkinter mainloop deadlocks with Fusion UIDispatcher
-def open_sam_click_window():
-    import threading, cv2
-    def run():
-        import tkinter as tk
-        from PIL import Image, ImageTk
-        import numpy as np
-        clips = timeline.GetItemListInTrack("video", 1) or []
-        if not clips: log("No clips"); return
-        cf, _ = get_current_frame_info()
-        clip = clips[0]
-        mpi = clip.GetMediaPoolItem()
-        props = mpi.GetClipProperty() if mpi else {}
-        fp = props.get("File Path", "")
-        fn = clip.GetLeftOffset() + (cf - clip.GetStart())
-        if fn < 0: fn = 0
-        cap = cv2.VideoCapture(fp)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, fn)
-        ret, frame = cap.read()
-        cap.release()
-        if not ret: log("Read failed"); return
-        sam_points["frame"], sam_points["positive"], sam_points["negative"] = frame.copy(), [], []
-        sw = tk.Tk()
-        sw.title("SAM2: Left=Include, Right=Exclude")
-        sw.configure(bg="#1a1a1a")
-        h, w = frame.shape[:2]
-        sc = min(1.0, 900 / max(h, w))
-        dw, dh = int(w * sc), int(h * sc)
-        canvas = tk.Canvas(sw, width=dw, height=dh, bg="black", highlightthickness=0)
-        canvas.pack(padx=10, pady=10)
-        img = ImageTk.PhotoImage(Image.fromarray(cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), (dw, dh))))
-        canvas.create_image(0, 0, anchor=tk.NW, image=img)
-        canvas.image = img
-        def click(e, pos):
-            ox, oy = int(e.x / sc), int(e.y / sc)
-            (sam_points["positive"] if pos else sam_points["negative"]).append((ox, oy))
-            c = "#00FF00" if pos else "#FF0000"
-            canvas.create_oval(e.x-8, e.y-8, e.x+8, e.y+8, outline=c, width=3)
-            canvas.create_text(e.x, e.y, text="+" if pos else "-", fill=c, font=("Arial", 12, "bold"))
-            sl.config(text=f"{len(sam_points['positive'])}+ {len(sam_points['negative'])}-")
-        canvas.bind("<Button-1>", lambda e: click(e, True))
-        canvas.bind("<Button-3>", lambda e: click(e, False))
-        sl = tk.Label(sw, text="Left=Include, Right=Exclude", fg="white", bg="#1a1a1a", font=("Arial", 12))
-        sl.pack(pady=5)
-        bf = tk.Frame(sw, bg="#1a1a1a")
-        bf.pack(pady=10)
-        def done(): log(f"SAM: {len(sam_points['positive'])}+ {len(sam_points['negative'])}-"); sw.destroy()
-        tk.Button(bf, text="Done", command=done, bg="#4CAF50", fg="white", font=("Arial", 12, "bold"), padx=25, pady=5).pack(side=tk.LEFT, padx=10)
-        tk.Button(bf, text="Cancel", command=sw.destroy, bg="#f44336", fg="white", font=("Arial", 12, "bold"), padx=20, pady=5).pack(side=tk.LEFT, padx=10)
-        sw.lift(); sw.attributes("-topmost", True); sw.after(100, lambda: sw.attributes("-topmost", False)); sw.mainloop()
-    threading.Thread(target=run, daemon=True).start()
 
-# WHAT IT DOES: Button handler — switches to SAM2 mode and opens the click window
-def on_sam_click_mask(ev):
-    log("Opening SAM2...")
-    status("Click on subject")
-    items["AlphaMethod"].CurrentIndex = 1
-    open_sam_click_window()
+# WHAT IT DOES: Runs SAM2 video predictor across the entire frame range in one pass.
+#   Exports every frame in [in_f, out_f) as a JPEG to a temp directory, loads the
+#   SAM2 video predictor, places the user's click points on the anchor frame
+#   (defaults to range frame 0), then calls propagate_in_video() which yields one
+#   mask per frame. Returns a dict {range_relative_index: float32_mask}.
+# DEPENDS-ON: SAM2 video predictor weights at CK_ROOT/sam2_weights/sam2.1_hiera_small.pt,
+#   cv2 VideoCapture on fp, ~50 MB disk space per 100 frames (95% JPEG), CUDA VRAM.
+# AFFECTS: writes then deletes a temp JPEG dir. Returns mask dict (no disk writes kept).
+# DANGER ZONE HIGH: Can fill disk on very long ranges. Each frame is a JPEG on disk.
+#   breaks: if disk space < ~0.5 MB * frame_count, or SAM2 weights missing.
+def run_sam2_video_propagation(fp, ss, cs, in_f, out_f, pos_pts, neg_pts, anchor_frame_abs):
+    import cv2, numpy as np, torch, shutil, tempfile
+    ckpt = str(CK_ROOT / "sam2_weights" / "sam2.1_hiera_small.pt")
+    cfg  = "configs/sam2.1/sam2.1_hiera_s.yaml"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dur = out_f - in_f
+
+    # Map the absolute clicked frame to a range-relative index for the predictor.
+    # If the click was outside the range (or never recorded), anchor to frame 0.
+    if anchor_frame_abs is not None and in_f <= anchor_frame_abs < out_f:
+        anchor_rel = anchor_frame_abs - in_f
+    else:
+        anchor_rel = 0
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="ck_sam2_frames_"))
+    try:
+        # --- Export frames ---
+        log(f"SAM2 video: exporting {dur} frames to {tmp_dir} ...")
+        status(f"SAM2: exporting {dur} frames...")
+        cap = cv2.VideoCapture(fp)
+        if not cap.isOpened():
+            log("SAM2 video: cannot open video"); return {}
+        for i in range(dur):
+            sf = ss + (in_f + i - cs)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, sf)
+            ret, frame = cap.read()
+            if not ret:
+                log(f"SAM2 video: skipped unreadable frame {in_f + i}")
+                continue
+            cv2.imwrite(str(tmp_dir / f"{i:06d}.jpg"), frame,
+                        [cv2.IMWRITE_JPEG_QUALITY, 95])
+        cap.release()
+
+        # --- Load video predictor and propagate ---
+        log(f"SAM2 video: loading predictor, anchor=range-frame {anchor_rel} ...")
+        status("SAM2: loading video model...")
+        from sam2.build_sam import build_sam2_video_predictor
+        predictor = build_sam2_video_predictor(cfg, ckpt, device=device)
+
+        all_pts = ([[p[0], p[1]] for p in pos_pts] +
+                   [[p[0], p[1]] for p in neg_pts])
+        labs    = ([1] * len(pos_pts) + [0] * len(neg_pts))
+
+        masks = {}
+        with torch.inference_mode():
+            # offload_video_to_cpu keeps JPEG frames in RAM not VRAM — critical
+            # because Resolve already uses 2-4 GB of VRAM on a working timeline.
+            # async_loading_frames pipelines disk reads with GPU compute.
+            state = predictor.init_state(
+                video_path=str(tmp_dir),
+                offload_video_to_cpu=True,
+                async_loading_frames=True,
+            )
+            predictor.add_new_points_or_box(
+                inference_state=state,
+                frame_idx=anchor_rel,
+                obj_id=1,
+                points=np.array(all_pts, dtype=np.float32),
+                labels=np.array(labs,    dtype=np.int32),
+                clear_old_points=True,
+            )
+            status("SAM2: propagating...")
+            for frame_idx, _obj_ids, mask_logits in predictor.propagate_in_video(state):
+                # mask_logits shape: [num_objects, 1, H, W] — squeeze to [H, W] float32
+                mask = (mask_logits[0] > 0.0).squeeze().cpu().numpy().astype(np.float32)
+                masks[frame_idx] = mask
+                if frame_idx % 20 == 0:
+                    log(f"SAM2: propagated {frame_idx}/{dur}")
+                    status(f"SAM2: {frame_idx}/{dur} frames")
+
+            # reset_state releases SAM2's internal CUDA buffers before we drop
+            # the predictor — prevents the GPU memory leak on Windows (issue #258).
+            try:
+                predictor.reset_state(state)
+            except Exception:
+                pass
+
+        # Delete state first (holds CUDA tensors), then predictor (holds weights).
+        # Wrong order leaks VRAM because the predictor holds references into state.
+        del state
+        del predictor
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()  # wait for GPU to finish before clearing cache
+            torch.cuda.empty_cache()
+        log(f"SAM2 video propagation done — {len(masks)} masks")
+        return masks
+
+    except Exception as e:
+        log(f"SAM2 video propagation error: {e}")
+        import traceback; log(traceback.format_exc())
+        return {}
+    finally:
+        shutil.rmtree(str(tmp_dir), ignore_errors=True)
+
 
 # WHAT IT DOES: Generates a gray checkerboard pattern for transparency preview
 # ISOLATED: pure function, no dependencies
@@ -421,14 +513,18 @@ def composite_over_checker(fg, alpha, sz=20):
 # DEPENDS-ON: timeline, get_current_frame_info(), OpenCV
 # AFFECTS: nothing — read-only, returns a frame or None
 def grab_background_frame():
-    """Try to grab a frame from the track below the green screen for composite background."""
+    """Try to grab a frame from tracks BELOW the green screen for composite background.
+    DEPENDS-ON: timeline, get_current_frame_info()
+    AFFECTS: nothing — read-only, returns a frame or None
+    DANGER ZONE: Skips V1 (assumed green screen source). If user has green screen
+      on V2+, this won't find the right background. Future: pass source track index."""
     import cv2
     try:
         cf, fps = get_current_frame_info()
-        # Check tracks below the source (V1 has green screen, check V2+ for bg plates
-        # OR if green screen is on V2+, check V1)
+        # Start from V2 — V1 is the green screen source. Grabbing V1 as background
+        # creates a double image in the composite (keyed fg over original = ghost).
         track_count = timeline.GetTrackCount("video")
-        for track_idx in range(1, track_count + 1):
+        for track_idx in range(2, track_count + 1):
             clips = timeline.GetItemListInTrack("video", track_idx) or []
             for c in clips:
                 if c.GetStart() <= cf < c.GetEnd():
@@ -457,10 +553,14 @@ def grab_background_frame():
 # DANGER ZONE FRAGILE: Hardcoded paths to viewer script and Python exe
 # breaks: if CorridorKey folder moves or venv is rebuilt
 def show_preview_window(orig_bgr, keyed_rgb, alpha):
+    # v2 flow: writes fg.png + alpha.png + v1_underlay.png + meta.json + live_params.json
+    # to SESSION_DIR atomically, then launches preview_viewer_v2.py in --persistent mode.
+    # The v2 viewer has its OWN despill / despeckle sliders — that's where the user drags
+    # (Fusion UIManager sliders can't be trusted in the current Resolve build). Panel sets
+    # rekeying:false at the end so an already-running viewer reloads the new PNGs.
     import cv2, numpy as np, subprocess, json
     a2d = alpha[:, :, 0] if len(alpha.shape) == 3 else alpha
     log(f"Matte debug — dtype:{a2d.dtype} min:{a2d.min():.4f} max:{a2d.max():.4f} mean:{a2d.mean():.4f}")
-    # Normalize matte to full 0-255 range (white=subject, black=background)
     if a2d.dtype in (np.float32, np.float64):
         matte_vis = (np.clip(a2d / max(a2d.max(), 1e-6), 0, 1) * 255).astype(np.uint8)
     else:
@@ -469,35 +569,106 @@ def show_preview_window(orig_bgr, keyed_rgb, alpha):
         else:
             matte_vis = a2d.astype(np.uint8)
     log(f"Matte after norm — min:{matte_vis.min()} max:{matte_vis.max()} mean:{matte_vis.mean():.1f}")
-    # Try to grab background plate from another track
     bg_frame = grab_background_frame()
-    # Save preview images to temp folder
-    preview_dir = Path(items["OutputPath"].Text) / "_preview"
-    preview_dir.mkdir(parents=True, exist_ok=True)
-    paths = {
-        "original": str(preview_dir / "original.png"),
-        "foreground": str(preview_dir / "foreground.png"),
-        "matte": str(preview_dir / "matte.png"),
-    }
-    cv2.imwrite(paths["original"], orig_bgr)
-    cv2.imwrite(paths["foreground"], cv2.cvtColor(keyed_rgb, cv2.COLOR_RGB2BGR))
-    cv2.imwrite(paths["matte"], matte_vis)
-    # Save background plate if found
+    SESSION_DIR.mkdir(parents=True, exist_ok=True)
+
+    def _atomic_imwrite(final_path, img):
+        base, ext = os.path.splitext(str(final_path))
+        tmp = base + ".tmp" + ext
+        if cv2.imwrite(tmp, img):
+            os.replace(tmp, str(final_path))
+
+    def _atomic_json(path, data):
+        tmp = str(path) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, str(path))
+
+    # fg.png — write the ORIGINAL SOURCE frame (full green spill intact) so the
+    # viewer's despill slider has real work to do. The NN's predicted fg is too
+    # clean: despill_opencv against it produces a sub-1/255 change per pixel
+    # (invisible). Compositing math: comp = fg * alpha + bg * (1-alpha). Since
+    # alpha is the NN's smart matte (hair, edges), the composite quality still
+    # comes from the NN — we're just using raw source as the color source for
+    # the despill-able part. This matches how dedicated keyers show live despill.
+    _atomic_imwrite(SESSION_DIR / "fg.png", orig_bgr)
+    _atomic_imwrite(SESSION_DIR / "alpha.png", matte_vis)
+
+    # Optional V1 underlay — viewer's BG:V1 button composites over it
     if bg_frame is not None:
         h, w = orig_bgr.shape[:2]
         if bg_frame.shape[:2] != (h, w):
             bg_frame = cv2.resize(bg_frame, (w, h))
-        paths["background"] = str(preview_dir / "background.png")
-        cv2.imwrite(paths["background"], bg_frame)
-        log("Background plate saved for composite")
-    # Launch preview as separate process — no event loop conflicts
-    viewer_script = str(CK_ROOT / "resolve_plugin" / "preview_viewer.py")
+        _atomic_imwrite(SESSION_DIR / "v1_underlay.png", bg_frame)
+        log("Background plate saved for V1 underlay")
+
+    # meta.json — frame/timebase info for debugging and future per-frame state
+    try:
+        _cf, _fps = get_current_frame_info()
+    except Exception:
+        _cf, _fps = 0, 24.0
+    _atomic_json(SESSION_DIR / "meta.json", {
+        "frame_num": int(_cf),
+        "fps": float(_fps),
+        "width": int(orig_bgr.shape[1]),
+        "height": int(orig_bgr.shape[0]),
+    })
+
+    # live_params.json — viewer owns slider state between launches. Preserve it if
+    # already present (user has dialed in); otherwise seed from Fusion panel values.
+    # Always set rekeying:false so a running viewer reloads the new PNGs.
+    lp_path = SESSION_DIR / "live_params.json"
+    if lp_path.exists():
+        try:
+            with open(lp_path, "r", encoding="utf-8") as f:
+                lp = json.load(f)
+        except Exception:
+            lp = {}
+    else:
+        _s = get_settings()
+        lp = {
+            "despill": float(_s.get("despill_strength", 1.0)),
+            "despeckle": bool(_s.get("despeckle_enabled", False)),
+            "despeckleSize": int(_s.get("despeckle_size", 400)),
+            "background": "checker",
+        }
+    lp["rekeying"] = False
+    _atomic_json(lp_path, lp)
+
+    # Launch v2 viewer — reuse existing subprocess if still alive. The mtime bump
+    # on live_params.json above signals a live viewer to reload.
+    global _viewer_proc
+    viewer_script = str(CK_ROOT / "resolve_plugin" / "preview_viewer_v2.py")
+    if not os.path.exists(viewer_script):
+        # Dev fallback — Plugin repo is the canonical source, engine repo mirrors it
+        viewer_script = r"D:\New AI Projects\CorridorKey-Plugin\resolve_plugin\preview_viewer_v2.py"
     python_exe = str(CK_PYTHON)
-    subprocess.Popen(
-        [python_exe, viewer_script, json.dumps(paths)],
-        creationflags=subprocess.CREATE_NO_WINDOW
+    if _viewer_proc is not None and _viewer_proc.poll() is None:
+        log("Preview updated (existing v2 window)")
+        return
+    # DANGER ZONE FRAGILE: Kill any zombie/orphan viewer before spawning a fresh one.
+    # Without this, clicking Preview repeatedly leaves stale python.exe processes holding
+    # VRAM/GPU. poll() returns None if still running — terminate first, hard-kill if needed.
+    if _viewer_proc is not None:
+        if _viewer_proc.poll() is None:
+            try:
+                _viewer_proc.terminate()
+                try:
+                    _viewer_proc.wait(timeout=2)
+                except Exception:
+                    _viewer_proc.kill()
+            except Exception:
+                pass
+        _viewer_proc = None
+    env = os.environ.copy()
+    env["CORRIDORKEY_PARENT_PID"] = str(os.getpid())
+    _viewer_proc = subprocess.Popen(
+        [python_exe, viewer_script, "--persistent", "--session", str(SESSION_DIR),
+         "--parent-pid", str(os.getpid())],
+        creationflags=subprocess.CREATE_NO_WINDOW,
+        env=env,
     )
-    log("Preview launched")
+    log("v2 preview launched (persistent mode)")
 
 # WHAT IT DOES: Writes the keyed result to disk as PNG. Three export formats:
 #   0 = RGBA (foreground + alpha), 1 = Alpha only (grayscale matte), 2 = Foreground only (no alpha)
@@ -523,22 +694,50 @@ def reprocess_with_cached():
     try:
         frame = cached_source["frame"]
         if frame is None: return
-        settings = get_settings()
+        # SAFETY: if the playhead has moved since the frame was cached, the cached frame
+        # is stale and re-keying it would silently show the wrong image. Compare timeline
+        # frame (cf, absolute playhead) — NOT "frame_num" which is source-video offset.
+        try:
+            cur_tf, _ = get_current_frame_info()
+            cached_tf = cached_source.get("timeline_frame")
+            if cached_tf is not None and cur_tf != cached_tf:
+                log(f"Cached timeline {cached_tf} != playhead {cur_tf} — falling through to full re-key")
+                process_current_frame(preview_only=True)
+                return
+        except Exception as _fn_err:
+            log(f"Frame identity check failed, aborting live re-key: {_fn_err}")
+            return
+        settings = _merge_live_params(get_settings())
         status("Updating...")
         from core.corridorkey_processor import CorridorKeyProcessor, ProcessingSettings
-        proc = CorridorKeyProcessor(device="cuda")
+        # BLOCKER FIX: reuse the cached model instead of reloading weights per slider drag.
+        # Without this, every slider change spawned a fresh CUDA processor (seconds of reload + VRAM churn).
+        proc = cached_processor.get("proc")
+        if proc is None:
+            proc = CorridorKeyProcessor(device="cuda")
+            cached_processor["proc"] = proc
         ah = generate_alpha_hint(frame, settings)
         fr = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         ah = ah.astype(np.float32) / 255.0 if ah.dtype == np.uint8 else ah
-        ps = ProcessingSettings(screen_type=settings["screen_type"], despill_strength=settings["despill_strength"])
+        ps = ProcessingSettings(screen_type=settings["screen_type"], despill_strength=settings["despill_strength"], refiner_strength=settings["refiner_strength"], despeckle_enabled=settings["despeckle_enabled"], despeckle_size=settings["despeckle_size"])
+        log(f"Settings: despeckle_enabled={ps.despeckle_enabled} despeckle_size={ps.despeckle_size} despill={ps.despill_strength} refiner={ps.refiner_strength}")
         res = proc.process_frame(fr, ah, ps)
         fg, mt = res.get("fg"), res.get("alpha")
+        if fg is not None:
+            try: log(f"FG stats — dtype:{fg.dtype} min:{float(fg.min()):.4f} max:{float(fg.max()):.4f} mean R:{float(fg[..., 0].mean()):.4f} G:{float(fg[..., 1].mean()):.4f} B:{float(fg[..., 2].mean()):.4f}")
+            except Exception as _e: log(f"FG stat error: {_e}")
         if fg is not None and mt is not None:
             if len(mt.shape) == 3: mt = mt[:, :, 0]
             last_preview_data["original"] = frame.copy()
             last_preview_data["keyed"] = (fg * 255).astype(np.uint8)
             last_preview_data["alpha"] = mt.copy()
-            show_preview_window(frame, (fg * 255).astype(np.uint8), mt)
+            # Send RAW fg (pre-despill) to viewer — viewer applies despill_opencv live
+            # per slider. Falls back to despilled fg if wrapper didn't preserve raw.
+            _fg_viewer = res.get("fg_raw", fg)
+            _is_raw = _fg_viewer is not fg and "fg_raw" in res
+            try: log(f"FG->viewer — raw:{_is_raw} mean R:{float(_fg_viewer[..., 0].mean()):.4f} G:{float(_fg_viewer[..., 1].mean()):.4f} B:{float(_fg_viewer[..., 2].mean()):.4f}")
+            except Exception as _e: log(f"FG->viewer log err: {_e}")
+            show_preview_window(frame, (_fg_viewer * 255).astype(np.uint8), mt)
             status("Updated")
     except Exception as e: log(f"Error: {e}")
 
@@ -554,7 +753,11 @@ def reprocess_with_cached():
 #   that can fail silently or behave differently across Resolve versions.
 # breaks: if Resolve API changes AppendToTimeline behavior, or if clip trimming fails
 def process_current_frame(preview_only=False):
-    global last_preview_data, cached_source
+    global last_preview_data, cached_source, timeline, media_pool
+    # Refresh in case timeline was opened after script loaded
+    if project:
+        timeline = project.GetCurrentTimeline()
+        media_pool = project.GetMediaPool()
     import cv2, numpy as np
     status("PROCESSING...")
     log("=" * 35)
@@ -562,7 +765,7 @@ def process_current_frame(preview_only=False):
         if not timeline or not media_pool: status("ERROR: No timeline!"); return
         clips = timeline.GetItemListInTrack("video", 1) or []
         if not clips: status("ERROR: No clips!"); return
-        settings = get_settings()
+        settings = _merge_live_params(get_settings())
         cf, fps = get_current_frame_info()
         log(f"Frame {cf}")
         clip = None
@@ -582,6 +785,10 @@ def process_current_frame(preview_only=False):
         cap.release()
         if not ret: status("ERROR: Cannot read"); return
         cached_source["frame"], cached_source["file_path"], cached_source["frame_num"] = frame.copy(), fp, fn
+        # Store timeline frame separately — "frame_num" above is source-video offset
+        # (clip.GetLeftOffset() + cf - cs), not the timeline position. reprocess_with_cached
+        # needs timeline position to know if the playhead moved.
+        cached_source["timeline_frame"] = cf
         log(f"Size: {frame.shape[1]}x{frame.shape[0]}")
         from core.corridorkey_processor import CorridorKeyProcessor, ProcessingSettings
         if cached_processor["proc"] is None:
@@ -596,20 +803,29 @@ def process_current_frame(preview_only=False):
         log("Processing...")
         fr = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         ah = ah.astype(np.float32) / 255.0 if ah.dtype == np.uint8 else ah
-        ps = ProcessingSettings(screen_type=settings["screen_type"], despill_strength=settings["despill_strength"])
+        ps = ProcessingSettings(screen_type=settings["screen_type"], despill_strength=settings["despill_strength"], refiner_strength=settings["refiner_strength"], despeckle_enabled=settings["despeckle_enabled"], despeckle_size=settings["despeckle_size"])
+        log(f"Settings: despeckle_enabled={ps.despeckle_enabled} despeckle_size={ps.despeckle_size} despill={ps.despill_strength} refiner={ps.refiner_strength}")
         res = proc.process_frame(fr, ah, ps)
         cn = Path(fp).stem
         od = Path(items["OutputPath"].Text) / f"CK_{cn}"
         od.mkdir(parents=True, exist_ok=True)
         op = od / f"CK_{cn}_{cf:06d}.png"
         fg, mt = res.get("fg"), res.get("alpha")
+        if fg is not None:
+            try: log(f"FG stats — dtype:{fg.dtype} min:{float(fg.min()):.4f} max:{float(fg.max()):.4f} mean R:{float(fg[..., 0].mean()):.4f} G:{float(fg[..., 1].mean()):.4f} B:{float(fg[..., 2].mean()):.4f}")
+            except Exception as _e: log(f"FG stat error: {_e}")
         if fg is not None and mt is not None:
             save_output(fg, mt, op, settings["export_format"])
             log(f"Saved: {op.name}")
         if len(mt.shape) == 3: mt = mt[:, :, 0]
         last_preview_data["original"], last_preview_data["keyed"], last_preview_data["alpha"] = frame.copy(), (fg * 255).astype(np.uint8), mt.copy()
         if preview_only:
-            show_preview_window(frame, (fg * 255).astype(np.uint8), mt)
+            # Raw NN fg to viewer — viewer applies despill live per slider drag.
+            _fg_viewer = res.get("fg_raw", fg)
+            _is_raw = _fg_viewer is not fg and "fg_raw" in res
+            try: log(f"FG->viewer — raw:{_is_raw} mean R:{float(_fg_viewer[..., 0].mean()):.4f} G:{float(_fg_viewer[..., 1].mean()):.4f} B:{float(_fg_viewer[..., 2].mean()):.4f}")
+            except Exception as _e: log(f"FG->viewer log err: {_e}")
+            show_preview_window(frame, (_fg_viewer * 255).astype(np.uint8), mt)
             status("Preview"); return
         root = media_pool.GetRootFolder()
         ckb = None
@@ -690,97 +906,178 @@ processing_cancelled = False
 # DANGER ZONE HIGH: Long-running loop with no progress callback to Resolve.
 #   Resolve may appear frozen during processing. Cannot be interrupted by Resolve UI.
 # breaks: if user closes Resolve during processing, or if disk fills up mid-range
+_range_running = False  # Guard — prevents double-click while processing
+
 def on_process_range(ev):
-    global processing_cancelled
+    # WHAT IT DOES: Starts range processing in a background thread so the UI stays
+    #   live and the Cancel button works between frames.
+    # DEPENDS-ON: timeline, media_pool, cached_processor, frame_range globals.
+    # AFFECTS: Disk (PNGs), MediaPool (sequence), Timeline (places on V above source).
+    global processing_cancelled, timeline, media_pool, _range_running
+    if _range_running:
+        status("Already running — hit CANCEL first"); return
     processing_cancelled = False
-    import cv2, numpy as np, time
+    # Refresh in case timeline was opened after script loaded
+    if project:
+        timeline = project.GetCurrentTimeline()
+        media_pool = project.GetMediaPool()
+    import cv2, numpy as np, time, threading
     log("=" * 35)
     log("PROCESS RANGE")
-    try:
-        if not timeline or not media_pool: status("ERROR: No timeline!"); return
-        clips = timeline.GetItemListInTrack("video", 1) or []
-        if not clips: status("ERROR: No clips!"); return
-        clip = clips[0]
-        cs, ce = clip.GetStart(), clip.GetEnd()
-        inf = frame_range["in_frame"] if frame_range["in_frame"] is not None else cs
-        outf = frame_range["out_frame"] if frame_range["out_frame"] is not None else ce
-        inf, outf = max(inf, cs), min(outf, ce)
-        if outf <= inf: status("Invalid range!"); return
-        dur = outf - inf
-        log(f"Range: {inf}-{outf} ({dur} frames)")
-        mpi = clip.GetMediaPoolItem()
-        props = mpi.GetClipProperty() if mpi else {}
-        fp = props.get("File Path", "")
-        ss = clip.GetLeftOffset()
-        settings = get_settings()
-        cn = Path(fp).stem
-        od = Path(items["OutputPath"].Text) / f"CK_{cn}"
-        od.mkdir(parents=True, exist_ok=True)
-        log(f"Saving to: {od}")
-        from core.corridorkey_processor import CorridorKeyProcessor, ProcessingSettings
-        if cached_processor["proc"] is None:
-            log("Loading AI (first time)...")
-            status("Loading AI...")
-            cached_processor["proc"] = CorridorKeyProcessor(device="cuda")
-            log("Model loaded!")
-        else:
-            log("AI ready (cached)")
-        proc = cached_processor["proc"]
-        ps = ProcessingSettings(screen_type=settings["screen_type"], despill_strength=settings["despill_strength"])
-        cap = cv2.VideoCapture(fp)
-        if not cap.isOpened(): status("Cannot open video"); return
-        st = time.time()
+    if not timeline or not media_pool: status("ERROR: No timeline!"); return
+    # Find which track has the source clip — scan all video tracks
+    source_track = 1
+    clip = None
+    track_count = timeline.GetTrackCount("video")
+    for ti in range(1, track_count + 1):
+        clips = timeline.GetItemListInTrack("video", ti) or []
+        if clips:
+            source_track = ti
+            clip = clips[0]
+            break
+    if not clip: status("ERROR: No clips!"); return
+    output_track = source_track + 1
+    log(f"Source on V{source_track} → output to V{output_track}")
+    cs, ce = clip.GetStart(), clip.GetEnd()
+    in_f = frame_range["in_frame"] if frame_range["in_frame"] is not None else cs
+    out_f = frame_range["out_frame"] if frame_range["out_frame"] is not None else ce
+    in_f, out_f = max(in_f, cs), min(out_f, ce)
+    if out_f <= in_f: status("Invalid range!"); return
+    dur = out_f - in_f
+    log(f"Range: {in_f}-{out_f} ({dur} frames)")
+    mpi = clip.GetMediaPoolItem()
+    props = mpi.GetClipProperty() if mpi else {}
+    fp = props.get("File Path", "")
+    ss = clip.GetLeftOffset()
+    settings = _merge_live_params(get_settings())
+    cn = Path(fp).stem
+    od = Path(items["OutputPath"].Text) / f"CK_{cn}"
+    od.mkdir(parents=True, exist_ok=True)
+    log(f"Saving to: {od}")
+    from core.corridorkey_processor import CorridorKeyProcessor, ProcessingSettings
+    if cached_processor["proc"] is None:
+        log("Loading AI (first time)...")
+        status("Loading AI...")
+        cached_processor["proc"] = CorridorKeyProcessor(device="cuda")
+        log("Model loaded!")
+    else:
+        log("AI ready (cached)")
+    proc = cached_processor["proc"]
+    ps = ProcessingSettings(screen_type=settings["screen_type"], despill_strength=settings["despill_strength"],
+                            refiner_strength=settings["refiner_strength"], despeckle_enabled=settings["despeckle_enabled"],
+                            despeckle_size=settings["despeckle_size"])
+    log(f"Settings: despill={ps.despill_strength} refiner={ps.refiner_strength} despeckle={ps.despeckle_enabled}")
+
+    def _run():
+        global _range_running
+        _range_running = True
         ofs = []
         pr = 0
-        for tf in range(inf, outf):
-            if processing_cancelled: log("Cancelled"); break
-            sf = ss + (tf - cs)
-            cap.set(cv2.CAP_PROP_POS_FRAMES, sf)
-            ret, frame = cap.read()
-            if not ret: continue
-            ah = generate_alpha_hint(frame, settings)
-            fr = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-            ah = ah.astype(np.float32) / 255.0 if ah.dtype == np.uint8 else ah
-            res = proc.process_frame(fr, ah, ps)
-            fg, mt = res.get("fg"), res.get("alpha")
-            if fg is not None and mt is not None:
-                op = od / f"CK_{cn}_{pr:06d}.png"
-                save_output(fg, mt, op, settings["export_format"])
-                ofs.append(str(op))
-            pr += 1
-            el = time.time() - st
-            fpsr = pr / el if el > 0 else 0
-            rem = (dur - pr) / fpsr if fpsr > 0 else 0
-            status(f"{pr}/{dur} ({fpsr:.1f}fps, {rem:.0f}s)")
-            if pr % 10 == 0: log(f"{pr}/{dur}")
-        cap.release()
-        if not ofs: status("No frames"); return
+
+        # --- SAM2 video propagation (runs ONCE before the per-frame loop) ---
+        # If the user has placed SAM2 click points and selected SAM2 mode, we run
+        # the video predictor across the entire range up front. This gives us one
+        # mask per frame instead of re-running SAM2 per frame (which was the bug).
+        # Falls back to per-frame generate_alpha_hint if propagation fails or if
+        # the user is in Simple Chroma mode (alpha_method != 1).
+        sam2_video_masks = {}
+        if (settings.get("alpha_method") == 1 and
+                (sam_points.get("positive") or sam_points.get("negative"))):
+            log("SAM2 mode — running video propagation for full range...")
+            sam2_video_masks = run_sam2_video_propagation(
+                fp, ss, cs, in_f, out_f,
+                sam_points.get("positive", []),
+                sam_points.get("negative", []),
+                sam_points.get("frame"),
+            )
+            if sam2_video_masks:
+                log(f"SAM2 video: {len(sam2_video_masks)} masks ready — using for all frames")
+            else:
+                log("SAM2 video propagation returned no masks — falling back to per-frame hint")
+
+        cap = cv2.VideoCapture(fp)
+        try:
+            if not cap.isOpened(): status("Cannot open video"); return
+            st = time.time()
+            for tf in range(in_f, out_f):
+                if processing_cancelled:
+                    log(f"Cancelled at frame {pr}/{dur}")
+                    status(f"CANCELLED — {pr} frames saved")
+                    break
+                sf = ss + (tf - cs)
+                cap.set(cv2.CAP_PROP_POS_FRAMES, sf)
+                ret, frame = cap.read()
+                if not ret: continue
+                # Use the pre-computed SAM2 video mask if we have one for this frame,
+                # otherwise fall back to the per-frame alpha hint (chroma or single-frame SAM2).
+                range_idx = tf - in_f
+                if sam2_video_masks and range_idx in sam2_video_masks:
+                    ah = sam2_video_masks[range_idx]
+                else:
+                    ah = generate_alpha_hint(frame, settings)
+                fr = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+                ah = ah.astype(np.float32) / 255.0 if ah.dtype == np.uint8 else ah
+                res = proc.process_frame(fr, ah, ps)
+                fg, mt = res.get("fg"), res.get("alpha")
+                if fg is not None and mt is not None:
+                    op = od / f"CK_{cn}_{pr:06d}.png"
+                    save_output(fg, mt, op, settings["export_format"])
+                    ofs.append(str(op))
+                    pr += 1
+                    el = time.time() - st
+                    fpsr = pr / el if el > 0 else 0
+                    rem = (dur - pr) / fpsr if fpsr > 0 else 0
+                    status(f"{pr}/{dur} ({fpsr:.1f}fps, {rem:.0f}s left)")
+                    if pr % 10 == 0: log(f"{pr}/{dur}")
+        finally:
+            try: cap.release()
+            except Exception: pass
+            _range_running = False
+
+        if not ofs or processing_cancelled: return
         log(f"Done: {len(ofs)} frames in {time.time()-st:.1f}s")
-        status("Importing...")
-        root = media_pool.GetRootFolder()
-        ckb = None
-        for f in root.GetSubFolderList():
-            if f.GetName() == "CorridorKey": ckb = f; break
-        if not ckb: ckb = media_pool.AddSubFolder(root, "CorridorKey")
-        media_pool.SetCurrentFolder(ckb)
-        imp = media_pool.ImportMedia(ofs)
-        if not imp: status("Import failed"); return
-        log(f"Imported {len(imp)} items to MediaPool")
-        if settings["output_mode"] in [0, 2]:
-            ci = {"mediaPoolItem": imp[0], "startFrame": 0, "endFrame": len(ofs), "trackIndex": 2, "recordFrame": inf, "mediaType": 1}
-            if media_pool.AppendToTimeline([ci]):
-                if items["DisableTrack1"].Checked: timeline.SetTrackEnable("video", 1, False)
-                status(f"DONE! {len(ofs)} frames")
-            else: status("MediaPool only")
-        else: status(f"{len(ofs)} frames in MediaPool")
-    except Exception as e:
-        status("ERROR!"); log(f"ERROR: {e}")
-        import traceback; log(traceback.format_exc())
+        status("Importing to MediaPool...")
+        try:
+            root = media_pool.GetRootFolder()
+            ckb = None
+            for f in root.GetSubFolderList():
+                if f.GetName() == "CorridorKey": ckb = f; break
+            if not ckb: ckb = media_pool.AddSubFolder(root, "CorridorKey")
+            media_pool.SetCurrentFolder(ckb)
+            imp = media_pool.ImportMedia(ofs)
+            if not imp: status("Import failed"); return
+            log(f"Imported {len(imp)} items to MediaPool")
+            if settings["output_mode"] in [0, 2]:
+                current_tracks = timeline.GetTrackCount("video")
+                while current_tracks < output_track:
+                    timeline.AddTrack("video")
+                    current_tracks += 1
+                    log(f"Added video track V{current_tracks}")
+                seq_item = imp[0]
+                log(f"Placing on V{output_track} — frames 0-{len(ofs)-1}")
+                ci_list = [{"mediaPoolItem": seq_item, "startFrame": 0, "endFrame": len(ofs) - 1,
+                            "trackIndex": output_track, "recordFrame": math.inf, "mediaType": 1}]
+                result = media_pool.AppendToTimeline(ci_list)
+                log(f"AppendToTimeline result: {result}")
+                if result:
+                    if items["DisableTrack1"].Checked: timeline.SetTrackEnable("video", source_track, False)
+                    status(f"DONE! {len(ofs)} frames on V{output_track}")
+                else:
+                    status("Timeline place failed — check log. Clips are in MediaPool.")
+            else:
+                status(f"{len(ofs)} frames in MediaPool")
+        except Exception as e:
+            status("Import ERROR!"); log(f"Import error: {e}")
+            import traceback; log(traceback.format_exc())
+
+    threading.Thread(target=_run, daemon=True).start()
 
 # WHAT IT DOES: Sets the cancel flag so the range processing loop stops on next iteration
 def on_cancel(ev):
-    global processing_cancelled
+    global processing_cancelled, _range_running
     processing_cancelled = True
+    _range_running = False  # Unlock immediately so user can restart right away
+    status("Cancelling — wait for current frame to finish...")
     log("Cancelling...")
 
 # WHAT IT DOES: Toggles Track 1 visibility on/off — lets user quickly show/hide source footage
@@ -798,21 +1095,60 @@ def on_open_fusion(ev):
     except: pass
 
 # WHAT IT DOES: Exits the Fusion UIDispatcher event loop, closing the plugin window
-def on_close(ev): disp.ExitLoop()
+# WHAT IT DOES: Kills any running preview viewer, then exits the Fusion event loop.
+#   Without this, the orphaned Python viewer holds GPU/CUDA open and Resolve can't restart.
+def on_close(ev):
+    global _viewer_proc
+    if _viewer_proc is not None:
+        try: _viewer_proc.kill()
+        except: pass
+        _viewer_proc = None
+    # Run cleanup in a daemon thread so it can't block the close button.
+    # disp.ExitLoop() fires immediately — Resolve window closes right away.
+    import threading
+    def _cleanup():
+        try:
+            proc = cached_processor.get("proc")
+            if proc is not None:
+                try: proc.cleanup()
+                except Exception: pass
+                cached_processor["proc"] = None
+        except Exception: pass
+    threading.Thread(target=_cleanup, daemon=True).start()
+    disp.ExitLoop()
 
-win.On.DespillSlider.SliderMoved = on_despill_changed
-win.On.RefinerSlider.SliderMoved = on_refiner_changed
 win.On.SetInPoint.Clicked = on_set_in_point
 win.On.SetOutPoint.Clicked = on_set_out_point
 win.On.ClearRange.Clicked = on_clear_range
 win.On.BrowseOutput.Clicked = on_browse_output
-win.On.SAMClickMask.Clicked = on_sam_click_mask
 win.On.ShowPreview.Clicked = on_show_preview
 win.On.ProcessFrame.Clicked = on_process_frame
 win.On.ProcessRange.Clicked = on_process_range
 win.On.Cancel.Clicked = on_cancel
 win.On.ToggleTrack1.Clicked = on_toggle_track1
 win.On.OpenFusion.Clicked = on_open_fusion
+
+# WHAT IT DOES: Terminates the running preview viewer subprocess immediately.
+#   Waits up to 2 seconds for a clean exit, then hard-kills if still running.
+#   Resets _viewer_proc to None so Preview can spawn a fresh one next click.
+# DEPENDS-ON: _viewer_proc global, subprocess module (already imported in show_preview_window)
+# AFFECTS: _viewer_proc global, status label
+def on_kill_viewer(ev):
+    global _viewer_proc
+    if _viewer_proc is not None:
+        try:
+            _viewer_proc.terminate()
+            try:
+                _viewer_proc.wait(timeout=2)
+            except Exception:
+                _viewer_proc.kill()
+        except Exception:
+            pass
+        _viewer_proc = None
+    status("Viewer killed — click Preview to reopen")
+
+win.On.KillViewer.Clicked = on_kill_viewer
+win.On.ClosePanel.Clicked = lambda ev: on_close(ev)
 
 # WHAT IT DOES: Shows the About dialog with credits, how-to-use guide, and Ko-fi link.
 #   Credits Niko Pueringer/Corridor Digital (engine) and Roberto+Elvis Lopez/StuntWorks (plugin).
@@ -858,6 +1194,31 @@ def on_about(ev):
     disp.RunLoop()
     about_win.Hide()
 
+# WHAT IT DOES: Header link — CorridorKey Pro → Corridor Digital website
+def on_header_ck(ev):
+    import subprocess
+    subprocess.Popen(["cmd", "/c", "start", "https://corridordigital.com"], creationflags=subprocess.CREATE_NO_WINDOW)
+
+# WHAT IT DOES: Header link — StuntWorks Action Cinema → YouTube channel
+def on_header_sw(ev):
+    import subprocess
+    subprocess.Popen(["cmd", "/c", "start", "https://www.youtube.com/@StuntworksActionCinema"], creationflags=subprocess.CREATE_NO_WINDOW)
+
+win.On.HeaderCK.Clicked = on_header_ck
+win.On.HeaderSW.Clicked = on_header_sw
+
+# WHAT IT DOES: Opens StuntWorks YouTube channel in the system browser
+def on_youtube(ev):
+    import subprocess
+    subprocess.Popen(["cmd", "/c", "start", "https://www.youtube.com/@StuntworksActionCinema"], creationflags=subprocess.CREATE_NO_WINDOW)
+
+# WHAT IT DOES: Opens the StuntWorks Ko-fi tip jar in the system browser
+def on_kofi(ev):
+    import subprocess
+    subprocess.Popen(["cmd", "/c", "start", "https://ko-fi.com/stuntworks"], creationflags=subprocess.CREATE_NO_WINDOW)
+
+win.On.YouTubeBtn.Clicked = on_youtube
+win.On.KofiBtn.Clicked = on_kofi
 win.On.AboutBtn.Clicked = on_about
 win.On.CK.Close = on_close
 
