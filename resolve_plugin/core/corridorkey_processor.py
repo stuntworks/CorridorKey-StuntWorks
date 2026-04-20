@@ -160,9 +160,15 @@ class CorridorKeyProcessor:
             raise RuntimeError(f"No input frames found in {input_dir}")
 
         if len(alpha_frames) < len(input_frames):
-            # Duplicate last alpha if needed
-            while len(alpha_frames) < len(input_frames):
-                alpha_frames.append(alpha_frames[-1])
+            if not alpha_frames:
+                raise RuntimeError(f"No alpha hint frames found in {alpha_dir}")
+            import logging
+            logging.getLogger(__name__).warning(
+                "Alpha frame count %d < input count %d — duplicating last alpha for remaining frames",
+                len(alpha_frames), len(input_frames),
+            )
+            last = alpha_frames[-1]
+            alpha_frames.extend([last] * (len(input_frames) - len(alpha_frames)))
 
         total_frames = len(input_frames)
         processed_count = 0
@@ -174,6 +180,8 @@ class CorridorKeyProcessor:
             # Read input frame
             img = cv2.imread(str(input_frame), cv2.IMREAD_UNCHANGED)
             if img is None:
+                if progress_callback:
+                    progress_callback(i, total_frames, f"WARNING: could not read {input_frame.name} — skipping")
                 continue
 
             # Convert BGR to RGB, normalize to 0-1
