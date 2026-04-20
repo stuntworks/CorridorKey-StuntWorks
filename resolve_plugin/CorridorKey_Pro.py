@@ -666,6 +666,7 @@ def show_preview_window(orig_bgr, keyed_rgb, alpha):
         [python_exe, viewer_script, "--persistent", "--session", str(SESSION_DIR),
          "--parent-pid", str(os.getpid())],
         creationflags=subprocess.CREATE_NO_WINDOW,
+        close_fds=True,
         env=env,
     )
     log("v2 preview launched (persistent mode)")
@@ -1056,7 +1057,7 @@ def on_process_range(ev):
                 seq_item = imp[0]
                 log(f"Placing on V{output_track} — frames 0-{len(ofs)-1}")
                 ci_list = [{"mediaPoolItem": seq_item, "startFrame": 0, "endFrame": len(ofs) - 1,
-                            "trackIndex": output_track, "recordFrame": math.inf, "mediaType": 1}]
+                            "trackIndex": output_track, "recordFrame": int(in_f), "mediaType": 1}]
                 result = media_pool.AppendToTimeline(ci_list)
                 log(f"AppendToTimeline result: {result}")
                 if result:
