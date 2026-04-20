@@ -220,20 +220,21 @@ class ResolveBridge:
         # Start rendering
         self.project.StartRendering(job_id)
 
-        # Wait for completion
-        while self.project.IsRenderingInProgress():
-            if progress_callback:
-                status = self.project.GetRenderJobStatus(job_id)
-                percent = status.get("CompletionPercentage", 0)
-                progress_callback(
-                    int(percent * duration / 100),
-                    duration,
-                    f"Exporting: {percent}%"
-                )
-            time.sleep(0.5)
-
-        # Clean up render job
-        self.project.DeleteRenderJob(job_id)
+        # DANGER ZONE FRAGILE/HIGH: try/finally ensures DeleteRenderJob always runs.
+        # An orphaned job blocks all future renders in the Resolve session.
+        try:
+            while self.project.IsRenderingInProgress():
+                if progress_callback:
+                    status = self.project.GetRenderJobStatus(job_id)
+                    percent = status.get("CompletionPercentage", 0)
+                    progress_callback(
+                        int(percent * duration / 100),
+                        duration,
+                        f"Exporting: {percent}%"
+                    )
+                time.sleep(0.5)
+        finally:
+            self.project.DeleteRenderJob(job_id)
 
         return {
             "output_dir": output_dir,
