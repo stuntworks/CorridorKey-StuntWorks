@@ -361,6 +361,11 @@ class PersistentWindow(QtWidgets.QWidget):
         self._save_timer.setInterval(250)
         self._save_timer.timeout.connect(self._save_live_params_now)
         self._suppress_poll_mtime = 0.0
+        # Tracks the last time a LOCAL slider/checkbox fired. While within
+        # 500ms of a local change we ignore file-poller updates — otherwise
+        # the poller reads the old value from disk (before the 250ms debounced
+        # save fires) and overrides the slider move, making sliders appear dead.
+        self._local_change_time = 0.0
 
         # Zoom + pan state. Mouse wheel adjusts _zoom, drag-while-zoomed updates
         # _pan_x/_pan_y (fractional 0..1 center point). _paint_into crops the
@@ -424,6 +429,12 @@ class PersistentWindow(QtWidgets.QWidget):
         # on every write. The tolerance handles FS-layer mtime jitter.
         if abs(mt - self._suppress_poll_mtime) < 0.01:
             self._live_params_mtime = mt
+            return
+        # Skip if a local slider/checkbox fired within the last 500ms. The
+        # debounced save takes 250ms, so during that window the file on disk
+        # still has the OLD value. Reading it back would override the slider
+        # move and make sliders appear dead. 500ms covers the debounce + jitter.
+        if (time.perf_counter() - self._local_change_time) < 0.5:
             return
         self._live_params_mtime = mt
         try:
@@ -498,6 +509,13 @@ class PersistentWindow(QtWidgets.QWidget):
         )
         self._sam_clear_btn.clicked.connect(self._clear_sam_points)
         sam_row.addWidget(self._sam_clear_btn)
+        self._sam_undo_btn = QtWidgets.QPushButton("UNDO LAST POINT")
+        self._sam_undo_btn.setStyleSheet(
+            "background-color: #111; color: #667; padding: 5px 10px; "
+            "border: 1px solid #444; border-radius: 12px; font-size: 12px;"
+        )
+        self._sam_undo_btn.clicked.connect(self._undo_last_sam_point)
+        sam_row.addWidget(self._sam_undo_btn)
         self._sam_apply_btn = QtWidgets.QPushButton("APPLY MASK")
         self._sam_apply_btn.setStyleSheet(
             "background-color: #1a4a2a; color: #5b5; padding: 5px 12px; "
@@ -752,6 +770,7 @@ class PersistentWindow(QtWidgets.QWidget):
     # DEPENDS-ON: self._save_timer QTimer already built in __init__.
     # AFFECTS: restarts the save timer — does not touch disk.
     def _schedule_save(self):
+        self._local_change_time = time.perf_counter()
         self._save_timer.start()
 
     # WHAT IT DOES: Atomically writes current self._params to live_params.json.
@@ -1031,6 +1050,25 @@ class PersistentWindow(QtWidgets.QWidget):
         self.status.setText("Points cleared")
         self._repaint_both()
 
+    # WHAT IT DOES: Removes the most recently added SAM click point (undo one step).
+    #   If no points remain, status bar says so. Updates the point count in status bar
+    #   and redraws the overlay so the removed dot disappears immediately.
+    # DEPENDS-ON: self._sam_display_pts (list of (nx, ny, is_positive) tuples),
+    #   _repaint_both to redraw the right-pane overlay.
+    # AFFECTS: self._sam_display_pts loses its last element, status updated, right pane repainted.
+    def _undo_last_sam_point(self):
+        if not self._sam_display_pts:
+            self.status.setText("No points to undo")
+            return
+        self._sam_display_pts.pop()
+        pos_count = sum(1 for _, _, is_pos in self._sam_display_pts if is_pos)
+        neg_count = len(self._sam_display_pts) - pos_count
+        if self._sam_display_pts:
+            self.status.setText(f"SAM points: {pos_count}+ {neg_count}−  (right-click=exclude)")
+        else:
+            self.status.setText("Points cleared")
+        self._repaint_both()
+
     # WHAT IT DOES: Runs SAM2 on the cached source frame using the user's click points.
     #   Converts normalized image coords back to full-res pixel coords, loads SAM2 from
     #   the engine's sam2_weights folder, predicts the best mask, writes alpha.png to the
@@ -1040,55 +1078,97 @@ class PersistentWindow(QtWidgets.QWidget):
     # AFFECTS: session_dir/alpha.png overwritten, session.alpha reloaded, repaint triggered.
     # DANGER ZONE HIGH: Synchronous — Qt event loop freezes during SAM2 inference (~2-5s).
     def _apply_sam_mask(self):
+        # WHAT IT DOES: Runs SAM2 in a background thread so the UI stays live.
+        #   Shows animated "Thinking..." dots while SAM2 runs (~2-5s on GPU).
+        #   Disables the Apply button to prevent double-clicks during inference.
+        # DEPENDS-ON: self._sam_display_pts, self.session, QtCore.QTimer, threading.
+        # AFFECTS: alpha.png in session dir, right pane redrawn, status text updated.
         if not self._sam_display_pts:
             self.status.setText("No points — click on image first")
             return
-        self.status.setText("Running SAM2…")
-        QtWidgets.QApplication.processEvents()
-        try:
-            import cv2, numpy as np, torch, os
-            ih, iw = self.session.shape_hw
-            pos_pts = [(int(nx * iw), int(ny * ih)) for nx, ny, v in self._sam_display_pts if v]
-            neg_pts = [(int(nx * iw), int(ny * ih)) for nx, ny, v in self._sam_display_pts if not v]
-            all_pts = [[p[0], p[1]] for p in pos_pts] + [[p[0], p[1]] for p in neg_pts]
-            labels  = [1] * len(pos_pts) + [0] * len(neg_pts)
-            if not all_pts:
-                self.status.setText("No valid points in image bounds")
-                return
-            # Source image for SAM2: uint8 RGB (session stores float32 RGB 0..1)
-            frame_rgb = np.clip(self.session.fg_rgb * 255.0, 0, 255).astype(np.uint8)
-            # CK_ROOT is two levels up from this script (resolve_plugin/ → engine root)
-            ck_root = Path(__file__).parent.parent
-            ckpt = str(ck_root / "sam2_weights" / "sam2.1_hiera_small.pt")
-            cfg   = "configs/sam2.1/sam2.1_hiera_s.yaml"
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            from sam2.build_sam import build_sam2
-            from sam2.sam2_image_predictor import SAM2ImagePredictor
-            model = build_sam2(cfg, ckpt, device=device)
-            pred  = SAM2ImagePredictor(model)
-            pred.set_image(frame_rgb)
-            masks, scores, _ = pred.predict(
-                point_coords=np.array(all_pts),
-                point_labels=np.array(labels),
-                multimask_output=True,
-            )
-            del pred, model
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            best = masks[int(np.argmax(scores))].astype(np.float32)
-            alpha_u8 = (best * 255).astype(np.uint8)
-            alpha_path = self.session.session_dir / "alpha.png"
-            tmp_path   = self.session.session_dir / "alpha.tmp.png"
-            cv2.imwrite(str(tmp_path), alpha_u8)
-            os.replace(str(tmp_path), str(alpha_path))
-            self.session.reload_pngs()
-            # Keep points visible so the user can add/refine and re-apply —
-            # each predict() takes ALL current points, so wiping them here
-            # forced users to re-click everything. CLEAR button wipes manually.
-            self._render_now()
-            self.status.setText(f"SAM2 mask applied — {len(pos_pts)}+ {len(neg_pts)}-")
-        except Exception as e:
-            self.status.setText(f"SAM2 error: {e}")
+
+        import threading, cv2, numpy as np, torch, os
+
+        ih, iw = self.session.shape_hw
+        pos_pts = [(int(nx * iw), int(ny * ih)) for nx, ny, v in self._sam_display_pts if v]
+        neg_pts = [(int(nx * iw), int(ny * ih)) for nx, ny, v in self._sam_display_pts if not v]
+        all_pts = [[p[0], p[1]] for p in pos_pts] + [[p[0], p[1]] for p in neg_pts]
+        labels  = [1] * len(pos_pts) + [0] * len(neg_pts)
+        if not all_pts:
+            self.status.setText("No valid points in image bounds")
+            return
+
+        # Disable button and start animated status dots
+        self._sam_apply_btn.setEnabled(False)
+        self._sam_apply_btn.setStyleSheet(
+            "background-color: #111; color: #444; padding: 5px 12px; "
+            "border: 1px solid #333; border-radius: 12px; font-size: 12px; font-weight: 600;"
+        )
+        self._thinking_dots = 0
+        # Stop any previous timer before creating a new one (handles rapid re-clicks).
+        if hasattr(self, '_thinking_timer') and self._thinking_timer is not None:
+            self._thinking_timer.stop()
+        self._thinking_timer = QtCore.QTimer(self)  # parent=self ensures Qt cleans it up on window close
+        def _tick():
+            self._thinking_dots = (self._thinking_dots + 1) % 4
+            self.status.setText("SAM2 thinking" + "." * self._thinking_dots)
+        self._thinking_timer.timeout.connect(_tick)
+        self._thinking_timer.start(400)
+
+        frame_rgb = np.clip(self.session.fg_rgb * 255.0, 0, 255).astype(np.uint8)
+        ck_root = Path(__file__).parent.parent
+        ckpt = str(ck_root / "sam2_weights" / "sam2.1_hiera_small.pt")
+        cfg  = "configs/sam2.1/sam2.1_hiera_s.yaml"
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        def _run_sam():
+            result = {"error": None, "alpha_u8": None}
+            try:
+                from sam2.build_sam import build_sam2
+                from sam2.sam2_image_predictor import SAM2ImagePredictor
+                model = build_sam2(cfg, ckpt, device=device)
+                pred  = SAM2ImagePredictor(model)
+                pred.set_image(frame_rgb)
+                masks, scores, _ = pred.predict(
+                    point_coords=np.array(all_pts),
+                    point_labels=np.array(labels),
+                    multimask_output=True,
+                )
+                del pred, model
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                best = masks[int(np.argmax(scores))].astype(np.float32)
+                result["alpha_u8"] = (best * 255).astype(np.uint8)
+            except Exception as e:
+                result["error"] = str(e)
+
+            # Post result back to main thread via a single-shot timer.
+            # Guard self.isVisible() — window may have closed while SAM2 was running.
+            import weakref
+            self_ref = weakref.ref(self)
+            def _finish():
+                win = self_ref()
+                if win is None or not win.isVisible():
+                    return
+                win._thinking_timer.stop()
+                win._sam_apply_btn.setEnabled(True)
+                win._sam_apply_btn.setStyleSheet(
+                    "background-color: #1a4a2a; color: #5b5; padding: 5px 12px; "
+                    "border: 1px solid #5b5; border-radius: 12px; font-size: 12px; font-weight: 600;"
+                )
+                if result["error"]:
+                    win.status.setText(f"SAM2 error: {result['error']}")
+                    return
+                alpha_path = win.session.session_dir / "alpha.png"
+                tmp_path   = win.session.session_dir / "alpha.tmp.png"
+                cv2.imwrite(str(tmp_path), result["alpha_u8"])
+                os.replace(str(tmp_path), str(alpha_path))
+                win.session.reload_pngs()
+                win._render_now()
+                win.status.setText(f"SAM2 mask applied — {len(pos_pts)}+ {len(neg_pts)}-")
+            QtCore.QTimer.singleShot(0, _finish)
+
+        threading.Thread(target=_run_sam, daemon=True).start()
 
     # WHAT IT DOES: Draws colored dot overlays on the right_label pixmap for all SAM
     #   click points. Green filled circle = include (+), red = exclude (−). Called
@@ -1122,11 +1202,11 @@ class PersistentWindow(QtWidgets.QWidget):
             fill = QtGui.QColor("#00ee00") if is_pos else QtGui.QColor("#ff3333")
             painter.setPen(QtGui.QPen(QtGui.QColor("#000000"), 2))
             painter.setBrush(QtGui.QBrush(fill))
-            painter.drawEllipse(QtCore.QPoint(px, py), 9, 9)
+            painter.drawEllipse(QtCore.QPoint(px, py), 5, 5)
             painter.setPen(QtGui.QPen(QtGui.QColor("#ffffff"), 1))
             font = painter.font()
             font.setBold(True)
-            font.setPixelSize(13)
+            font.setPixelSize(10)
             painter.setFont(font)
             painter.drawText(px - 4, py + 5, "+" if is_pos else "\u2212")
         painter.end()
