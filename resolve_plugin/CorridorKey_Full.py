@@ -99,8 +99,10 @@ def on_test(ev):
             return
 
         cap = cv2.VideoCapture(file_path)
-        ret, frame = cap.read()
-        cap.release()
+        try:
+            ret, frame = cap.read()
+        finally:
+            cap.release()
 
         if not ret:
             items["Status"].Text = "ERROR: Can't read video"
@@ -149,8 +151,10 @@ def on_full(ev):
         file_path = props.get("File Path", "")
 
         cap = cv2.VideoCapture(file_path)
-        ret, frame = cap.read()
-        cap.release()
+        try:
+            ret, frame = cap.read()
+        finally:
+            cap.release()
 
         if not ret:
             items["Status"].Text = "ERROR: Can't read"
@@ -160,30 +164,31 @@ def on_full(ev):
         from core.alpha_hint_generator import AlphaHintGenerator
 
         processor = CorridorKeyProcessor(device="cuda")
-        hint_gen = AlphaHintGenerator(screen_type="green")
-        alpha_hint = hint_gen.generate_hint(frame)
+        try:
+            hint_gen = AlphaHintGenerator(screen_type="green")
+            alpha_hint = hint_gen.generate_hint(frame)
 
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        alpha_hint = alpha_hint.astype(np.float32) / 255.0 if alpha_hint.dtype == np.uint8 else alpha_hint
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+            alpha_hint = alpha_hint.astype(np.float32) / 255.0 if alpha_hint.dtype == np.uint8 else alpha_hint
 
-        settings = ProcessingSettings(screen_type="green", despill_strength=0.5)
-        result = processor.process_frame(frame_rgb, alpha_hint, settings)
+            settings = ProcessingSettings(screen_type="green", despill_strength=0.5)
+            result = processor.process_frame(frame_rgb, alpha_hint, settings)
 
-        out_dir = Path(tempfile.gettempdir()) / "corridorkey_preview"
-        out_dir.mkdir(exist_ok=True)
+            out_dir = Path(tempfile.gettempdir()) / "corridorkey_preview"
+            out_dir.mkdir(exist_ok=True)
 
-        matte = result.get("alpha")
-        if matte is not None:
-            if len(matte.shape) == 3:
-                matte = matte[:, :, 0]
-            cv2.imwrite(str(out_dir / "matte.png"), (matte * 255).astype(np.uint8))
+            matte = result.get("alpha")
+            if matte is not None:
+                if len(matte.shape) == 3:
+                    matte = matte[:, :, 0]
+                cv2.imwrite(str(out_dir / "matte.png"), (matte * 255).astype(np.uint8))
 
-        comp = result.get("comp")
-        if comp is not None:
-            cv2.imwrite(str(out_dir / "composite.png"),
-                       cv2.cvtColor((comp * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
-
-        processor.cleanup()
+            comp = result.get("comp")
+            if comp is not None:
+                cv2.imwrite(str(out_dir / "composite.png"),
+                           cv2.cvtColor((comp * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
+        finally:
+            processor.cleanup()
         items["Status"].Text = "DONE!"
         os.startfile(str(out_dir))
 
