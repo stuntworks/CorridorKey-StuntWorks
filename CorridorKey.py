@@ -387,11 +387,10 @@ def generate_sam2_mask(frame, pos_pts, neg_pts):
 # ISOLATED: pure function, no dependencies
 def create_checkerboard(h, w, sz=20):
     import numpy as np
-    c = np.zeros((h, w, 3), dtype=np.uint8)
-    for y in range(h):
-        for x in range(w):
-            c[y, x] = [180, 180, 180] if ((x // sz) + (y // sz)) % 2 == 0 else [120, 120, 120]
-    return c
+    xs = np.arange(w) // sz
+    ys = np.arange(h) // sz
+    mask = ((xs[None, :] + ys[:, None]) % 2 == 0)
+    return np.where(mask[:, :, None], np.uint8(180), np.uint8(120)).repeat(3, axis=2).astype(np.uint8)
 
 # WHAT IT DOES: Composites foreground over a checkerboard using the alpha matte
 # DEPENDS-ON: create_checkerboard()
