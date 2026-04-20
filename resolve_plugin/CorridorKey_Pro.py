@@ -325,8 +325,8 @@ def _merge_live_params(settings):
         if "sam_positive" in lp or "sam_negative" in lp:
             sam_points["positive"] = [tuple(p) for p in lp.get("sam_positive", [])]
             sam_points["negative"] = [tuple(p) for p in lp.get("sam_negative", [])]
-            sam_points["frame"] = None
-            if sam_points["positive"] or sam_points["negative"]:
+            sam_points["frame"]    = lp.get("sam_anchor_frame", None)
+            if lp.get("alpha_method") == 1:
                 out["alpha_method"] = 1
         return out
     except Exception:
@@ -383,15 +383,31 @@ def on_browse_output(ev):
 # DEPENDS-ON: core/alpha_hint_generator.py, SAM2 weights (if SAM2 mode selected)
 # AFFECTS: Quality of the final key — bad hint = bad matte
 def generate_alpha_hint(frame, settings):
-    import numpy as np
+    import numpy as np, cv2
     if settings["alpha_method"] == 0:
         from core.alpha_hint_generator import AlphaHintGenerator
         return AlphaHintGenerator(screen_type=settings["screen_type"]).generate_hint(frame)
-    elif settings["alpha_method"] == 1 and (sam_points["positive"] or sam_points["negative"]):
-        return generate_sam2_mask(frame, sam_points["positive"], sam_points["negative"])
-    else:
-        from core.alpha_hint_generator import AlphaHintGenerator
-        return AlphaHintGenerator(screen_type=settings["screen_type"]).generate_hint(frame)
+    elif settings["alpha_method"] == 1:
+        # Fast path: use the mask the viewer already computed and saved
+        alpha_png = SESSION_DIR / "alpha.png"
+        anchor = sam_points.get("frame")
+        render_frame = settings.get("_render_frame")
+        if alpha_png.exists() and anchor is not None:
+            if render_frame is None or render_frame == anchor:
+                mask = cv2.imread(str(alpha_png), cv2.IMREAD_GRAYSCALE)
+                if mask is not None:
+                    h, w = frame.shape[:2]
+                    if mask.shape != (h, w):
+                        _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
+                        mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+                    log("SAM2: using cached alpha.png from viewer")
+                    return mask
+        # Fallback: re-run SAM2 from click points
+        if sam_points["positive"] or sam_points["negative"]:
+            return generate_sam2_mask(frame, sam_points["positive"], sam_points["negative"])
+    # Final fallback: chroma key
+    from core.alpha_hint_generator import AlphaHintGenerator
+    return AlphaHintGenerator(screen_type=settings["screen_type"]).generate_hint(frame)
 
 # WHAT IT DOES: Runs SAM2 (Segment Anything Model 2) to generate a mask from user click points.
 #   Loads the SAM2 model, feeds it the frame + positive/negative points, returns the best mask.
@@ -482,10 +498,12 @@ def run_sam2_video_propagation(fp, ss, cs, in_f, out_f, pos_pts, neg_pts, anchor
             # offload_video_to_cpu keeps JPEG frames in RAM not VRAM — critical
             # because Resolve already uses 2-4 GB of VRAM on a working timeline.
             # async_loading_frames pipelines disk reads with GPU compute.
+            # async_loading_frames=False — Resolve's embedded Python deadlocks on
+            # background threads (same issue that killed threaded PROCESS RANGE).
             state = predictor.init_state(
                 video_path=str(tmp_dir),
                 offload_video_to_cpu=True,
-                async_loading_frames=True,
+                async_loading_frames=False,
             )
             predictor.add_new_points_or_box(
                 inference_state=state,
@@ -841,6 +859,7 @@ def process_current_frame(preview_only=False):
             log("AI ready (cached)")
         proc = cached_processor["proc"]
         log("Alpha hint...")
+        settings["_render_frame"] = cf
         ah = generate_alpha_hint(frame, settings)
         log("Processing...")
         fr = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
