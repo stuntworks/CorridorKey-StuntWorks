@@ -429,9 +429,15 @@ def grab_background_frame():
                     if not fp: continue
                     fn = c.GetLeftOffset() + (cf - c.GetStart())
                     cap = cv2.VideoCapture(fp)
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, fn))
-                    ret, bg_frame = cap.read()
-                    cap.release()
+                    try:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, fn))
+                        ret, bg_frame = cap.read()
+                    finally:
+                        # DANGER ZONE CRITICAL: MUST release before returning on Windows.
+                        # On K: drive (network/USB), an unreleased cv2.VideoCapture handle
+                        # is inherited by child processes and blocks the NEXT VideoCapture
+                        # open on the same file indefinitely (FFMPEG network lock hang).
+                        cap.release()
                     if ret:
                         log(f"BG plate from V{track_idx}: {os.path.basename(fp)}")
                         return bg_frame
@@ -542,10 +548,18 @@ def show_preview_window(orig_bgr, keyed_rgb, alpha):
         return
     env = os.environ.copy()
     env["CORRIDORKEY_PARENT_PID"] = str(os.getpid())
+    # DANGER ZONE CRITICAL: On Windows + K: drive, any cv2.VideoCapture handle open
+    # in this (Resolve's embedded Python) process gets inherited by child processes
+    # unless we explicitly block inheritance. An inherited FFMPEG handle keeps the MOV
+    # file locked, causing the NEXT cv2.VideoCapture(fp) call (range processing) to
+    # hang indefinitely waiting for the lock. CREATE_NO_WINDOW alone does NOT prevent
+    # handle inheritance — we must pass close_fds=True (Python 3.7+ maps this to the
+    # Win32 bInheritHandles=FALSE flag in CreateProcess).
     _viewer_proc = subprocess.Popen(
         [python_exe, viewer_script, "--persistent", "--session", str(SESSION_DIR),
          "--parent-pid", str(os.getpid())],
         creationflags=subprocess.CREATE_NO_WINDOW,
+        close_fds=True,
         env=env,
     )
     log("v2 preview launched (persistent mode)")
@@ -822,6 +836,8 @@ def on_process_range(ev):
         log(f"Settings: despeckle_enabled={ps.despeckle_enabled} despeckle_size={ps.despeckle_size} despill={ps.despill_strength} refiner={ps.refiner_strength}")
         cap = cv2.VideoCapture(fp)
         if not cap.isOpened(): status("Cannot open video"); return
+        log(f"Video opened OK. Total source frames: {int(cap.get(cv2.CAP_PROP_FRAME_COUNT))}")
+        log(f"First seek target: frame {int(ss + (inf - cs))} (ss={ss} inf={inf} cs={cs})")
         st = time.time()
         ofs = []
         pr = 0
@@ -831,6 +847,7 @@ def on_process_range(ev):
             sf = ss + (tf - cs)
             cap.set(cv2.CAP_PROP_POS_FRAMES, sf)
             ret, frame = cap.read()
+            if pr == 0: log(f"Frame {tf}: seek={sf} ret={ret} shape={frame.shape if ret else 'N/A'}")
             if not ret: continue
             ah = generate_alpha_hint(frame, settings)
             fr = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
