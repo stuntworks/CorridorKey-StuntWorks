@@ -209,7 +209,7 @@ winLayout = ui.VGroup({"Spacing": 14}, [
         ui.Button({"ID": "ClearRange", "Text": "Clear", "Weight": 1, "StyleSheet": "QPushButton { background-color: #222; color: #667; border-radius: 4px; padding: 4px; }"}),
     ]),
     ui.HGroup({"Weight": 0}, [
-        ui.CheckBox({"ID": "DisableTrack1", "Text": "Disable source clip after processing", "Checked": True}),
+        ui.CheckBox({"ID": "DisableTrack1", "Text": "Hide source track after processing (press D to re-enable)", "Checked": True}),
     ]),
 
     ui.VGap(2),
@@ -1095,6 +1095,7 @@ def on_process_range(ev):
             if result:
                 if items["DisableTrack1"].Checked:
                     timeline.SetTrackEnable("video", source_track, False)
+                    log(f"V{source_track} hidden — press D in timeline to re-enable source clip")
                 status(f"DONE! {len(ofs)} frames on V{output_track}")
             else:
                 status("Timeline place failed — clips are in MediaPool")
@@ -1181,6 +1182,7 @@ def _do_import(task):
             if result:
                 if items["DisableTrack1"].Checked:
                     timeline.SetTrackEnable("video", source_track, False)
+                    log(f"V{source_track} hidden — press D in timeline to re-enable source clip")
                 status(f"DONE! {len(ofs)} frames on V{output_track}")
             else:
                 status("Timeline place failed — clips are in MediaPool")
