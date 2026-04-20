@@ -826,10 +826,11 @@ def on_process_range(ev):
         ofs = []
         pr = 0
         try:
+         # Seek once to the start frame, then read sequentially.
+         # Calling cap.set() per-frame on H.264/HEVC re-decodes the whole GOP each time.
+         cap.set(cv2.CAP_PROP_POS_FRAMES, ss + (inf - cs))
          for tf in range(inf, outf):
             if processing_cancelled: log("Cancelled"); break
-            sf = ss + (tf - cs)
-            cap.set(cv2.CAP_PROP_POS_FRAMES, sf)
             ret, frame = cap.read()
             if not ret: continue
             ah = generate_alpha_hint(frame, settings)
