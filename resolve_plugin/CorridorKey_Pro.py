@@ -926,17 +926,21 @@ def on_process_range(ev):
     log("=" * 35)
     log("PROCESS RANGE")
     if not timeline or not media_pool: status("ERROR: No timeline!"); return
-    # Find which track has the source clip — scan all video tracks
+    # Find the clip at the current playhead — same logic as process_current_frame
+    cf, fps = get_current_frame_info()
     source_track = 1
     clip = None
     track_count = timeline.GetTrackCount("video")
     for ti in range(1, track_count + 1):
-        clips = timeline.GetItemListInTrack("video", ti) or []
-        if clips:
-            source_track = ti
-            clip = clips[0]
+        clips_on_track = timeline.GetItemListInTrack("video", ti) or []
+        for c in clips_on_track:
+            if c.GetStart() <= cf < c.GetEnd():
+                source_track = ti
+                clip = c
+                break
+        if clip:
             break
-    if not clip: status("ERROR: No clips!"); return
+    if not clip: status("ERROR: No clip at playhead!"); return
     output_track = source_track + 1
     log(f"Source on V{source_track} → output to V{output_track}")
     cs, ce = clip.GetStart(), clip.GetEnd()
