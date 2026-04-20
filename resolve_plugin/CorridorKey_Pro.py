@@ -1,4 +1,4 @@
-# Last modified: 2026-04-14 | Change: Remove hardcoded D:\ paths — dynamic engine resolver | Full history: git log
+# Last modified: 2026-04-20 | Change: Fix SAM2 garbage matte — was replacing chroma key, now multiplies as gate | Full history: git log
 """CorridorKey Pro - Neural Green Screen for DaVinci Resolve
 Enhanced with SAM2 Click-to-Mask, Frame Range, Export Modes
 
@@ -378,36 +378,54 @@ def on_browse_output(ev):
         log(f"Output: {folder}")
 
 
-# WHAT IT DOES: Generates an alpha hint (rough matte) for the neural keyer to refine.
-#   Simple mode uses chroma difference; SAM2 mode uses click points from the SAM window.
-# DEPENDS-ON: core/alpha_hint_generator.py, SAM2 weights (if SAM2 mode selected)
-# AFFECTS: Quality of the final key — bad hint = bad matte
+# WHAT IT DOES: Generates an alpha hint (rough matte) for the neural keyer.
+#   Chroma key always runs first to produce soft colour-accurate edges. When SAM2 mode
+#   is active the SAM2 mask is applied as a GARBAGE MATTE: where SAM2=background (0)
+#   the chroma result is forced to 0; where SAM2=foreground (1) it is left alone.
+#   SAM2 never replaces the chroma key — it only suppresses known-background regions.
+# DEPENDS-ON: AlphaHintGenerator, generate_sam2_mask(), sam_points global, SESSION_DIR
+# AFFECTS: Neural keyer input quality — this is the primary alpha signal into process_frame()
+# DANGER ZONE FRAGILE/HIGH: Changing the multiply logic here silently alters every
+#   keyed frame. / breaks: chroma edges / depends on: sam2_mask being 0-1 float32
 def generate_alpha_hint(frame, settings):
     import numpy as np, cv2
-    if settings["alpha_method"] == 0:
-        from core.alpha_hint_generator import AlphaHintGenerator
-        return AlphaHintGenerator(screen_type=settings["screen_type"]).generate_hint(frame)
-    elif settings["alpha_method"] == 1:
-        # Fast path: use the mask the viewer already computed and saved
-        alpha_png = SESSION_DIR / "alpha.png"
-        anchor = sam_points.get("frame")
-        render_frame = settings.get("_render_frame")
-        if alpha_png.exists() and anchor is not None:
-            if render_frame is None or render_frame == anchor:
-                mask = cv2.imread(str(alpha_png), cv2.IMREAD_GRAYSCALE)
-                if mask is not None:
-                    h, w = frame.shape[:2]
-                    if mask.shape != (h, w):
-                        _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
-                        mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
-                    log("SAM2: using cached alpha.png from viewer")
-                    return mask
-        # Fallback: re-run SAM2 from click points
-        if sam_points["positive"] or sam_points["negative"]:
-            return generate_sam2_mask(frame, sam_points["positive"], sam_points["negative"])
-    # Final fallback: chroma key
     from core.alpha_hint_generator import AlphaHintGenerator
-    return AlphaHintGenerator(screen_type=settings["screen_type"]).generate_hint(frame)
+
+    # Step 1: always generate chroma key hint — provides soft, colour-accurate edges
+    chroma_hint = AlphaHintGenerator(screen_type=settings["screen_type"]).generate_hint(frame)
+
+    if settings["alpha_method"] != 1:
+        return chroma_hint  # plain chroma mode — done
+
+    # Step 2 (SAM2 mode): locate the SAM2 foreground mask to use as garbage matte
+    sam2_mask = None
+    alpha_png = SESSION_DIR / "alpha.png"
+    anchor = sam_points.get("frame")
+    render_frame = settings.get("_render_frame")
+    if alpha_png.exists() and anchor is not None:
+        if render_frame is None or render_frame == anchor:
+            raw = cv2.imread(str(alpha_png), cv2.IMREAD_GRAYSCALE)
+            if raw is not None:
+                h, w = frame.shape[:2]
+                if raw.shape != (h, w):
+                    _, raw = cv2.threshold(raw, 127, 255, cv2.THRESH_BINARY)
+                    raw = cv2.resize(raw, (w, h), interpolation=cv2.INTER_NEAREST)
+                log("SAM2: applying cached alpha.png as garbage matte")
+                sam2_mask = raw.astype(np.float32) / 255.0
+    if sam2_mask is None and (sam_points["positive"] or sam_points["negative"]):
+        raw = generate_sam2_mask(frame, sam_points["positive"], sam_points["negative"])
+        if raw is not None:
+            sam2_mask = raw if raw.dtype == np.float32 else raw.astype(np.float32)
+            if sam2_mask.max() > 1.0:
+                sam2_mask = sam2_mask / 255.0
+
+    if sam2_mask is None:
+        log("SAM2: no mask available — using chroma key only")
+        return chroma_hint
+
+    # Step 3: apply garbage matte — multiply so background regions are zeroed out
+    chroma_float = chroma_hint.astype(np.float32) / 255.0
+    return chroma_float * sam2_mask  # float32 0-1; callers normalise uint8 but pass float through
 
 # WHAT IT DOES: Runs SAM2 (Segment Anything Model 2) to generate a mask from user click points.
 #   Loads the SAM2 model, feeds it the frame + positive/negative points, returns the best mask.
@@ -1035,6 +1053,8 @@ def on_process_range(ev):
                             refiner_strength=settings["refiner_strength"], despeckle_enabled=settings["despeckle_enabled"],
                             despeckle_size=settings["despeckle_size"])
     log(f"Settings: despill={ps.despill_strength} refiner={ps.refiner_strength} despeckle={ps.despeckle_enabled}")
+    from core.alpha_hint_generator import AlphaHintGenerator
+    chroma_hint_gen = AlphaHintGenerator(screen_type=settings["screen_type"])
 
     # DANGER ZONE HIGH: Runs on the main thread — UI freezes during processing.
     # Background threading was attempted but Resolve's embedded Python kills daemon threads
@@ -1073,12 +1093,16 @@ def on_process_range(ev):
             ret, frame = cap.read()
             if not ret: continue
             range_idx = tf - in_f
+            # SAM2 video mask is applied as GARBAGE MATTE on top of the chroma key —
+            # never a replacement. Chroma key gives soft colour edges; SAM2 zeros out
+            # pixels SAM2 classified as background. Multiply: bg(0)*chroma=0, fg(1)*chroma=chroma.
+            chroma_float = chroma_hint_gen.generate_hint(frame).astype(np.float32) / 255.0
             if sam2_video_masks and range_idx in sam2_video_masks:
-                ah = sam2_video_masks[range_idx]
+                ah = chroma_float * sam2_video_masks[range_idx]  # sam2 mask is float32 0-1
             else:
-                ah = generate_alpha_hint(frame, settings)
+                ah = chroma_float
             fr = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-            ah = ah.astype(np.float32) / 255.0 if ah.dtype == np.uint8 else ah
+            # ah is already float32 0-1 — skip the uint8 normalisation guard
             res = proc.process_frame(fr, ah, ps)
             fg, mt = res.get("fg"), res.get("alpha")
             if fg is not None and mt is not None:
