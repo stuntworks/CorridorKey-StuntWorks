@@ -991,26 +991,26 @@ def on_about(ev):
 
 # WHAT IT DOES: Header link — CorridorKey Pro → Corridor Digital website
 def on_header_ck(ev):
-    import subprocess
-    subprocess.Popen(["cmd", "/c", "start", "https://corridordigital.com"], creationflags=subprocess.CREATE_NO_WINDOW)
+    import webbrowser
+    webbrowser.open("https://corridordigital.com")
 
 # WHAT IT DOES: Header link — StuntWorks Action Cinema → YouTube channel
 def on_header_sw(ev):
-    import subprocess
-    subprocess.Popen(["cmd", "/c", "start", "https://www.youtube.com/@StuntworksActionCinema"], creationflags=subprocess.CREATE_NO_WINDOW)
+    import webbrowser
+    webbrowser.open("https://www.youtube.com/@StuntworksActionCinema")
 
 win.On.HeaderCK.Clicked = on_header_ck
 win.On.HeaderSW.Clicked = on_header_sw
 
 # WHAT IT DOES: Opens StuntWorks YouTube channel in the system browser
 def on_youtube(ev):
-    import subprocess
-    subprocess.Popen(["cmd", "/c", "start", "https://www.youtube.com/@StuntworksActionCinema"], creationflags=subprocess.CREATE_NO_WINDOW)
+    import webbrowser
+    webbrowser.open("https://www.youtube.com/@StuntworksActionCinema")
 
 # WHAT IT DOES: Opens the StuntWorks Ko-fi tip jar in the system browser
 def on_kofi(ev):
-    import subprocess
-    subprocess.Popen(["cmd", "/c", "start", "https://ko-fi.com/stuntworks"], creationflags=subprocess.CREATE_NO_WINDOW)
+    import webbrowser
+    webbrowser.open("https://ko-fi.com/stuntworks")
 
 win.On.YouTubeBtn.Clicked = on_youtube
 win.On.KofiBtn.Clicked = on_kofi
