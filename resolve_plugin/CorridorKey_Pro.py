@@ -19,7 +19,7 @@ DEPENDS-ON:
 AFFECTS: Timeline Track 2 (writes keyed frames), MediaPool (creates CorridorKey bin),
   source clip on Track 1 (optionally disabled after processing)
 """
-import sys, os, site, tempfile, math
+import sys, os, site, tempfile, math, queue, threading
 from pathlib import Path
 
 # WHAT IT DOES: Finds the CorridorKey engine folder (neural-net code + .venv + model weights)
@@ -103,6 +103,12 @@ pm = resolve.GetProjectManager()
 project = pm.GetCurrentProject()
 media_pool = project.GetMediaPool() if project else None
 timeline = project.GetCurrentTimeline() if project else None
+
+# Thread-safe queues — background thread posts UI updates and import tasks here;
+# the main-thread timer drains them so Resolve's UIDispatcher stays safe.
+_ui_queue = queue.Queue()
+_import_queue = queue.Queue()
+_main_thread_id = threading.get_ident()
 
 # Global state caches — these persist between button clicks during one session
 last_preview_data = {"original": None, "keyed": None, "alpha": None}
@@ -215,6 +221,7 @@ winLayout = ui.VGroup({"Spacing": 14}, [
     ]),
     ui.Label({"Text": "AI: Niko Pueringer / Corridor Digital  •  Plugin: Roberto & Elvis Lopez / StuntWorks", "Weight": 0, "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #334; font-size: 10px;"}),
     ui.VGap(4),
+    ui.Timer({"ID": "PollTimer", "Interval": 500}),
     ui.HGroup({"Weight": 0, "Spacing": 8}, [
         ui.Button({"ID": "KillViewer", "Text": "KILL VIEWER", "Weight": 1,
                    "StyleSheet": "background-color: #3a1a1a; color: #f55; padding: 5px 14px; border: 1px solid #f55; border-radius: 12px; font-size: 12px; font-weight: 600;"}),
@@ -236,15 +243,27 @@ items["ExportFormat"].AddItem("Foreground Only")
 items["OutputMode"].AddItem("Track 2 (Above Source)")
 items["OutputMode"].AddItem("MediaPool Only")
 items["OutputMode"].AddItem("Fusion Comp")
+try:
+    items["PollTimer"].Start()
+except Exception:
+    pass
 
-# WHAT IT DOES: Writes a message to both the console and the in-panel log window
+# WHAT IT DOES: Writes a message to the log — thread-safe.
+#   Main thread writes directly; background threads post to _ui_queue (drained by timer).
 # AFFECTS: Log TextEdit widget in the UI panel
 def log(msg):
     print(msg)
-    items["Log"].PlainText = (items["Log"].PlainText or "") + msg + "\n"
+    if threading.get_ident() == _main_thread_id:
+        items["Log"].PlainText = (items["Log"].PlainText or "") + msg + "\n"
+    else:
+        _ui_queue.put(("log", msg))
 
-# WHAT IT DOES: Updates the cyan status label at the center of the panel
-def status(msg): items["Status"].Text = msg
+# WHAT IT DOES: Updates the cyan status label — thread-safe (same queue pattern as log)
+def status(msg):
+    if threading.get_ident() == _main_thread_id:
+        items["Status"].Text = msg
+    else:
+        _ui_queue.put(("status", msg))
 
 # WHAT IT DOES: Reads all UI controls and returns a dict of current processing settings.
 #   Despill/refiner/despeckle defaults are used here; _merge_live_params() overrides them
@@ -1045,38 +1064,14 @@ def on_process_range(ev):
         if not ofs or processing_cancelled: return
         log(f"Done: {len(ofs)} frames in {time.time()-st:.1f}s")
         status("Importing to MediaPool...")
-        try:
-            root = media_pool.GetRootFolder()
-            ckb = None
-            for f in root.GetSubFolderList():
-                if f.GetName() == "CorridorKey": ckb = f; break
-            if not ckb: ckb = media_pool.AddSubFolder(root, "CorridorKey")
-            media_pool.SetCurrentFolder(ckb)
-            imp = media_pool.ImportMedia(ofs)
-            if not imp: status("Import failed"); return
-            log(f"Imported {len(imp)} items to MediaPool")
-            if settings["output_mode"] in [0, 2]:
-                current_tracks = timeline.GetTrackCount("video")
-                while current_tracks < output_track:
-                    timeline.AddTrack("video")
-                    current_tracks += 1
-                    log(f"Added video track V{current_tracks}")
-                seq_item = imp[0]
-                log(f"Placing on V{output_track} — frames 0-{len(ofs)-1}")
-                ci_list = [{"mediaPoolItem": seq_item, "startFrame": 0, "endFrame": len(ofs) - 1,
-                            "trackIndex": output_track, "recordFrame": int(in_f), "mediaType": 1}]
-                result = media_pool.AppendToTimeline(ci_list)
-                log(f"AppendToTimeline result: {result}")
-                if result:
-                    if items["DisableTrack1"].Checked: timeline.SetTrackEnable("video", source_track, False)
-                    status(f"DONE! {len(ofs)} frames on V{output_track}")
-                else:
-                    status("Timeline place failed — check log. Clips are in MediaPool.")
-            else:
-                status(f"{len(ofs)} frames in MediaPool")
-        except Exception as e:
-            status("Import ERROR!"); log(f"Import error: {e}")
-            import traceback; log(traceback.format_exc())
+        # Hand off to main thread via queue — MediaPool/Timeline API must run on main thread
+        _import_queue.put({
+            "ofs": ofs,
+            "output_track": output_track,
+            "source_track": source_track,
+            "in_f": in_f,
+            "settings": settings,
+        })
 
     threading.Thread(target=_run, daemon=True).start()
 
@@ -1096,6 +1091,73 @@ def on_toggle_track1(ev):
             timeline.SetTrackEnable("video", 1, not cur)
             status(f"Track 1 {'enabled' if not cur else 'disabled'}")
     except: pass
+
+# WHAT IT DOES: Runs on the main thread (called by PollTimer) — drains _ui_queue to
+#   update log/status widgets safely, then processes any pending import tasks.
+# DEPENDS-ON: _ui_queue, _import_queue, _do_import()
+# AFFECTS: Log widget, Status label, MediaPool, Timeline
+def on_poll_timer(ev):
+    while not _ui_queue.empty():
+        try:
+            kind, msg = _ui_queue.get_nowait()
+            if kind == "log":
+                items["Log"].PlainText = (items["Log"].PlainText or "") + msg + "\n"
+            elif kind == "status":
+                items["Status"].Text = msg
+        except Exception:
+            pass
+    while not _import_queue.empty():
+        try:
+            task = _import_queue.get_nowait()
+            _do_import(task)
+        except Exception as e:
+            log(f"Import queue error: {e}")
+
+# WHAT IT DOES: Imports processed PNGs to MediaPool and places them on the output track.
+#   Must run on the main thread — Resolve's MediaPool/Timeline API is not thread-safe.
+# DEPENDS-ON: media_pool, timeline globals; task dict from _import_queue
+# AFFECTS: MediaPool (CorridorKey bin), Timeline (output track), source track enable state
+def _do_import(task):
+    ofs = task["ofs"]
+    output_track = task["output_track"]
+    source_track = task["source_track"]
+    in_f = task["in_f"]
+    settings = task["settings"]
+    try:
+        root = media_pool.GetRootFolder()
+        ckb = None
+        for f in root.GetSubFolderList():
+            if f.GetName() == "CorridorKey": ckb = f; break
+        if not ckb: ckb = media_pool.AddSubFolder(root, "CorridorKey")
+        media_pool.SetCurrentFolder(ckb)
+        imp = media_pool.ImportMedia(ofs)
+        if not imp: status("Import failed — check MediaPool bin"); return
+        log(f"Imported {len(imp)} items to MediaPool")
+        if settings["output_mode"] in [0, 2]:
+            current_tracks = timeline.GetTrackCount("video")
+            while current_tracks < output_track:
+                timeline.AddTrack("video")
+                current_tracks += 1
+                log(f"Added video track V{current_tracks}")
+            seq_item = imp[0]
+            log(f"Placing on V{output_track} — frames 0-{len(ofs)-1}")
+            ci_list = [{"mediaPoolItem": seq_item, "startFrame": 0, "endFrame": len(ofs) - 1,
+                        "trackIndex": output_track, "recordFrame": int(in_f), "mediaType": 1}]
+            result = media_pool.AppendToTimeline(ci_list)
+            log(f"AppendToTimeline result: {result}")
+            if result:
+                if items["DisableTrack1"].Checked:
+                    timeline.SetTrackEnable("video", source_track, False)
+                status(f"DONE! {len(ofs)} frames on V{output_track}")
+            else:
+                status("Timeline place failed — clips are in MediaPool")
+        else:
+            status(f"{len(ofs)} frames in MediaPool")
+    except Exception as e:
+        import traceback
+        status("Import ERROR!")
+        log(f"Import error: {e}")
+        log(traceback.format_exc())
 
 # WHAT IT DOES: Switches Resolve to the Fusion page for manual compositing
 def on_open_fusion(ev):
@@ -1157,6 +1219,7 @@ def on_kill_viewer(ev):
 
 win.On.KillViewer.Clicked = on_kill_viewer
 win.On.ClosePanel.Clicked = lambda ev: on_close(ev)
+win.On.PollTimer.Timeout = on_poll_timer
 
 # WHAT IT DOES: Shows the About dialog with credits, how-to-use guide, and Ko-fi link.
 #   Credits Niko Pueringer/Corridor Digital (engine) and Roberto+Elvis Lopez/StuntWorks (plugin).
