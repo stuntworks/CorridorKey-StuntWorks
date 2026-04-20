@@ -95,16 +95,18 @@ class CorridorKeyProcessor:
                 - "processed": RGBA [H, W, 4]
                 - "comp": Preview composite [H, W, 3]
         """
-        result = self.engine.process_frame(
-            image,
-            alpha_hint,
-            input_is_linear=not settings.input_is_srgb,
-            fg_is_straight=True,
-            despill_strength=settings.despill_strength,
-            auto_despeckle=settings.despeckle_enabled,
-            despeckle_size=settings.despeckle_size,
-            refiner_scale=settings.refiner_strength,
-        )
+        import torch
+        with torch.no_grad():
+            result = self.engine.process_frame(
+                image,
+                alpha_hint,
+                input_is_linear=not settings.input_is_srgb,
+                fg_is_straight=True,
+                despill_strength=settings.despill_strength,
+                auto_despeckle=settings.despeckle_enabled,
+                despeckle_size=settings.despeckle_size,
+                refiner_scale=settings.refiner_strength,
+            )
         return result
 
     # WHAT IT DOES: Batch-processes an image sequence (PNG/EXR/TIF), writes FG, Matte, and Processed EXR outputs
