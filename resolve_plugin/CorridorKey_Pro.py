@@ -955,6 +955,17 @@ def on_process_range(ev):
     od = Path(items["OutputPath"].Text) / f"CK_{cn}"
     od.mkdir(parents=True, exist_ok=True)
     log(f"Saving to: {od}")
+    # Kill viewer NOW on main thread before the background thread opens VideoCapture.
+    # On Windows the viewer holds inherited file handles — must be dead before cap opens.
+    if _viewer_proc is not None and _viewer_proc.poll() is None:
+        try:
+            _viewer_proc.terminate()
+            _viewer_proc.wait(timeout=3)
+        except Exception:
+            try: _viewer_proc.kill()
+            except Exception: pass
+        _viewer_proc = None
+        log("Viewer closed — ready to process")
     from core.corridorkey_processor import CorridorKeyProcessor, ProcessingSettings
     if cached_processor["proc"] is None:
         log("Loading AI (first time)...")
@@ -970,21 +981,8 @@ def on_process_range(ev):
     log(f"Settings: despill={ps.despill_strength} refiner={ps.refiner_strength} despeckle={ps.despeckle_enabled}")
 
     def _run():
-        global _range_running, _viewer_proc
+        global _range_running
         _range_running = True
-        # Kill the viewer before opening VideoCapture — on Windows the viewer subprocess
-        # holds inherited file handles on the source MOV, causing VideoCapture to hang.
-        # Slider values were already captured by _merge_live_params() before this thread
-        # started, so killing the viewer here loses nothing.
-        if _viewer_proc is not None and _viewer_proc.poll() is None:
-            try:
-                _viewer_proc.terminate()
-                _viewer_proc.wait(timeout=2)
-            except Exception:
-                try: _viewer_proc.kill()
-                except Exception: pass
-            _viewer_proc = None
-            log("Viewer closed — starting range processing")
         ofs = []
         pr = 0
 
