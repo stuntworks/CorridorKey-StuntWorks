@@ -74,7 +74,15 @@ CK_PYTHON = CK_VENV / ("Scripts/python.exe" if sys.platform == "win32" else "bin
 venv_packages = str(find_venv_site_packages(CK_VENV))
 site.addsitedir(venv_packages)
 sys.path.insert(0, venv_packages)
-sys.path.insert(0, r"C:\ProgramData\Blackmagic Design\DaVinci Resolve\Support\Developer\Scripting\Modules")
+# Resolve scripting modules — resolve the base via %PROGRAMDATA% (Windows) / standard install
+# path (mac/linux) so the plugin works on machines that don't have C: as ProgramData.
+if sys.platform == "win32":
+    _resolve_sdk = Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData")) / "Blackmagic Design" / "DaVinci Resolve" / "Support" / "Developer" / "Scripting" / "Modules"
+elif sys.platform == "darwin":
+    _resolve_sdk = Path("/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/Modules")
+else:
+    _resolve_sdk = Path("/opt/resolve/Developer/Scripting/Modules")
+sys.path.insert(0, str(_resolve_sdk))
 sys.path.insert(0, str(CK_ROOT))
 sys.path.insert(0, str(CK_ROOT / "resolve_plugin"))
 

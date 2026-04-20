@@ -243,6 +243,13 @@ def install_adobe(ck_engine_path, allow_unsigned=False):
         shutil.copy2(processor, dest_dir / "ae_processor.py")
         print("  Copied: ae_processor.py")
 
+    # Copy the live-preview viewer (shared across Resolve / AE / Premiere). The CEP
+    # panel spawns this in --persistent mode when the user clicks PREVIEW FRAME.
+    viewer = PLUGIN_ROOT / "preview_viewer.py"
+    if viewer.exists():
+        shutil.copy2(viewer, dest_dir / "preview_viewer.py")
+        print("  Copied: preview_viewer.py")
+
     # Write config file
     config_path = dest_dir / "corridorkey_path.txt"
     config_path.write_text(str(ck_engine_path))
