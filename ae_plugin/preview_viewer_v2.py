@@ -1040,7 +1040,7 @@ class PersistentWindow(QtWidgets.QWidget):
                 is_pos = event.button() == QtCore.Qt.LeftButton
                 is_neg = event.button() == QtCore.Qt.RightButton
                 if is_pos or is_neg:
-                    p = event.pos()
+                    p = event.position().toPoint()
                     g = self._last_right_geom
                     if g and g["iw"] > 0 and g["ih"] > 0:
                         # Convert label coords → normalized image coords (0..1)
@@ -1100,8 +1100,10 @@ class PersistentWindow(QtWidgets.QWidget):
                 return
             # Source image for SAM2: uint8 RGB (session stores float32 RGB 0..1)
             frame_rgb = np.clip(self.session.fg_rgb * 255.0, 0, 255).astype(np.uint8)
-            # CK_ROOT is two levels up from this script (resolve_plugin/ → engine root)
-            ck_root = Path(__file__).parent.parent
+            # CORRIDORKEY_ROOT is injected by the CEP panel's spawnViewer() env block.
+            # Fall back to parent.parent for the Resolve plugin where __file__ is
+            # inside resolve_plugin/core/ so parent.parent IS the engine root.
+            ck_root = Path(os.environ["CORRIDORKEY_ROOT"]) if "CORRIDORKEY_ROOT" in os.environ else Path(__file__).parent.parent
             ckpt = str(ck_root / "sam2_weights" / "sam2.1_hiera_small.pt")
             cfg   = "configs/sam2.1/sam2.1_hiera_s.yaml"
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -1214,7 +1216,7 @@ class PersistentWindow(QtWidgets.QWidget):
             return
         if self._zoom > 1.001 and event.button() == QtCore.Qt.LeftButton:
             self._dragging = True
-            self._drag_start = event.pos()
+            self._drag_start = event.position().toPoint()
             self._drag_start_pan = (self._pan_x, self._pan_y)
             self.setCursor(QtCore.Qt.ClosedHandCursor)
         super().mousePressEvent(event)
@@ -1224,8 +1226,8 @@ class PersistentWindow(QtWidgets.QWidget):
     #   consistent across zoom levels.
     def mouseMoveEvent(self, event):
         if self._dragging and self._drag_start is not None:
-            dx = event.pos().x() - self._drag_start.x()
-            dy = event.pos().y() - self._drag_start.y()
+            dx = event.position().toPoint().x() - self._drag_start.x()
+            dy = event.position().toPoint().y() - self._drag_start.y()
             # Inverted so dragging right shows content to the left of current view
             # (like grabbing and pulling a photo).
             w = max(1, self.right_label.width())

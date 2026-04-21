@@ -93,6 +93,7 @@ DEFAULT_SETTINGS = {
     "refiner": 1.0,
     "despeckle": True,
     "despeckleSize": 400,
+    "choke": 0,
 }
 
 
@@ -123,6 +124,7 @@ def load_settings(params_path, args):
     settings["refiner"] = max(0.0, min(1.0, float(settings["refiner"])))
     settings["despeckleSize"] = max(50, min(2000, int(settings["despeckleSize"])))
     settings["despeckle"] = bool(settings["despeckle"])
+    settings["choke"] = max(0, min(20, int(settings.get("choke", 0))))
     return settings
 
 
@@ -160,8 +162,12 @@ def cmd_extract(source_video, output_png, frame_idx=None, time_sec=None):
             cap.set(cv2.CAP_PROP_POS_MSEC, float(time_sec) * 1000.0)
             log.info(f"Seek by time: {time_sec:.4f}s")
         else:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
-            log.info(f"Seek by frame: {frame_idx}")
+            # Convert frame index to time — avoids POS_FRAMES off-by-one bug in
+            # OpenCV where set(N)+read() returns frame N+1 on H.264/HEVC/ProRes.
+            source_fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+            t_ms = float(frame_idx) / source_fps * 1000.0
+            cap.set(cv2.CAP_PROP_POS_MSEC, t_ms)
+            log.info(f"Seek by frame {frame_idx} -> {t_ms:.2f}ms @ {source_fps:.3f}fps")
         ok, frame = cap.read()
         if not ok or frame is None:
             log.error("Could not read frame at requested position")
@@ -228,11 +234,13 @@ def cmd_single(input_path, output_path, settings, sam2_mask_path=None):
     alpha_hint = generate_chroma_hint(img_rgb, settings["screenType"])
 
     from corridorkey_processor import CorridorKeyProcessor, ProcessingSettings
+    from CorridorKeyModule.core import color_utils as _cu
     processor = CorridorKeyProcessor(device="cuda")
     try:
+        # Run NN with despill DISABLED — apply manually below to match the viewer's path.
         ps = ProcessingSettings(
             screen_type=settings["screenType"],
-            despill_strength=settings["despill"],
+            despill_strength=0.0,
             despeckle_enabled=settings["despeckle"],
             despeckle_size=settings["despeckleSize"],
             refiner_strength=settings["refiner"],
@@ -245,6 +253,11 @@ def cmd_single(input_path, output_path, settings, sam2_mask_path=None):
             return False
         if len(alpha.shape) == 3:
             alpha = alpha[:, :, 0]
+        # Apply despill via the same despill_opencv path the live viewer uses so that
+        # KEY CURRENT FRAME output matches what the preview window showed.
+        despill_str = float(settings.get("despill", 1.0))
+        if despill_str > 0:
+            fg = _cu.despill_opencv(fg, green_limit_mode="average", strength=despill_str)
         # Apply SAM2 garbage matte gate to output alpha (post-keyer)
         h, w = alpha.shape[:2]
         gate = load_sam2_gate(sam2_mask_path, h, w)
@@ -308,10 +321,13 @@ def cmd_batch(source_video, output_folder, settings,
         return 0
 
     from corridorkey_processor import CorridorKeyProcessor, ProcessingSettings
+    from CorridorKeyModule.core import color_utils as _cu
     processor = CorridorKeyProcessor(device="cuda")
+    # Run NN with despill DISABLED — we apply despill manually below using the same
+    # despill_opencv path the live viewer uses. This ensures render matches preview.
     ps = ProcessingSettings(
         screen_type=settings["screenType"],
-        despill_strength=settings["despill"],
+        despill_strength=0.0,
         despeckle_enabled=settings["despeckle"],
         despeckle_size=settings["despeckleSize"],
         refiner_strength=settings["refiner"],
@@ -322,9 +338,10 @@ def cmd_batch(source_video, output_folder, settings,
     total = max(1, end_frame - start_frame)
 
     try:
-        # Seek once, then sequential read — 10-100x faster than re-seeking per frame
-        # on long-GOP codecs like H.264 / HEVC / ProRes.
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(start_frame))
+        # Seek once via MSEC — avoids the off-by-one bug in POS_FRAMES where
+        # set(N) + read() returns frame N+1 on H.264/HEVC with some OpenCV builds.
+        # After the initial MSEC seek, subsequent reads advance frame-by-frame normally.
+        cap.set(cv2.CAP_PROP_POS_MSEC, float(start_frame) / source_fps * 1000.0)
         for frame_idx in range(int(start_frame), int(end_frame)):
             seq_num = frame_idx - int(start_frame)
             ok, frame = cap.read()
@@ -344,6 +361,19 @@ def cmd_batch(source_video, output_folder, settings,
                     continue
                 if len(alpha.shape) == 3:
                     alpha = alpha[:, :, 0]
+                # Apply despill using the same despill_opencv path as the live viewer.
+                # result["fg"] is the raw undespilled sRGB foreground. The engine's
+                # internal despill (via ProcessingSettings) would use a different code
+                # path and produce different results — matching the viewer requires this.
+                despill_str = float(settings.get("despill", 1.0))
+                if despill_str > 0:
+                    fg = _cu.despill_opencv(fg, green_limit_mode="average", strength=despill_str)
+                choke_px = int(settings.get("choke", 0))
+                if choke_px > 0:
+                    k = choke_px * 2 + 1
+                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+                    a8 = (np.clip(alpha, 0, 1) * 255).astype(np.uint8)
+                    alpha = cv2.erode(a8, kernel).astype(np.float32) / 255.0
                 fg_uint8 = (np.clip(fg, 0, 1) * 255).astype(np.uint8)
                 alpha_uint8 = (np.clip(alpha, 0, 1) * 255).astype(np.uint8)
                 fg_bgr = cv2.cvtColor(fg_uint8, cv2.COLOR_RGB2BGR)

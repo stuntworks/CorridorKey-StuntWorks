@@ -1,61 +1,198 @@
 <!DOCTYPE html>
-<!-- Last modified: 2026-04-21 | Change: Switch to preview_viewer_v2.py (file-polling
-     protocol). Session dir is now PID-stable so sam2_mask.png written by the viewer
-     survives between PREVIEW FRAME and KEY CURRENT FRAME. KEY CURRENT FRAME now
-     detects sam2_mask.png and passes --sam2-mask to ae_processor single. -->
+<!-- Last modified: 2026-04-14 | Change: Phase 4 — live-preview viewer integration.
+     PREVIEW FRAME now runs the `cache` subcommand + spawns preview_viewer.py in
+     --persistent mode. Sliders debounce 50ms and write JSON lines to viewer
+     stdin for real-time stage-2 re-render. Commit path (KEY CURRENT FRAME,
+     PROCESS WORK AREA) untouched — frame alignment stays safe. -->
 <html>
 <head>
     <meta charset="UTF-8">
     <title>CorridorKey StuntWorks</title>
     <style>
+        /* ── CorridorKey StuntWorks — Honeycomb Theme ─────────────── */
         * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { font-family: 'Segoe UI', Arial, sans-serif; background: #232323; color: #e0e0e0;
-               padding: 15px; font-size: 12px; overflow-y: auto; }
-        h1 { color: #4CAF50; font-size: 16px; text-align: center; margin-bottom: 2px; }
-        .credit { text-align: center; font-size: 9px; color: #777; margin-bottom: 12px; }
-        .credit a { color: #999; text-decoration: none; }
-        .credit a:hover { color: #4CAF50; }
-        .section { margin-bottom: 12px; }
-        label { display: block; margin-bottom: 5px; color: #aaa; }
-        select, input[type="range"] { width: 100%; padding: 8px; background: #333;
-            border: 1px solid #444; color: #fff; border-radius: 4px; }
-        input[type="range"] { padding: 0; height: 20px; }
-        .slider-row { display: flex; align-items: center; gap: 10px; }
+        body {
+            font-family: 'Inter', 'SF Pro Display', 'Segoe UI', sans-serif;
+            background: linear-gradient(180deg, #000 0%, #001 100%);
+            color: #e8e8e8; padding: 10px 8px; font-size: 12px; overflow-y: auto;
+        }
+        h1 {
+            color: #0ff; font-size: 14px; text-align: center;
+            text-transform: uppercase; letter-spacing: 2px;
+            margin-bottom: 2px; font-weight: 700;
+            text-shadow: 0 0 15px rgba(0,255,255,0.5);
+        }
+        .credit { text-align: center; font-size: 9px; color: #bcc; margin-bottom: 8px; }
+        .credit a { color: #dff; text-decoration: none; }
+        .credit a:hover { color: #0ff; }
+        .section {
+            margin-bottom: 12px; padding-bottom: 6px;
+            border-bottom: 1px solid rgba(0,255,255,0.06);
+        }
+        label {
+            display: block; margin-bottom: 4px; color: #0ff;
+            font-size: 10px; font-weight: 600; letter-spacing: 1px;
+            text-transform: uppercase;
+        }
+        select {
+            width: 100%; padding: 7px 10px; background: rgba(0,20,40,0.6);
+            border: 1px solid rgba(0,255,255,0.15); color: #e8e8e8; border-radius: 4px;
+            font-size: 10px; outline: none; transition: border-color 0.2s;
+        }
+        select:focus { border-color: #0ff; box-shadow: 0 0 8px rgba(0,255,255,0.2); }
+
+        /* ── Sliders — precision instrument look ───────────────────── */
+        input[type="range"] {
+            -webkit-appearance: none; appearance: none;
+            width: 100%; height: 20px; background: transparent;
+            margin: 2px 0; cursor: pointer;
+        }
+        input[type="range"]::-webkit-slider-runnable-track {
+            height: 4px; border-radius: 2px;
+            background: linear-gradient(to right, #0ff 0%, #0ff var(--fill, 50%), rgba(0,20,40,0.5) var(--fill, 50%), rgba(0,20,40,0.5) 100%);
+            box-shadow: inset 0 1px 2px rgba(0,0,0,0.5);
+        }
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none; appearance: none;
+            width: 14px; height: 14px; border-radius: 50%;
+            background: #000; border: 2px solid #0ff;
+            margin-top: -6px;
+            box-shadow: 0 0 8px rgba(0,255,255,0.4), 0 2px 6px rgba(0,0,0,0.4);
+            transition: transform 0.12s cubic-bezier(0.4,0,0.2,1), box-shadow 0.2s;
+        }
+        input[type="range"]:hover::-webkit-slider-thumb {
+            transform: scale(1.25);
+            box-shadow: 0 0 12px rgba(0,255,255,0.5), 0 4px 12px rgba(0,0,0,0.5);
+        }
+        input[type="range"]:active::-webkit-slider-thumb {
+            box-shadow: 0 0 16px rgba(0,255,255,0.6), 0 4px 12px rgba(0,0,0,0.6);
+        }
+        .slider-row { display: flex; align-items: center; gap: 6px; }
         .slider-row input { flex: 1; }
-        .slider-value { width: 40px; text-align: right; color: #4CAF50; }
-        .checkbox-row { display: flex; align-items: center; gap: 8px; margin: 10px 0; }
-        button { width: 100%; padding: 12px; margin: 5px 0; border: none; border-radius: 4px;
-            font-size: 13px; font-weight: bold; cursor: pointer; transition: background 0.2s; }
-        button:disabled { opacity: 0.5; cursor: not-allowed; }
-        .btn-process { background: #4CAF50; color: white; }
-        .btn-process:hover:enabled { background: #45a049; }
-        .btn-preview { background: #9C27B0; color: white; }
-        .btn-preview:hover:enabled { background: #7B1FA2; }
-        .btn-batch { background: #2196F3; color: white; }
-        .btn-batch:hover:enabled { background: #1976D2; }
-        #preview-container { margin-top: 10px; text-align: center; background: #1a1a1a;
-            border-radius: 4px; min-height: 40px; overflow: hidden; }
-        #preview-container img { width: 48%; display: inline-block; border-radius: 4px; margin: 1%; }
-        #preview-label { color: #666; font-size: 10px; padding: 12px; }
-        #status { text-align: center; padding: 8px; margin-top: 8px; background: #1a1a1a;
-            border-radius: 4px; color: #0ff; font-weight: bold; font-size: 11px; }
-        #progress-bar { margin-top: 6px; height: 6px; background: #111; border-radius: 3px; overflow: hidden; display: none; position: relative; }
-        #progress-fill { height: 100%; width: 0%; background: #2196F3; transition: width 0.2s; }
-        /* Indeterminate mode — animated stripe for "something is happening" when
-           we don't have a percentage to show (PREVIEW FRAME cache phase). */
+        .slider-value {
+            width: 36px; text-align: right; color: #0ff;
+            font-family: 'JetBrains Mono', 'SF Mono', 'Consolas', monospace;
+            font-size: 11px; font-weight: 500;
+        }
+        .checkbox-row { display: flex; align-items: center; gap: 6px; margin: 4px 0; }
+
+        /* ── Buttons — clear clickable controls ───────────────────── */
+        button {
+            width: 100%; padding: 10px; margin: 4px 0;
+            font-size: 11px; font-weight: 700; letter-spacing: 1px;
+            cursor: pointer; text-transform: uppercase;
+            border-radius: 6px;
+            transition: all 0.2s cubic-bezier(0.4,0,0.2,1);
+        }
+        button:hover:enabled {
+            transform: translateY(-1px);
+            filter: brightness(1.2);
+        }
+        button:active:enabled {
+            transform: translateY(1px);
+        }
+        button:disabled { opacity: 0.35; cursor: not-allowed; transform: none; }
+
+        /* ── Button working state — bold static change ──────────────
+             CEP's Chromium does NOT animate during spawnSync, even on the
+             compositor thread. So we use a dramatic static color inversion
+             instead of animation. The user sees a clear state change. ── */
+        button.btn-working {
+            background: #001833 !important;
+            color: #ffffff !important;
+            border: 2px solid #0ff !important;
+            box-shadow: 0 0 12px rgba(0,255,255,0.4) !important;
+            opacity: 1 !important;
+            cursor: wait !important;
+            pointer-events: none;
+            font-weight: 900 !important;
+            letter-spacing: 2px !important;
+        }
+
+        /* ── Button error flash — red pulse then fades back ────────── */
+        .btn-error {
+            background: rgba(255,60,0,0.25) !important;
+            color: #FF3D00 !important; border: 1px solid rgba(255,60,0,0.5) !important;
+            opacity: 1 !important;
+            animation: btn-error-flash 0.4s ease-in-out 3;
+        }
+        @keyframes btn-error-flash {
+            0%, 100% { background-color: rgba(255,60,0,0.1); }
+            50%      { background-color: rgba(255,60,0,0.35); }
+        }
+
+        .btn-preview {
+            background: linear-gradient(135deg, rgba(0,255,255,0.2), rgba(0,200,255,0.15));
+            color: #0ff; border: 1px solid rgba(0,255,255,0.3);
+            box-shadow: 0 2px 8px rgba(0,255,255,0.15);
+        }
+        .btn-preview:hover:enabled {
+            background: linear-gradient(135deg, rgba(0,255,255,0.35), rgba(0,200,255,0.25));
+            box-shadow: 0 4px 16px rgba(0,255,255,0.25);
+        }
+        .btn-process {
+            background: linear-gradient(135deg, rgba(0,255,100,0.25), rgba(0,200,80,0.2));
+            color: #0f8; border: 1px solid rgba(0,255,100,0.3);
+            box-shadow: 0 2px 8px rgba(0,255,100,0.15);
+        }
+        .btn-process:hover:enabled {
+            background: linear-gradient(135deg, rgba(0,255,100,0.4), rgba(0,200,80,0.3));
+            box-shadow: 0 4px 16px rgba(0,255,100,0.25);
+        }
+        .btn-batch {
+            background: linear-gradient(135deg, rgba(255,150,0,0.2), rgba(255,100,0,0.15));
+            color: #fa0; border: 1px solid rgba(255,150,0,0.3);
+            box-shadow: 0 2px 8px rgba(255,150,0,0.15);
+        }
+        .btn-batch:hover:enabled {
+            background: linear-gradient(135deg, rgba(255,150,0,0.35), rgba(255,100,0,0.25));
+            box-shadow: 0 4px 16px rgba(255,150,0,0.25);
+        }
+
+        /* ── Preview container ─────────────────────────────────────── */
+        #preview-container {
+            margin-top: 6px; text-align: center; background: rgba(0,20,40,0.3);
+            border-radius: 6px; min-height: 30px; overflow: hidden;
+            border: 1px solid rgba(0,255,255,0.06); padding: 4px;
+        }
+        #preview-container img { width: 48%; display: inline-block; border-radius: 2px; margin: 1%; }
+        #preview-label { color: #444; font-size: 9px; padding: 10px; }
+
+        /* ── Status bar ────────────────────────────────────────────── */
+        #status {
+            text-align: center; padding: 5px; margin-top: 6px;
+            background: rgba(0,255,255,0.05); border: 1px solid rgba(0,255,255,0.1);
+            border-radius: 4px; color: #0ff; font-weight: 600;
+            font-family: 'JetBrains Mono', 'SF Mono', 'Consolas', monospace;
+            font-size: 8px; letter-spacing: 0.5px;
+        }
+
+        /* ── Progress bar ──────────────────────────────────────────── */
+        #progress-bar {
+            margin-top: 4px; height: 3px; background: rgba(0,20,40,0.5);
+            border-radius: 2px; overflow: hidden; display: none; position: relative;
+        }
+        #progress-fill { height: 100%; width: 0%; background: #0ff; transition: width 0.2s; }
         #progress-bar.indeterminate #progress-fill { display: none; }
         #progress-bar.indeterminate::before {
             content: ''; position: absolute; top: 0; left: -40%; height: 100%; width: 40%;
-            background: linear-gradient(90deg, transparent, #9C27B0, transparent);
+            background: linear-gradient(90deg, transparent, #0ff, transparent);
             animation: ck-indeterminate 1.2s infinite linear;
         }
         @keyframes ck-indeterminate {
             0%   { left: -40%; }
             100% { left: 100%; }
         }
-        #log { background: #111; color: #0f0; font-family: monospace; font-size: 10px;
-            padding: 8px; margin-top: 8px; height: 80px; overflow-y: auto; border-radius: 4px; }
-        .log-err { color: #f66; }
+
+        /* ── Log ───────────────────────────────────────────────────── */
+        #log {
+            background: rgba(0,10,20,0.8); color: #0ff;
+            font-family: 'JetBrains Mono', 'SF Mono', 'Consolas', monospace;
+            font-size: 10px; padding: 8px; margin-top: 4px;
+            height: 160px; overflow-y: auto; border-radius: 4px;
+            border: 1px solid #1e1e1e;
+        }
+        .log-err { color: #FF3D00; }
     </style>
 </head>
 <body>
@@ -65,12 +202,8 @@
         Plugin by Roberto Lopez / <a href="#" onclick="openURL('https://www.youtube.com/@stuntworksactioncinema')">StuntWorks Action Cinema</a>
     </div>
 
-    <div id="preview-container">
-        <span id="preview-label">Preview will appear here</span>
-    </div>
-
     <div class="section">
-        <label>Screen Type</label>
+        <label>Screen</label>
         <select id="screenType">
             <option value="green">Green Screen</option>
             <option value="blue">Blue Screen</option>
@@ -78,34 +211,18 @@
     </div>
 
     <div class="section">
-        <label>Despill</label>
-        <div class="slider-row">
-            <input type="range" id="despill" min="0" max="100" value="50">
-            <span class="slider-value" id="despillVal">0.50</span>
-        </div>
-    </div>
-
-    <div class="section">
-        <label>Edge Refiner</label>
+        <label>Refiner</label>
         <div class="slider-row">
             <input type="range" id="refiner" min="0" max="100" value="100">
             <span class="slider-value" id="refinerVal">1.00</span>
         </div>
-    </div>
-
-    <div class="section">
-        <div class="checkbox-row" style="margin-bottom:5px;">
-            <input type="checkbox" id="despeckle" checked>
-            <label for="despeckle" style="margin:0">Despeckle</label>
-        </div>
-        <div class="slider-row">
-            <input type="range" id="despeckleSize" min="50" max="2000" value="400">
-            <span class="slider-value" id="despeckleSizeVal">400</span>
+        <div style="color:#556;font-size:9px;margin-top:3px;text-align:center;">
+            Despill / Despeckle / Choke — drag sliders in the preview window
         </div>
     </div>
 
     <div class="section">
-        <label>Output Folder</label>
+        <label>Output</label>
         <div style="display:flex;gap:5px;">
             <input type="text" id="outputPath" readonly style="flex:1;padding:6px;background:#333;border:1px solid #444;color:#fff;border-radius:4px;font-size:11px;">
             <button onclick="browseOutput()" style="width:auto;padding:6px 12px;margin:0;background:#555;font-size:11px;">Browse</button>
@@ -115,6 +232,10 @@
     <button id="btn-preview" class="btn-preview" onclick="previewFrameLive()">PREVIEW FRAME (LIVE)</button>
     <button id="btn-process" class="btn-process" onclick="processFrame(false)">KEY CURRENT FRAME</button>
     <button id="btn-batch"   class="btn-batch"   onclick="processBatch()">PROCESS WORK AREA</button>
+    <div style="display:flex;align-items:center;gap:6px;margin:4px 0 0 2px;">
+        <input type="checkbox" id="hideSourceLayer" checked>
+        <label for="hideSourceLayer" style="font-size:10px;color:#aaa;margin:0;cursor:pointer;">Hide source layer after batch</label>
+    </div>
 
     <div id="status">Ready</div>
     <div id="progress-bar"><div id="progress-fill"></div></div>
@@ -206,9 +327,25 @@ function logLine(msg, isErr) {
 
 function status(msg) { document.getElementById('status').textContent = msg; }
 
-function setBusy(busy) {
-    for (const id of ['btn-preview', 'btn-process', 'btn-batch']) {
-        document.getElementById(id).disabled = busy;
+// WHAT IT DOES: Toggles busy state. The preview button itself becomes an
+//   animated progress bar so the user sees activity on the control they clicked.
+//   Other buttons just disable. Old separate progress bar kept for batch %.
+function setBusy(busy, source) {
+    const previewBtn = document.getElementById('btn-preview');
+    // Disable process + batch buttons normally. Preview button stays enabled
+    // but gets pointer-events:none via .btn-working so the animation runs.
+    // (:disabled kills CSS animations in Chromium.)
+    document.getElementById('btn-process').disabled = busy;
+    document.getElementById('btn-batch').disabled = busy;
+    if (busy) {
+        previewBtn.disabled = false;  // keep enabled so animation works
+        previewBtn.classList.add('btn-working');
+        previewBtn._savedText = previewBtn.textContent;
+        previewBtn.textContent = source === 'batch' ? 'PROCESSING... PLEASE WAIT' : 'LOADING... PLEASE WAIT';
+    } else {
+        previewBtn.classList.remove('btn-working');
+        previewBtn.disabled = false;
+        if (previewBtn._savedText) previewBtn.textContent = previewBtn._savedText;
     }
     document.getElementById('progress-bar').style.display = busy ? 'block' : 'none';
     if (!busy) document.getElementById('progress-fill').style.width = '0%';
@@ -216,6 +353,22 @@ function setBusy(busy) {
 
 function setProgress(pct) {
     document.getElementById('progress-fill').style.width = Math.max(0, Math.min(100, pct)) + '%';
+}
+
+// WHAT IT DOES: Flashes a button red with an error message, then restores it
+//   after 3 seconds. Tells the user what went wrong on the thing they clicked.
+// DEPENDS-ON: .btn-error CSS class.
+// AFFECTS: button text + class, temporarily.
+function flashButtonError(btnId, msg) {
+    const btn = document.getElementById(btnId);
+    const saved = btn.textContent;
+    btn.textContent = msg;
+    btn.classList.add('btn-error');
+    btn.disabled = false;  // re-enable so it's visible (disabled = 35% opacity)
+    setTimeout(() => {
+        btn.classList.remove('btn-error');
+        btn.textContent = saved;
+    }, 3000);
 }
 
 function openURL(url) { cs.openURLInDefaultBrowser(url); }
@@ -239,45 +392,47 @@ function browseOutput() {
 }
 
 // ── UI ──────────────────────────────────────────────────────
-document.getElementById('despill').oninput = function() {
-    document.getElementById('despillVal').textContent = (this.value / 100).toFixed(2);
-    scheduleViewerUpdate();
-};
+// WHAT IT DOES: Updates the CSS --fill custom property on a range input so the
+//   green fill track visually tracks the thumb position. Called on every input.
+function updateSliderFill(el) {
+    const pct = ((el.value - el.min) / (el.max - el.min)) * 100;
+    el.style.setProperty('--fill', pct + '%');
+}
+// Set initial fill on all sliders at startup
+document.querySelectorAll('input[type="range"]').forEach(updateSliderFill);
+
 document.getElementById('refiner').oninput = function() {
     document.getElementById('refinerVal').textContent = (this.value / 100).toFixed(2);
-    // Refiner is stage-1 (NN-internal) — does NOT live-update the viewer. A full
-    // re-key is required; user must click PREVIEW FRAME again to apply a new refiner
-    // value. See PLAN_LIVE_PREVIEW.md §6 Phase 1 discovery.
+    updateSliderFill(this);
 };
-document.getElementById('despeckleSize').oninput = function() {
-    document.getElementById('despeckleSizeVal').textContent = this.value;
-    scheduleViewerUpdate();
-};
-// Despeckle — standard feature-toggle pattern. Checked = feature ON, slider
-// active (user picks size). Unchecked = feature OFF, slider greyed (no effect).
-// Earlier "Auto Despeckle" naming was ambiguous; dropped the "Auto" prefix so
-// the toggle means what it says.
-document.getElementById('despeckle').onchange = function() {
-    const on = this.checked;
-    const slider = document.getElementById('despeckleSize');
-    slider.disabled = !on;
-    slider.style.opacity = on ? '1' : '0.4';
-    document.getElementById('despeckleSizeVal').style.opacity = on ? '1' : '0.4';
-    scheduleViewerUpdate();
+document.getElementById('refiner').onchange = function() {
+    rekeyWithCurrentSettings();
 };
 
 // WHAT IT DOES: Collects the current UI state into a plain settings object.
-//   Validated here — Python receives the sanitized object via a JSON file.
+//   Despill/despeckle/choke are owned by the preview viewer — read from its
+//   live_params.json so KEY CURRENT FRAME applies exactly what the user dialed.
+//   Falls back to sensible defaults if no viewer session is active.
 function getSettings() {
-    const despill = parseFloat(document.getElementById('despill').value) / 100;
     const refiner = parseFloat(document.getElementById('refiner').value) / 100;
-    const despeckleSize = parseInt(document.getElementById('despeckleSize').value, 10);
+    let despill = 1.0, despeckle = true, despeckleSize = 400, choke = 0;
+    if (CURRENT_SESSION_DIR) {
+        try {
+            const lp = JSON.parse(fs.readFileSync(
+                path.join(CURRENT_SESSION_DIR, 'live_params.json'), 'utf8'));
+            if (typeof lp.despill === 'number') despill = lp.despill;
+            if (typeof lp.despeckle === 'boolean') despeckle = lp.despeckle;
+            if (typeof lp.despeckleSize === 'number') despeckleSize = lp.despeckleSize;
+            if (typeof lp.choke === 'number') choke = lp.choke;
+        } catch (_) {}
+    }
     return {
         screenType: document.getElementById('screenType').value === 'blue' ? 'blue' : 'green',
-        despill: isFinite(despill) && despill >= 0 && despill <= 1 ? despill : 0.5,
+        despill: despill,
         refiner: isFinite(refiner) && refiner >= 0 && refiner <= 1 ? refiner : 1.0,
-        despeckle: document.getElementById('despeckle').checked,
-        despeckleSize: isFinite(despeckleSize) && despeckleSize >= 50 && despeckleSize <= 2000 ? despeckleSize : 400
+        despeckle: despeckle,
+        despeckleSize: despeckleSize,
+        choke: choke
     };
 }
 
@@ -352,12 +507,7 @@ function jsxCall(fn, args, cb) {
 
 // ── Preview rendering ──────────────────────────────────────
 function showPreview(filePath) {
-    const container = document.getElementById('preview-container');
-    const ts = Date.now();
-    const keyedUri = 'file:///' + filePath.replace(/\\/g, '/');
-    const matteUri = keyedUri.replace(/\.png$/i, '_matte.png');
-    container.innerHTML = '<img src="' + keyedUri + '?' + ts + '" alt="Keyed" title="Keyed Result">' +
-                          '<img src="' + matteUri + '?' + ts + '" alt="Matte" title="Alpha Matte">';
+    logLine('Preview: ' + filePath);
 }
 
 // ============================================================
@@ -370,29 +520,27 @@ function showPreview(filePath) {
 
 let VIEWER_PROC = null;
 let CURRENT_SESSION_DIR = null;
+// Path to the extracted source frame PNG. Kept at module scope so the refiner
+// re-key (stage-1 NN re-run) can reuse the same extracted frame instead of
+// pulling from the video source again.
+let LAST_FRAME_PNG = null;
 const SLIDER_DEBOUNCE_MS = 50;
 let sliderDebounceTimer = null;
 let sliderPendingState = null;
 
-// PID-stable session dir — lives for the lifetime of the panel process. Using a stable
-// dir means sam2_mask.png written by the viewer (via Apply Mask) is still there when
-// the user later clicks KEY CURRENT FRAME, even after multiple PREVIEW FRAME re-runs.
-const SESSION_DIR = path.join(os.tmpdir(), 'corridorkey_ae_session_' + process.pid);
-
-// WHAT IT DOES: Finds preview_viewer_v2.py on disk. v2 uses file-polling (live_params.json)
-//   instead of stdin, which lets the session dir persist between PREVIEW FRAME and KEY so
-//   sam2_mask.png written by the viewer survives until the user commits.
+// WHAT IT DOES: Finds preview_viewer_v2.py on disk. v2 is required — it supports
+//   --persistent mode with file-polling. v1 (preview_viewer.py) crashes when given
+//   --persistent because it tries json.loads("--session") and dies immediately.
 // DEPENDS-ON: PANEL_DIR constant, findCorridorkeyRoot() for the engine fallback.
 // AFFECTS: returns a string path. Throws if nothing found.
 function findViewerScript() {
     const candidates = [
         path.join(PANEL_DIR, 'preview_viewer_v2.py'),
-        path.resolve(PANEL_DIR, '..', 'preview_viewer_v2.py'),
+        path.resolve(PANEL_DIR, '..', '..', 'preview_viewer_v2.py')
     ];
     try {
         const ckRoot = findCorridorkeyRoot();
         candidates.push(path.join(ckRoot, 'resolve_plugin', 'preview_viewer_v2.py'));
-        candidates.push(path.join(ckRoot, 'ae_plugin', 'preview_viewer_v2.py'));
     } catch (_) {}
     for (const c of candidates) {
         if (fs.existsSync(c)) return c;
@@ -400,21 +548,25 @@ function findViewerScript() {
     throw new Error('preview_viewer_v2.py not found. Tried:\n  ' + candidates.join('\n  '));
 }
 
-// WHAT IT DOES: Starts preview_viewer_v2 subprocess. v2 uses file-polling (live_params.json)
-//   so we don't need a stdin pipe — stdio is ignore/pipe/pipe. The viewer discovers
-//   settings by reading live_params.json from sessionDir; the parent-PID watchdog inside
-//   the viewer handles cleanup if this panel crashes without firing beforeunload.
+// WHAT IT DOES: Starts a persistent viewer subprocess. Keeps stdio pipes so we can
+//   stream slider updates over stdin. Wires exit/error logging so panel log captures
+//   viewer crashes. Does NOT call kill() — viewer self-terminates via {"cmd":"quit"}
+//   on stdin end OR when its parent-PID watchdog detects the panel is gone.
 // DEPENDS-ON: findViewerScript(), findPythonExe(), findCorridorkeyRoot().
 // AFFECTS: sets VIEWER_PROC to the new child_process handle.
 function spawnViewer(sessionDir) {
     const ckRoot = findCorridorkeyRoot();
     const python = findPythonExe(ckRoot);
     const viewer = findViewerScript();
-    const args = ['-u', viewer, '--session', sessionDir, '--parent-pid', String(process.pid)];
+    // -u forces unbuffered stdin/stdout on the Python side. Without it, Python
+    // block-buffers stdin when it's a pipe (not a tty), so the viewer's
+    // readline() won't see slider updates until ~4KB of JSON accumulates.
+    // That's the single reason sliders felt "dead" on the first live build.
+    const args = ['-u', viewer, '--persistent', '--session', sessionDir, '--parent-pid', String(process.pid)];
     logLine('spawn viewer: ' + args.join(' '));
     const proc = childProcess.spawn(python, args, {
-        stdio: ['ignore', 'pipe', 'pipe'],   // no stdin — v2 reads live_params.json
-        windowsHide: false,                  // viewer is a GUI window — let it show
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: false,       // viewer is a GUI window — let it show
         env: Object.assign({}, process.env, { CORRIDORKEY_ROOT: ckRoot })
     });
     proc.stdout.on('data', () => { /* viewer is quiet on stdout; ignore by design */ });
@@ -433,54 +585,88 @@ function spawnViewer(sessionDir) {
     return proc;
 }
 
-// WHAT IT DOES: Atomically writes a settings object to live_params.json in the session
-//   dir. The viewer polls this file and re-renders whenever the mtime changes. Atomic
-//   write (tmp + rename) prevents the viewer from reading a half-written file.
-// DEPENDS-ON: CURRENT_SESSION_DIR set (session dir exists on disk).
-// AFFECTS: writes/replaces live_params.json. No return value.
-function writeViewerParams(obj) {
-    if (!CURRENT_SESSION_DIR) return;
+// WHAT IT DOES: Writes one JSON object + newline to the viewer's stdin. Silently
+//   drops writes if the pipe is already closed (viewer may have exited between
+//   the caller's last check and now). Callers must not rely on delivery — the
+//   viewer is a display; a missed slider tick is acceptable.
+// DEPENDS-ON: VIEWER_PROC being set and its stdin stream being writable.
+// AFFECTS: writes to a pipe. No return value.
+function sendToViewer(obj) {
+    // File-watcher bridge for "update" commands — the viewer polls
+    // <session_dir>/live_params.json every 50ms. Atomic write (tmp + rename) so
+    // the viewer never reads a half-written file. This is the reliable path;
+    // stdin below is best-effort only (CEP Node pipes on Windows are flaky).
+    if (obj && obj.cmd === 'update' && CURRENT_SESSION_DIR) {
+        try {
+            const finalPath = path.join(CURRENT_SESSION_DIR, 'live_params.json');
+            const tmpPath = finalPath + '.tmp';
+            fs.writeFileSync(tmpPath, JSON.stringify(obj), 'utf8');
+            fs.renameSync(tmpPath, finalPath);
+        } catch (e) { logLine('live_params write failed: ' + e.message, true); }
+    }
+    // Belt-and-suspenders: also try stdin. Harmless if it fails.
+    if (!VIEWER_PROC || !VIEWER_PROC.stdin || VIEWER_PROC.stdin.destroyed) return;
     try {
-        const tmpPath   = path.join(CURRENT_SESSION_DIR, 'live_params.tmp.json');
-        const finalPath = path.join(CURRENT_SESSION_DIR, 'live_params.json');
-        fs.writeFileSync(tmpPath, JSON.stringify(obj), 'utf8');
-        fs.renameSync(tmpPath, finalPath);
-    } catch (_) { /* session dir may not exist yet — viewer will catch up */ }
+        VIEWER_PROC.stdin.write(JSON.stringify(obj) + '\n');
+    } catch (_) { /* broken pipe — viewer is shutting down */ }
 }
 
-// WHAT IT DOES: Kills the viewer subprocess. v2 doesn't use stdin so we just call
-//   kill(). The parent-PID watchdog inside the viewer also covers the case where
-//   the panel crashes without firing beforeunload.
+// WHAT IT DOES: Sends {"cmd":"quit"} and closes stdin. The viewer exits cleanly on
+//   EOF even if the quit message is dropped. We do NOT send SIGKILL — the parent-
+//   PID watchdog inside the viewer is a belt-and-suspenders for the case where
+//   the panel itself crashes without firing beforeunload.
+// DEPENDS-ON: sendToViewer() for the quit message.
 // AFFECTS: VIEWER_PROC set to null. Viewer process terminates within ~1 second.
 function killViewer() {
     if (!VIEWER_PROC) return;
-    try { VIEWER_PROC.kill(); } catch (_) {}
+    try { sendToViewer({ cmd: 'quit' }); } catch (_) {}
+    try { VIEWER_PROC.stdin.end(); } catch (_) {}
     VIEWER_PROC = null;
     CURRENT_SESSION_DIR = null;
 }
 
-// WHAT IT DOES: Debounced slider → viewer update. Coalesces all slider movements
-//   inside a 50ms window into a single stdin write. "Drop-stale" policy — only
-//   the most recent slider state is sent; no queue backup during fast drags.
-// DEPENDS-ON: getSettings() for current UI values, sendToViewer() for delivery.
-// AFFECTS: may write one JSON line to viewer stdin after the debounce window.
-function scheduleViewerUpdate() {
-    if (!CURRENT_SESSION_DIR) return;
-    const s = getSettings();
-    sliderPendingState = {
-        cmd: 'update',
-        despill: s.despill,
-        despeckle: s.despeckle,
-        despeckleSize: s.despeckleSize,
-        background: 'checker'   // Phase 4: checker only; Phase 4b adds bg UI
-    };
-    if (sliderDebounceTimer) return;  // timer already armed — latest state will ride it
-    sliderDebounceTimer = setTimeout(() => {
-        sliderDebounceTimer = null;
-        const state = sliderPendingState;
-        sliderPendingState = null;
-        if (state && CURRENT_SESSION_DIR) writeViewerParams(state);
-    }, SLIDER_DEBOUNCE_MS);
+// WHAT IT DOES: Re-runs stage-1 (neural net) with current slider values against
+//   the last extracted frame, overwriting fg.png + alpha.png in the active
+//   session dir. Then kills and respawns the viewer so it loads the fresh PNGs.
+//   Used by the refiner slider's onchange, since refiner is NN-internal and
+//   can't be applied to cached output.
+// DEPENDS-ON: LAST_FRAME_PNG from a prior PREVIEW FRAME click, CURRENT_SESSION_DIR,
+//   VIEWER_PROC. No-op if preview isn't active.
+// AFFECTS: rewrites fg.png + alpha.png in CURRENT_SESSION_DIR; kills and
+//   respawns VIEWER_PROC; writes live_params.json.
+let REKEY_BUSY = false;
+
+function rekeyWithCurrentSettings() {
+    if (!LAST_FRAME_PNG || !CURRENT_SESSION_DIR || !VIEWER_PROC) return;
+    if (REKEY_BUSY) {
+        // Drop overlapping releases — each re-key is an expensive NN pass and
+        // running multiple in parallel kills the viewer mid-render.
+        status('Re-key in progress, ignoring new refiner value');
+        return;
+    }
+    REKEY_BUSY = true;
+    setBusy(true);
+    document.getElementById('progress-bar').classList.add('indeterminate');
+    status('Re-keying with new refiner...');
+    try {
+        const settings = getSettings();
+        const paramsPath = writeParamsFile(settings);
+        // Signal viewer to show processing overlay before the NN runs.
+        sendToViewer({ cmd: 'update', rekeying: true });
+        runPython(['cache', LAST_FRAME_PNG, CURRENT_SESSION_DIR, '--params', paramsPath]);
+        // Viewer's fg.png mtime watcher reloads Session in place and hides
+        // the overlay. Also bump live_params so post-proc sliders apply.
+        // Viewer owns despill/despeckle/choke — just signal PNGs are ready.
+        sendToViewer({ cmd: 'update', rekeying: false });
+        status('Re-keyed — adjust despill/despeckle/choke in preview window');
+    } catch (e) {
+        logLine('refiner re-key failed: ' + e.message, true);
+        status('Re-key error');
+    } finally {
+        document.getElementById('progress-bar').classList.remove('indeterminate');
+        setBusy(false);
+        REKEY_BUSY = false;
+    }
 }
 
 // WHAT IT DOES: Top-level handler for PREVIEW FRAME (LIVE). Extracts the current
@@ -493,14 +679,23 @@ function scheduleViewerUpdate() {
 //   opens a preview window. Does NOT write to the timeline.
 function previewFrameLive() {
     setBusy(true);
-    // Indeterminate progress bar — we don't have a % number to show during the
-    // NN pass, so an animated stripe tells the user "something is happening."
     document.getElementById('progress-bar').classList.add('indeterminate');
-    status('Reading timeline...');
+    status('Keying frame...');
 
     const infoFn = HOST_APP === 'ppro' ? 'ppro_getFrameInfo' : 'ae_getFrameInfo';
     jsxCall(infoFn, [], (info) => {
-        if (!info.ok) { logLine('host error: ' + info.error, true); status('Error'); document.getElementById('progress-bar').classList.remove('indeterminate'); setBusy(false); return; }
+        if (!info.ok) {
+            logLine('host error: ' + info.error, true);
+            document.getElementById('progress-bar').classList.remove('indeterminate');
+            setBusy(false);
+            flashButtonError('btn-preview', 'SELECT A CLIP FIRST');
+            status('No clip selected — click your video layer then try again');
+            return;
+        }
+        // setTimeout gives the browser a chance to PAINT the button state change
+        // before spawnSync freezes the thread. Without this, the "KEYING FRAME..."
+        // button never renders because JS never yields to the paint loop.
+        setTimeout(() => {
         let framePng = null;
         let sessionDir = null;
         let paramsPath = null;
@@ -511,41 +706,49 @@ function previewFrameLive() {
             // CURRENT FRAME so there's zero chance of preview vs commit diverging.
             status('Extracting frame...');
             framePng = randomTempPath('extract', '.png');
-            const extractArgs = (HOST_APP === 'ppro' && typeof info.sourceTimeSeconds === 'number')
+            // Both AE and Premiere use --time (CAP_PROP_POS_MSEC). Frame-index seek
+            // (POS_FRAMES) has a known off-by-one bug with H.264/HEVC on some OpenCV
+            // builds — seek to N then read() returns N+1. Time-based seek is accurate.
+            const extractArgs = (typeof info.sourceTimeSeconds === 'number')
                 ? ['extract', info.sourceFile, framePng, '--time', String(info.sourceTimeSeconds)]
                 : ['extract', info.sourceFile, framePng, '--frame', String(info.sourceFrame)];
             runPython(extractArgs);
             if (!fs.existsSync(framePng)) throw new Error('Extract produced no output');
 
             // Step 2 — stage-1 only. Writes fg.png + alpha.png + meta.json to session dir.
-            // Use the PID-stable SESSION_DIR so sam2_mask.png written by the viewer in a
-            // prior session survives a re-key. Mark rekeying:true so the viewer shows a
-            // spinner while the NN runs; cleared to false once cache finishes.
             status('Running neural key (this can take a few seconds)...');
-            sessionDir = SESSION_DIR;
+            sessionDir = randomTempPath('session', '');
             fs.mkdirSync(sessionDir, { recursive: true });
-            CURRENT_SESSION_DIR = sessionDir;   // set early so writeViewerParams works
-            writeViewerParams({ rekeying: true });
+            // Copy the extracted frame INTO the session dir. %TEMP% gets cleaned
+            // aggressively by Windows, which was eating the extract PNG before
+            // refiner onchange could reuse it for a re-key. Session dir lifetime
+            // is ours to manage — safe to point LAST_FRAME_PNG at.
+            const stableFramePng = path.join(sessionDir, 'source.png');
+            fs.copyFileSync(framePng, stableFramePng);
+            LAST_FRAME_PNG = stableFramePng;
             paramsPath = writeParamsFile(settings);
             runPython(['cache', framePng, sessionDir, '--params', paramsPath]);
-            // Write final settings — viewer picks them up and re-renders immediately.
-            writeViewerParams({
-                despill: settings.despill,
-                despeckle: settings.despeckle,
-                despeckleSize: settings.despeckleSize,
-                background: 'checker',
-                rekeying: false
-            });
 
-            // Step 3 — spawn viewer if not already running; otherwise it self-updates
-            // by detecting the new live_params.json / fresh fg+alpha files.
+            // Step 3 — spawn the viewer. Kill any existing viewer first so the
+            // new one watches the correct session dir's live_params.json (the
+            // stdin reload path was unreliable; kill+respawn is deterministic
+            // and only costs ~500ms — viewer loads 2 PNGs, no torch).
             status('Opening live preview...');
-            if (!VIEWER_PROC) {
-                VIEWER_PROC = spawnViewer(sessionDir);
+            if (VIEWER_PROC) {
+                try { VIEWER_PROC.kill(); } catch (_) {}
+                VIEWER_PROC = null;
             }
             CURRENT_SESSION_DIR = sessionDir;
+            VIEWER_PROC = spawnViewer(sessionDir);
 
-            status('Live preview active — drag sliders to re-key');
+            // Send the initial settings after a small delay so the viewer has time to
+            // show its window. (A missed initial update just means the user's first
+            // slider move paints the first frame — harmless.)
+            // Viewer owns despill/despeckle/choke — don't override its slider state.
+            // Just signal rekeying:false so it reloads the fresh PNGs.
+            setTimeout(() => { sendToViewer({ cmd: 'update', rekeying: false }); }, 400);
+
+            status('Live preview active — adjust despill/despeckle/choke in preview window');
         } catch (e) {
             logLine('fatal: ' + e.message, true);
             status('Error');
@@ -556,6 +759,7 @@ function previewFrameLive() {
             document.getElementById('progress-bar').classList.remove('indeterminate');
             setBusy(false);
         }
+        }, 100);  // end setTimeout — 100ms lets browser paint before spawnSync blocks
     });
 }
 
@@ -570,7 +774,7 @@ function processFrame(previewOnly) {
 
     const infoFn = HOST_APP === 'ppro' ? 'ppro_getFrameInfo' : 'ae_getFrameInfo';
     jsxCall(infoFn, [], (info) => {
-        if (!info.ok) { logLine('host error: ' + info.error, true); status('Error'); setBusy(false); return; }
+        if (!info.ok) { logLine('host error: ' + info.error, true); setBusy(false); flashButtonError('btn-process', 'SELECT A LAYER'); return; }
         try {
             const settings = getSettings();
             const framePng = randomTempPath('extract', '.png');
@@ -580,25 +784,18 @@ function processFrame(previewOnly) {
             // --time SECONDS so Python can seek by CAP_PROP_POS_MSEC using the source's
             // native fps, avoiding the drift that happens when we convert to frames
             // using the sequence's fps. AE still uses --frame (comp fps matches source).
-            const extractArgs = (HOST_APP === 'ppro' && typeof info.sourceTimeSeconds === 'number')
+            // Both AE and Premiere use --time (CAP_PROP_POS_MSEC). Frame-index seek
+            // (POS_FRAMES) has a known off-by-one bug with H.264/HEVC on some OpenCV
+            // builds — seek to N then read() returns N+1. Time-based seek is accurate.
+            const extractArgs = (typeof info.sourceTimeSeconds === 'number')
                 ? ['extract', info.sourceFile, framePng, '--time', String(info.sourceTimeSeconds)]
                 : ['extract', info.sourceFile, framePng, '--frame', String(info.sourceFrame)];
             runPython(extractArgs);
             if (!fs.existsSync(framePng)) throw new Error('Extract produced no output');
 
             // Step 2 — key it (params via JSON file, not argv).
-            // If the viewer wrote sam2_mask.png to the session dir (via Apply Mask), pass
-            // it as --sam2-mask so the neural keyer output is gated by the SAM2 matte.
             const paramsPath = writeParamsFile(settings);
-            const sam2MaskPath = CURRENT_SESSION_DIR
-                ? path.join(CURRENT_SESSION_DIR, 'sam2_mask.png')
-                : null;
-            const hasSam2 = sam2MaskPath && fs.existsSync(sam2MaskPath);
-            const singleArgs = hasSam2
-                ? ['single', framePng, keyedPng, '--params', paramsPath, '--sam2-mask', sam2MaskPath]
-                : ['single', framePng, keyedPng, '--params', paramsPath];
-            if (hasSam2) logLine('SAM2 gate: ' + sam2MaskPath);
-            runPython(singleArgs);
+            runPython(['single', framePng, keyedPng, '--params', paramsPath]);
             try { fs.unlinkSync(paramsPath); } catch (_) {}
             if (!fs.existsSync(keyedPng)) throw new Error('Keyer produced no output');
 
@@ -635,14 +832,17 @@ function processFrame(previewOnly) {
 // BATCH FLOW
 // ============================================================
 function processBatch() {
-    setBusy(true);
+    // Read viewer settings BEFORE killViewer() — killViewer nulls CURRENT_SESSION_DIR
+    // which causes getSettings() to fall back to defaults and lose the user's sliders.
+    const settings = getSettings();
+    killViewer();  // close preview window before batch starts
+    setBusy(true, 'batch');
     status('Reading range...');
 
     const infoFn = HOST_APP === 'ppro' ? 'ppro_getInOutInfo' : 'ae_getWorkAreaInfo';
     jsxCall(infoFn, [], (info) => {
-        if (!info.ok) { logLine('host error: ' + info.error, true); status('Error'); setBusy(false); return; }
+        if (!info.ok) { logLine('host error: ' + info.error, true); setBusy(false); flashButtonError('btn-batch', 'SELECT A LAYER'); return; }
         try {
-            const settings = getSettings();
             const outDir = path.join(savedOutput, 'ck_batch_' + crypto.randomBytes(6).toString('hex'));
             fs.mkdirSync(outDir, { recursive: true });
 
@@ -657,38 +857,52 @@ function processBatch() {
             const approxFrames = (HOST_APP === 'ppro')
                 ? Math.round((info.endSeconds - info.startSeconds) * info.fps)
                 : (info.endFrame - info.startFrame);
-            status('Keying ~' + approxFrames + ' frames...');
 
-            runPython(
-                ['batch', info.sourceFile, outDir, '--params', paramsPath],
-                (line) => {
-                    // Python emits progress lines like "PROGRESS n/m"
-                    const m = line.match(/PROGRESS\s+(\d+)\/(\d+)/);
-                    if (m) {
-                        const pct = (parseInt(m[1], 10) / parseInt(m[2], 10)) * 100;
-                        setProgress(pct);
-                        status('Keyed ' + m[1] + '/' + m[2]);
-                    }
+            // Show status BEFORE the blocking spawnSync call — setTimeout(50) gives CEP
+            // one repaint cycle so the button text and status bar actually render.
+            const batchBtn = document.getElementById('btn-batch');
+            batchBtn.textContent = 'KEYING ' + approxFrames + ' FRAMES...';
+            status('Keying ~' + approxFrames + ' frames... DO NOT CLOSE');
+
+            setTimeout(() => {
+                try {
+                    runPython(
+                        ['batch', info.sourceFile, outDir, '--params', paramsPath],
+                        (line) => {
+                            // Python emits progress lines like "PROGRESS n/m"
+                            const m = line.match(/PROGRESS\s+(\d+)\/(\d+)/);
+                            if (m) {
+                                const pct = (parseInt(m[1], 10) / parseInt(m[2], 10)) * 100;
+                                setProgress(pct);
+                                status('Keyed ' + m[1] + '/' + m[2]);
+                            }
+                        }
+                    );
+                    try { fs.unlinkSync(paramsPath); } catch (_) {}
+
+                    // Import sequence via the appropriate host hook
+                    const firstFrame = path.join(outDir, 'output_00000.png');
+                    if (!fs.existsSync(firstFrame)) throw new Error('No output frames produced');
+
+                    const importFn = HOST_APP === 'ppro' ? 'ppro_importSequence' : 'ae_importSequence';
+                    const hideSource = document.getElementById('hideSourceLayer').checked;
+                    const importArgs = HOST_APP === 'ppro'
+                        ? [firstFrame, info.inPointSeconds, info.fps, info.sourceFrameRate || info.fps]
+                        : [firstFrame, info.fps, info.compStartTime, hideSource];
+                    jsxCall(importFn, importArgs, (imp) => {
+                        if (!imp.ok) { logLine('import error: ' + imp.error, true); status('Import failed'); }
+                        else { status('Batch done — source layer hidden'); logLine('Sequence imported, source hidden'); }
+                        setBusy(false);
+                    });
+                } catch (e) {
+                    logLine('fatal: ' + e.message, true);
+                    status('Error — check log');
+                    setBusy(false);
                 }
-            );
-            try { fs.unlinkSync(paramsPath); } catch (_) {}
-
-            // Import sequence via the appropriate host hook
-            const firstFrame = path.join(outDir, 'output_00000.png');
-            if (!fs.existsSync(firstFrame)) throw new Error('No output frames produced');
-
-            const importFn = HOST_APP === 'ppro' ? 'ppro_importSequence' : 'ae_importSequence';
-            const importArgs = HOST_APP === 'ppro'
-                ? [firstFrame, info.inPointSeconds, info.fps, info.sourceFrameRate || info.fps]
-                : [firstFrame, info.fps, info.compStartTime];
-            jsxCall(importFn, importArgs, (imp) => {
-                if (!imp.ok) { logLine('import error: ' + imp.error, true); status('Import failed'); }
-                else { status('Batch done'); logLine('Sequence imported'); }
-                setBusy(false);
-            });
+            }, 50);
         } catch (e) {
             logLine('fatal: ' + e.message, true);
-            status('Error');
+            status('Error — check log');
             setBusy(false);
         }
     });

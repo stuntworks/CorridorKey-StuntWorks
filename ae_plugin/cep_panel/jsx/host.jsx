@@ -83,7 +83,8 @@ function ae_getFrameInfo() {
         if (!layer.source || !layer.source.file) return JSON.stringify({ ok: false, error: "Selected layer has no source file" });
 
         var fps = 1.0 / comp.frameDuration;
-        var sourceTime = comp.time - layer.startTime + layer.inPoint;
+        var sourceTime = comp.time - layer.startTime;
+        if (sourceTime < 0) sourceTime = 0;
         var sourceFrame = Math.round(sourceTime * fps);
         if (sourceFrame < 0) sourceFrame = 0;
 
@@ -91,6 +92,7 @@ function ae_getFrameInfo() {
             ok: true,
             sourceFile: layer.source.file.fsName,
             sourceFrame: sourceFrame,
+            sourceTimeSeconds: sourceTime,
             fps: fps,
             compTime: comp.time,
             frameDuration: comp.frameDuration
@@ -113,8 +115,8 @@ function ae_getWorkAreaInfo() {
         var startTime = comp.workAreaStart;
         var duration = comp.workAreaDuration;
         var endTime = startTime + duration;
-        var sourceStartTime = startTime - layer.startTime + layer.inPoint;
-        var sourceEndTime = endTime - layer.startTime + layer.inPoint;
+        var sourceStartTime = startTime - layer.startTime;
+        var sourceEndTime = endTime - layer.startTime;
         var startFrame = Math.round(sourceStartTime * fps);
         var endFrame = Math.round(sourceEndTime * fps);
         if (startFrame < 0) startFrame = 0;
@@ -166,7 +168,11 @@ function ae_importFrame(outputPath) {
 //   above the source layer at the work-area start time.
 // DEPENDS-ON: firstFramePath exists and is the first PNG of a numbered sequence.
 // AFFECTS: Adds ImportItem + Layer.
-function ae_importSequence(firstFramePath, fps, compStartTime) {
+// WHAT IT DOES: Imports the keyed PNG sequence above the source layer, then optionally
+//   hides the source layer so the keyed result is immediately visible.
+// DEPENDS-ON: firstFramePath exists; comp has a selected layer (the original source clip).
+// AFFECTS: Adds a new layer to the comp; optionally sets source layer.enabled = false.
+function ae_importSequence(firstFramePath, fps, compStartTime, hideSource) {
     try {
         var comp = app.project.activeItem;
         if (!(comp instanceof CompItem)) return JSON.stringify({ ok: false, error: "No composition selected" });
@@ -184,6 +190,9 @@ function ae_importSequence(firstFramePath, fps, compStartTime) {
             var newLayer = comp.layers.add(importedSeq);
             newLayer.moveBefore(layer);
             newLayer.startTime = Number(compStartTime);
+        }
+        if (String(hideSource) === 'true') {
+            layer.enabled = false;
         }
         app.endUndoGroup();
         comp.time = comp.time;
