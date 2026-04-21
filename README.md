@@ -51,7 +51,8 @@
 
 - AI-powered green/blue screen removal — no manual color picking
 - Works inside **Resolve**, **After Effects**, and **Premiere Pro**
-- Preview the key before committing to your timeline
+- **SAM2 Garbage Matte** — click points on the live preview to draw a precision foreground boundary; the AI mask is applied to the render so background garbage never bleeds through
+- Live preview viewer — see your key in a floating window, drag sliders to update in real time
 - Batch process entire clips or frame ranges
 - Adjustable despill, edge refinement, and despeckle
 - Output saves to your project folder automatically
@@ -103,9 +104,12 @@ python install.py
 | 1 | Put green screen footage on **Track 1** |
 | 2 | Open the CorridorKey panel |
 | 3 | Pick screen type, adjust despill and refiner |
-| 4 | **SHOW PREVIEW** — check the key quality |
-| 5 | **PROCESS FRAME** — key one frame, adds to Track 2 |
-| 6 | **PROCESS ALL** — key entire clip, sequence on Track 2 |
+| 4 | **SHOW PREVIEW** — opens a live preview window; drag sliders to update in real time |
+| 5 | *(Optional)* **SAM2 Garbage Matte** — in the preview window, left-click foreground points (green dots), right-click background points (red dots), then click **Apply SAM2**. The AI draws a clean boundary. Click **Clear** to reset. |
+| 6 | **PROCESS FRAME** — keys the current frame using your settings + SAM2 mask if set; places result on Track 2 |
+| 7 | **PROCESS ALL** — keys the entire clip; sequence lands on Track 2 |
+
+**Disable source clip** checkbox: when checked, Track 1 is hidden after processing so you see the keyed result immediately. Uncheck it if you want to keep the source visible for comparison.
 
 Output saves to a `CorridorKey` folder next to your project.
 
@@ -124,9 +128,10 @@ Output saves to a `CorridorKey` folder next to your project.
 |:---:|---|
 | 1 | Select the green screen **layer** in your comp |
 | 2 | Pick screen type, adjust despill and refiner |
-| 3 | **PREVIEW FRAME** — see result in panel (no comp changes) |
-| 4 | **PROCESS FRAME** — key current frame, imports above your layer |
-| 5 | **PROCESS WORK AREA** — key all frames in work area (B/N to set range) |
+| 3 | **PREVIEW FRAME (LIVE)** — opens a floating preview window; drag sliders to update in real time |
+| 4 | *(Optional)* **SAM2 Garbage Matte** — in the preview window, left-click foreground points, right-click background points, then click **Apply SAM2**. The AI draws a clean boundary used when you commit. |
+| 5 | **KEY CURRENT FRAME** — keys the frame using your settings + SAM2 mask if set; imports above your layer |
+| 6 | **PROCESS WORK AREA** — key all frames in work area (B/N to set range) |
 
 Output saves to a `CorridorKey` folder next to your project.
 
@@ -148,9 +153,10 @@ Output saves to a `CorridorKey` folder next to your project.
 | 1 | Put green screen footage on **V1** |
 | 2 | Move playhead to the frame you want |
 | 3 | Pick screen type, adjust despill and refiner |
-| 4 | **PREVIEW FRAME** — see result in panel |
-| 5 | **PROCESS FRAME** — key current frame, places on V2 |
-| 6 | **PROCESS IN/OUT RANGE** — set I/O points, batch key all frames |
+| 4 | **PREVIEW FRAME (LIVE)** — opens a floating preview window; drag sliders to update in real time |
+| 5 | *(Optional)* **SAM2 Garbage Matte** — in the preview window, left-click foreground points, right-click background points, then click **Apply SAM2**. The AI draws a clean boundary used when you commit. |
+| 6 | **KEY CURRENT FRAME** — keys the frame using your settings + SAM2 mask if set; places on V2 |
+| 7 | **PROCESS IN/OUT RANGE** — set I/O points, batch key all frames |
 
 Output saves to a `CorridorKey` folder next to your project.
 
