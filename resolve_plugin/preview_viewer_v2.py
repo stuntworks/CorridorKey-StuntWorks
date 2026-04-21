@@ -96,8 +96,8 @@ class _ViewerColorUtils:
             limit = (r + b) / 2.0
         spill_amount = np.maximum(g - limit, 0.0)
         g_new = g - spill_amount
-        r_new = r + (spill_amount * 1.0)
-        b_new = b + (spill_amount * 1.0)
+        r_new = r + (spill_amount * 0.5)
+        b_new = b + (spill_amount * 0.5)
         despilled = np.stack([r_new, g_new, b_new], axis=-1)
         if strength < 1.0:
             return image * (1.0 - strength) + despilled * strength
