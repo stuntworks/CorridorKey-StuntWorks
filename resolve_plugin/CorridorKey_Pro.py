@@ -198,7 +198,7 @@ winLayout = ui.VGroup({"Spacing": 14}, [
         ui.Button({"ID": "HeaderSW", "Text": "StuntWorks Action Cinema", "Weight": 1, "StyleSheet": "QPushButton { background: transparent; color: #0ff; font-size: 14px; font-weight: bold; border: none; padding: 2px; } QPushButton:hover { color: #5ff; }"}),
     ]),
     ui.HGroup({"Weight": 0, "Spacing": 8}, [
-        ui.Label({"Text": "Alpha:", "Weight": 0}),
+        ui.Label({"Text": "Mask Mode:", "Weight": 0}),
         ui.ComboBox({"ID": "AlphaMethod", "Weight": 2}),
         ui.Label({"Text": "Screen:", "Weight": 0}),
         ui.ComboBox({"ID": "ScreenType", "Weight": 2}),
@@ -251,6 +251,8 @@ winLayout = ui.VGroup({"Spacing": 14}, [
         ui.Button({"ID": "ShowPreview", "Text": "PREVIEW", "Weight": 1, "StyleSheet": "QPushButton { background-color: #1a3a4a; color: #5df; font-weight: bold; border-radius: 5px; padding: 6px; border: 1px solid #5df; }"}),
         ui.Button({"ID": "ProcessFrame", "Text": "SINGLE FRAME", "Weight": 1, "StyleSheet": "QPushButton { background-color: #1a3a5a; color: #5af; font-weight: bold; border-radius: 5px; padding: 6px; border: 1px solid #5af; }"}),
     ]),
+    ui.Label({"Text": "SAM2 garbage matte: click PREVIEW → CLICK TO MASK in viewer", "Weight": 0,
+              "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #556; font-size: 10px;"}),
     ui.VGap(2),
     ui.Button({"ID": "ProcessRange", "Text": "PROCESS RANGE", "Weight": 0, "StyleSheet": "QPushButton { background-color: #1a4a2a; color: #5b5; font-size: 15px; font-weight: bold; border-radius: 6px; padding: 10px; border: 1px solid #5b5; }"}),
     ui.Button({"ID": "Cancel", "Text": "CANCEL", "Weight": 0, "StyleSheet": "QPushButton { background-color: #4a1a1a; color: #f66; font-weight: bold; border-radius: 5px; padding: 4px; border: 1px solid #f66; }"}),
@@ -375,12 +377,21 @@ def get_current_frame_info():
     try:
         fps = float(project.GetSetting("timelineFrameRate") or 24)
         tc = timeline.GetCurrentTimecode()
+        log(f"Timecode raw: '{tc}' fps={fps}")
         parts = tc.replace(";", ":").split(":")
         if len(parts) == 4:
             h, m, s, f = [int(p) for p in parts]
-            return int(h * 3600 * fps + m * 60 * fps + s * fps + f), fps
+            cf = int(h * 3600 * fps + m * 60 * fps + s * fps + f)
+            try:
+                cf -= int(timeline.GetStartFrame())
+            except Exception:
+                pass
+            return max(0, cf), fps
+        log(f"Timecode parse failed: '{tc}'")
         return 0, fps
-    except: return 0, 24.0
+    except Exception as e:
+        log(f"get_current_frame_info error: {e}")
+        return 0, 24.0
 
 # --- Frame Range UI Callbacks ---
 # WHAT IT DOES: Sets IN point to current playhead frame for range processing
