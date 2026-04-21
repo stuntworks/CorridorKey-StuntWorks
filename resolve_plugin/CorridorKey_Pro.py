@@ -186,6 +186,13 @@ winLayout = ui.VGroup({"Spacing": 14}, [
         ui.Label({"Text": "Screen:", "Weight": 0}),
         ui.ComboBox({"ID": "ScreenType", "Weight": 2}),
     ]),
+    ui.HGroup({"Weight": 0, "Spacing": 8}, [
+        ui.Label({"Text": "SAM2 Margin:", "Weight": 0, "StyleSheet": "color: #aaa; font-size: 11px;"}),
+        ui.SpinBox({"ID": "Sam2Margin", "Minimum": 0, "Maximum": 80, "Value": 20, "Weight": 1,
+                    "StyleSheet": "background: #222; color: #ccc; border: 1px solid #444; border-radius: 3px;"}),
+        ui.Label({"Text": "px  (expand SAM2 mask so keyer handles edges)", "Weight": 2,
+                  "StyleSheet": "color: #556; font-size: 10px;"}),
+    ]),
     ui.HGroup({"Weight": 0, "Spacing": 5}, [
         ui.Label({"Text": "Export:", "Weight": 0}),
         ui.ComboBox({"ID": "ExportFormat", "Weight": 2}),
@@ -295,6 +302,7 @@ def get_settings():
         "despeckle_size": 400,      # viewer-owned; overridden by _merge_live_params
         "export_format": items["ExportFormat"].CurrentIndex,
         "output_mode": items["OutputMode"].CurrentIndex,
+        "sam2_margin": int(items["Sam2Margin"].Value),
     }
 
 # WHAT IT DOES: Overrides panel's despill / despeckle settings with the v2 viewer's
@@ -386,11 +394,13 @@ def on_browse_output(ev):
 # AFFECTS: Every garbage-matte multiply in generate_alpha_hint() and the range loop.
 # DANGER ZONE FRAGILE/MEDIUM: Increase margin on 4K+ footage (pixel count scales up).
 #   Too small = edge clipping. Too large = garbage matte stops blocking junk BG.
-SAM2_MATTE_MARGIN = 20  # pixels to expand SAM2 mask outward before multiplying
+SAM2_MATTE_MARGIN = 20  # default; overridden at runtime by Sam2Margin spinner
 
-def _dilate_sam2_mask(mask_float32):
+def _dilate_sam2_mask(mask_float32, margin=SAM2_MATTE_MARGIN):
     import cv2, numpy as np
-    sz = SAM2_MATTE_MARGIN * 2 + 1
+    if margin <= 0:
+        return mask_float32
+    sz = margin * 2 + 1
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (sz, sz))
     mask_u8 = (mask_float32 * 255).astype(np.uint8)
     dilated = cv2.dilate(mask_u8, kernel, iterations=1)
@@ -445,7 +455,7 @@ def generate_alpha_hint(frame, settings):
 
     # Step 3: dilate SAM2 mask outward to give neural keyer room at the silhouette edge,
     #   then apply as garbage matte — multiply so background regions are zeroed out.
-    sam2_mask = _dilate_sam2_mask(sam2_mask)
+    sam2_mask = _dilate_sam2_mask(sam2_mask, margin=settings.get("sam2_margin", SAM2_MATTE_MARGIN))
     chroma_float = chroma_hint.astype(np.float32) / 255.0
     return chroma_float * sam2_mask  # float32 0-1; callers normalise uint8 but pass float through
 
@@ -1152,7 +1162,7 @@ def on_process_range(ev):
             chroma_float = chroma_hint_gen.generate_hint(frame).astype(np.float32) / 255.0
             if sam2_video_masks and range_idx in sam2_video_masks:
                 # Dilate mask before multiply — gives neural keyer room at silhouette edge
-                ah = chroma_float * _dilate_sam2_mask(sam2_video_masks[range_idx])
+                ah = chroma_float * _dilate_sam2_mask(sam2_video_masks[range_idx], margin=settings.get("sam2_margin", SAM2_MATTE_MARGIN))
             else:
                 ah = chroma_float
             fr = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
