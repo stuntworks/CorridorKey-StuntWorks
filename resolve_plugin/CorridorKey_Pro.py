@@ -891,7 +891,7 @@ def reprocess_with_cached():
         ah = generate_alpha_hint(frame, settings)
         fr = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         ah = ah.astype(np.float32) / 255.0 if ah.dtype == np.uint8 else ah
-        ps = ProcessingSettings(screen_type=settings["screen_type"], despill_strength=settings["despill_strength"], refiner_strength=settings["refiner_strength"], despeckle_enabled=settings["despeckle_enabled"], despeckle_size=settings["despeckle_size"])
+        ps = ProcessingSettings(screen_type=settings["screen_type"], despill_strength=0.0, refiner_strength=settings["refiner_strength"], despeckle_enabled=settings["despeckle_enabled"], despeckle_size=settings["despeckle_size"])
         log(f"Settings: despeckle_enabled={ps.despeckle_enabled} despeckle_size={ps.despeckle_size} despill={ps.despill_strength} refiner={ps.refiner_strength}")
         res = proc.process_frame(fr, ah, ps)
         fg, mt = res.get("fg"), res.get("alpha")
@@ -985,7 +985,7 @@ def process_current_frame(preview_only=False):
         log("Processing...")
         fr = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         ah = ah.astype(np.float32) / 255.0 if ah.dtype == np.uint8 else ah
-        ps = ProcessingSettings(screen_type=settings["screen_type"], despill_strength=settings["despill_strength"], refiner_strength=settings["refiner_strength"], despeckle_enabled=settings["despeckle_enabled"], despeckle_size=settings["despeckle_size"])
+        ps = ProcessingSettings(screen_type=settings["screen_type"], despill_strength=0.0, refiner_strength=settings["refiner_strength"], despeckle_enabled=settings["despeckle_enabled"], despeckle_size=settings["despeckle_size"])
         log(f"Settings: despeckle_enabled={ps.despeckle_enabled} despeckle_size={ps.despeckle_size} despill={ps.despill_strength} refiner={ps.refiner_strength}")
         res = proc.process_frame(fr, ah, ps)
         cn = Path(fp).stem
@@ -993,6 +993,12 @@ def process_current_frame(preview_only=False):
         od.mkdir(parents=True, exist_ok=True)
         op = od / f"CK_{cn}_{cf:06d}.png"
         fg, mt = res.get("fg"), res.get("alpha")
+        # Apply despill manually — NN ran with despill_strength=0 so result["fg"] is raw.
+        # Viewer applies its own despill live; render path must match it here.
+        from CorridorKeyModule.core import color_utils as _cu
+        _despill_str = float(settings.get("despill_strength", 0.5))
+        if _despill_str > 0 and fg is not None:
+            fg = _cu.despill_opencv(fg, green_limit_mode="average", strength=_despill_str)
         if fg is not None:
             try: log(f"FG stats — dtype:{fg.dtype} min:{float(fg.min()):.4f} max:{float(fg.max()):.4f} mean R:{float(fg[..., 0].mean()):.4f} G:{float(fg[..., 1].mean()):.4f} B:{float(fg[..., 2].mean()):.4f}")
             except Exception as _e: log(f"FG stat error: {_e}")
@@ -1163,10 +1169,12 @@ def on_process_range(ev):
     else:
         log("AI ready (cached)")
     proc = cached_processor["proc"]
-    ps = ProcessingSettings(screen_type=settings["screen_type"], despill_strength=settings["despill_strength"],
+    ps = ProcessingSettings(screen_type=settings["screen_type"], despill_strength=0.0,
                             refiner_strength=settings["refiner_strength"], despeckle_enabled=settings["despeckle_enabled"],
                             despeckle_size=settings["despeckle_size"])
     log(f"Settings: despill={ps.despill_strength} refiner={ps.refiner_strength} despeckle={ps.despeckle_enabled}")
+    from CorridorKeyModule.core import color_utils as _cu
+    _despill_str = float(settings.get("despill_strength", 0.5))
     from core.alpha_hint_generator import AlphaHintGenerator
     chroma_hint_gen = AlphaHintGenerator(screen_type=settings["screen_type"])
 
@@ -1214,6 +1222,9 @@ def on_process_range(ev):
             fr = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
             res = proc.process_frame(fr, ah, ps)
             fg, mt = res.get("fg"), res.get("alpha")
+            # Apply despill manually — NN ran with despill_strength=0; render must match viewer.
+            if _despill_str > 0 and fg is not None:
+                fg = _cu.despill_opencv(fg, green_limit_mode="average", strength=_despill_str)
             # Post-process: apply SAM2 video mask to output alpha as garbage matte
             if mt is not None and sam2_video_masks and range_idx in sam2_video_masks:
                 _gate = _dilate_sam2_mask(sam2_video_masks[range_idx], margin=settings.get("sam2_margin", SAM2_MATTE_MARGIN))
