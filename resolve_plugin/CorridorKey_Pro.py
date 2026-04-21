@@ -1013,6 +1013,12 @@ def process_current_frame(preview_only=False):
                 _gated = _mt2d * _gate
                 mt = np.stack([_gated] * mt.shape[2], axis=2) if len(mt.shape) == 3 else _gated
                 log(f"SAM2 output gate applied — alpha mean {_mt2d.mean():.3f} -> {_gated.mean():.3f}")
+        choke_px = int(settings.get("choke", 0))
+        if choke_px > 0 and mt is not None:
+            k = choke_px * 2 + 1
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+            _mt_c = mt[:, :, 0] if len(mt.shape) == 3 else mt
+            mt = cv2.erode((_mt_c * 255).astype(np.uint8), kernel).astype(np.float32) / 255.0
         if fg is not None and mt is not None:
             save_output(fg, mt, op, settings["export_format"])
             log(f"Saved: {op.name}")
@@ -1230,6 +1236,12 @@ def on_process_range(ev):
                 _gate = _dilate_sam2_mask(sam2_video_masks[range_idx], margin=settings.get("sam2_margin", SAM2_MATTE_MARGIN))
                 _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
                 mt = _mt2d * _gate
+            choke_px = int(settings.get("choke", 0))
+            if choke_px > 0 and mt is not None:
+                k = choke_px * 2 + 1
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+                _mt_c = mt[:, :, 0] if len(mt.shape) == 3 else mt
+                mt = cv2.erode((_mt_c * 255).astype(np.uint8), kernel).astype(np.float32) / 255.0
             if fg is not None and mt is not None:
                 op = od / f"CK_{cn}_{pr:06d}.png"
                 save_output(fg, mt, op, settings["export_format"])
