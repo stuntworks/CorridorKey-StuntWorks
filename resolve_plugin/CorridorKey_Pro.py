@@ -357,6 +357,9 @@ def _merge_live_params(settings):
         if "despeckleSize" in lp:
             try: out["despeckle_size"] = max(50, min(2000, int(lp["despeckleSize"])))
             except (ValueError, TypeError): pass
+        if "choke" in lp:
+            try: out["choke"] = max(0, min(20, int(lp["choke"])))
+            except (ValueError, TypeError): pass
         if "sam_positive" in lp or "sam_negative" in lp:
             sam_points["positive"] = [tuple(p) for p in lp.get("sam_positive", [])]
             sam_points["negative"] = [tuple(p) for p in lp.get("sam_negative", [])]
