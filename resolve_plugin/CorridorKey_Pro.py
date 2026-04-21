@@ -1,4 +1,4 @@
-# Last modified: 2026-04-20 | Change: Fix SAM2 garbage matte — was replacing chroma key, now multiplies as gate | Full history: git log
+# Last modified: 2026-04-21 | Change: SAM2 margin dilation (COO-2) + backward propagation (COO-3) | Full history: git log
 """CorridorKey Pro - Neural Green Screen for DaVinci Resolve
 Enhanced with SAM2 Click-to-Mask, Frame Range, Export Modes
 
@@ -378,12 +378,32 @@ def on_browse_output(ev):
         log(f"Output: {folder}")
 
 
+# WHAT IT DOES: Expands a binary SAM2 mask outward by SAM2_MATTE_MARGIN pixels.
+#   This safety buffer ensures the hard garbage-matte boundary sits outside the
+#   actual silhouette, leaving the soft chroma-key edges untouched so the neural
+#   keyer can refine them properly. Without dilation SAM2 clips the edges too tight.
+# DEPENDS-ON: cv2, numpy
+# AFFECTS: Every garbage-matte multiply in generate_alpha_hint() and the range loop.
+# DANGER ZONE FRAGILE/MEDIUM: Increase margin on 4K+ footage (pixel count scales up).
+#   Too small = edge clipping. Too large = garbage matte stops blocking junk BG.
+SAM2_MATTE_MARGIN = 20  # pixels to expand SAM2 mask outward before multiplying
+
+def _dilate_sam2_mask(mask_float32):
+    import cv2, numpy as np
+    sz = SAM2_MATTE_MARGIN * 2 + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (sz, sz))
+    mask_u8 = (mask_float32 * 255).astype(np.uint8)
+    dilated = cv2.dilate(mask_u8, kernel, iterations=1)
+    return dilated.astype(np.float32) / 255.0
+
+
 # WHAT IT DOES: Generates an alpha hint (rough matte) for the neural keyer.
 #   Chroma key always runs first to produce soft colour-accurate edges. When SAM2 mode
-#   is active the SAM2 mask is applied as a GARBAGE MATTE: where SAM2=background (0)
-#   the chroma result is forced to 0; where SAM2=foreground (1) it is left alone.
-#   SAM2 never replaces the chroma key — it only suppresses known-background regions.
-# DEPENDS-ON: AlphaHintGenerator, generate_sam2_mask(), sam_points global, SESSION_DIR
+#   is active the SAM2 mask is dilated by SAM2_MATTE_MARGIN pixels then applied as a
+#   GARBAGE MATTE: where dilated-SAM2=background (0) chroma is forced to 0; where
+#   dilated-SAM2=foreground (1) the chroma key result passes through unchanged.
+#   The dilation gives the neural keyer a safety zone at the silhouette edge.
+# DEPENDS-ON: AlphaHintGenerator, generate_sam2_mask(), _dilate_sam2_mask(), sam_points, SESSION_DIR
 # AFFECTS: Neural keyer input quality — this is the primary alpha signal into process_frame()
 # DANGER ZONE FRAGILE/HIGH: Changing the multiply logic here silently alters every
 #   keyed frame. / breaks: chroma edges / depends on: sam2_mask being 0-1 float32
@@ -423,7 +443,9 @@ def generate_alpha_hint(frame, settings):
         log("SAM2: no mask available — using chroma key only")
         return chroma_hint
 
-    # Step 3: apply garbage matte — multiply so background regions are zeroed out
+    # Step 3: dilate SAM2 mask outward to give neural keyer room at the silhouette edge,
+    #   then apply as garbage matte — multiply so background regions are zeroed out.
+    sam2_mask = _dilate_sam2_mask(sam2_mask)
     chroma_float = chroma_hint.astype(np.float32) / 255.0
     return chroma_float * sam2_mask  # float32 0-1; callers normalise uint8 but pass float through
 
@@ -458,11 +480,13 @@ def generate_sam2_mask(frame, pos_pts, neg_pts):
         return AlphaHintGenerator(screen_type="green").generate_hint(frame)
 
 
-# WHAT IT DOES: Runs SAM2 video predictor across the entire frame range in one pass.
-#   Exports every frame in [in_f, out_f) as a JPEG to a temp directory, loads the
-#   SAM2 video predictor, places the user's click points on the anchor frame
-#   (defaults to range frame 0), then calls propagate_in_video() which yields one
-#   mask per frame. Returns a dict {range_relative_index: float32_mask}.
+# WHAT IT DOES: Runs SAM2 video predictor across the entire frame range in two passes —
+#   forward (anchor → last frame) then backward (anchor → first frame) — so every frame
+#   in [in_f, out_f) receives a mask regardless of where the user clicked.
+#   Exports every frame as a JPEG to a temp directory, loads the SAM2 video predictor,
+#   places the user's click points on the anchor frame (defaults to range frame 0), runs
+#   propagate_in_video() forward then reverse=True backward, merges both results.
+#   Returns a dict {range_relative_index: float32_mask}.
 # DEPENDS-ON: SAM2 video predictor weights at CK_ROOT/sam2_weights/sam2.1_hiera_small.pt,
 #   cv2 VideoCapture on fp, ~50 MB disk space per 100 frames (95% JPEG), CUDA VRAM.
 # AFFECTS: writes then deletes a temp JPEG dir. Returns mask dict (no disk writes kept).
@@ -515,7 +539,6 @@ def run_sam2_video_propagation(fp, ss, cs, in_f, out_f, pos_pts, neg_pts, anchor
         with torch.inference_mode():
             # offload_video_to_cpu keeps JPEG frames in RAM not VRAM — critical
             # because Resolve already uses 2-4 GB of VRAM on a working timeline.
-            # async_loading_frames pipelines disk reads with GPU compute.
             # async_loading_frames=False — Resolve's embedded Python deadlocks on
             # background threads (same issue that killed threaded PROCESS RANGE).
             state = predictor.init_state(
@@ -531,14 +554,44 @@ def run_sam2_video_propagation(fp, ss, cs, in_f, out_f, pos_pts, neg_pts, anchor
                 labels=np.array(labs,    dtype=np.int32),
                 clear_old_points=True,
             )
-            status("SAM2: propagating...")
+
+            # --- Forward pass: anchor → last frame ---
+            # DANGER ZONE FRAGILE: SAM2 propagate_in_video() is stateful — the backward
+            # pass must reuse the same state object so the tracker memory from the forward
+            # pass carries over. Reinitialising state between passes loses anchor context.
+            # breaks: if state is reset between passes, backward masks drift from forward.
+            status("SAM2: forward pass...")
+            log(f"SAM2 video: forward pass (anchor={anchor_rel} → frame {dur-1})")
+            forward_count = 0
             for frame_idx, _obj_ids, mask_logits in predictor.propagate_in_video(state):
-                # mask_logits shape: [num_objects, 1, H, W] — squeeze to [H, W] float32
                 mask = (mask_logits[0] > 0.0).squeeze().cpu().numpy().astype(np.float32)
                 masks[frame_idx] = mask
+                forward_count += 1
                 if frame_idx % 20 == 0:
-                    log(f"SAM2: propagated {frame_idx}/{dur}")
-                    status(f"SAM2: {frame_idx}/{dur} frames")
+                    log(f"SAM2 forward: frame {frame_idx}/{dur}")
+                    status(f"SAM2 forward: {frame_idx}/{dur} frames")
+            log(f"SAM2 forward pass done — {forward_count} masks")
+
+            # --- Backward pass: anchor → first frame ---
+            # Only needed when the anchor is not the first frame. Frames already
+            # written by the forward pass are not overwritten (forward wins on overlap).
+            if anchor_rel > 0:
+                status("SAM2: backward pass...")
+                log(f"SAM2 video: backward pass (anchor={anchor_rel} → frame 0)")
+                backward_count = 0
+                for frame_idx, _obj_ids, mask_logits in predictor.propagate_in_video(
+                        state, reverse=True):
+                    if frame_idx not in masks:
+                        mask = (mask_logits[0] > 0.0).squeeze().cpu().numpy().astype(np.float32)
+                        masks[frame_idx] = mask
+                    backward_count += 1
+                    if frame_idx % 20 == 0:
+                        log(f"SAM2 backward: frame {frame_idx}")
+                        status(f"SAM2 backward: {frame_idx} frames")
+                log(f"SAM2 backward pass done — {backward_count} frames visited, "
+                    f"{sum(1 for k in masks if k < anchor_rel)} new masks added")
+            else:
+                log("SAM2 video: anchor is frame 0 — backward pass skipped")
 
             # reset_state releases SAM2's internal CUDA buffers before we drop
             # the predictor — prevents the GPU memory leak on Windows (issue #258).
@@ -1098,7 +1151,8 @@ def on_process_range(ev):
             # pixels SAM2 classified as background. Multiply: bg(0)*chroma=0, fg(1)*chroma=chroma.
             chroma_float = chroma_hint_gen.generate_hint(frame).astype(np.float32) / 255.0
             if sam2_video_masks and range_idx in sam2_video_masks:
-                ah = chroma_float * sam2_video_masks[range_idx]  # sam2 mask is float32 0-1
+                # Dilate mask before multiply — gives neural keyer room at silhouette edge
+                ah = chroma_float * _dilate_sam2_mask(sam2_video_masks[range_idx])
             else:
                 ah = chroma_float
             fr = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
