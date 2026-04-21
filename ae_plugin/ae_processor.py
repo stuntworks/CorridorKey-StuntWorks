@@ -175,8 +175,38 @@ def cmd_extract(source_video, output_png, frame_idx=None, time_sec=None):
         cap.release()
 
 
+# ── SAM2 output gate helper ──────────────────────────────────
+# WHAT IT DOES: Loads sam2_mask.png written by preview_viewer_v2.py after the user
+#   clicks "Apply Mask". Returns a float32 [0,1] array (1=foreground, 0=background)
+#   ready to multiply with the neural keyer's output alpha as a garbage matte gate.
+#   Same approach as Resolve's _load_sam2_output_gate — gate the OUTPUT, not the input.
+# DEPENDS-ON: sam2_mask_path existing on disk (written by viewer).
+# AFFECTS: called from cmd_single and cmd_batch; returns None if mask not available.
+def load_sam2_gate(sam2_mask_path, target_h, target_w):
+    import numpy as np
+    import cv2
+    if not sam2_mask_path or not Path(sam2_mask_path).exists():
+        return None
+    raw = cv2.imread(str(sam2_mask_path), cv2.IMREAD_GRAYSCALE)
+    if raw is None:
+        log.warning(f"SAM2 gate: could not read {sam2_mask_path}")
+        return None
+    _, raw = cv2.threshold(raw, 127, 255, cv2.THRESH_BINARY)
+    if raw.shape != (target_h, target_w):
+        raw = cv2.resize(raw, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+    gate = raw.astype(np.float32) / 255.0
+    log.info(f"SAM2 gate loaded — coverage {gate.mean():.3f}")
+    return gate
+
+
 # ── Subcommand: single ────────────────────────────────────────
-def cmd_single(input_path, output_path, settings):
+# WHAT IT DOES: Keys a single PNG. Accepts an optional --sam2-mask path pointing to
+#   sam2_mask.png written by the viewer after Apply Mask is clicked. When present,
+#   the SAM2 binary mask is applied to the OUTPUT alpha as a garbage matte gate
+#   (same technique as traditional garbage mattes — gate the output, not the input).
+# DEPENDS-ON: corridorkey_processor, load_sam2_gate.
+# AFFECTS: writes output BGRA PNG + _matte.png.
+def cmd_single(input_path, output_path, settings, sam2_mask_path=None):
     import numpy as np
     import cv2
     log.info(f"Keying: {input_path}")
@@ -215,6 +245,13 @@ def cmd_single(input_path, output_path, settings):
             return False
         if len(alpha.shape) == 3:
             alpha = alpha[:, :, 0]
+        # Apply SAM2 garbage matte gate to output alpha (post-keyer)
+        h, w = alpha.shape[:2]
+        gate = load_sam2_gate(sam2_mask_path, h, w)
+        if gate is not None:
+            before_mean = float(alpha.mean())
+            alpha = alpha * gate
+            log.info(f"SAM2 gate applied — alpha mean {before_mean:.3f} -> {float(alpha.mean()):.3f}")
         fg_uint8 = (np.clip(fg, 0, 1) * 255).astype(np.uint8)
         alpha_uint8 = (np.clip(alpha, 0, 1) * 255).astype(np.uint8)
         fg_bgr = cv2.cvtColor(fg_uint8, cv2.COLOR_RGB2BGR)
@@ -553,6 +590,8 @@ def build_parser():
     sg.add_argument("--despeckle", type=int)
     sg.add_argument("--despeckle-size", dest="despeckle_size", type=int)
     sg.add_argument("--refiner", type=float)
+    sg.add_argument("--sam2-mask", dest="sam2_mask", default=None,
+                    help="Path to sam2_mask.png written by the viewer after Apply Mask")
 
     bt = sub.add_parser("batch", help="Key a frame range from a video")
     bt.add_argument("source")
@@ -609,7 +648,8 @@ def main():
 
         if args.mode == "single":
             settings = load_settings(args.params, args)
-            ok = cmd_single(args.input, args.output, settings)
+            ok = cmd_single(args.input, args.output, settings,
+                            sam2_mask_path=getattr(args, "sam2_mask", None))
             sys.exit(0 if ok else 1)
 
         if args.mode == "batch":
