@@ -372,9 +372,19 @@ def _merge_live_params(settings):
     except Exception:
         return settings
 
-# WHAT IT DOES: Gets the current playhead position as a frame number and the timeline fps
+# WHAT IT DOES: Gets the current playhead position as a frame number and the timeline fps.
+#   Returns cf in the SAME absolute timecode-frame coordinate system that clip.GetStart()
+#   uses. Both must stay in the same system or fn = GetLeftOffset() + (cf - cs) goes wrong.
 # DEPENDS-ON: Resolve project settings for frame rate, timeline for timecode
-# DANGER ZONE FRAGILE: Timecode parsing assumes HH:MM:SS:FF format
+# DANGER ZONE CRITICAL: DO NOT subtract timeline.GetStartFrame() from cf here.
+#   clip.GetStart() returns ABSOLUTE frame numbers matching the timecode conversion below.
+#   Subtracting GetStartFrame() makes cf relative while cs stays absolute → cf-cs goes
+#   deeply negative → fn clamps to 0 → every seek lands on frame 0 of the source video.
+#   Broke April 2026, fixed by reverting. Do not "fix" this without checking both sides.
+# DANGER ZONE CRITICAL: DO NOT switch cap.set() calls to CAP_PROP_POS_MSEC.
+#   POS_MSEC at non-integer fps (24fps = 41.666ms/frame) has floating-point off-by-one:
+#   frame N seeks to N/fps*1000 ms which rounds just below the frame boundary → reads N-1.
+#   Resolve footage is all-intra (ProRes, BRAW, DNxHD) so POS_FRAMES is exact. Keep it.
 # breaks: if Resolve returns non-standard timecode format or drop-frame semicolons
 def get_current_frame_info():
     try:
@@ -385,10 +395,6 @@ def get_current_frame_info():
         if len(parts) == 4:
             h, m, s, f = [int(p) for p in parts]
             cf = int(h * 3600 * fps + m * 60 * fps + s * fps + f)
-            try:
-                cf -= int(timeline.GetStartFrame())
-            except Exception:
-                pass
             return max(0, cf), fps
         log(f"Timecode parse failed: '{tc}'")
         return 0, fps
@@ -555,6 +561,7 @@ def run_sam2_video_propagation(fp, ss, cs, in_f, out_f, pos_pts, neg_pts, anchor
         cap = cv2.VideoCapture(fp)
         if not cap.isOpened():
             log("SAM2 video: cannot open video"); return {}
+        _src_fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
         for i in range(dur):
             sf = ss + (in_f + i - cs)
             cap.set(cv2.CAP_PROP_POS_FRAMES, sf)
@@ -961,6 +968,7 @@ def process_current_frame(preview_only=False):
         fn = clip.GetLeftOffset() + (cf - cs)
         if fn < 0: fn = 0
         cap = cv2.VideoCapture(fp)
+        log(f"SEEK: cf={cf} cs={cs} leftoff={clip.GetLeftOffset()} fn={fn}")
         cap.set(cv2.CAP_PROP_POS_FRAMES, fn)
         ret, frame = cap.read()
         cap.release()
@@ -1184,116 +1192,107 @@ def on_process_range(ev):
     from core.alpha_hint_generator import AlphaHintGenerator
     chroma_hint_gen = AlphaHintGenerator(screen_type=settings["screen_type"])
 
-    # DANGER ZONE HIGH: Runs on the main thread — UI freezes during processing.
-    # Background threading was attempted but Resolve's embedded Python kills daemon threads
-    # silently (sys.stdout=None crashes print() before any code runs). Synchronous is reliable.
-    # breaks: do not move back to threading.Thread without solving the Resolve stdout issue
+    # Run heavy processing in a background thread so the Fusion event loop stays alive.
+    # The fix for the old deadlock: patch sys.stdout/stderr at thread start (Resolve sets
+    # them None for non-main threads), then route all UI updates through _ui_queue so only
+    # the main-thread PollTimer touches Fusion widgets. Resolve MediaPool/timeline calls
+    # stay on the main thread via _import_queue → _do_import().
     _range_running = True
-    ofs = []
-    pr = 0
-    try:
-        # SAM2 video propagation — runs once up front, produces one mask per frame
-        sam2_video_masks = {}
-        if (settings.get("alpha_method") == 1 and
-                (sam_points.get("positive") or sam_points.get("negative"))):
-            log("SAM2 mode — running video propagation for full range...")
-            sam2_video_masks = run_sam2_video_propagation(
-                fp, ss, cs, in_f, out_f,
-                sam_points.get("positive", []),
-                sam_points.get("negative", []),
-                sam_points.get("frame"),
-            )
-            if sam2_video_masks:
-                log(f"SAM2 video: {len(sam2_video_masks)} masks ready")
-            else:
-                log("SAM2 propagation returned no masks — falling back to chroma hint")
 
-        cap = cv2.VideoCapture(fp)
-        if not cap.isOpened(): status("Cannot open video"); return
+    def _run():
+        global _range_running
+        import sys as _sys, io as _io
+        if _sys.stdout is None: _sys.stdout = _io.StringIO()
+        if _sys.stderr is None: _sys.stderr = _io.StringIO()
+
+        def _tlog(msg):
+            _ui_queue.put(("log", msg))
+            try:
+                with open(_ck_debug_log, "a", encoding="utf-8") as _f: _f.write(msg + "\n")
+            except Exception: pass
+
+        def _tstatus(msg):
+            _ui_queue.put(("status", msg))
+
+        ofs = []
+        pr = 0
         st = time.time()
-        for tf in range(in_f, out_f):
-            if processing_cancelled:
-                log(f"Cancelled at frame {pr}/{dur}")
-                status(f"CANCELLED — {pr} frames saved")
-                break
-            sf = ss + (tf - cs)
-            cap.set(cv2.CAP_PROP_POS_FRAMES, sf)
-            ret, frame = cap.read()
-            if not ret: continue
-            range_idx = tf - in_f
-            # Neural keyer always gets the plain chroma hint. SAM2 garbage matte is applied
-            # to the OUTPUT alpha after keying (traditional garbage matte technique).
-            chroma_float = chroma_hint_gen.generate_hint(frame).astype(np.float32) / 255.0
-            ah = chroma_float
-            fr = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-            res = proc.process_frame(fr, ah, ps)
-            fg, mt = res.get("fg"), res.get("alpha")
-            # Apply despill manually — NN ran with despill_strength=0; render must match viewer.
-            if _despill_str > 0 and fg is not None:
-                fg = _cu.despill_opencv(fg, green_limit_mode="average", strength=_despill_str)
-            # Post-process: apply SAM2 video mask to output alpha as garbage matte
-            if mt is not None and sam2_video_masks and range_idx in sam2_video_masks:
-                _gate = _dilate_sam2_mask(sam2_video_masks[range_idx], margin=settings.get("sam2_margin", SAM2_MATTE_MARGIN))
-                _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
-                mt = _mt2d * _gate
-            choke_px = int(settings.get("choke", 0))
-            if choke_px > 0 and mt is not None:
-                k = choke_px * 2 + 1
-                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-                _mt_c = mt[:, :, 0] if len(mt.shape) == 3 else mt
-                mt = cv2.erode((_mt_c * 255).astype(np.uint8), kernel).astype(np.float32) / 255.0
-            if fg is not None and mt is not None:
-                op = od / f"CK_{cn}_{pr:06d}.png"
-                save_output(fg, mt, op, settings["export_format"])
-                ofs.append(str(op))
-                pr += 1
-                el = time.time() - st
-                fpsr = pr / el if el > 0 else 0
-                rem = (dur - pr) / fpsr if fpsr > 0 else 0
-                status(f"{pr}/{dur} ({fpsr:.1f}fps, {rem:.0f}s left)")
-                if pr % 10 == 0: log(f"{pr}/{dur}")
-        cap.release()
+        try:
+            # SAM2 video propagation — runs once up front, produces one mask per frame
+            sam2_video_masks = {}
+            if (settings.get("alpha_method") == 1 and
+                    (sam_points.get("positive") or sam_points.get("negative"))):
+                _tlog("SAM2 mode — running video propagation for full range...")
+                sam2_video_masks = run_sam2_video_propagation(
+                    fp, ss, cs, in_f, out_f,
+                    sam_points.get("positive", []),
+                    sam_points.get("negative", []),
+                    sam_points.get("frame"),
+                )
+                if sam2_video_masks:
+                    _tlog(f"SAM2 video: {len(sam2_video_masks)} masks ready")
+                else:
+                    _tlog("SAM2 propagation returned no masks — falling back to chroma hint")
 
-        if not ofs or processing_cancelled: return
-        log(f"Done: {len(ofs)} frames in {time.time()-st:.1f}s")
-        status("Importing to MediaPool...")
-        root = media_pool.GetRootFolder()
-        ckb = None
-        for f in root.GetSubFolderList():
-            if f.GetName() == "CorridorKey": ckb = f; break
-        if not ckb: ckb = media_pool.AddSubFolder(root, "CorridorKey")
-        media_pool.SetCurrentFolder(ckb)
-        imp = media_pool.ImportMedia(ofs)
-        if not imp: status("Import failed — check MediaPool bin"); return
-        log(f"Imported {len(imp)} items to MediaPool")
-        if settings["output_mode"] in [0, 2]:
-            current_tracks = timeline.GetTrackCount("video")
-            while current_tracks < output_track:
-                timeline.AddTrack("video")
-                current_tracks += 1
-                log(f"Added video track V{current_tracks}")
-            seq_item = imp[0]
-            log(f"Placing on V{output_track} — frames 0-{len(ofs)-1}")
-            ci_list = [{"mediaPoolItem": seq_item, "startFrame": 0, "endFrame": len(ofs) - 1,
-                        "trackIndex": output_track, "recordFrame": int(in_f), "mediaType": 1}]
-            result = media_pool.AppendToTimeline(ci_list)
-            log(f"AppendToTimeline result: {result}")
-            if result:
-                if items["DisableTrack1"].Checked:
-                    timeline.SetTrackEnable("video", source_track, False)
-                    log(f"V{source_track} hidden — press D in timeline to re-enable source clip")
-                status(f"DONE! {len(ofs)} frames on V{output_track}")
-            else:
-                status("Timeline place failed — clips are in MediaPool")
-        else:
-            status(f"{len(ofs)} frames in MediaPool")
-    except Exception as e:
-        import traceback
-        status("ERROR!")
-        log(f"Range error: {e}")
-        log(traceback.format_exc())
-    finally:
-        _range_running = False
+            cap = cv2.VideoCapture(fp)
+            if not cap.isOpened():
+                _tstatus("Cannot open video"); return
+            _src_fps = cap.get(cv2.CAP_PROP_FPS) or fps
+            for tf in range(in_f, out_f):
+                if processing_cancelled:
+                    _tlog(f"Cancelled at frame {pr}/{dur}")
+                    _tstatus(f"CANCELLED — {pr} frames saved")
+                    break
+                sf = ss + (tf - cs)
+                cap.set(cv2.CAP_PROP_POS_FRAMES, sf)
+                ret, frame = cap.read()
+                if not ret: continue
+                range_idx = tf - in_f
+                chroma_float = chroma_hint_gen.generate_hint(frame).astype(np.float32) / 255.0
+                ah = chroma_float
+                fr = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+                res = proc.process_frame(fr, ah, ps)
+                fg, mt = res.get("fg"), res.get("alpha")
+                if _despill_str > 0 and fg is not None:
+                    fg = _cu.despill_opencv(fg, green_limit_mode="average", strength=_despill_str)
+                if mt is not None and sam2_video_masks and range_idx in sam2_video_masks:
+                    _gate = _dilate_sam2_mask(sam2_video_masks[range_idx], margin=settings.get("sam2_margin", SAM2_MATTE_MARGIN))
+                    _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
+                    mt = _mt2d * _gate
+                choke_px = int(settings.get("choke", 0))
+                if choke_px > 0 and mt is not None:
+                    k = choke_px * 2 + 1
+                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+                    _mt_c = mt[:, :, 0] if len(mt.shape) == 3 else mt
+                    mt = cv2.erode((_mt_c * 255).astype(np.uint8), kernel).astype(np.float32) / 255.0
+                if fg is not None and mt is not None:
+                    op = od / f"CK_{cn}_{pr:06d}.png"
+                    save_output(fg, mt, op, settings["export_format"])
+                    ofs.append(str(op))
+                    pr += 1
+                    el = time.time() - st
+                    fpsr = pr / el if el > 0 else 0
+                    rem = (dur - pr) / fpsr if fpsr > 0 else 0
+                    _tstatus(f"{pr}/{dur} ({fpsr:.1f}fps, {rem:.0f}s left)")
+                    if pr % 10 == 0: _tlog(f"{pr}/{dur}")
+            cap.release()
+
+            if ofs and not processing_cancelled:
+                _tlog(f"Done: {len(ofs)} frames in {time.time()-st:.1f}s")
+                _tstatus("Importing to MediaPool...")
+                _import_queue.put({
+                    "ofs": ofs, "output_track": output_track,
+                    "source_track": source_track, "in_f": in_f, "settings": settings,
+                })
+        except Exception as _e:
+            import traceback as _tb
+            _tstatus("ERROR!")
+            _tlog(f"Range error: {_e}")
+            _tlog(_tb.format_exc())
+        finally:
+            _range_running = False
+
+    threading.Thread(target=_run, daemon=True).start()
 
 # WHAT IT DOES: Sets the cancel flag so the range processing loop stops on next iteration
 def on_cancel(ev):
