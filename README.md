@@ -25,7 +25,15 @@
 ---
 
 > **Which version should I download?**
-> For a verified, tested build use the latest **[release tag](https://github.com/stuntworks/CorridorKey-StuntWorks/releases)** (currently `v1.0.1-stable`). The `main` branch is active development and may include unfinished work. The `live-preview` branch is in-progress slider work.
+> For a verified, tested build use the latest **[release tag](https://github.com/stuntworks/CorridorKey-StuntWorks/releases)** (currently `v0.7.0`). The `main` branch is active development and may include unfinished work.
+
+---
+
+## Test Footage
+
+Real stunt/action greenscreen clips for testing are attached to the [v0.7.0 release](https://github.com/stuntworks/CorridorKey-StuntWorks/releases/tag/v0.7.0).
+
+> **Important:** These are intentionally difficult shots — fast action, motion blur, and suboptimal lighting — chosen to stress-test the plugin on worst-case material. Results on well-lit production greenscreen will be significantly cleaner.
 
 ---
 
