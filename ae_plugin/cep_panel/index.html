@@ -1,9 +1,8 @@
 <!DOCTYPE html>
-<!-- Last modified: 2026-04-14 | Change: Phase 4 — live-preview viewer integration.
-     PREVIEW FRAME now runs the `cache` subcommand + spawns preview_viewer.py in
-     --persistent mode. Sliders debounce 50ms and write JSON lines to viewer
-     stdin for real-time stage-2 re-render. Commit path (KEY CURRENT FRAME,
-     PROCESS WORK AREA) untouched — frame alignment stays safe. -->
+<!-- Last modified: 2026-04-21 | Change: Switch to preview_viewer_v2.py (file-polling
+     protocol). Session dir is now PID-stable so sam2_mask.png written by the viewer
+     survives between PREVIEW FRAME and KEY CURRENT FRAME. KEY CURRENT FRAME now
+     detects sam2_mask.png and passes --sam2-mask to ae_processor single. -->
 <html>
 <head>
     <meta charset="UTF-8">
@@ -375,45 +374,47 @@ const SLIDER_DEBOUNCE_MS = 50;
 let sliderDebounceTimer = null;
 let sliderPendingState = null;
 
-// WHAT IT DOES: Finds preview_viewer.py on disk. Looks next to ae_processor.py first
-//   (where install.py bundles it), then in the engine's resolve_plugin/ (legacy
-//   location for the Resolve one-shot flow), then in the plugin-repo root (dev mode).
+// PID-stable session dir — lives for the lifetime of the panel process. Using a stable
+// dir means sam2_mask.png written by the viewer (via Apply Mask) is still there when
+// the user later clicks KEY CURRENT FRAME, even after multiple PREVIEW FRAME re-runs.
+const SESSION_DIR = path.join(os.tmpdir(), 'corridorkey_ae_session_' + process.pid);
+
+// WHAT IT DOES: Finds preview_viewer_v2.py on disk. v2 uses file-polling (live_params.json)
+//   instead of stdin, which lets the session dir persist between PREVIEW FRAME and KEY so
+//   sam2_mask.png written by the viewer survives until the user commits.
 // DEPENDS-ON: PANEL_DIR constant, findCorridorkeyRoot() for the engine fallback.
 // AFFECTS: returns a string path. Throws if nothing found.
 function findViewerScript() {
     const candidates = [
-        path.join(PANEL_DIR, 'preview_viewer.py'),
-        path.resolve(PANEL_DIR, '..', '..', 'preview_viewer.py')
+        path.join(PANEL_DIR, 'preview_viewer_v2.py'),
+        path.resolve(PANEL_DIR, '..', 'preview_viewer_v2.py'),
     ];
     try {
         const ckRoot = findCorridorkeyRoot();
-        candidates.push(path.join(ckRoot, 'resolve_plugin', 'preview_viewer.py'));
+        candidates.push(path.join(ckRoot, 'resolve_plugin', 'preview_viewer_v2.py'));
+        candidates.push(path.join(ckRoot, 'ae_plugin', 'preview_viewer_v2.py'));
     } catch (_) {}
     for (const c of candidates) {
         if (fs.existsSync(c)) return c;
     }
-    throw new Error('preview_viewer.py not found. Tried:\n  ' + candidates.join('\n  '));
+    throw new Error('preview_viewer_v2.py not found. Tried:\n  ' + candidates.join('\n  '));
 }
 
-// WHAT IT DOES: Starts a persistent viewer subprocess. Keeps stdio pipes so we can
-//   stream slider updates over stdin. Wires exit/error logging so panel log captures
-//   viewer crashes. Does NOT call kill() — viewer self-terminates via {"cmd":"quit"}
-//   on stdin end OR when its parent-PID watchdog detects the panel is gone.
+// WHAT IT DOES: Starts preview_viewer_v2 subprocess. v2 uses file-polling (live_params.json)
+//   so we don't need a stdin pipe — stdio is ignore/pipe/pipe. The viewer discovers
+//   settings by reading live_params.json from sessionDir; the parent-PID watchdog inside
+//   the viewer handles cleanup if this panel crashes without firing beforeunload.
 // DEPENDS-ON: findViewerScript(), findPythonExe(), findCorridorkeyRoot().
 // AFFECTS: sets VIEWER_PROC to the new child_process handle.
 function spawnViewer(sessionDir) {
     const ckRoot = findCorridorkeyRoot();
     const python = findPythonExe(ckRoot);
     const viewer = findViewerScript();
-    // -u forces unbuffered stdin/stdout on the Python side. Without it, Python
-    // block-buffers stdin when it's a pipe (not a tty), so the viewer's
-    // readline() won't see slider updates until ~4KB of JSON accumulates.
-    // That's the single reason sliders felt "dead" on the first live build.
-    const args = ['-u', viewer, '--persistent', '--session', sessionDir, '--parent-pid', String(process.pid)];
+    const args = ['-u', viewer, '--session', sessionDir, '--parent-pid', String(process.pid)];
     logLine('spawn viewer: ' + args.join(' '));
     const proc = childProcess.spawn(python, args, {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        windowsHide: false,       // viewer is a GUI window — let it show
+        stdio: ['ignore', 'pipe', 'pipe'],   // no stdin — v2 reads live_params.json
+        windowsHide: false,                  // viewer is a GUI window — let it show
         env: Object.assign({}, process.env, { CORRIDORKEY_ROOT: ckRoot })
     });
     proc.stdout.on('data', () => { /* viewer is quiet on stdout; ignore by design */ });
@@ -432,29 +433,28 @@ function spawnViewer(sessionDir) {
     return proc;
 }
 
-// WHAT IT DOES: Writes one JSON object + newline to the viewer's stdin. Silently
-//   drops writes if the pipe is already closed (viewer may have exited between
-//   the caller's last check and now). Callers must not rely on delivery — the
-//   viewer is a display; a missed slider tick is acceptable.
-// DEPENDS-ON: VIEWER_PROC being set and its stdin stream being writable.
-// AFFECTS: writes to a pipe. No return value.
-function sendToViewer(obj) {
-    if (!VIEWER_PROC || !VIEWER_PROC.stdin || VIEWER_PROC.stdin.destroyed) return;
+// WHAT IT DOES: Atomically writes a settings object to live_params.json in the session
+//   dir. The viewer polls this file and re-renders whenever the mtime changes. Atomic
+//   write (tmp + rename) prevents the viewer from reading a half-written file.
+// DEPENDS-ON: CURRENT_SESSION_DIR set (session dir exists on disk).
+// AFFECTS: writes/replaces live_params.json. No return value.
+function writeViewerParams(obj) {
+    if (!CURRENT_SESSION_DIR) return;
     try {
-        VIEWER_PROC.stdin.write(JSON.stringify(obj) + '\n');
-    } catch (_) { /* broken pipe — viewer is shutting down */ }
+        const tmpPath   = path.join(CURRENT_SESSION_DIR, 'live_params.tmp.json');
+        const finalPath = path.join(CURRENT_SESSION_DIR, 'live_params.json');
+        fs.writeFileSync(tmpPath, JSON.stringify(obj), 'utf8');
+        fs.renameSync(tmpPath, finalPath);
+    } catch (_) { /* session dir may not exist yet — viewer will catch up */ }
 }
 
-// WHAT IT DOES: Sends {"cmd":"quit"} and closes stdin. The viewer exits cleanly on
-//   EOF even if the quit message is dropped. We do NOT send SIGKILL — the parent-
-//   PID watchdog inside the viewer is a belt-and-suspenders for the case where
-//   the panel itself crashes without firing beforeunload.
-// DEPENDS-ON: sendToViewer() for the quit message.
+// WHAT IT DOES: Kills the viewer subprocess. v2 doesn't use stdin so we just call
+//   kill(). The parent-PID watchdog inside the viewer also covers the case where
+//   the panel crashes without firing beforeunload.
 // AFFECTS: VIEWER_PROC set to null. Viewer process terminates within ~1 second.
 function killViewer() {
     if (!VIEWER_PROC) return;
-    try { sendToViewer({ cmd: 'quit' }); } catch (_) {}
-    try { VIEWER_PROC.stdin.end(); } catch (_) {}
+    try { VIEWER_PROC.kill(); } catch (_) {}
     VIEWER_PROC = null;
     CURRENT_SESSION_DIR = null;
 }
@@ -465,7 +465,7 @@ function killViewer() {
 // DEPENDS-ON: getSettings() for current UI values, sendToViewer() for delivery.
 // AFFECTS: may write one JSON line to viewer stdin after the debounce window.
 function scheduleViewerUpdate() {
-    if (!VIEWER_PROC) return;
+    if (!CURRENT_SESSION_DIR) return;
     const s = getSettings();
     sliderPendingState = {
         cmd: 'update',
@@ -479,7 +479,7 @@ function scheduleViewerUpdate() {
         sliderDebounceTimer = null;
         const state = sliderPendingState;
         sliderPendingState = null;
-        if (state && VIEWER_PROC) sendToViewer(state);
+        if (state && CURRENT_SESSION_DIR) writeViewerParams(state);
     }, SLIDER_DEBOUNCE_MS);
 }
 
@@ -518,33 +518,32 @@ function previewFrameLive() {
             if (!fs.existsSync(framePng)) throw new Error('Extract produced no output');
 
             // Step 2 — stage-1 only. Writes fg.png + alpha.png + meta.json to session dir.
+            // Use the PID-stable SESSION_DIR so sam2_mask.png written by the viewer in a
+            // prior session survives a re-key. Mark rekeying:true so the viewer shows a
+            // spinner while the NN runs; cleared to false once cache finishes.
             status('Running neural key (this can take a few seconds)...');
-            sessionDir = randomTempPath('session', '');
+            sessionDir = SESSION_DIR;
             fs.mkdirSync(sessionDir, { recursive: true });
+            CURRENT_SESSION_DIR = sessionDir;   // set early so writeViewerParams works
+            writeViewerParams({ rekeying: true });
             paramsPath = writeParamsFile(settings);
             runPython(['cache', framePng, sessionDir, '--params', paramsPath]);
+            // Write final settings — viewer picks them up and re-renders immediately.
+            writeViewerParams({
+                despill: settings.despill,
+                despeckle: settings.despeckle,
+                despeckleSize: settings.despeckleSize,
+                background: 'checker',
+                rekeying: false
+            });
 
-            // Step 3 — spawn or reload the viewer.
+            // Step 3 — spawn viewer if not already running; otherwise it self-updates
+            // by detecting the new live_params.json / fresh fg+alpha files.
             status('Opening live preview...');
-            if (VIEWER_PROC) {
-                sendToViewer({ cmd: 'reload', sessionDir: sessionDir });
-            } else {
+            if (!VIEWER_PROC) {
                 VIEWER_PROC = spawnViewer(sessionDir);
             }
             CURRENT_SESSION_DIR = sessionDir;
-
-            // Send the initial settings after a small delay so the viewer has time to
-            // show its window. (A missed initial update just means the user's first
-            // slider move paints the first frame — harmless.)
-            setTimeout(() => {
-                sendToViewer({
-                    cmd: 'update',
-                    despill: settings.despill,
-                    despeckle: settings.despeckle,
-                    despeckleSize: settings.despeckleSize,
-                    background: 'checker'
-                });
-            }, 400);
 
             status('Live preview active — drag sliders to re-key');
         } catch (e) {
@@ -588,8 +587,18 @@ function processFrame(previewOnly) {
             if (!fs.existsSync(framePng)) throw new Error('Extract produced no output');
 
             // Step 2 — key it (params via JSON file, not argv).
+            // If the viewer wrote sam2_mask.png to the session dir (via Apply Mask), pass
+            // it as --sam2-mask so the neural keyer output is gated by the SAM2 matte.
             const paramsPath = writeParamsFile(settings);
-            runPython(['single', framePng, keyedPng, '--params', paramsPath]);
+            const sam2MaskPath = CURRENT_SESSION_DIR
+                ? path.join(CURRENT_SESSION_DIR, 'sam2_mask.png')
+                : null;
+            const hasSam2 = sam2MaskPath && fs.existsSync(sam2MaskPath);
+            const singleArgs = hasSam2
+                ? ['single', framePng, keyedPng, '--params', paramsPath, '--sam2-mask', sam2MaskPath]
+                : ['single', framePng, keyedPng, '--params', paramsPath];
+            if (hasSam2) logLine('SAM2 gate: ' + sam2MaskPath);
+            runPython(singleArgs);
             try { fs.unlinkSync(paramsPath); } catch (_) {}
             if (!fs.existsSync(keyedPng)) throw new Error('Keyer produced no output');
 

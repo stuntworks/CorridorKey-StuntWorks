@@ -1,4 +1,4 @@
-# Last modified: 2026-04-21 | Change: SAM2 margin dilation (COO-2) + backward propagation (COO-3) | Full history: git log
+# Last modified: 2026-04-21 | Change: despeckle default ON; disable-source-clip checkbox label clarified; single-frame path uses SetTrackEnable | Full history: git log
 """CorridorKey Pro - Neural Green Screen for DaVinci Resolve
 Enhanced with SAM2 Click-to-Mask, Frame Range, Export Modes
 
@@ -141,16 +141,33 @@ _viewer_proc = None  # Tracks preview viewer subprocess — killed on plugin clo
 # AFFECTS: Terminates _viewer_proc, clears cached_processor, frees CUDA memory.
 import atexit
 def _cleanup_on_exit():
-    # WHAT IT DOES: Kills the viewer subprocess on Resolve exit. That's all.
-    #   proc.cleanup() and torch.cuda.empty_cache() were here but caused Resolve
-    #   to hang on shutdown — CUDA unload blocked the Python interpreter.
-    #   Windows reclaims GPU memory automatically when the process exits.
-    # DEPENDS-ON: atexit (stdlib).
-    # AFFECTS: terminates _viewer_proc only.
+    # WHAT IT DOES: Kills the viewer subprocess on Resolve exit and WAITS for it to die.
+    #   Without wait(), kill() fires the signal but returns immediately — the viewer
+    #   python.exe is still alive (holding a CUDA handle) when Resolve tries to restart,
+    #   forcing the user to kill it in Task Manager before Resolve will open again.
+    #   proc.cleanup() and torch.cuda.empty_cache() were removed here because they caused
+    #   Resolve to hang on shutdown (CUDA unload blocked the interpreter). Windows reclaims
+    #   GPU memory when the process exits — we just need the process to actually be dead.
+    # DEPENDS-ON: atexit (stdlib), subprocess on Windows.
+    # AFFECTS: terminates _viewer_proc and waits for full exit before returning.
     global _viewer_proc
     try:
         if _viewer_proc is not None and _viewer_proc.poll() is None:
+            pid = _viewer_proc.pid
             _viewer_proc.kill()
+            try:
+                _viewer_proc.wait(timeout=3)
+            except Exception:
+                # Still alive after 3 s — force-kill entire process tree
+                # (covers any SAM2 child processes the viewer may have spawned)
+                try:
+                    import subprocess as _sp
+                    _sp.run(
+                        ["taskkill", "/F", "/T", "/PID", str(pid)],
+                        capture_output=True, timeout=3
+                    )
+                except Exception:
+                    pass
             _viewer_proc = None
     except Exception:
         pass
@@ -216,7 +233,8 @@ winLayout = ui.VGroup({"Spacing": 14}, [
         ui.Button({"ID": "ClearRange", "Text": "Clear", "Weight": 1, "StyleSheet": "QPushButton { background-color: #222; color: #667; border-radius: 4px; padding: 4px; }"}),
     ]),
     ui.HGroup({"Weight": 0}, [
-        ui.CheckBox({"ID": "DisableTrack1", "Text": "Hide source track after processing (press D to re-enable)", "Checked": True}),
+        ui.CheckBox({"ID": "DisableTrack1", "Text": "Disable source clip after processing  (uncheck to leave source visible)", "Checked": True,
+                    "StyleSheet": "color: #aaa; font-size: 11px;"}),
     ]),
 
     ui.VGap(2),
@@ -298,7 +316,7 @@ def get_settings():
         "screen_type": "green" if items["ScreenType"].CurrentIndex == 0 else "blue",
         "despill_strength": 0.5,    # viewer-owned; overridden by _merge_live_params
         "refiner_strength": 1.0,    # viewer-owned; overridden by _merge_live_params
-        "despeckle_enabled": False, # viewer-owned; overridden by _merge_live_params
+        "despeckle_enabled": True,  # viewer-owned; overridden by _merge_live_params — default ON matches viewer checkbox default
         "despeckle_size": 400,      # viewer-owned; overridden by _merge_live_params
         "export_format": items["ExportFormat"].CurrentIndex,
         "output_mode": items["OutputMode"].CurrentIndex,
@@ -334,7 +352,9 @@ def _merge_live_params(settings):
             sam_points["positive"] = [tuple(p) for p in lp.get("sam_positive", [])]
             sam_points["negative"] = [tuple(p) for p in lp.get("sam_negative", [])]
             sam_points["frame"]    = lp.get("sam_anchor_frame", None)
-            if lp.get("alpha_method") == 1:
+            # Auto-enable SAM2 mode whenever positive points exist — panel dropdown
+            # does not need to be set to SAM2; the viewer places points = intent to use SAM2.
+            if lp.get("alpha_method") == 1 or sam_points["positive"]:
                 out["alpha_method"] = 1
         return out
     except Exception:
@@ -407,57 +427,48 @@ def _dilate_sam2_mask(mask_float32, margin=SAM2_MATTE_MARGIN):
     return dilated.astype(np.float32) / 255.0
 
 
-# WHAT IT DOES: Generates an alpha hint (rough matte) for the neural keyer.
-#   Chroma key always runs first to produce soft colour-accurate edges. When SAM2 mode
-#   is active the SAM2 mask is dilated by SAM2_MATTE_MARGIN pixels then applied as a
-#   GARBAGE MATTE: where dilated-SAM2=background (0) chroma is forced to 0; where
-#   dilated-SAM2=foreground (1) the chroma key result passes through unchanged.
-#   The dilation gives the neural keyer a safety zone at the silhouette edge.
-# DEPENDS-ON: AlphaHintGenerator, generate_sam2_mask(), _dilate_sam2_mask(), sam_points, SESSION_DIR
+# WHAT IT DOES: Generates a chroma-key alpha hint for the neural keyer.
+#   SAM2 is no longer applied here — it is applied as a POST-PROCESS gate on the
+#   neural keyer's OUTPUT alpha (see _apply_sam2_output_gate). Applying SAM2 to
+#   the input hint caused the neural network to interpret the hint incorrectly and
+#   produce a dark/empty alpha. Traditional garbage mattes gate the OUTPUT, not the input.
+# DEPENDS-ON: AlphaHintGenerator
 # AFFECTS: Neural keyer input quality — this is the primary alpha signal into process_frame()
-# DANGER ZONE FRAGILE/HIGH: Changing the multiply logic here silently alters every
-#   keyed frame. / breaks: chroma edges / depends on: sam2_mask being 0-1 float32
 def generate_alpha_hint(frame, settings):
     import numpy as np, cv2
     from core.alpha_hint_generator import AlphaHintGenerator
+    return AlphaHintGenerator(screen_type=settings["screen_type"]).generate_hint(frame)
 
-    # Step 1: always generate chroma key hint — provides soft, colour-accurate edges
-    chroma_hint = AlphaHintGenerator(screen_type=settings["screen_type"]).generate_hint(frame)
 
-    if settings["alpha_method"] != 1:
-        return chroma_hint  # plain chroma mode — done
-
-    # Step 2 (SAM2 mode): locate the SAM2 foreground mask to use as garbage matte
-    sam2_mask = None
-    alpha_png = SESSION_DIR / "alpha.png"
-    anchor = sam_points.get("frame")
-    render_frame = settings.get("_render_frame")
-    if alpha_png.exists() and anchor is not None:
-        if render_frame is None or render_frame == anchor:
-            raw = cv2.imread(str(alpha_png), cv2.IMREAD_GRAYSCALE)
-            if raw is not None:
-                h, w = frame.shape[:2]
-                if raw.shape != (h, w):
-                    _, raw = cv2.threshold(raw, 127, 255, cv2.THRESH_BINARY)
-                    raw = cv2.resize(raw, (w, h), interpolation=cv2.INTER_NEAREST)
-                log("SAM2: applying cached alpha.png as garbage matte")
-                sam2_mask = raw.astype(np.float32) / 255.0
-    if sam2_mask is None and (sam_points["positive"] or sam_points["negative"]):
-        raw = generate_sam2_mask(frame, sam_points["positive"], sam_points["negative"])
-        if raw is not None:
-            sam2_mask = raw if raw.dtype == np.float32 else raw.astype(np.float32)
-            if sam2_mask.max() > 1.0:
-                sam2_mask = sam2_mask / 255.0
-
-    if sam2_mask is None:
-        log("SAM2: no mask available — using chroma key only")
-        return chroma_hint
-
-    # Step 3: dilate SAM2 mask outward to give neural keyer room at the silhouette edge,
-    #   then apply as garbage matte — multiply so background regions are zeroed out.
-    sam2_mask = _dilate_sam2_mask(sam2_mask, margin=settings.get("sam2_margin", SAM2_MATTE_MARGIN))
-    chroma_float = chroma_hint.astype(np.float32) / 255.0
-    return chroma_float * sam2_mask  # float32 0-1; callers normalise uint8 but pass float through
+# WHAT IT DOES: Loads the SAM2 binary mask from sam2_mask.png and returns it dilated,
+#   ready to multiply with the neural keyer's OUTPUT alpha as a garbage matte gate.
+#   This is the correct place to apply a garbage matte — after keying, not before.
+#   Applying it before (on the input hint) caused the neural keyer to produce dark results.
+# DEPENDS-ON: SESSION_DIR/sam2_mask.png (written ONLY by the viewer after Apply SAM2), _dilate_sam2_mask
+# AFFECTS: Called after proc.process_frame() in single-frame and cached render paths.
+# NOTE: sam2_mask.png is separate from alpha.png so Preview Frame cannot overwrite it.
+#   alpha.png is the neural keyer output (display); sam2_mask.png is the binary SAM2 gate (render).
+def _load_sam2_output_gate(frame_shape, settings):
+    import numpy as np, cv2
+    if settings.get("alpha_method") != 1:
+        log(f"SAM2 output gate: alpha_method={settings.get('alpha_method')} — gate skipped")
+        return None
+    sam2_png = SESSION_DIR / "sam2_mask.png"
+    if not sam2_png.exists():
+        log(f"SAM2 output gate: sam2_mask.png not found at {sam2_png} — no garbage matte applied")
+        return None
+    raw = cv2.imread(str(sam2_png), cv2.IMREAD_GRAYSCALE)
+    if raw is None:
+        log("SAM2 output gate: could not read sam2_mask.png")
+        return None
+    h, w = frame_shape[:2]
+    _, raw = cv2.threshold(raw, 127, 255, cv2.THRESH_BINARY)
+    if raw.shape != (h, w):
+        raw = cv2.resize(raw, (w, h), interpolation=cv2.INTER_NEAREST)
+    mask = raw.astype(np.float32) / 255.0
+    mask = _dilate_sam2_mask(mask, margin=settings.get("sam2_margin", SAM2_MATTE_MARGIN))
+    log(f"SAM2 output gate loaded — coverage {mask.mean():.3f} ({int(mask.sum())} px foreground)")
+    return mask
 
 # WHAT IT DOES: Runs SAM2 (Segment Anything Model 2) to generate a mask from user click points.
 #   Loads the SAM2 model, feeds it the frame + positive/negative points, returns the best mask.
@@ -486,8 +497,7 @@ def generate_sam2_mask(frame, pos_pts, neg_pts):
         return masks[np.argmax(scores)].astype(np.float32)
     except Exception as e:
         log(f"SAM2 error: {e}")
-        from core.alpha_hint_generator import AlphaHintGenerator
-        return AlphaHintGenerator(screen_type="green").generate_hint(frame)
+        return None  # caller (generate_alpha_hint) handles None — falls back to plain chroma hint
 
 
 # WHAT IT DOES: Runs SAM2 video predictor across the entire frame range in two passes —
@@ -768,7 +778,7 @@ def show_preview_window(orig_bgr, keyed_rgb, alpha):
         _s = get_settings()
         lp = {
             "despill": float(_s.get("despill_strength", 1.0)),
-            "despeckle": bool(_s.get("despeckle_enabled", False)),
+            "despeckle": bool(_s.get("despeckle_enabled", True)),
             "despeckleSize": int(_s.get("despeckle_size", 400)),
             "background": "checker",
         }
@@ -867,6 +877,13 @@ def reprocess_with_cached():
         if fg is not None:
             try: log(f"FG stats — dtype:{fg.dtype} min:{float(fg.min()):.4f} max:{float(fg.max()):.4f} mean R:{float(fg[..., 0].mean()):.4f} G:{float(fg[..., 1].mean()):.4f} B:{float(fg[..., 2].mean()):.4f}")
             except Exception as _e: log(f"FG stat error: {_e}")
+        # Apply SAM2 garbage matte to output alpha (post-keyer)
+        if mt is not None:
+            _gate = _load_sam2_output_gate(frame.shape, settings)
+            if _gate is not None:
+                _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
+                _gated = _mt2d * _gate
+                mt = np.stack([_gated] * mt.shape[2], axis=2) if len(mt.shape) == 3 else _gated
         if fg is not None and mt is not None:
             if len(mt.shape) == 3: mt = mt[:, :, 0]
             last_preview_data["original"] = frame.copy()
@@ -907,6 +924,8 @@ def process_current_frame(preview_only=False):
         clips = timeline.GetItemListInTrack("video", 1) or []
         if not clips: status("ERROR: No clips!"); return
         settings = _merge_live_params(get_settings())
+        sam2_gate_file = SESSION_DIR / "sam2_mask.png"
+        log(f"SAM2 gate: alpha_method={settings.get('alpha_method')} sam2_mask.png={'EXISTS' if sam2_gate_file.exists() else 'MISSING'}")
         cf, fps = get_current_frame_info()
         log(f"Frame {cf}")
         clip = None
@@ -956,6 +975,17 @@ def process_current_frame(preview_only=False):
         if fg is not None:
             try: log(f"FG stats — dtype:{fg.dtype} min:{float(fg.min()):.4f} max:{float(fg.max()):.4f} mean R:{float(fg[..., 0].mean()):.4f} G:{float(fg[..., 1].mean()):.4f} B:{float(fg[..., 2].mean()):.4f}")
             except Exception as _e: log(f"FG stat error: {_e}")
+        # Apply SAM2 garbage matte to the neural keyer's OUTPUT alpha.
+        # Doing it here (post-keyer) instead of on the input hint matches how the viewer works
+        # and how traditional garbage mattes work — gate the output, not the input.
+        if mt is not None:
+            _gate = _load_sam2_output_gate(frame.shape, settings)
+            if _gate is not None:
+                import numpy as _np
+                _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
+                _gated = _mt2d * _gate
+                mt = np.stack([_gated] * mt.shape[2], axis=2) if len(mt.shape) == 3 else _gated
+                log(f"SAM2 output gate applied — alpha mean {_mt2d.mean():.3f} -> {_gated.mean():.3f}")
         if fg is not None and mt is not None:
             save_output(fg, mt, op, settings["export_format"])
             log(f"Saved: {op.name}")
@@ -1017,9 +1047,9 @@ def process_current_frame(preview_only=False):
                             log(f"Move: {current_start} → {cf} (result: {moved})")
                 except Exception as trim_err:
                     log(f"Trim/Move: {trim_err}")
-                if items["DisableTrack1"].Checked and clip:
-                    clip.SetClipEnabled(False)
-                    log(f"Disabled source clip: {os.path.basename(fp)}")
+                if items["DisableTrack1"].Checked:
+                    timeline.SetTrackEnable("video", 1, False)
+                    log("Track 1 disabled — uncheck 'Disable source clip' or press D in timeline to re-enable")
                 status("DONE! Track 2")
             else:
                 log(f"AppendToTimeline FAILED")
@@ -1156,19 +1186,18 @@ def on_process_range(ev):
             ret, frame = cap.read()
             if not ret: continue
             range_idx = tf - in_f
-            # SAM2 video mask is applied as GARBAGE MATTE on top of the chroma key —
-            # never a replacement. Chroma key gives soft colour edges; SAM2 zeros out
-            # pixels SAM2 classified as background. Multiply: bg(0)*chroma=0, fg(1)*chroma=chroma.
+            # Neural keyer always gets the plain chroma hint. SAM2 garbage matte is applied
+            # to the OUTPUT alpha after keying (traditional garbage matte technique).
             chroma_float = chroma_hint_gen.generate_hint(frame).astype(np.float32) / 255.0
-            if sam2_video_masks and range_idx in sam2_video_masks:
-                # Dilate mask before multiply — gives neural keyer room at silhouette edge
-                ah = chroma_float * _dilate_sam2_mask(sam2_video_masks[range_idx], margin=settings.get("sam2_margin", SAM2_MATTE_MARGIN))
-            else:
-                ah = chroma_float
+            ah = chroma_float
             fr = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-            # ah is already float32 0-1 — skip the uint8 normalisation guard
             res = proc.process_frame(fr, ah, ps)
             fg, mt = res.get("fg"), res.get("alpha")
+            # Post-process: apply SAM2 video mask to output alpha as garbage matte
+            if mt is not None and sam2_video_masks and range_idx in sam2_video_masks:
+                _gate = _dilate_sam2_mask(sam2_video_masks[range_idx], margin=settings.get("sam2_margin", SAM2_MATTE_MARGIN))
+                _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
+                mt = _mt2d * _gate
             if fg is not None and mt is not None:
                 op = od / f"CK_{cn}_{pr:06d}.png"
                 save_output(fg, mt, op, settings["export_format"])

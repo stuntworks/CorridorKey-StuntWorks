@@ -1,4 +1,4 @@
-# Last modified: 2026-04-14 | Change: Phase 2 — persistent viewer with stdin JSON listener, live slider re-key, 4 backgrounds, parent-PID watchdog
+# Last modified: 2026-04-21 | Change: despeckle checkbox saves immediately (fix: cycling required before Process Frame saw new state)
 """CorridorKey Preview Viewer — two modes.
 
 MODE 1 (one-shot, back-compat with Resolve's existing flow):
@@ -699,6 +699,9 @@ class PersistentWindow(QtWidgets.QWidget):
             "QCheckBox::indicator:checked { background: #0ff; border-color: #0ff; }"
         )
         self.despeckle_cb.toggled.connect(self._on_despeckle_toggled)
+        # setChecked() above fired before signal was connected, so handler never ran.
+        # Defer one event loop tick to sync initial state without double-rendering at startup.
+        QtCore.QTimer.singleShot(0, lambda: self._on_despeckle_toggled(self.despeckle_cb.isChecked()))
         grid.addWidget(self.despeckle_cb, 1, 0)
         self.despeckle_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.despeckle_slider.setRange(50, 2000)
@@ -743,7 +746,7 @@ class PersistentWindow(QtWidgets.QWidget):
         self._params["despeckle"] = bool(checked)
         self.despeckle_slider.setEnabled(checked)
         self._render_now()
-        self._schedule_save()
+        self._save_live_params_now()  # checkbox is discrete — save immediately so Process Frame sees it
 
     # WHAT IT DOES: Despeckle size slider (50-2000 px area threshold). Updates
     #   the params dict, shows the integer in the label, repaints.
@@ -1061,6 +1064,13 @@ class PersistentWindow(QtWidgets.QWidget):
     # AFFECTS: self._sam_display_pts emptied, status updated, right pane repainted.
     def _clear_sam_points(self):
         self._sam_display_pts = []
+        # Also remove the persistent gate so Process Frame doesn't use a stale mask
+        try:
+            sam2_mask_path = self.session.session_dir / "sam2_mask.png"
+            if sam2_mask_path.exists():
+                sam2_mask_path.unlink()
+        except Exception:
+            pass
         self.status.setText("Points cleared")
         self._repaint_both()
 
@@ -1110,10 +1120,17 @@ class PersistentWindow(QtWidgets.QWidget):
                 torch.cuda.empty_cache()
             best = masks[int(np.argmax(scores))].astype(np.float32)
             alpha_u8 = (best * 255).astype(np.uint8)
+            # Write alpha.png for viewer display (session.reload_pngs reads it)
             alpha_path = self.session.session_dir / "alpha.png"
             tmp_path   = self.session.session_dir / "alpha.tmp.png"
             cv2.imwrite(str(tmp_path), alpha_u8)
             os.replace(str(tmp_path), str(alpha_path))
+            # Write sam2_mask.png as the permanent gate for the panel's Process Frame.
+            # alpha.png gets overwritten when Preview Frame re-runs; sam2_mask.png does not.
+            sam2_mask_path = self.session.session_dir / "sam2_mask.png"
+            sam2_tmp_path  = self.session.session_dir / "sam2_mask.tmp.png"
+            cv2.imwrite(str(sam2_tmp_path), alpha_u8)
+            os.replace(str(sam2_tmp_path), str(sam2_mask_path))
             self.session.reload_pngs()
             # Keep points visible so the user can add/refine and re-apply —
             # each predict() takes ALL current points, so wiping them here
