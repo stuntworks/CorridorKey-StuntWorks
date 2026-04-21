@@ -204,6 +204,13 @@ winLayout = ui.VGroup({"Spacing": 14}, [
         ui.ComboBox({"ID": "ScreenType", "Weight": 2}),
     ]),
     ui.HGroup({"Weight": 0, "Spacing": 8}, [
+        ui.Label({"Text": "Refiner:", "Weight": 0}),
+        ui.SpinBox({"ID": "RefinerStrength", "Minimum": 0, "Maximum": 100, "Value": 100, "Weight": 1,
+                    "StyleSheet": "background: #222; color: #ccc; border: 1px solid #444; border-radius: 3px;"}),
+        ui.Label({"Text": "%  (edge detail — re-key required when changed)", "Weight": 2,
+                  "StyleSheet": "color: #556; font-size: 10px;"}),
+    ]),
+    ui.HGroup({"Weight": 0, "Spacing": 8}, [
         ui.Label({"Text": "SAM2 Margin:", "Weight": 0, "StyleSheet": "color: #aaa; font-size: 11px;"}),
         ui.SpinBox({"ID": "Sam2Margin", "Minimum": 0, "Maximum": 80, "Value": 20, "Weight": 1,
                     "StyleSheet": "background: #222; color: #ccc; border: 1px solid #444; border-radius: 3px;"}),
@@ -315,7 +322,7 @@ def get_settings():
         "alpha_method": items["AlphaMethod"].CurrentIndex,
         "screen_type": "green" if items["ScreenType"].CurrentIndex == 0 else "blue",
         "despill_strength": 0.5,    # viewer-owned; overridden by _merge_live_params
-        "refiner_strength": 1.0,    # viewer-owned; overridden by _merge_live_params
+        "refiner_strength": max(0.0, min(1.0, int(items["RefinerStrength"].Value) / 100.0)),
         "despeckle_enabled": True,  # viewer-owned; overridden by _merge_live_params — default ON matches viewer checkbox default
         "despeckle_size": 400,      # viewer-owned; overridden by _merge_live_params
         "export_format": items["ExportFormat"].CurrentIndex,
