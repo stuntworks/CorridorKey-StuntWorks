@@ -1,4 +1,4 @@
-# Last modified: 2026-04-23 | Change: BRAW fallback rewired — SetCurrentTimecode seek replaces per-frame temp timeline creation (no mouse steal/blink); _export_braw_range_to_frames gains timeline/in_f/fps params; OOM fix (on-demand TIFF decode) | Full history: git log
+# Last modified: 2026-04-24 | Change: sliders; progress bar fills + frame count text; SAM2→"Click to Mask" rename; hint text readable; Resolve shutdown hang fix | Full history: git log
 """CorridorKey Pro - Neural Green Screen for DaVinci Resolve
 Enhanced with SAM2 Click-to-Mask, Frame Range, Export Modes
 
@@ -186,6 +186,10 @@ def _cleanup_on_exit():
             _viewer_proc = None
     except Exception:
         pass
+    # Skip CUDA/torch finalizers — they block 30-60 s on Windows when Resolve terminates
+    # the Python session without first firing the window Close event.
+    # This handles the path where on_close never ran (crash, force-quit, Resolve killed first).
+    os._exit(0)
 atexit.register(_cleanup_on_exit)
 
 # Persistent settings — saved to temp folder so output path survives between sessions
@@ -212,26 +216,47 @@ winLayout = ui.VGroup({"Spacing": 14}, [
         ui.Label({"Text": "—", "Weight": 0, "StyleSheet": "color: #0ff; font-size: 14px; font-weight: bold;"}),
         ui.Button({"ID": "HeaderSW", "Text": "StuntWorks Action Cinema", "Weight": 1, "StyleSheet": "QPushButton { background: transparent; color: #0ff; font-size: 14px; font-weight: bold; border: none; padding: 2px; } QPushButton:hover { color: #5ff; }"}),
     ]),
+    ui.HGroup({"Weight": 0, "Spacing": 4}, [
+        ui.Button({"ID": "YouTubeBtn", "Text": "▶ YouTube", "Weight": 1, "StyleSheet": "QPushButton { background-color: #1a1a1a; color: #cc3300; font-size: 11px; font-weight: bold; border-radius: 4px; padding: 4px; border: 1px solid #cc3300; } QPushButton:hover { background-color: #cc3300; color: #fff; }"}),
+        ui.Button({"ID": "KofiBtn", "Text": "☕ Ko-fi", "Weight": 1, "StyleSheet": "QPushButton { background-color: #1a1a1a; color: #FF5E5B; font-size: 11px; font-weight: bold; border-radius: 4px; padding: 4px; border: 1px solid #FF5E5B; } QPushButton:hover { background-color: #FF5E5B; color: #fff; }"}),
+        ui.Button({"ID": "AboutBtn", "Text": "About", "Weight": 1, "StyleSheet": "QPushButton { background-color: #1a1a1a; color: #888; font-size: 11px; border-radius: 4px; padding: 4px; } QPushButton:hover { background-color: #444; color: #fff; }"}),
+    ]),
     ui.HGroup({"Weight": 0, "Spacing": 8}, [
         ui.Label({"Text": "Mask Mode:", "Weight": 0}),
         ui.ComboBox({"ID": "AlphaMethod", "Weight": 2}),
         ui.Label({"Text": "Screen:", "Weight": 0}),
         ui.ComboBox({"ID": "ScreenType", "Weight": 2}),
     ]),
-    ui.HGroup({"Weight": 0, "Spacing": 8}, [
+    ui.HGroup({"Weight": 0, "Spacing": 6}, [
         ui.Label({"Text": "Refiner:", "Weight": 0}),
-        ui.SpinBox({"ID": "RefinerStrength", "Minimum": 0, "Maximum": 100, "Value": 100, "Weight": 1,
-                    "StyleSheet": "background: #222; color: #ccc; border: 1px solid #444; border-radius: 3px;"}),
-        ui.Label({"Text": "%  (edge detail — re-key required when changed)", "Weight": 2,
-                  "StyleSheet": "color: #556; font-size: 10px;"}),
+        ui.Slider({"ID": "RefinerStrength", "Minimum": 0, "Maximum": 100, "Value": 100, "Weight": 3,
+                   "Orientation": "Horizontal", "SingleStep": 1}),
+        ui.SpinBox({"ID": "RefinerInput", "Minimum": 0, "Maximum": 100, "Value": 100, "Weight": 0,
+                    "StyleSheet": "background: #222; color: #ccc; border: 1px solid #444; border-radius: 3px; max-width: 48px;"}),
+        ui.Label({"Text": "%", "Weight": 0, "StyleSheet": "color: #888; font-size: 11px;"}),
     ]),
-    ui.HGroup({"Weight": 0, "Spacing": 8}, [
-        ui.Label({"Text": "SAM2 Margin:", "Weight": 0, "StyleSheet": "color: #aaa; font-size: 11px;"}),
-        ui.SpinBox({"ID": "Sam2Margin", "Minimum": 0, "Maximum": 80, "Value": 20, "Weight": 1,
-                    "StyleSheet": "background: #222; color: #ccc; border: 1px solid #444; border-radius: 3px;"}),
-        ui.Label({"Text": "px  (expand SAM2 mask so keyer handles edges)", "Weight": 2,
-                  "StyleSheet": "color: #556; font-size: 10px;"}),
+    ui.Label({"Text": "Edge detail. Re-run Process Range after changing.", "Weight": 0,
+              "StyleSheet": "color: #888; font-size: 10px; padding-left: 2px;"}),
+    ui.HGroup({"Weight": 0, "Spacing": 6}, [
+        ui.Label({"Text": "Mask Margin:", "Weight": 0, "StyleSheet": "color: #aaa; font-size: 11px;"}),
+        ui.Slider({"ID": "Sam2Margin", "Minimum": 0, "Maximum": 80, "Value": 5, "Weight": 3,
+                   "Orientation": "Horizontal", "SingleStep": 1}),
+        ui.SpinBox({"ID": "Sam2MarginInput", "Minimum": 0, "Maximum": 80, "Value": 5, "Weight": 0,
+                    "StyleSheet": "background: #222; color: #ccc; border: 1px solid #444; border-radius: 3px; max-width: 48px;"}),
+        ui.Label({"Text": "px", "Weight": 0, "StyleSheet": "color: #888; font-size: 11px;"}),
     ]),
+    ui.Label({"Text": "Mask Adjustments — controls how tight or loose the mask fits the subject.", "Weight": 0,
+              "StyleSheet": "color: #888; font-size: 10px; padding-left: 2px;"}),
+    ui.HGroup({"Weight": 0, "Spacing": 6}, [
+        ui.Label({"Text": "Soften:", "Weight": 0, "StyleSheet": "color: #aaa; font-size: 11px;"}),
+        ui.Slider({"ID": "Sam2Soften", "Minimum": 0, "Maximum": 20, "Value": 0, "Weight": 3,
+                   "Orientation": "Horizontal", "SingleStep": 1}),
+        ui.SpinBox({"ID": "Sam2SoftenInput", "Minimum": 0, "Maximum": 20, "Value": 0, "Weight": 0,
+                    "StyleSheet": "background: #222; color: #ccc; border: 1px solid #444; border-radius: 3px; max-width: 48px;"}),
+        ui.Label({"Text": "px", "Weight": 0, "StyleSheet": "color: #888; font-size: 11px;"}),
+    ]),
+    ui.Label({"Text": "Feathers the mask edge — 0 is sharp, higher values create a soft fade.", "Weight": 0,
+              "StyleSheet": "color: #888; font-size: 10px; padding-left: 2px;"}),
     ui.HGroup({"Weight": 0, "Spacing": 5}, [
         ui.Label({"Text": "Export:", "Weight": 0}),
         ui.ComboBox({"ID": "ExportFormat", "Weight": 2}),
@@ -263,14 +288,14 @@ winLayout = ui.VGroup({"Spacing": 14}, [
     ui.Label({"ID": "Status", "Text": "Ready", "Weight": 0, "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #0FF; font-size: 14px; font-weight: bold;"}),
     ui.VGap(4),
     ui.Label({"ID": "Progress", "Text": "", "Weight": 0,
-        "StyleSheet": "background: #111; border: 1px solid #333; border-radius: 4px; min-height: 12px; max-height: 12px;"}),
+        "StyleSheet": "background: #111; border: 1px solid #333; border-radius: 4px; min-height: 20px; max-height: 20px; color: #fff; font-size: 10px;"}),
     ui.VGap(2),
     ui.HGroup({"Weight": 0, "Spacing": 5}, [
         ui.Button({"ID": "ShowPreview", "Text": "PREVIEW", "Weight": 1, "StyleSheet": "QPushButton { background-color: #1a3a4a; color: #5df; font-weight: bold; border-radius: 5px; padding: 6px; border: 1px solid #5df; }"}),
         ui.Button({"ID": "ProcessFrame", "Text": "SINGLE FRAME", "Weight": 1, "StyleSheet": "QPushButton { background-color: #1a3a5a; color: #5af; font-weight: bold; border-radius: 5px; padding: 6px; border: 1px solid #5af; }"}),
     ]),
-    ui.Label({"Text": "SAM2 garbage matte: click PREVIEW → CLICK TO MASK in viewer", "Weight": 0,
-              "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #556; font-size: 10px;"}),
+    ui.Label({"Text": "Click to Mask: open Preview → paint the person to isolate them", "Weight": 0,
+              "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #888; font-size: 10px;"}),
     ui.VGap(2),
     ui.Button({"ID": "ProcessRange", "Text": "PROCESS RANGE", "Weight": 0, "StyleSheet": "QPushButton { background-color: #1a4a2a; color: #5b5; font-size: 15px; font-weight: bold; border-radius: 6px; padding: 10px; border: 1px solid #5b5; }"}),
     ui.Button({"ID": "Cancel", "Text": "CANCEL", "Weight": 0, "StyleSheet": "QPushButton { background-color: #4a1a1a; color: #f66; font-weight: bold; border-radius: 5px; padding: 4px; border: 1px solid #f66; }"}),
@@ -281,12 +306,7 @@ winLayout = ui.VGroup({"Spacing": 14}, [
     ]),
     ui.VGap(2),
     ui.TextEdit({"ID": "Log", "ReadOnly": True, "Weight": 3, "StyleSheet": "background: #111; color: #0ff; font-family: monospace; font-size: 10px; border-radius: 4px; border: 1px solid #222;"}),
-    ui.HGroup({"Weight": 0, "Spacing": 6}, [
-        ui.Button({"ID": "YouTubeBtn", "Text": "▶ YouTube", "Weight": 1, "StyleSheet": "QPushButton { background-color: #1a1a1a; color: #cc3300; font-size: 11px; font-weight: bold; border-radius: 4px; padding: 3px; border: 1px solid #cc3300; }"}),
-        ui.Button({"ID": "KofiBtn", "Text": "☕ Ko-fi", "Weight": 1, "StyleSheet": "QPushButton { background-color: #1a1a1a; color: #FF5E5B; font-size: 11px; font-weight: bold; border-radius: 4px; padding: 3px; border: 1px solid #FF5E5B; }"}),
-        ui.Button({"ID": "AboutBtn", "Text": "About", "Weight": 1, "StyleSheet": "QPushButton { background-color: #1a1a1a; color: #556; font-size: 11px; border-radius: 4px; padding: 3px; }"}),
-    ]),
-    ui.Label({"Text": "AI: Niko Pueringer / Corridor Digital  •  Plugin: Roberto & Elvis Lopez / StuntWorks", "Weight": 0, "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #334; font-size: 10px;"}),
+    ui.Label({"Text": "AI: Niko Pueringer / Corridor Digital  •  Plugin: Roberto & Elvis Lopez / StuntWorks", "Weight": 0, "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #666; font-size: 10px;"}),
     ui.VGap(4),
     ui.Timer({"ID": "PollTimer", "Interval": 500}),
     ui.HGroup({"Weight": 0, "Spacing": 8}, [
@@ -386,6 +406,7 @@ def get_settings():
         "export_format": items["ExportFormat"].CurrentIndex,
         "output_mode": items["OutputMode"].CurrentIndex,
         "sam2_margin": int(items["Sam2Margin"].Value),
+        "sam2_soften": int(items["Sam2Soften"].Value),
     }
 
 # WHAT IT DOES: Overrides panel's despill / despeckle settings with the v2 viewer's
@@ -499,7 +520,7 @@ def on_browse_output(ev):
 # AFFECTS: Every garbage-matte multiply in generate_alpha_hint() and the range loop.
 # DANGER ZONE FRAGILE/MEDIUM: Increase margin on 4K+ footage (pixel count scales up).
 #   Too small = edge clipping. Too large = garbage matte stops blocking junk BG.
-SAM2_MATTE_MARGIN = 20  # default; overridden at runtime by Sam2Margin spinner
+SAM2_MATTE_MARGIN = 5  # default; overridden at runtime by Sam2Margin slider
 
 def _dilate_sam2_mask(mask_float32, margin=SAM2_MATTE_MARGIN):
     import cv2, numpy as np
@@ -510,6 +531,20 @@ def _dilate_sam2_mask(mask_float32, margin=SAM2_MATTE_MARGIN):
     mask_u8 = (mask_float32 * 255).astype(np.uint8)
     dilated = cv2.dilate(mask_u8, kernel, iterations=1)
     return dilated.astype(np.float32) / 255.0
+
+# WHAT IT DOES: Applies Gaussian blur to the mask boundary to create a soft feathered
+#   edge instead of a hard pixel cut. Runs AFTER dilation so the safety buffer is
+#   already in place before softening. soften=0 skips entirely (no-op).
+# DEPENDS-ON: cv2
+# AFFECTS: mask boundary softness — higher values create wider, softer transitions
+def _soften_sam2_mask(mask_float32, soften=0):
+    import cv2, numpy as np
+    if soften <= 0:
+        return mask_float32
+    # Kernel must be odd — multiply by 2+1 so soften=1 → 3px, soften=5 → 11px, etc.
+    sz = soften * 2 + 1
+    blurred = cv2.GaussianBlur(mask_float32, (sz, sz), sigmaX=soften * 0.5)
+    return blurred
 
 
 # WHAT IT DOES: Generates a chroma-key alpha hint for the neural keyer.
@@ -552,6 +587,7 @@ def _load_sam2_output_gate(frame_shape, settings):
         raw = cv2.resize(raw, (w, h), interpolation=cv2.INTER_NEAREST)
     mask = raw.astype(np.float32) / 255.0
     mask = _dilate_sam2_mask(mask, margin=settings.get("sam2_margin", SAM2_MATTE_MARGIN))
+    mask = _soften_sam2_mask(mask, soften=settings.get("sam2_soften", 0))
     log(f"SAM2 output gate loaded — coverage {mask.mean():.3f} ({int(mask.sum())} px foreground)")
     return mask
 
@@ -1835,29 +1871,54 @@ def on_process_range(ev):
             pr = 0
             st = time.time()
             try:
-                items["Progress"].StyleSheet = "background: #111; border: 1px solid #333; border-radius: 4px; min-height: 12px; max-height: 12px;"
+                items["Progress"].StyleSheet = "background: #111; border: 1px solid #333; border-radius: 4px; min-height: 20px; max-height: 20px; color: #888; font-size: 10px;"
+                items["Progress"].Text = f"  0 / {dur} frames"
                 items["Progress"].Visible = True
             except Exception: pass
-            # WHAT IT DOES: Loads SAM2 garbage matte gate once for the whole BRAW range.
-            #   Applied per-frame inside the loop. BRAW never reaches _run() so the gate
-            #   must be loaded here on the synchronous path.
-            # DEPENDS-ON: _load_sam2_output_gate(), _braw_tif_buffers[0] for shape detection
+            # WHAT IT DOES: Run SAM2 video propagation for BRAW — one tracking mask per frame.
+            #   Falls back to static gate if propagation returns nothing (e.g. no dots placed,
+            #   or Resolve restart wiped sam_points but sam2_mask.png still exists on disk).
+            #   BRAW never reaches _run() so propagation must happen here on the sync path.
+            # DEPENDS-ON: run_sam2_video_propagation(), braw_frames_dir, sam_points
+            #   _load_sam2_output_gate(), _braw_tif_buffers[0] for static gate shape detection
             # AFFECTS: mt (alpha) for every frame in this BRAW range
+            # DANGER ZONE HIGH: runs on main thread — blocks Fusion event loop during propagation.
+            #   Acceptable because BRAW sync path already blocks during frame export and NN processing.
+            _braw_sam2_video_masks = {}
             _braw_sam2_gate = None
             if settings.get("alpha_method") == 1:
-                try:
-                    _braw_tif_buffers[0].seek(0)
-                    _shape_pil = _PILImage.open(_braw_tif_buffers[0]).convert("RGB")
-                    _shape_arr = np.array(_shape_pil)
-                    _braw_tif_buffers[0].seek(0)
-                    _braw_sam2_gate = _load_sam2_output_gate(_shape_arr.shape, settings)
-                    del _shape_arr, _shape_pil
-                    if _braw_sam2_gate is not None:
-                        log(f"SAM2 static gate loaded for BRAW — applying to all {dur} frames")
-                    else:
-                        log("SAM2 gate: not loaded (file missing or alpha_method mismatch)")
-                except Exception as _ge:
-                    log(f"SAM2 gate load failed: {_ge}")
+                pos = sam_points.get("positive", [])
+                neg = sam_points.get("negative", [])
+                if (pos or neg) and braw_frames_dir:
+                    try:
+                        _anchor_abs = sam_points.get("frame")
+                        _anchor_in_tif = (_anchor_abs - in_f) if _anchor_abs is not None else None
+                        status("SAM2: running video propagation for BRAW range...")
+                        _braw_sam2_video_masks = run_sam2_video_propagation(
+                            braw_frames_dir, 0, 0, 0, dur,
+                            pos, neg, _anchor_in_tif,
+                        )
+                        if _braw_sam2_video_masks:
+                            log(f"SAM2 video propagation: {len(_braw_sam2_video_masks)} per-frame masks ready")
+                        else:
+                            log("SAM2 video propagation returned no masks — trying static gate fallback")
+                    except Exception as _se:
+                        log(f"SAM2 video propagation failed: {_se}")
+                        log(traceback.format_exc())
+                if not _braw_sam2_video_masks:
+                    try:
+                        _braw_tif_buffers[0].seek(0)
+                        _shape_pil = _PILImage.open(_braw_tif_buffers[0]).convert("RGB")
+                        _shape_arr = np.array(_shape_pil)
+                        _braw_tif_buffers[0].seek(0)
+                        _braw_sam2_gate = _load_sam2_output_gate(_shape_arr.shape, settings)
+                        del _shape_arr, _shape_pil
+                        if _braw_sam2_gate is not None:
+                            log(f"SAM2 static gate loaded for BRAW — applying to all {dur} frames")
+                        else:
+                            log("SAM2 gate: not loaded (file missing or alpha_method mismatch)")
+                    except Exception as _ge:
+                        log(f"SAM2 gate load failed: {_ge}")
 
             for fidx, _buf in enumerate(_braw_tif_buffers):
                 if processing_cancelled:
@@ -1880,21 +1941,27 @@ def on_process_range(ev):
                     log(f"  Decode frame {fidx} failed: {_fde} — skipping")
                     pr += 1
                     continue
-                status(f"{pr+1}/{dur}...")
+                status(f"Keying frame {pr+1} of {dur}...")
                 chroma_float = chroma_hint_gen.generate_hint(frame).astype(np.float32) / 255.0
                 fr = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
                 res = proc.process_frame(fr, chroma_float, ps)
                 fg, mt = res.get("fg"), res.get("alpha")
                 if _despill_str > 0 and fg is not None:
                     fg = _cu.despill_opencv(fg, green_limit_mode="average", strength=_despill_str)
-                # Apply SAM2 garbage matte gate to BRAW frame
-                # WHAT IT DOES: Multiplies the NN alpha by the pre-loaded SAM2 gate mask,
-                #   zeroing out pixels outside the SAM2-painted region.
-                # DEPENDS-ON: _braw_sam2_gate (loaded above before loop), mt from proc
+                # Apply SAM2 matte to BRAW frame — per-frame tracking mask (propagation)
+                # preferred over static gate; static gate used only as fallback.
+                # WHAT IT DOES: Multiplies NN alpha by SAM2 mask for this frame.
+                # DEPENDS-ON: _braw_sam2_video_masks (propagation), _braw_sam2_gate (fallback)
                 # AFFECTS: mt for this frame only
-                if _braw_sam2_gate is not None and mt is not None:
-                    _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
-                    mt = _mt2d * _braw_sam2_gate
+                if mt is not None:
+                    if _braw_sam2_video_masks and fidx in _braw_sam2_video_masks:
+                        _gate = _dilate_sam2_mask(_braw_sam2_video_masks[fidx], margin=settings.get("sam2_margin", SAM2_MATTE_MARGIN))
+                        _gate = _soften_sam2_mask(_gate, soften=settings.get("sam2_soften", 0))
+                        _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
+                        mt = _mt2d * _gate
+                    elif _braw_sam2_gate is not None:
+                        _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
+                        mt = _mt2d * _braw_sam2_gate
                 choke_px = int(settings.get("choke", 0))
                 if choke_px > 0 and mt is not None:
                     _k = choke_px * 2 + 1
@@ -1911,6 +1978,31 @@ def on_process_range(ev):
                 el = time.time() - st
                 fpsr = pr / el if el > 0 else 0
                 log(f"{pr}/{dur} ({fpsr:.1f}fps)")
+                # Update progress bar on the main thread — BRAW sync path never goes through _ui_queue.
+                try:
+                    _bp = max(0.0, min(1.0, pr / dur)) if dur else 0.0
+                    if _bp >= 1.0:
+                        _bss = "background: #00ffff; border: 1px solid #333; border-radius: 4px; min-height: 20px; max-height: 20px; color: #111; font-size: 10px;"
+                    else:
+                        _bss = (f"background: qlineargradient(x1:0, y1:0, x2:1, y2:0, "
+                                f"stop:0 #00cccc, stop:{_bp:.3f} #00cccc, "
+                                f"stop:{_bp:.3f} #1a1a1a, stop:1 #1a1a1a); "
+                                f"border: 1px solid #333; border-radius: 4px; min-height: 20px; max-height: 20px; color: #fff; font-size: 10px;")
+                    items["Progress"].StyleSheet = _bss
+                    items["Progress"].Text = f"  {pr} / {dur} frames"
+                    # Force Qt to repaint now — sync path blocks the event loop so without
+                    # this the bar only shows its final state after all frames are done.
+                    try:
+                        from PyQt5.QtWidgets import QApplication as _QApp
+                        _QApp.processEvents()
+                    except Exception:
+                        try:
+                            from PySide2.QtWidgets import QApplication as _QApp
+                            _QApp.processEvents()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
             el = time.time() - st
             log(f"Done: {len(ofs)} frames in {el:.1f}s")
             try: items["Progress"].Visible = False
@@ -2072,6 +2164,7 @@ def on_process_range(ev):
                     if sam2_video_masks and range_idx in sam2_video_masks:
                         # Normal path — per-frame mask from video propagation.
                         _gate = _dilate_sam2_mask(sam2_video_masks[range_idx], margin=settings.get("sam2_margin", SAM2_MATTE_MARGIN))
+                        _gate = _soften_sam2_mask(_gate, soften=settings.get("sam2_soften", 0))
                         _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
                         mt = _mt2d * _gate
                     else:
@@ -2195,16 +2288,18 @@ def on_poll_timer(ev):
                     else:
                         try:
                             pct = max(0.0, min(1.0, msg / 100.0))
+                            txt = f"  {int(pct * 100)}%"
                             if pct >= 1.0:
-                                ss = "background: #00ffff; border: 1px solid #333; border-radius: 4px; min-height: 12px; max-height: 12px;"
+                                ss = "background: #00ffff; border: 1px solid #333; border-radius: 4px; min-height: 20px; max-height: 20px; color: #111; font-size: 10px;"
                             elif pct <= 0.0:
-                                ss = "background: #111; border: 1px solid #333; border-radius: 4px; min-height: 12px; max-height: 12px;"
+                                ss = "background: #111; border: 1px solid #333; border-radius: 4px; min-height: 20px; max-height: 20px; color: #888; font-size: 10px;"
                             else:
                                 ss = (f"background: qlineargradient(x1:0, y1:0, x2:1, y2:0, "
                                       f"stop:0 #00cccc, stop:{pct:.3f} #00cccc, "
                                       f"stop:{pct:.3f} #1a1a1a, stop:1 #1a1a1a); "
-                                      f"border: 1px solid #333; border-radius: 4px; min-height: 12px; max-height: 12px;")
+                                      f"border: 1px solid #333; border-radius: 4px; min-height: 20px; max-height: 20px; color: #fff; font-size: 10px;")
                             items["Progress"].StyleSheet = ss
+                            items["Progress"].Text = txt
                             items["Progress"].Visible = True
                         except Exception: pass
                 elif kind == "probe":
@@ -2332,7 +2427,11 @@ def on_close(ev):
     except Exception: pass
     try: _INSTANCE_LOCK.unlink(missing_ok=True)
     except: pass
-    disp.ExitLoop()
+    # Exit immediately — do NOT call disp.ExitLoop() and wait for RunLoop to unwind.
+    # When Resolve is mid-shutdown, win.Hide() (called after RunLoop returns) blocks
+    # indefinitely on a window with no valid Fusion context, causing the Task Manager hang.
+    # os._exit skips all Python/CUDA finalizers — Windows reclaims GPU memory on process death.
+    os._exit(0)
 
 win.On.SetInPoint.Clicked = on_set_in_point
 win.On.SetOutPoint.Clicked = on_set_out_point
@@ -2367,6 +2466,71 @@ def on_kill_viewer(ev):
 win.On.KillViewer.Clicked = on_kill_viewer
 win.On.ClosePanel.Clicked = lambda ev: on_close(ev)
 win.On.PollTimer.Timeout = on_poll_timer
+
+# WHAT IT DOES: Keeps the slider and spinbox in sync for Refiner and Mask Margin.
+#   Guards prevent infinite loops when one updates the other.
+# DEPENDS-ON: items["RefinerStrength"], items["RefinerInput"],
+#   items["Sam2Margin"], items["Sam2MarginInput"]
+# AFFECTS: display and the value actually read at process time (slider.Value)
+_syncing_refiner = False
+_syncing_margin  = False
+
+def on_refiner_changed(ev):
+    global _syncing_refiner
+    if _syncing_refiner: return
+    _syncing_refiner = True
+    try: items["RefinerInput"].Value = items["RefinerStrength"].Value
+    except Exception: pass
+    _syncing_refiner = False
+
+def on_refiner_input(ev):
+    global _syncing_refiner
+    if _syncing_refiner: return
+    _syncing_refiner = True
+    try: items["RefinerStrength"].Value = items["RefinerInput"].Value
+    except Exception: pass
+    _syncing_refiner = False
+
+def on_sam2_margin_changed(ev):
+    global _syncing_margin
+    if _syncing_margin: return
+    _syncing_margin = True
+    try: items["Sam2MarginInput"].Value = items["Sam2Margin"].Value
+    except Exception: pass
+    _syncing_margin = False
+
+def on_sam2_margin_input(ev):
+    global _syncing_margin
+    if _syncing_margin: return
+    _syncing_margin = True
+    try: items["Sam2Margin"].Value = items["Sam2MarginInput"].Value
+    except Exception: pass
+    _syncing_margin = False
+
+win.On.RefinerStrength.ValueChanged  = on_refiner_changed
+win.On.RefinerInput.ValueChanged     = on_refiner_input
+win.On.Sam2Margin.ValueChanged       = on_sam2_margin_changed
+win.On.Sam2MarginInput.ValueChanged  = on_sam2_margin_input
+
+_syncing_soften = False
+def on_soften_changed(ev):
+    global _syncing_soften
+    if _syncing_soften: return
+    _syncing_soften = True
+    try: items["Sam2SoftenInput"].Value = items["Sam2Soften"].Value
+    except Exception: pass
+    _syncing_soften = False
+
+def on_soften_input(ev):
+    global _syncing_soften
+    if _syncing_soften: return
+    _syncing_soften = True
+    try: items["Sam2Soften"].Value = items["Sam2SoftenInput"].Value
+    except Exception: pass
+    _syncing_soften = False
+
+win.On.Sam2Soften.ValueChanged      = on_soften_changed
+win.On.Sam2SoftenInput.ValueChanged = on_soften_input
 
 # WHAT IT DOES: Shows the About dialog with credits, how-to-use guide, and Ko-fi link.
 #   Credits Niko Pueringer/Corridor Digital (engine) and Roberto+Elvis Lopez/StuntWorks (plugin).
