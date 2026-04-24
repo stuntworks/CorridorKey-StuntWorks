@@ -1852,6 +1852,27 @@ def on_process_range(ev):
                 items["Progress"].StyleSheet = "background: #111; border: 1px solid #333; border-radius: 4px; min-height: 12px; max-height: 12px;"
                 items["Progress"].Visible = True
             except Exception: pass
+            # WHAT IT DOES: Loads SAM2 garbage matte gate once for the whole BRAW range.
+            #   Applied per-frame inside the loop. BRAW never reaches _run() so the gate
+            #   must be loaded here on the synchronous path.
+            # DEPENDS-ON: _load_sam2_output_gate(), _braw_tif_buffers[0] for shape detection
+            # AFFECTS: mt (alpha) for every frame in this BRAW range
+            _braw_sam2_gate = None
+            if settings.get("alpha_method") == 1:
+                try:
+                    _braw_tif_buffers[0].seek(0)
+                    _shape_pil = _PILImage.open(_braw_tif_buffers[0]).convert("RGB")
+                    _shape_arr = np.array(_shape_pil)
+                    _braw_tif_buffers[0].seek(0)
+                    _braw_sam2_gate = _load_sam2_output_gate(_shape_arr.shape, settings)
+                    del _shape_arr, _shape_pil
+                    if _braw_sam2_gate is not None:
+                        log(f"SAM2 static gate loaded for BRAW — applying to all {dur} frames")
+                    else:
+                        log("SAM2 gate: not loaded (file missing or alpha_method mismatch)")
+                except Exception as _ge:
+                    log(f"SAM2 gate load failed: {_ge}")
+
             for fidx, _buf in enumerate(_braw_tif_buffers):
                 if processing_cancelled:
                     log(f"Cancelled at frame {pr}/{dur}")
@@ -1880,6 +1901,14 @@ def on_process_range(ev):
                 fg, mt = res.get("fg"), res.get("alpha")
                 if _despill_str > 0 and fg is not None:
                     fg = _cu.despill_opencv(fg, green_limit_mode="average", strength=_despill_str)
+                # Apply SAM2 garbage matte gate to BRAW frame
+                # WHAT IT DOES: Multiplies the NN alpha by the pre-loaded SAM2 gate mask,
+                #   zeroing out pixels outside the SAM2-painted region.
+                # DEPENDS-ON: _braw_sam2_gate (loaded above before loop), mt from proc
+                # AFFECTS: mt for this frame only
+                if _braw_sam2_gate is not None and mt is not None:
+                    _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
+                    mt = _mt2d * _braw_sam2_gate
                 choke_px = int(settings.get("choke", 0))
                 if choke_px > 0 and mt is not None:
                     _k = choke_px * 2 + 1
