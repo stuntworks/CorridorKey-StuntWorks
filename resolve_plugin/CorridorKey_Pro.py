@@ -1978,6 +1978,17 @@ def on_process_range(ev):
                 else:
                     _tlog("SAM2 propagation returned no masks — falling back to chroma hint")
 
+            # WHAT IT DOES: Static SAM2 gate fallback — if video propagation was skipped because
+            #   sam_points lost on Resolve restart, but sam2_mask.png still exists on disk,
+            #   load one mask on the first rendered frame and stamp it on every frame in the range.
+            # DEPENDS-ON: _load_sam2_output_gate, sam2_video_masks, settings["alpha_method"]
+            # AFFECTS: _static_sam2_gate applied per-frame in the render loop below.
+            # DANGER ZONE: HIGH — gate is loaded lazily (first frame) to get real frame_shape.
+            #   breaks: if sam2_mask.png resolution differs wildly from source frames AND cv2.resize
+            #   produces a bad result (e.g. rotated media); depends on: SESSION_DIR/sam2_mask.png
+            _static_sam2_gate = None          # populated on first frame if needed
+            _static_sam2_gate_loaded = False  # guard so we only attempt once
+
             # For BRAW: read TIFF files from braw_frames_dir (4:4:4, no seeking needed).
             # For normal files: seek with VideoCapture as before.
             cap = None
@@ -2036,10 +2047,29 @@ def on_process_range(ev):
                 fg, mt = res.get("fg"), res.get("alpha")
                 if _despill_str > 0 and fg is not None:
                     fg = _cu.despill_opencv(fg, green_limit_mode="average", strength=_despill_str)
-                if mt is not None and sam2_video_masks and range_idx in sam2_video_masks:
-                    _gate = _dilate_sam2_mask(sam2_video_masks[range_idx], margin=settings.get("sam2_margin", SAM2_MATTE_MARGIN))
-                    _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
-                    mt = _mt2d * _gate
+                # WHAT IT DOES: Apply SAM2 garbage matte to the keyed alpha for this frame.
+                #   Primary path: per-frame propagated mask from sam2_video_masks.
+                #   Fallback path: static sam2_mask.png loaded once and reused every frame —
+                #     handles Resolve-restart case where sam_points were lost but PNG still exists.
+                # DEPENDS-ON: sam2_video_masks, _static_sam2_gate, _load_sam2_output_gate
+                # AFFECTS: mt (alpha) — multiplied by gate, zeroing pixels outside the matte.
+                if mt is not None:
+                    if sam2_video_masks and range_idx in sam2_video_masks:
+                        # Normal path — per-frame mask from video propagation.
+                        _gate = _dilate_sam2_mask(sam2_video_masks[range_idx], margin=settings.get("sam2_margin", SAM2_MATTE_MARGIN))
+                        _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
+                        mt = _mt2d * _gate
+                    else:
+                        # Fallback path — static gate loaded lazily on first frame so we have
+                        # real frame.shape for the resize check inside _load_sam2_output_gate.
+                        if not _static_sam2_gate_loaded:
+                            _static_sam2_gate = _load_sam2_output_gate(frame.shape, settings)
+                            _static_sam2_gate_loaded = True
+                            if _static_sam2_gate is not None:
+                                _tlog("SAM2 static gate loaded — applying same mask to all range frames (no propagation)")
+                        if _static_sam2_gate is not None:
+                            _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
+                            mt = _mt2d * _static_sam2_gate
                 choke_px = int(settings.get("choke", 0))
                 if choke_px > 0 and mt is not None:
                     k = choke_px * 2 + 1
