@@ -1,4 +1,4 @@
-# Last modified: 2026-04-21 | Change: despeckle checkbox saves immediately (fix: cycling required before Process Frame saw new state)
+# Last modified: 2026-04-23 | Change: _live_watcher idle slowdown (50ms→500ms after 2s quiet); singleShot(0)→singleShot(16) in render finally block; HRCS audio-pop pressure reduction
 """CorridorKey Preview Viewer — two modes.
 
 MODE 1 (one-shot, back-compat with Resolve's existing flow):
@@ -311,6 +311,32 @@ def alpha_to_rgb_u8(alpha_float):
     return cv2.cvtColor(a, cv2.COLOR_GRAY2RGB)
 
 
+# WHAT IT DOES: QSlider that locks onto the click position immediately and tracks
+#   the mouse 1:1 during drag. Default QSlider moves in page steps toward the cursor
+#   instead of snapping — this replaces all three sliders in the panel.
+# DEPENDS-ON: QtWidgets, QtCore.
+# AFFECTS: nothing outside the slider widget itself.
+class JumpSlider(QtWidgets.QSlider):
+    def _value_from_pos(self, pos):
+        ratio = pos.x() / max(self.width() - 1, 1)
+        ratio = max(0.0, min(1.0, ratio))
+        return int(self.minimum() + ratio * (self.maximum() - self.minimum()) + 0.5)
+
+    def mousePressEvent(self, ev):
+        if ev.button() == QtCore.Qt.LeftButton:
+            self.setValue(self._value_from_pos(ev.pos()))
+            ev.accept()
+        else:
+            super().mousePressEvent(ev)
+
+    def mouseMoveEvent(self, ev):
+        if ev.buttons() & QtCore.Qt.LeftButton:
+            self.setValue(self._value_from_pos(ev.pos()))
+            ev.accept()
+        else:
+            super().mouseMoveEvent(ev)
+
+
 # ===== Persistent viewer window =====
 # WHAT IT DOES: Live-preview Qt widget. Two-up layout (original static, composite
 #   live). Re-renders the right pane on every stdin update by running stage-2
@@ -360,12 +386,25 @@ class PersistentWindow(QtWidgets.QWidget):
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(250)
         self._save_timer.timeout.connect(self._save_live_params_now)
+        # Throttle render: immediate on first drag event, then at most once per 60ms
+        # while still dragging. SingleShot restarts each cycle — stops automatically
+        # when no more events arrive.
+        self._render_timer = QtCore.QTimer(self)
+        self._render_timer.setSingleShot(True)
+        self._render_timer.setInterval(60)
+        self._render_timer.timeout.connect(self._on_render_throttle_tick)
+        self._render_pending = False
         self._suppress_poll_mtime = 0.0
         # Tracks the last time a LOCAL slider/checkbox fired. While within
         # 500ms of a local change we ignore file-poller updates — otherwise
         # the poller reads the old value from disk (before the 250ms debounced
         # save fires) and overrides the slider move, making sliders appear dead.
         self._local_change_time = 0.0
+        # Tracks last time ANY local activity happened (slider drag, checkbox,
+        # background switch). Used by the idle-slowdown logic in _poll_live_params
+        # to back off the poll interval from 50ms to 500ms after 2s of quiet.
+        # This reduces ASIO buffer pressure on Focusrite during inactive periods.
+        self._last_activity_time = time.perf_counter()
 
         # Zoom + pan state. Mouse wheel adjusts _zoom, drag-while-zoomed updates
         # _pan_x/_pan_y (fractional 0..1 center point). _paint_into crops the
@@ -416,6 +455,17 @@ class PersistentWindow(QtWidgets.QWidget):
         # NOTE: fg.png mtime polling was removed — reading a partially-written
         # PNG caused libpng crashes. Instead, the panel sends rekeying:false
         # AFTER cache finishes, so PNGs are guaranteed complete when we reload.
+
+        # ADAPTIVE POLL RATE — reduces ASIO buffer pressure on Focusrite during idle.
+        # After 2 seconds with no local activity, slow the poll from 50ms to 500ms.
+        # Any incoming update from disk resets the rate back to 50ms immediately.
+        # At 128-sample / 48kHz (2.7ms headroom), 20 polls/sec adds measurable
+        # scheduler jitter; 2 polls/sec is imperceptible.
+        idle_secs = time.perf_counter() - self._last_activity_time
+        desired_interval = 50 if idle_secs < 2.0 else 500
+        if self._live_watcher.interval() != desired_interval:
+            self._live_watcher.setInterval(desired_interval)
+
         try:
             mt = self._live_params_path.stat().st_mtime
         except FileNotFoundError:
@@ -443,6 +493,8 @@ class PersistentWindow(QtWidgets.QWidget):
         except Exception:
             # Partial write or transient — next tick will retry.
             return
+        # Disk update received — reset activity clock so poll snaps back to 50ms.
+        self._last_activity_time = time.perf_counter()
         self.on_update(params)
 
     def _build_ui(self):
@@ -679,7 +731,7 @@ class PersistentWindow(QtWidgets.QWidget):
 
         # --- Despill slider: 0-100 → 0.0-1.0 ---
         grid.addWidget(_label("DESPILL"), 0, 0)
-        self.despill_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.despill_slider = JumpSlider(QtCore.Qt.Horizontal)
         self.despill_slider.setRange(0, 100)
         self.despill_slider.setValue(int(self._params["despill"] * 100))
         self.despill_slider.valueChanged.connect(self._on_despill_slider_changed)
@@ -699,11 +751,12 @@ class PersistentWindow(QtWidgets.QWidget):
             "QCheckBox::indicator:checked { background: #0ff; border-color: #0ff; }"
         )
         self.despeckle_cb.toggled.connect(self._on_despeckle_toggled)
-        # setChecked() above fired before signal was connected, so handler never ran.
-        # Defer one event loop tick to sync initial state without double-rendering at startup.
-        QtCore.QTimer.singleShot(0, lambda: self._on_despeckle_toggled(self.despeckle_cb.isChecked()))
+        # FIX A-1: singleShot(0) removed — it raced with the 50ms live_params.json poll
+        # and caused the first render to use stale default params instead of saved values.
+        # The 300ms delayed render in _run_persistent (Fix A-2) handles the first paint
+        # after the poll has had time to load the correct params.
         grid.addWidget(self.despeckle_cb, 1, 0)
-        self.despeckle_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.despeckle_slider = JumpSlider(QtCore.Qt.Horizontal)
         self.despeckle_slider.setRange(50, 2000)
         self.despeckle_slider.setValue(int(self._params["despeckleSize"]))
         self.despeckle_slider.valueChanged.connect(self._on_despeckle_size_changed)
@@ -715,7 +768,7 @@ class PersistentWindow(QtWidgets.QWidget):
 
         # --- Choke slider: 0-20 px erosion to tighten soft/bloated matte edges ---
         grid.addWidget(_label("CHOKE"), 2, 0)
-        self.choke_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.choke_slider = JumpSlider(QtCore.Qt.Horizontal)
         self.choke_slider.setRange(0, 20)
         self.choke_slider.setValue(int(self._params["choke"]))
         self.choke_slider.valueChanged.connect(self._on_choke_changed)
@@ -735,7 +788,7 @@ class PersistentWindow(QtWidgets.QWidget):
         v = value / 100.0
         self._params["despill"] = v
         self.despill_value_label.setText(f"{v:.2f}")
-        self._render_now()
+        self._schedule_render()
         self._schedule_save()
 
     # WHAT IT DOES: Despeckle on/off checkbox. Toggles the boolean flag and enables
@@ -745,6 +798,8 @@ class PersistentWindow(QtWidgets.QWidget):
     def _on_despeckle_toggled(self, checked: bool):
         self._params["despeckle"] = bool(checked)
         self.despeckle_slider.setEnabled(checked)
+        self._local_change_time = time.perf_counter()  # guard poller for 500ms so it doesn't read stale file
+        self._last_activity_time = self._local_change_time  # reset idle clock → snap poll back to 50ms
         self._render_now()
         self._save_live_params_now()  # checkbox is discrete — save immediately so Process Frame sees it
 
@@ -755,7 +810,10 @@ class PersistentWindow(QtWidgets.QWidget):
     def _on_despeckle_size_changed(self, value: int):
         self._params["despeckleSize"] = int(value)
         self.despeckle_value_label.setText(f"{value}")
-        self._render_now()
+        # FIX B: Was _render_now() — on 4K frames each render takes 50-300ms so
+        # dragging fired 20+ renders and locked the UI. _schedule_render() uses a
+        # 60ms debounce timer so only one render fires after the drag settles.
+        self._schedule_render()
         self._schedule_save()
 
     def _on_choke_changed(self, value: int):
@@ -769,8 +827,21 @@ class PersistentWindow(QtWidgets.QWidget):
     #   thrash on rapid drags.
     # DEPENDS-ON: self._save_timer QTimer already built in __init__.
     # AFFECTS: restarts the save timer — does not touch disk.
+    def _schedule_render(self):
+        # Throttle: render immediately if not in cooldown, otherwise flag for next tick.
+        self._render_pending = True
+        if not self._render_timer.isActive():
+            self._on_render_throttle_tick()
+
+    def _on_render_throttle_tick(self):
+        if self._render_pending:
+            self._render_pending = False
+            self._render_now()
+            self._render_timer.start()  # start 60ms cooldown for next tick
+
     def _schedule_save(self):
         self._local_change_time = time.perf_counter()
+        self._last_activity_time = self._local_change_time  # reset idle clock → snap poll back to 50ms
         self._save_timer.start()
 
     # WHAT IT DOES: Atomically writes current self._params to live_params.json.
@@ -827,9 +898,37 @@ class PersistentWindow(QtWidgets.QWidget):
             self._overlay.show()
             self._overlay.raise_()
             return
+        # FIX: Build merged params and sync self._params BEFORE any _render_now() call.
+        # Previously, merged was built AFTER the rekeying:false block, which calls
+        # _set_view_mode() -> _render_now(). That render used stale self._params (the
+        # hardcoded defaults, e.g. despeckle=True) instead of the values from the file.
+        # The checkbox was then synced correctly, but self._params was not updated until
+        # after the render. If the 300ms singleShot fired between those two points, or
+        # if the rekeying render was the only render (no second _render_now at the end
+        # when _painting was True from within the rekeying block), the display stayed
+        # stale. Fix: update self._params from the file values first, then render once
+        # with the correct state.
+        merged = dict(self._params)
+        for k, v in params.items():
+            if k in ("despill", "despeckle", "despeckleSize", "background"):
+                merged[k] = v
+        # Sync checkbox UI and self._params NOW — before any render fires — so that
+        # every code path below uses the correct despeckle value. blockSignals prevents
+        # _on_despeckle_toggled from firing (and re-saving) during the programmatic sync.
+        if "despeckle" in params:
+            new_val = bool(merged["despeckle"])
+            if self.despeckle_cb.isChecked() != new_val:
+                self.despeckle_cb.blockSignals(True)
+                self.despeckle_cb.setChecked(new_val)
+                self.despeckle_slider.setEnabled(new_val)
+                self.despeckle_cb.blockSignals(False)
+        # Commit the merged params immediately so any _render_now() called below
+        # (including from _set_view_mode) sees the correct despeckle value.
+        self._params = merged
         if params.get("rekeying") is False:
             self._overlay.hide()
             # Panel signals cache is done — PNGs are fully written, safe to read.
+            rekey_rendered = False
             try:
                 self.session.reload_pngs()
                 self.original_u8 = np.clip(
@@ -837,16 +936,17 @@ class PersistentWindow(QtWidgets.QWidget):
                 ).astype(np.uint8)
                 self._place_original()
                 self._set_view_mode("Composite")
+                rekey_rendered = True
             except Exception:
                 pass  # PNGs unreadable — stale view is better than a crash
-        merged = dict(self._params)
-        for k, v in params.items():
-            if k in ("despill", "despeckle", "despeckleSize", "background", "choke"):
-                merged[k] = v
+            if rekey_rendered:
+                # _set_view_mode already called _render_now() — don't double-render.
+                return
+            # PNG reload failed — fall through to the normal render path below so
+            # the viewer at least repaints with the updated params.
         if self._painting:
             self._pending = merged
             return
-        self._params = merged
         self._render_now()
 
     @QtCore.Slot(str)
@@ -936,7 +1036,11 @@ class PersistentWindow(QtWidgets.QWidget):
                 self._pending = None
                 self._params = next_params
                 # Defer through the event loop so UI stays responsive during drag.
-                QtCore.QTimer.singleShot(0, self._render_now)
+                # 16ms (~one 60fps frame) gives ASIO one full buffer cycle of breathing
+                # room before the next render fires. singleShot(0) pumped immediately
+                # on the next event loop iteration, adding measurable scheduler pressure
+                # on Focusrite ASIO at 128-sample / 48kHz (2.7ms headroom).
+                QtCore.QTimer.singleShot(16, self._render_now)
 
     # WHAT IT DOES: Scales a full-res uint8 RGB array to the current size of the
     #   given label (respecting aspect ratio via a letterbox bounding box) and
@@ -1040,7 +1144,7 @@ class PersistentWindow(QtWidgets.QWidget):
                 is_pos = event.button() == QtCore.Qt.LeftButton
                 is_neg = event.button() == QtCore.Qt.RightButton
                 if is_pos or is_neg:
-                    p = event.position().toPoint()
+                    p = event.pos()
                     g = self._last_right_geom
                     if g and g["iw"] > 0 and g["ih"] > 0:
                         # Convert label coords → normalized image coords (0..1)
@@ -1060,19 +1164,55 @@ class PersistentWindow(QtWidgets.QWidget):
         return super().eventFilter(obj, event)
 
     # WHAT IT DOES: Clears all SAM click points and resets status bar.
+    #   If a SAM2 mask gate exists, shows a confirm dialog first — CLEAR deletes
+    #   the render gate (sam2_mask.png), not just the visible dots. After clearing,
+    #   Process Frame and Process Range will use NN alpha only with no SAM2 gate.
     # DEPENDS-ON: self._sam_display_pts, _repaint_both to redraw without dots.
-    # AFFECTS: self._sam_display_pts emptied, status updated, right pane repainted.
+    # AFFECTS: self._sam_display_pts emptied, sam2_mask.png deleted, status updated.
     def _clear_sam_points(self):
+        sam2_mask_path = self.session.session_dir / "sam2_mask.png"
+        # Warn before deleting the render gate — a stray CLEAR click silently removes
+        # the SAM2 gate from every subsequent frame render.
+        if sam2_mask_path.exists():
+            # QMessageBox.question() inherits WindowStaysOnTopHint from the viewer
+            # and renders BELOW it on Windows — user never sees it. Use an instance
+            # with the flag explicitly set so the dialog appears in front.
+            _dlg = QtWidgets.QMessageBox(self)
+            _dlg.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
+            _dlg.setWindowTitle("Clear SAM2 Mask Gate")
+            _dlg.setText(
+                "CLEAR will delete your SAM2 mask.\n"
+                "Process Frame and Process Range will use NN alpha only.\n\n"
+                "Continue?"
+            )
+            _dlg.setStandardButtons(QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
+            _dlg.setDefaultButton(QtWidgets.QMessageBox.No)
+            if _dlg.exec() != QtWidgets.QMessageBox.Yes:
+                return
         self._sam_display_pts = []
-        # Also remove the persistent gate so Process Frame doesn't use a stale mask
         try:
-            sam2_mask_path = self.session.session_dir / "sam2_mask.png"
             if sam2_mask_path.exists():
                 sam2_mask_path.unlink()
         except Exception:
             pass
-        self.status.setText("Points cleared")
-        self._repaint_both()
+        # Restore the NN alpha that _apply_sam_mask backed up before overwriting alpha.png.
+        # Without this, CLEAR leaves alpha.png as the SAM2 binary → actress disappears.
+        nn_backup = self.session.session_dir / "alpha_nn_backup.png"
+        alpha_path = self.session.session_dir / "alpha.png"
+        try:
+            if nn_backup.exists():
+                import shutil as _shutil
+                _shutil.copy2(str(nn_backup), str(alpha_path))
+                nn_backup.unlink()
+        except Exception:
+            pass
+        try:
+            self.session.reload_pngs()
+        except Exception:
+            pass
+        self._save_live_params_now()
+        self.status.setText("SAM2 mask cleared — NN alpha restored")
+        self._render_now()
 
     # WHAT IT DOES: Runs SAM2 on the cached source frame using the user's click points.
     #   Converts normalized image coords back to full-res pixel coords, loads SAM2 from
@@ -1120,9 +1260,14 @@ class PersistentWindow(QtWidgets.QWidget):
                 torch.cuda.empty_cache()
             best = masks[int(np.argmax(scores))].astype(np.float32)
             alpha_u8 = (best * 255).astype(np.uint8)
-            # Write alpha.png for viewer display (session.reload_pngs reads it)
-            alpha_path = self.session.session_dir / "alpha.png"
-            tmp_path   = self.session.session_dir / "alpha.tmp.png"
+            # Backup the NN alpha before SAM2 overwrites alpha.png.
+            # CLEAR restores this backup so the actress comes back without re-processing.
+            alpha_path   = self.session.session_dir / "alpha.png"
+            nn_backup    = self.session.session_dir / "alpha_nn_backup.png"
+            tmp_path     = self.session.session_dir / "alpha.tmp.png"
+            if alpha_path.exists() and not nn_backup.exists():
+                import shutil as _shutil
+                _shutil.copy2(str(alpha_path), str(nn_backup))
             cv2.imwrite(str(tmp_path), alpha_u8)
             os.replace(str(tmp_path), str(alpha_path))
             # Write sam2_mask.png as the permanent gate for the panel's Process Frame.
@@ -1214,7 +1359,7 @@ class PersistentWindow(QtWidgets.QWidget):
             return
         if self._zoom > 1.001 and event.button() == QtCore.Qt.LeftButton:
             self._dragging = True
-            self._drag_start = event.position().toPoint()
+            self._drag_start = event.pos()
             self._drag_start_pan = (self._pan_x, self._pan_y)
             self.setCursor(QtCore.Qt.ClosedHandCursor)
         super().mousePressEvent(event)
@@ -1224,8 +1369,8 @@ class PersistentWindow(QtWidgets.QWidget):
     #   consistent across zoom levels.
     def mouseMoveEvent(self, event):
         if self._dragging and self._drag_start is not None:
-            dx = event.position().toPoint().x() - self._drag_start.x()
-            dy = event.position().toPoint().y() - self._drag_start.y()
+            dx = event.pos().x() - self._drag_start.x()
+            dy = event.pos().y() - self._drag_start.y()
             # Inverted so dragging right shows content to the left of current view
             # (like grabbing and pulling a photo).
             w = max(1, self.right_label.width())
@@ -1465,6 +1610,9 @@ def _run_persistent(session_dir: str, parent_pid: int):
     # NOTE: activateWindow() removed — it stole keyboard focus from Resolve
     # every time the viewer launched, making the panel unresponsive to typing.
     # raise_() is enough to bring the window to the front visually.
+    # FIX A-2: 300ms delay gives the 50ms poll at least 6 cycles to load
+    # live_params.json before the first render fires, so despeckle state is correct.
+    QtCore.QTimer.singleShot(300, win._render_now)
 
     reader = StdinReader()
     reader.updateRequested.connect(win.on_update)

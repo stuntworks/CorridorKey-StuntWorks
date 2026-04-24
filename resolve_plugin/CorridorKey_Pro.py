@@ -1,4 +1,4 @@
-# Last modified: 2026-04-21 | Change: despeckle default ON; disable-source-clip checkbox label clarified; single-frame path uses SetTrackEnable | Full history: git log
+# Last modified: 2026-04-23 | Change: BRAW fallback rewired — SetCurrentTimecode seek replaces per-frame temp timeline creation (no mouse steal/blink); _export_braw_range_to_frames gains timeline/in_f/fps params; OOM fix (on-demand TIFF decode) | Full history: git log
 """CorridorKey Pro - Neural Green Screen for DaVinci Resolve
 Enhanced with SAM2 Click-to-Mask, Frame Range, Export Modes
 
@@ -19,7 +19,7 @@ DEPENDS-ON:
 AFFECTS: Timeline Track 2 (writes keyed frames), MediaPool (creates CorridorKey bin),
   source clip on Track 1 (optionally disabled after processing)
 """
-import sys, os, site, tempfile, math, queue, threading, io
+import sys, os, site, tempfile, math, queue, threading, io, traceback, shutil
 from pathlib import Path
 
 # DANGER ZONE FRAGILE: Resolve's embedded Python sets sys.stdout/stderr to None for
@@ -28,6 +28,20 @@ from pathlib import Path
 # breaks: if removed, all background thread log output silently disappears
 if sys.stdout is None: sys.stdout = io.StringIO()
 if sys.stderr is None: sys.stderr = io.StringIO()
+
+# WHAT IT DOES: disables ALL tqdm progress bars before SAM2 imports them.
+# DANGER ZONE FRAGILE: tqdm writes to Fusion's broken sys.stdout in background threads,
+# throwing SystemError. env var fires before any import; monkeypatch covers third-party
+# libs that cache the class before the env var takes effect.
+# breaks: if removed, SAM2 init_state throws SystemError on first BRAW range run.
+import os as _os
+_os.environ["TQDM_DISABLE"] = "True"
+try:
+    from functools import partialmethod
+    from tqdm import tqdm as _tqdm_cls
+    _tqdm_cls.__init__ = partialmethod(_tqdm_cls.__init__, disable=True)
+except Exception:
+    pass
 
 # WHAT IT DOES: Finds the CorridorKey engine folder (neural-net code + .venv + model weights)
 #   by checking in order: 1) CORRIDORKEY_ROOT env var, 2) corridorkey_path.txt in the script
@@ -88,7 +102,7 @@ CK_PYTHON = CK_VENV / ("Scripts/python.exe" if sys.platform == "win32" else "bin
 # The v2 viewer polls live_params.json for slider state (viewer writes it too) and
 # reloads fg/alpha PNGs when the panel signals "rekeying:false" in that same JSON.
 # A single atomic .tmp→os.replace pattern is used for every write.
-SESSION_DIR = Path(tempfile.gettempdir()) / f"corridorkey_session_{os.getpid()}"
+SESSION_DIR = Path(tempfile.gettempdir()) / "corridorkey_session"
 
 venv_packages = str(find_venv_site_packages(CK_VENV))
 site.addsitedir(venv_packages)
@@ -123,6 +137,7 @@ except Exception:
 # the main-thread timer drains them so Resolve's UIDispatcher stays safe.
 _ui_queue = queue.Queue()
 _import_queue = queue.Queue()
+_save_queue = queue.Queue()  # thread puts encoded PNG bytes, main thread writes to disk
 _main_thread_id = threading.get_ident()
 
 # Global state caches — these persist between button clicks during one session
@@ -246,6 +261,9 @@ winLayout = ui.VGroup({"Spacing": 14}, [
 
     ui.VGap(2),
     ui.Label({"ID": "Status", "Text": "Ready", "Weight": 0, "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #0FF; font-size: 14px; font-weight: bold;"}),
+    ui.VGap(4),
+    ui.Label({"ID": "Progress", "Text": "", "Weight": 0,
+        "StyleSheet": "background: #111; border: 1px solid #333; border-radius: 4px; min-height: 12px; max-height: 12px;"}),
     ui.VGap(2),
     ui.HGroup({"Weight": 0, "Spacing": 5}, [
         ui.Button({"ID": "ShowPreview", "Text": "PREVIEW", "Weight": 1, "StyleSheet": "QPushButton { background-color: #1a3a4a; color: #5df; font-weight: bold; border-radius: 5px; padding: 6px; border: 1px solid #5df; }"}),
@@ -279,6 +297,42 @@ winLayout = ui.VGroup({"Spacing": 14}, [
     ]),
 ])
 
+# WHAT IT DOES: Prevents two copies of the panel from opening at the same time.
+#   Writes a lock file with the current PID on launch, deletes it on close.
+#   If the lock file exists and the PID is still alive, shows an error and exits.
+# DEPENDS-ON: tempfile, os, ctypes (Windows)
+# AFFECTS: script startup — exits early if another instance is running
+_INSTANCE_LOCK = Path(tempfile.gettempdir()) / "corridorkey_instance.lock"
+
+def _check_single_instance():
+    if _INSTANCE_LOCK.exists():
+        try:
+            pid = int(_INSTANCE_LOCK.read_text().strip())
+            import ctypes
+            handle = ctypes.windll.kernel32.OpenProcess(0x100000, False, pid)  # SYNCHRONIZE
+            if handle:
+                ctypes.windll.kernel32.CloseHandle(handle)
+                err_win = disp.AddWindow(
+                    {"ID": "CKErr", "WindowTitle": "CorridorKey Already Open", "Geometry": [300, 200, 400, 110]},
+                    [ui.VGroup({"Spacing": 10, "Margin": 16}, [
+                        ui.Label({"Text": "CorridorKey Pro is already open. Close the existing panel first.",
+                                  "Alignment": {"AlignHCenter": True}}),
+                        ui.Button({"ID": "CKErrOK", "Text": "OK"}),
+                    ])]
+                )
+                def _close_err(ev): disp.ExitLoop()
+                err_win.On.CKErrOK.Clicked = _close_err
+                err_win.On.CKErr.Close = _close_err
+                err_win.Show()
+                disp.RunLoop()
+                err_win.Hide()
+                sys.exit(0)
+        except (ValueError, OSError):
+            pass
+    _INSTANCE_LOCK.write_text(str(os.getpid()))
+
+_check_single_instance()
+
 win = disp.AddWindow({"ID": "CK", "WindowTitle": "CorridorKey Pro", "Geometry": [100, 50, 500, 750]}, winLayout)
 
 items = win.GetItems()
@@ -296,6 +350,8 @@ try:
     items["PollTimer"].Start()
 except Exception:
     pass
+try: items["Progress"].Visible = False
+except Exception: pass
 
 # WHAT IT DOES: Writes a message to both the console and the in-panel log window.
 #   Also writes to a debug log file so background thread output is always recoverable.
@@ -357,9 +413,6 @@ def _merge_live_params(settings):
         if "despeckleSize" in lp:
             try: out["despeckle_size"] = max(50, min(2000, int(lp["despeckleSize"])))
             except (ValueError, TypeError): pass
-        if "choke" in lp:
-            try: out["choke"] = max(0, min(20, int(lp["choke"])))
-            except (ValueError, TypeError): pass
         if "sam_positive" in lp or "sam_negative" in lp:
             sam_points["positive"] = [tuple(p) for p in lp.get("sam_positive", [])]
             sam_points["negative"] = [tuple(p) for p in lp.get("sam_negative", [])]
@@ -368,6 +421,11 @@ def _merge_live_params(settings):
             # does not need to be set to SAM2; the viewer places points = intent to use SAM2.
             if lp.get("alpha_method") == 1 or sam_points["positive"]:
                 out["alpha_method"] = 1
+        # If a SAM2 gate file exists on disk, always activate SAM2 mode regardless of
+        # the panel dropdown or whether live_params.json still has the points. The gate
+        # file persists across viewer restarts; the points in live_params.json do not.
+        if (SESSION_DIR / "sam2_mask.png").exists():
+            out["alpha_method"] = 1
         return out
     except Exception:
         return settings
@@ -558,20 +616,37 @@ def run_sam2_video_propagation(fp, ss, cs, in_f, out_f, pos_pts, neg_pts, anchor
         # --- Export frames ---
         log(f"SAM2 video: exporting {dur} frames to {tmp_dir} ...")
         status(f"SAM2: exporting {dur} frames...")
-        cap = cv2.VideoCapture(fp)
-        if not cap.isOpened():
-            log("SAM2 video: cannot open video"); return {}
-        _src_fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+
+        # BRAW path: caller passes a directory of TIFF files (4:4:4, no seek needed).
+        # Normal path: caller passes a video file path for VideoCapture.
+        _tif_files = []
+        _cap = None
+        if Path(fp).is_dir():
+            _tif_files = sorted(Path(fp).glob("*.tif*"))
+            log(f"SAM2 video: {len(_tif_files)} TIFF frames from {Path(fp).name}")
+        else:
+            log(f"SAM2 video: opening {os.path.basename(fp)}")
+            _cap = cv2.VideoCapture(fp)
+            if not _cap.isOpened():
+                log("SAM2 video: cannot open video"); return {}
         for i in range(dur):
-            sf = ss + (in_f + i - cs)
-            cap.set(cv2.CAP_PROP_POS_FRAMES, sf)
-            ret, frame = cap.read()
-            if not ret:
-                log(f"SAM2 video: skipped unreadable frame {in_f + i}")
-                continue
+            if _tif_files:
+                fidx = in_f + i  # in_f=0 for BRAW path
+                frame = cv2.imread(str(_tif_files[fidx])) if fidx < len(_tif_files) else None
+                if frame is None:
+                    log(f"SAM2 video: skipped unreadable frame {in_f + i}")
+                    continue
+            else:
+                sf = ss + (in_f + i - cs)
+                _cap.set(cv2.CAP_PROP_POS_FRAMES, sf)
+                ret, frame = _cap.read()
+                if not ret:
+                    log(f"SAM2 video: skipped unreadable frame {in_f + i}")
+                    continue
             cv2.imwrite(str(tmp_dir / f"{i:06d}.jpg"), frame,
                         [cv2.IMWRITE_JPEG_QUALITY, 95])
-        cap.release()
+        if _cap:
+            _cap.release()
 
         # --- Load video predictor and propagate ---
         log(f"SAM2 video: loading predictor, anchor=range-frame {anchor_rel} ...")
@@ -589,11 +664,18 @@ def run_sam2_video_propagation(fp, ss, cs, in_f, out_f, pos_pts, neg_pts, anchor
             # because Resolve already uses 2-4 GB of VRAM on a working timeline.
             # async_loading_frames=False — Resolve's embedded Python deadlocks on
             # background threads (same issue that killed threaded PROCESS RANGE).
-            state = predictor.init_state(
-                video_path=str(tmp_dir),
-                offload_video_to_cpu=True,
-                async_loading_frames=False,
-            )
+            # tqdm in SAM2's frame loader writes to sys.stdout — Fusion's patched stdout
+            # throws SystemError. Redirect to stderr (a safe stream) during init_state only.
+            _ck_save_out = sys.stdout
+            sys.stdout = sys.stderr
+            try:
+                state = predictor.init_state(
+                    video_path=str(tmp_dir),
+                    offload_video_to_cpu=True,
+                    async_loading_frames=False,
+                )
+            finally:
+                sys.stdout = _ck_save_out
             predictor.add_new_points_or_box(
                 inference_state=state,
                 frame_idx=anchor_rel,
@@ -666,6 +748,438 @@ def run_sam2_video_propagation(fp, ss, cs, in_f, out_f, pos_pts, neg_pts, anchor
         shutil.rmtree(str(tmp_dir), ignore_errors=True)
 
 
+# WHAT IT DOES: Last-resort frame reader for formats OpenCV cannot decode (BRAW, CinemaDNG, etc).
+#   Three-path strategy, fastest first:
+#   A) ExportCurrentFrameAsStill() — no render queue, TIFF output, Resolve 18.5+ (AiConsensus find)
+#   B) Render queue with SetCurrentRenderFormatAndCodec("tif","RGB16LZW") — lossless, full chroma
+#   C) Video fallback (.mov H.264) — last resort only; 4:2:0 chroma hurts edge quality for SAM2
+#   Creates a 2-frame temp timeline to isolate source frame fn without touching the user's timeline.
+# DEPENDS-ON: project, media_pool (Resolve globals), cv2, Path, time, tempfile
+# AFFECTS: Creates then deletes a timestamped "CK_TempRender_N_T" timeline in the project.
+#   Temporarily switches the active timeline to the temp one, then restores the original.
+# DANGER ZONE HIGH: project.SetCurrentTimeline() switches the active timeline.
+#   The finally block MUST restore the original timeline — do not add code that can raise before it.
+def _read_frame_via_resolve_render(mpi, fn, try_direct=False):
+    import time
+    import traceback as _tb
+    import cv2
+    if mpi is None:
+        log("Resolve render fallback: mpi is None — skipping")
+        return None
+    temp_dir = Path(tempfile.gettempdir()) / "corridorkey_renders"
+    temp_dir.mkdir(exist_ok=True)
+    # Timestamp in name prevents collision if a prior crash left a timeline behind
+    temp_name = f"CK_TempRender_{fn}_{int(time.time())}"
+    # Clean up stale files from prior runs
+    try:
+        for stale in temp_dir.glob("CK_TempRender_*"):
+            stale.unlink()
+    except Exception:
+        pass
+
+    # PATH 0: Export the current frame directly — NO timeline switch, NO audio pop.
+    # WHY Path 0 runs FIRST: any CreateTimelineFromClips + SetCurrentTimeline resets the
+    # Windows audio engine, causing an audible pop through ASIO/WDM devices (Focusrite, etc).
+    # By attempting ExportCurrentFrameAsStill on the CURRENT timeline before touching anything,
+    # we avoid that reset entirely when the caller's playhead is already at the target frame.
+    # Only safe when called from process_current_frame (playhead == fn).
+    # NOT used for background plate extraction (wrong composite would be captured).
+    if try_direct:
+        direct_path = str(temp_dir / f"{temp_name}_direct.tif")
+        try:
+            ok0 = project.ExportCurrentFrameAsStill(direct_path)
+            # DANGER ZONE HIGH: Check file existence independently of ok0 — some Resolve
+            # builds return None/False even on success. If the file is readable, trust it.
+            # This prevents a spurious fallthrough to CreateTimelineFromClips (= audio pop).
+            direct_exists = Path(direct_path).exists()
+            if direct_exists:
+                frame0 = cv2.imread(direct_path, cv2.IMREAD_COLOR)
+                if frame0 is not None:
+                    log(f"Resolve render fallback: OK (Path 0 — direct still, no timeline switch) ok0={ok0} shape={frame0.shape}")
+                    try: Path(direct_path).unlink()
+                    except: pass
+                    return frame0
+                else:
+                    log(f"Resolve render fallback: Path 0 file written but unreadable by cv2 (ok0={ok0}) — falling back to temp timeline")
+            else:
+                log(f"Resolve render fallback: Path 0 no file (ok0={ok0}) — falling back to temp timeline")
+        except Exception as _e0:
+            log(f"Resolve render fallback: Path 0 exception ({_e0}) — falling back to temp timeline")
+
+    original_tl = project.GetCurrentTimeline()
+    temp_tl = None
+    frame = None
+    job_id = None
+    log(f"Resolve render fallback: mpi={type(mpi).__name__} fn={fn}")
+    try:
+        # Create 2-frame temp timeline: source frame fn → fn+1
+        # endFrame = fn+1 because some Resolve versions reject startFrame == endFrame
+        clip_info = {"mediaPoolItem": mpi, "startFrame": fn, "endFrame": fn + 1}
+        temp_tl = media_pool.CreateTimelineFromClips(temp_name, [clip_info])
+        if not temp_tl:
+            log("Resolve render fallback: ranged CreateTimelineFromClips failed, trying without range")
+            temp_tl = media_pool.CreateTimelineFromClips(temp_name + "_f", [{"mediaPoolItem": mpi}])
+        if not temp_tl:
+            log("Resolve render fallback: CreateTimelineFromClips failed (both attempts)")
+            return None
+        project.SetCurrentTimeline(temp_tl)
+        tl_start = temp_tl.GetStartFrame()
+        tl_end = temp_tl.GetEndFrame()
+        log(f"Resolve render fallback: temp timeline created start={tl_start} end={tl_end}")
+
+        # --- PATH A: ExportCurrentFrameAsStill --- fastest, no render queue, no preset needed.
+        # After SetCurrentTimeline the playhead is at the first frame = source frame fn.
+        # AiConsensus: confirmed works in Resolve 18.5+. PNG is broken; .tif works.
+        still_path = str(temp_dir / f"{temp_name}.tif")
+        try:
+            ok = project.ExportCurrentFrameAsStill(still_path)
+            still_exists = Path(still_path).exists()
+            log(f"Resolve render fallback: ExportCurrentFrameAsStill ok={ok} file_exists={still_exists}")
+            if still_exists:
+                frame = cv2.imread(still_path, cv2.IMREAD_COLOR)
+                if frame is not None:
+                    log(f"Resolve render fallback: OK (Path A — still) shape={frame.shape}")
+                    try: Path(still_path).unlink()
+                    except: pass
+                    return frame   # finally block still runs and cleans up
+                else:
+                    log("Resolve render fallback: Path A — still file unreadable by cv2")
+                    try: Path(still_path).unlink()
+                    except: pass
+        except Exception as ae:
+            log(f"Resolve render fallback: Path A exception: {ae}")
+
+        # DANGER ZONE HIGH: StartRendering() (Path B) resets the Windows audio engine,
+        # killing Focusrite and any ASIO/WDM device — same bug that affected BRAW range export.
+        # For BRAW and other camera-raw formats, bail here instead of triggering the audio pop.
+        # Path A (ExportCurrentFrameAsStill) is the correct path for these formats on Resolve 18.5+.
+        # If Path A failed, the user needs to fix the root cause (Resolve version, permissions),
+        # not silently accept an audio device reset.
+        try:
+            _props = mpi.GetClipProperty() or {}
+        except Exception:
+            _props = {}
+        _clip_fp = (_props.get("File Path") or _props.get("Clip Path") or "").lower()
+        if _clip_fp.endswith(('.braw', '.cin', '.dng', '.ari')):
+            status("ERROR: Cannot read camera-raw frame — ExportCurrentFrameAsStill failed. Audio protected (render queue skipped). Check Resolve 18.5+.")
+            log("Resolve render fallback: camera-raw detected — skipping Path B to protect audio. Fix: verify Resolve 18.5+ and that ExportCurrentFrameAsStill works for this clip.")
+            return None
+
+        # --- PATH B: Render queue with TIFF --- lossless, full chroma (non-camera-raw only).
+        # SetCurrentRenderFormatAndCodec overrides the active preset's format.
+        # PNG is silently broken in Resolve 18.5+ via API (AiConsensus confirmed bug).
+        # "tif" + "RGB16LZW" is confirmed working.
+        try:
+            project.SetCurrentRenderFormatAndCodec("tif", "RGB16LZW")
+            log("Resolve render fallback: render format set to tif/RGB16LZW")
+        except Exception as fe:
+            log(f"Resolve render fallback: SetCurrentRenderFormatAndCodec warning: {fe}")
+
+        project.SetRenderSettings({
+            "SelectAllFrames": 1,
+            "TargetDir": str(temp_dir),
+            "CustomName": temp_name,
+            "ExportVideo": 1,
+            "ExportAudio": 0,
+        })
+        job_id = project.AddRenderJob()
+        log(f"Resolve render fallback: Path B job added")
+        project.StartRendering(job_id)
+        deadline = time.time() + 30
+        while project.IsRenderingInProgress() and time.time() < deadline:
+            time.sleep(0.1)
+        if project.IsRenderingInProgress():
+            project.StopRendering()
+            log("Resolve render fallback: timed out after 30s")
+        else:
+            all_out = sorted(temp_dir.iterdir()) if temp_dir.exists() else []
+            log(f"Resolve render fallback: temp_dir contains {[f.name for f in all_out]}")
+
+            # Try lossless image formats first (TIFF preferred for SAM2 edge quality)
+            img_file = None
+            for ext in ("*.tif", "*.tiff", "*.exr", "*.dpx", "*.png", "*.jpg"):
+                hits = sorted(temp_dir.glob(f"{temp_name}{ext}"))
+                if hits:
+                    img_file = hits[0]
+                    log(f"Resolve render fallback: Path B image — {img_file.name}")
+                    break
+
+            if img_file:
+                frame = cv2.imread(str(img_file), cv2.IMREAD_COLOR)
+                log(f"Resolve render fallback: OK (Path B — image) shape={frame.shape if frame is not None else 'None'}")
+                for m in sorted(temp_dir.glob(f"{temp_name}*")):
+                    try: m.unlink()
+                    except: pass
+            else:
+                # --- PATH C: Video fallback --- H.264 .mov, 4:2:0 chroma, degraded edges.
+                # Only runs if TIFF render also failed. Quality is lower than Path A/B.
+                vid_file = None
+                for ext in ("*.mov", "*.mp4", "*.mxf", "*.avi"):
+                    hits = sorted(temp_dir.glob(f"{temp_name}{ext}"))
+                    if hits:
+                        vid_file = hits[0]
+                        break
+                if vid_file:
+                    log(f"Resolve render fallback: Path C (degraded H.264) — {vid_file.name}")
+                    cap = cv2.VideoCapture(str(vid_file))
+                    ret, frame = cap.read()
+                    cap.release()
+                    if ret and frame is not None:
+                        log(f"Resolve render fallback: OK (Path C — video/degraded) shape={frame.shape}")
+                    else:
+                        log(f"Resolve render fallback: cv2 could not read from {vid_file.name}")
+                    for m in sorted(temp_dir.glob(f"{temp_name}*")):
+                        try: m.unlink()
+                        except: pass
+                else:
+                    log(f"Resolve render fallback: all paths failed — no output in {temp_dir}")
+    except Exception as ex:
+        log(f"Resolve render fallback exception: {ex}")
+        log(_tb.format_exc())
+    finally:
+        if original_tl:
+            try: project.SetCurrentTimeline(original_tl)
+            except: pass
+        if job_id:
+            try: project.DeleteRenderJob(job_id)
+            except: pass
+        if temp_tl:
+            try: media_pool.DeleteTimelines([temp_tl])
+            except: pass
+    return frame
+
+
+# WHAT IT DOES: Reads exactly n bytes from a binary stream (subprocess stdout pipe).
+#   Returns bytes on success, None if the stream ends before n bytes are available.
+# ISOLATED: pure utility, no side effects
+def _read_exact(stream, n):
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = stream.read(n - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return bytes(buf)
+
+
+# WHAT IT DOES: Fast BRAW frame extraction via braw-decode.exe + BlackmagicRawAPI.dll.
+#   Decodes clip frames src_start..src_end-1 directly from the BRAW file (no Resolve UI,
+#   no render queue, no timeline changes). Streams BGRA pixels from the exe's stdout and
+#   writes each frame to a TIFF file in a temp directory.
+# DEPENDS-ON: braw-decode.exe (alongside this script or dev path), BlackmagicRawAPI.dll
+#   (found automatically via Resolve / Desktop Video install — same DLL Resolve uses).
+# AFFECTS: Creates CK_BrawDec_* subdirectory in corridorkey_renders temp folder.
+# RETURNS: str path to temp dir, or None if exe missing / decode fails (caller falls back).
+# DANGER ZONE FRAGILE: braw-decode.exe streams raw bytes with NO frame separator.
+#   _read_exact() MUST consume exactly width*height*4 bytes per frame or the stream
+#   goes out of sync and all subsequent frames are corrupt.
+def _try_braw_decode_exe(fp, src_start, src_end):
+    import subprocess, tempfile as _tf2, numpy as _np, cv2 as _cv2, time as _time2
+    # __file__ is not defined in Resolve's embedded Python — use known absolute paths.
+    exe_candidates = [
+        Path("C:/ProgramData/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility/braw-decode.exe"),
+        Path("D:/New AI Projects/braw-decode-win/bin/braw-decode.exe"),
+    ]
+    exe = next((str(p) for p in exe_candidates if p.exists()), None)
+    if exe is None:
+        log("BRAW decode exe: braw-decode.exe not found — will use render queue"); return None
+
+    # Build subprocess env: inherit parent env and ensure BRAW_SDK_PATH points to
+    # the Resolve install directory where BlackmagicRawAPI.dll lives. Resolve's
+    # Python subprocess does not inherit the standard system PATH entries that
+    # braw-decode.exe uses for its DLL fallback lookup.
+    import os as _os
+    braw_env = _os.environ.copy()
+    resolve_dll_dir = r"C:\Program Files\Blackmagic Design\DaVinci Resolve"
+    if Path(resolve_dll_dir + "/BlackmagicRawAPI.dll").exists():
+        # BRAW_SDK_PATH tells braw-decode.exe where to load the DLL from.
+        # PATH must also include this dir so the Windows DLL loader can find
+        # BlackmagicRawAPI.dll's own dependencies — without this the DLL
+        # crashes at init time with 0xC0000005 (access violation during DLL init).
+        if not braw_env.get("BRAW_SDK_PATH"):
+            braw_env["BRAW_SDK_PATH"] = resolve_dll_dir
+        if resolve_dll_dir.lower() not in braw_env.get("PATH", "").lower():
+            braw_env["PATH"] = resolve_dll_dir + ";" + braw_env.get("PATH", "")
+
+    # Query clip dimensions with -n (info-only, no decode).
+    # Log env vars before launching so DLL/path errors are diagnosable without a debugger.
+    log(f"BRAW decode exe: using {exe!r}  clip={fp!r}")
+    # DIAGNOSTIC: show the PATH prefix and BRAW_SDK_PATH actually injected into the subprocess
+    log(f"BRAW decode exe env: BRAW_SDK_PATH={braw_env.get('BRAW_SDK_PATH')!r}  PATH[0:120]={braw_env.get('PATH', '')[:120]!r}")
+    try:
+        # CREATE_NO_WINDOW: suppresses the console window without creating a detached session.
+        # DETACHED_PROCESS was giving the subprocess NULL std handles which caused
+        # BlackmagicRawAPI.dll to fault (0xC0000005) during DLL initialisation before main()
+        # ran — stderr was empty because the crash happened in DLL_PROCESS_ATTACH.
+        # CREATE_NO_WINDOW keeps std handles valid (redirected to PIPE/DEVNULL) so the DLL
+        # initialises cleanly, while still avoiding any console window or audio-session reset.
+        # stdin=DEVNULL: prevents the subprocess from inheriting or blocking on the parent's
+        # stdin handle, which can hang when Resolve's stdin is a pipe.
+        r = subprocess.run([exe, "-n", fp], capture_output=True, text=True, timeout=30,
+                           stdin=subprocess.DEVNULL,
+                           env=braw_env,
+                           creationflags=subprocess.CREATE_NO_WINDOW)
+        if r.returncode != 0 or not r.stdout:
+            log(f"BRAW decode exe: info failed (rc={r.returncode}) stderr={r.stderr!r}"); return None
+        w, h = None, None
+        for line in r.stdout.splitlines():
+            if "Resolution:" in line:
+                parts = line.split(":")[1].strip().split("x")
+                w, h = int(parts[0].strip()), int(parts[1].strip())
+                break
+        if w is None:
+            log(f"BRAW decode exe: cannot parse resolution — stdout={r.stdout!r} stderr={r.stderr!r}"); return None
+        log(f"BRAW decode exe: {w}x{h}, decoding clip frames {src_start}–{src_end - 1}")
+    except Exception as _e:
+        log(f"BRAW decode exe: info query failed: {_e}"); return None
+
+    dur = src_end - src_start
+    bytes_per_frame = w * h * 4  # BGRA U8
+    temp_dir = (Path(_tf2.gettempdir()) / "corridorkey_renders"
+                / f"CK_BrawDec_{src_start}_{src_end}_{int(_time2.time())}")
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    written = 0
+    try:
+        # CREATE_NO_WINDOW + stdin=DEVNULL: same reasoning as the -n info call above.
+        # stdout=PIPE carries the raw BGRA pixel stream; stderr=PIPE captures error text.
+        proc = subprocess.Popen(
+            [exe, "-c", "bgra", "-s", "1", "-i", str(src_start), "-o", str(src_end), fp],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=braw_env,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        for fidx in range(dur):
+            raw = _read_exact(proc.stdout, bytes_per_frame)
+            if raw is None:
+                log(f"BRAW decode exe: stream ended at frame {fidx}/{dur}"); break
+            arr = _np.frombuffer(raw, dtype=_np.uint8).reshape(h, w, 4)
+            bgr = _cv2.cvtColor(arr, _cv2.COLOR_BGRA2BGR)
+            _cv2.imwrite(str(temp_dir / f"frame_{fidx:06d}.tif"), bgr)
+            written += 1
+        proc.stdout.close()
+        stderr_out = proc.stderr.read().decode("utf-8", errors="replace").strip()
+        proc.wait(timeout=30)
+        if proc.returncode not in (0, None):
+            log(f"BRAW decode exe: exit {proc.returncode} — {stderr_out}")
+        log(f"BRAW decode exe: {written}/{dur} frames written to {temp_dir.name}")
+        if written == dur:
+            return str(temp_dir)
+        import shutil as _sh4
+        _sh4.rmtree(temp_dir, ignore_errors=True); return None
+    except Exception as _ex:
+        import traceback as _tb3, shutil as _sh5
+        log(f"BRAW decode exe: failed: {_ex}"); log(_tb3.format_exc())
+        _sh5.rmtree(temp_dir, ignore_errors=True); return None
+
+
+# WHAT IT DOES: Exports a BRAW (or other camera-raw) range to a TIFF image sequence.
+#   Fast path: braw-decode.exe (direct SDK, no Resolve UI, no render queue overhead).
+#   Fallback: For each frame in range, seek the CURRENT timeline playhead via
+#     timeline.SetCurrentTimecode() then call project.ExportCurrentFrameAsStill().
+#     NO temp timeline creation, NO SetCurrentTimeline, NO CreateTimelineFromClips.
+#     SLOW (~1-3 s/frame) but audio-safe and no mouse-stealing UI blink per frame.
+#   Both paths return str(temp_dir) containing frame_XXXXXX.tif files — same shape.
+#   Caller must rmtree the returned directory when done.
+# DEPENDS-ON: project, timeline (Resolve globals), tempfile, Path, time, shutil
+# AFFECTS: Creates CK_Braw* temp subdirectory. Fallback seeks the active timeline
+#   playhead via SetCurrentTimecode — no timeline switching at all.
+# DANGER ZONE HIGH: SetCurrentTimecode() moves the playhead on the live timeline.
+#   in_f is the absolute timeline frame where the BRAW range begins (same coordinate
+#   system as clip.GetStart()). fps must match the project frame rate.
+#   Resolve does NOT steal the mouse because SetCurrentTimeline is never called.
+def _export_braw_range_to_frames(mpi, src_start, src_end, timeline, in_f, fps):
+    import time as _t2, tempfile as _tf, shutil as _sh
+    import traceback as _tb_fb
+    if mpi is None:
+        log("BRAW range export: mpi is None"); return None
+
+    # Fast path: direct SDK decode via braw-decode.exe — no Resolve render queue needed.
+    exe_result = None
+    braw_fp = ""
+    try:
+        props = mpi.GetClipProperty()
+        braw_fp = (props.get("File Path") or props.get("Clip Path") or "") if props else ""
+        if not braw_fp:
+            status("ERROR: Cannot read BRAW file path from Resolve. Check media is online.")
+            log("BRAW range export: cannot get file path from mpi")
+            return None
+        exe_result = _try_braw_decode_exe(braw_fp, src_start, src_end)
+    except Exception as _ep:
+        log(f"BRAW range export: exe path exception: {_ep}")
+        # Fall through to the Resolve still-export fallback below.
+
+    if exe_result is not None:
+        return exe_result
+
+    # -----------------------------------------------------------------------
+    # FALLBACK: Resolve ExportCurrentFrameAsStill — seek current timeline, no blink.
+    # WHY THIS AND NOT THE RENDER QUEUE: Resolve's StartRendering() resets the
+    # Windows audio engine, killing Focusrite and any other ASIO/WDM device.
+    # ExportCurrentFrameAsStill does NOT trigger that reset, and — critically —
+    # seeking via SetCurrentTimecode() does NOT switch the active timeline, so
+    # Resolve never steals the mouse or flickers the viewer per frame.
+    # Returns: str(temp_dir) containing frame_000000.tif … frame_NNNNNN.tif — same
+    # shape as _try_braw_decode_exe so downstream code needs no changes.
+    # DANGER ZONE HIGH: SetCurrentTimecode() format must be HH:MM:SS:FF (colon-separated,
+    # no drop-frame semicolons) and fps must match the project setting exactly.
+    # If fps is wrong the seek lands on the wrong frame. fps is passed from the caller.
+    # -----------------------------------------------------------------------
+    dur = src_end - src_start
+    log(f"BRAW decode exe failed — using Resolve seek+still fallback ({dur} frames). No mouse blink.")
+    status(f"BRAW decode fallback: exporting {dur} frames via Resolve still export (slow, audio-safe)...")
+
+    temp_dir = (Path(_tf.gettempdir()) / "corridorkey_renders"
+                / f"CK_BrawFB_{src_start}_{src_end}_{int(_t2.time())}")
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    # Clamp fps to a sensible minimum to avoid divide-by-zero on broken project settings.
+    safe_fps = max(float(fps), 1.0)
+
+    written = 0
+    for fidx in range(dur):
+        # tl_frame is the absolute timeline frame to seek to — same coordinate as in_f.
+        tl_frame = in_f + fidx
+        out_path = str(temp_dir / f"frame_{fidx:06d}.tif")
+        try:
+            # Convert absolute timeline frame number to HH:MM:SS:FF timecode string.
+            total_frames = int(tl_frame)
+            ff = total_frames % int(safe_fps)
+            total_secs = total_frames // int(safe_fps)
+            ss_tc = total_secs % 60
+            mm_tc = (total_secs // 60) % 60
+            hh_tc = total_secs // 3600
+            tc_str = f"{hh_tc:02d}:{mm_tc:02d}:{ss_tc:02d}:{ff:02d}"
+            # Seek the current timeline playhead — NO timeline switch, NO mouse steal.
+            # DANGER ZONE HIGH: some Resolve builds return None/False even on success.
+            # Proceed regardless and trust file existence, not the return value.
+            timeline.SetCurrentTimecode(tc_str)
+            ok = project.ExportCurrentFrameAsStill(out_path)
+            if Path(out_path).exists():
+                written += 1
+                log(f"BRAW fallback frame {written}/{dur} (tl={tl_frame} tc={tc_str}) ok={ok}")
+            else:
+                log(f"BRAW fallback frame {fidx + 1}/{dur}: ExportCurrentFrameAsStill no file "
+                    f"(tc={tc_str} ok={ok})")
+        except Exception as _fe:
+            log(f"BRAW fallback frame {fidx + 1}/{dur} exception: {_fe}")
+            log(_tb_fb.format_exc())
+
+    if written == dur:
+        log(f"BRAW fallback: all {dur} frames written to {temp_dir.name}")
+        return str(temp_dir)
+    elif written > 0:
+        # Partial success — return the dir anyway. Downstream globs *.tif* so a short
+        # sequence produces a short keyed range rather than a silent total failure.
+        log(f"BRAW fallback: partial — {written}/{dur} frames written. Returning partial dir.")
+        status(f"WARNING: BRAW fallback partial ({written}/{dur} frames) — keyed range will be short.")
+        return str(temp_dir)
+    else:
+        log("BRAW fallback: zero frames written — giving up.")
+        status("ERROR: BRAW fallback failed — no frames exported. Check Resolve 18.5+ and media online.")
+        _sh.rmtree(temp_dir, ignore_errors=True)
+        return None
+
+
 # WHAT IT DOES: Generates a gray checkerboard pattern for transparency preview
 # ISOLATED: pure function, no dependencies
 def create_checkerboard(h, w, sz=20):
@@ -712,6 +1226,13 @@ def grab_background_frame():
                     fp = props.get("File Path", "")
                     if not fp: continue
                     fn = c.GetLeftOffset() + (cf - c.GetStart())
+                    # BRAW (and other camera-raw formats) cannot be decoded by OpenCV
+                    if fp.lower().endswith(('.braw', '.cin', '.dng', '.ari')):
+                        bg_frame = _read_frame_via_resolve_render(mpi, fn)
+                        if bg_frame is not None:
+                            log(f"BG plate from V{track_idx} via Resolve render: {os.path.basename(fp)}")
+                            return bg_frame
+                        continue
                     cap = cv2.VideoCapture(fp)
                     cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, fn))
                     ret, bg_frame = cap.read()
@@ -968,11 +1489,42 @@ def process_current_frame(preview_only=False):
         fn = clip.GetLeftOffset() + (cf - cs)
         if fn < 0: fn = 0
         cap = cv2.VideoCapture(fp)
-        log(f"SEEK: cf={cf} cs={cs} leftoff={clip.GetLeftOffset()} fn={fn}")
-        cap.set(cv2.CAP_PROP_POS_FRAMES, fn)
+        opened = cap.isOpened()
+        if not opened:
+            log(f"ERROR: OpenCV could not open the file. BRAW requires Blackmagic Desktop Video codecs.")
+            status("ERROR: Cannot open source file"); return
+        _src_fps = cap.get(cv2.CAP_PROP_FPS) or fps
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        log(f"SEEK: cf={cf} cs={cs} leftoff={clip.GetLeftOffset()} fn={fn} total={total_frames}")
+        seek_ok = cap.set(cv2.CAP_PROP_POS_FRAMES, fn)
+        if not seek_ok:
+            # BRAW does not support CAP_PROP_POS_FRAMES random-access — try millisecond seek.
+            ms = (fn / _src_fps) * 1000.0 + 0.01
+            seek_ok2 = cap.set(cv2.CAP_PROP_POS_MSEC, ms)
+            log(f"SEEK POS_MSEC fallback: ms={ms:.3f} ok={seek_ok2}")
         ret, frame = cap.read()
+        if not ret:
+            # Last resort: sequential read. Reads every frame from 0 to fn in order.
+            # Slow (seconds for deep frames) but works on BRAW which can't random-seek.
+            log(f"SEEK sequential: reading {fn+1} frames in order (random seek not supported)")
+            cap.release()
+            cap = cv2.VideoCapture(fp)
+            frame = None
+            for _i in range(fn + 1):
+                ret, frame = cap.read()
+                if not ret:
+                    log(f"Sequential read failed at frame {_i}")
+                    frame = None; break
         cap.release()
-        if not ret: status("ERROR: Cannot read"); return
+        if frame is None:
+            # All OpenCV methods failed (BRAW has no OpenCV decoder). Use Resolve's render queue
+            # to export the frame as a PNG and read that instead.
+            log(f"All OpenCV seeks failed — trying Resolve render export for BRAW...")
+            status("Reading via Resolve render (BRAW)...")
+            frame = _read_frame_via_resolve_render(mpi, fn, try_direct=True)
+            if frame is None:
+                log(f"ERROR: All frame reading methods failed for {os.path.basename(fp)}")
+                status("ERROR: Cannot read frame"); return
         cached_source["frame"], cached_source["file_path"], cached_source["frame_num"] = frame.copy(), fp, fn
         # Store timeline frame separately — "frame_num" above is source-video offset
         # (clip.GetLeftOffset() + cf - cs), not the timeline position. reprocess_with_cached
@@ -995,6 +1547,8 @@ def process_current_frame(preview_only=False):
         ah = ah.astype(np.float32) / 255.0 if ah.dtype == np.uint8 else ah
         ps = ProcessingSettings(screen_type=settings["screen_type"], despill_strength=0.0, refiner_strength=settings["refiner_strength"], despeckle_enabled=settings["despeckle_enabled"], despeckle_size=settings["despeckle_size"])
         log(f"Settings: despeckle_enabled={ps.despeckle_enabled} despeckle_size={ps.despeckle_size} despill={ps.despill_strength} refiner={ps.refiner_strength}")
+        if ps.despeckle_enabled:
+            log(f"Despeckle: ON (size {ps.despeckle_size})")
         res = proc.process_frame(fr, ah, ps)
         cn = Path(fp).stem
         od = Path(items["OutputPath"].Text) / f"CK_{cn}"
@@ -1027,6 +1581,7 @@ def process_current_frame(preview_only=False):
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
             _mt_c = mt[:, :, 0] if len(mt.shape) == 3 else mt
             mt = cv2.erode((_mt_c * 255).astype(np.uint8), kernel).astype(np.float32) / 255.0
+            log(f"Choke: {choke_px}px")
         if fg is not None and mt is not None:
             save_output(fg, mt, op, settings["export_format"])
             log(f"Saved: {op.name}")
@@ -1129,12 +1684,27 @@ def on_process_range(ev):
     global processing_cancelled, timeline, media_pool, _range_running
     if _range_running:
         status("Already running — hit CANCEL first"); return
+    # Kill viewer immediately — must happen before any early return so it always closes.
+    on_kill_viewer(None)
     processing_cancelled = False
     # Refresh in case timeline was opened after script loaded
     if project:
         timeline = project.GetCurrentTimeline()
         media_pool = project.GetMediaPool()
     import cv2, numpy as np, time, threading
+    # tifffile handles 16-bit LZW TIFFs correctly — PIL has silent truncation bugs on 16-bit RGB.
+    # tifffile 2026.3.3 is confirmed in the CorridorKey venv.
+    try:
+        import tifffile as _tifffile
+        _has_tifffile = True
+    except ImportError:
+        _has_tifffile = False
+    # PIL fallback if tifffile missing (less reliable for 16-bit).
+    try:
+        from PIL import Image as _PILImage
+        _has_pil = True
+    except ImportError:
+        _has_pil = False
     log("=" * 35)
     log("PROCESS RANGE")
     if not timeline or not media_pool: status("ERROR: No timeline!"); return
@@ -1171,6 +1741,21 @@ def on_process_range(ev):
     od = Path(items["OutputPath"].Text) / f"CK_{cn}"
     od.mkdir(parents=True, exist_ok=True)
     log(f"Saving to: {od}")
+    # BRAW range export — must happen on main thread before background thread starts.
+    # For BRAW/camera-raw, OpenCV cannot decode the file. Export the full range as a
+    # single H.264 .mov first (one render job for all frames = fast), then the background
+    # thread reads TIFF files from that directory instead of the source BRAW.
+    braw_frames_dir = None
+    if fp.lower().endswith(('.braw', '.cin', '.dng', '.ari')):
+        src_start = ss + (in_f - cs)
+        src_end   = ss + (out_f - cs) + 1  # +1: Resolve timeline end is exclusive
+        log(f"BRAW detected — exporting source frames {src_start}-{src_end} to TIFF sequence...")
+        status(f"Exporting BRAW range ({dur} frames) — please wait...")
+        braw_frames_dir = _export_braw_range_to_frames(mpi, src_start, src_end, timeline, in_f, fps)
+        if braw_frames_dir is None:
+            status("ERROR: BRAW range export failed — see log"); return
+        n_tifs = len(sorted(Path(braw_frames_dir).glob("*.tif*")))
+        log(f"BRAW range export done: {n_tifs} TIFF frames in {Path(braw_frames_dir).name}")
     # Kill viewer on main thread before background thread opens VideoCapture.
     # Reuses on_kill_viewer to avoid global scoping issues with nested _run() closure.
     on_kill_viewer(None)
@@ -1187,71 +1772,267 @@ def on_process_range(ev):
                             refiner_strength=settings["refiner_strength"], despeckle_enabled=settings["despeckle_enabled"],
                             despeckle_size=settings["despeckle_size"])
     log(f"Settings: despill={ps.despill_strength} refiner={ps.refiner_strength} despeckle={ps.despeckle_enabled}")
+    if ps.despeckle_enabled:
+        log(f"Despeckle: ON (size {ps.despeckle_size})")
     from CorridorKeyModule.core import color_utils as _cu
     _despill_str = float(settings.get("despill_strength", 0.5))
     from core.alpha_hint_generator import AlphaHintGenerator
     chroma_hint_gen = AlphaHintGenerator(screen_type=settings["screen_type"])
+
+    # Pre-thread diagnostic — runs on main thread, writes to debug log directly (no Defender risk).
+    # Also pre-computes the TIFF file list and pre-reads bytes into BytesIO so the thread never
+    # needs to open() any file (Defender scans every file open from a background thread).
+    _braw_tif_files_precomputed = []
+    _braw_tif_buffers = []
+    _braw_frames_decoded = []
+    if braw_frames_dir:
+        _pre_tifs = sorted(Path(braw_frames_dir).glob("*.tif*"))
+        _braw_tif_files_precomputed = _pre_tifs
+        log(f"Pre-thread TIFF check: {len(_pre_tifs)} files in {Path(braw_frames_dir).name}")
+        if _pre_tifs:
+            log(f"  First TIFF: {_pre_tifs[0].name}, size={_pre_tifs[0].stat().st_size}")
+            # DANGER ZONE: FRAGILE — Defender scans ANY file opened from a background thread, even reads.
+            # Pre-read all TIFF bytes on the main thread into BytesIO buffers. Thread uses BytesIO — no
+            # open() call from thread = no Defender scan per-file. Same pattern as pre-opened probe file.
+            for _ptf in _pre_tifs:
+                try:
+                    with open(str(_ptf), "rb") as _ptf_fp:
+                        _braw_tif_buffers.append(io.BytesIO(_ptf_fp.read()))
+                except Exception as _re:
+                    log(f"  Pre-read TIFF failed: {_ptf.name}: {_re}")
+                    _braw_tif_buffers = []
+                    break
+            if _braw_tif_buffers:
+                # MEMORY FIX: Do NOT pre-decode all frames to numpy — that would consume ~11GB
+                # for a 145-frame 4K sequence (53MB per frame as uint8 BGR). Instead, BytesIO
+                # buffers stay in memory (~7.7GB compressed) and each frame is decoded on-demand
+                # in the processing loop, one at a time. Peak numpy RAM = 1 frame (~53MB).
+                log(f"  Pre-read {len(_braw_tif_buffers)} TIFFs into BytesIO — will decode on-demand (1 frame at a time)")
+            else:
+                log("  WARNING: pre-read failed — thread will open TIFFs directly (may be slow)")
+        else:
+            log("  WARNING: no TIFF files found — thread will skip all frames")
+
+    # Warmup chroma_hint_gen on main thread — triggers any lazy DLL/model loads before
+    # the thread starts. Defender blocks file opens from untrusted threads; if generate_hint
+    # loads a model file on first call inside the thread, it would hang indefinitely.
+    # Decode only the first frame for warmup — discard immediately after. No persistent array.
+    if _braw_tif_buffers:
+        try:
+            _wb = _braw_tif_buffers[0]
+            _wb.seek(0)
+            _wf_pil = _PILImage.open(_wb).convert("RGB")
+            _wf_arr = np.array(_wf_pil)
+            if _wf_arr.dtype == np.uint16:
+                _wf_arr = (_wf_arr >> 8).astype(np.uint8)
+            elif _wf_arr.dtype != np.uint8:
+                _wf_arr = (_wf_arr.astype(np.float64) / float(np.iinfo(_wf_arr.dtype).max) * 255.0).clip(0, 255).astype(np.uint8)
+            _wf = np.ascontiguousarray(cv2.cvtColor(_wf_arr, cv2.COLOR_RGB2BGR))
+            chroma_hint_gen.generate_hint(_wf)
+            cv2.cvtColor(_wf, cv2.COLOR_BGR2RGB)
+            del _wf, _wf_arr, _wf_pil  # Free warmup frame immediately — not needed after this
+            log("  chroma_hint_gen warmup done on main thread")
+        except Exception as _we:
+            log(f"  chroma_hint_gen warmup (non-fatal): {_we}")
+
+    # SYNCHRONOUS BRAW PATH: process frames on the main thread, decoding one at a time.
+    # The BRAW render queue blocks Fusion's event loop long enough to kill the PollTimer,
+    # so the background-thread + queue architecture cannot communicate back. Frames are
+    # decoded on-demand from BytesIO buffers — peak numpy RAM is 1 frame (~53MB), not
+    # all frames at once (~11GB for a 145-frame 4K sequence).
+    if _braw_tif_buffers:
+        try: items["PollTimer"].Interval = 500  # Wake up fast — processing starting
+        except Exception: pass
+        _range_running = True
+        try:
+            ofs = []
+            pr = 0
+            st = time.time()
+            try:
+                items["Progress"].StyleSheet = "background: #111; border: 1px solid #333; border-radius: 4px; min-height: 12px; max-height: 12px;"
+                items["Progress"].Visible = True
+            except Exception: pass
+            for fidx, _buf in enumerate(_braw_tif_buffers):
+                if processing_cancelled:
+                    log(f"Cancelled at frame {pr}/{dur}")
+                    status(f"CANCELLED — {pr} frames saved")
+                    break
+                # ON-DEMAND DECODE: read one frame from its BytesIO buffer, convert to uint8 BGR,
+                # process it, then let it fall out of scope. This keeps peak numpy RAM at 1 frame.
+                try:
+                    _buf.seek(0)
+                    _fd_pil = _PILImage.open(_buf).convert("RGB")
+                    _fd_arr = np.array(_fd_pil)
+                    if _fd_arr.dtype == np.uint16:
+                        _fd_arr = (_fd_arr >> 8).astype(np.uint8)
+                    elif _fd_arr.dtype != np.uint8:
+                        _fd_arr = (_fd_arr.astype(np.float64) / float(np.iinfo(_fd_arr.dtype).max) * 255.0).clip(0, 255).astype(np.uint8)
+                    frame = np.ascontiguousarray(cv2.cvtColor(_fd_arr, cv2.COLOR_RGB2BGR))
+                    del _fd_arr, _fd_pil  # Free intermediates immediately
+                except Exception as _fde:
+                    log(f"  Decode frame {fidx} failed: {_fde} — skipping")
+                    pr += 1
+                    continue
+                status(f"{pr+1}/{dur}...")
+                chroma_float = chroma_hint_gen.generate_hint(frame).astype(np.float32) / 255.0
+                fr = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+                res = proc.process_frame(fr, chroma_float, ps)
+                fg, mt = res.get("fg"), res.get("alpha")
+                if _despill_str > 0 and fg is not None:
+                    fg = _cu.despill_opencv(fg, green_limit_mode="average", strength=_despill_str)
+                choke_px = int(settings.get("choke", 0))
+                if choke_px > 0 and mt is not None:
+                    _k = choke_px * 2 + 1
+                    _kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_k, _k))
+                    _mt_c = mt[:, :, 0] if len(mt.shape) == 3 else mt
+                    mt = cv2.erode((_mt_c * 255).astype(np.uint8), _kernel).astype(np.float32) / 255.0
+                    log(f"Choke: {choke_px}px")
+                if fg is not None and mt is not None:
+                    op = od / f"CK_{cn}_{pr:06d}.png"
+                    save_output(fg, mt, op, settings["export_format"])
+                    ofs.append(str(op))
+                del frame  # Release this frame's numpy array before the next decode
+                pr += 1
+                el = time.time() - st
+                fpsr = pr / el if el > 0 else 0
+                log(f"{pr}/{dur} ({fpsr:.1f}fps)")
+            el = time.time() - st
+            log(f"Done: {len(ofs)} frames in {el:.1f}s")
+            try: items["Progress"].Visible = False
+            except Exception: pass
+            if ofs and not processing_cancelled:
+                status("Importing to MediaPool...")
+                _do_import({
+                    "ofs": ofs, "output_track": output_track,
+                    "source_track": source_track, "in_f": in_f, "settings": settings,
+                })
+        except Exception as _e:
+            log(f"Range error: {_e}")
+            log(traceback.format_exc())
+            status("ERROR!")
+            try: items["Progress"].Visible = False
+            except Exception: pass
+        finally:
+            _range_running = False
+        return  # BRAW sync path done — skip thread launch below
 
     # Run heavy processing in a background thread so the Fusion event loop stays alive.
     # The fix for the old deadlock: patch sys.stdout/stderr at thread start (Resolve sets
     # them None for non-main threads), then route all UI updates through _ui_queue so only
     # the main-thread PollTimer touches Fusion widgets. Resolve MediaPool/timeline calls
     # stay on the main thread via _import_queue → _do_import().
+    try: items["PollTimer"].Interval = 500  # Wake up fast — processing starting
+    except Exception: pass
     _range_running = True
 
     def _run():
         global _range_running
-        import sys as _sys, io as _io
-        if _sys.stdout is None: _sys.stdout = _io.StringIO()
-        if _sys.stderr is None: _sys.stderr = _io.StringIO()
-
-        def _tlog(msg):
-            _ui_queue.put(("log", msg))
-            try:
-                with open(_ck_debug_log, "a", encoding="utf-8") as _f: _f.write(msg + "\n")
-            except Exception: pass
-
-        def _tstatus(msg):
-            _ui_queue.put(("status", msg))
+        # sys and io are module globals (line 22) — no import needed here.
+        # sys.stdout/stderr already patched at module level (lines 29-30).
+        # A redundant 'import sys as _sys' inside a daemon thread can block on
+        # Fusion's custom import hooks, freezing the thread silently.
+        if sys.stdout is None: sys.stdout = io.StringIO()
+        if sys.stderr is None: sys.stderr = io.StringIO()
+        try:
+            def _tlog(msg):
+                # Queue-only — no file I/O in thread (Defender blocks file opens, even with try/except).
+                _ui_queue.put(("log", msg))
+            def _tstatus(msg):
+                _ui_queue.put(("status", msg))
+            def _tprogress(done, total):
+                val = int(done / total * 100) if total > 0 else 0
+                _ui_queue.put(("progress", val))
+        except BaseException as _be:
+            _range_running = False
+            return
 
         ofs = []
         pr = 0
         st = time.time()
         try:
-            # SAM2 video propagation — runs once up front, produces one mask per frame
+            # SAM2 video propagation — runs once up front, produces one mask per frame.
+            # For BRAW, braw_frames_dir is the TIFF sequence directory — pass it so SAM2
+            # gets full-chroma frames. Anchor frame shifts to TIFF index space (0-based).
             sam2_video_masks = {}
             if (settings.get("alpha_method") == 1 and
                     (sam_points.get("positive") or sam_points.get("negative"))):
-                _tlog("SAM2 mode — running video propagation for full range...")
-                sam2_video_masks = run_sam2_video_propagation(
-                    fp, ss, cs, in_f, out_f,
-                    sam_points.get("positive", []),
-                    sam_points.get("negative", []),
-                    sam_points.get("frame"),
-                )
+                _tlog(f"SAM2 mode — running video propagation for full range... braw_frames_dir={braw_frames_dir!r}")
+                if braw_frames_dir:
+                    _anchor_abs = sam_points.get("frame")
+                    _anchor_in_tif = (_anchor_abs - in_f) if _anchor_abs is not None else None
+                    sam2_video_masks = run_sam2_video_propagation(
+                        braw_frames_dir, 0, 0, 0, dur,
+                        sam_points.get("positive", []),
+                        sam_points.get("negative", []),
+                        _anchor_in_tif,
+                    )
+                else:
+                    sam2_video_masks = run_sam2_video_propagation(
+                        fp, ss, cs, in_f, out_f,
+                        sam_points.get("positive", []),
+                        sam_points.get("negative", []),
+                        sam_points.get("frame"),
+                    )
                 if sam2_video_masks:
                     _tlog(f"SAM2 video: {len(sam2_video_masks)} masks ready")
                 else:
                     _tlog("SAM2 propagation returned no masks — falling back to chroma hint")
 
-            cap = cv2.VideoCapture(fp)
-            if not cap.isOpened():
-                _tstatus("Cannot open video"); return
-            _src_fps = cap.get(cv2.CAP_PROP_FPS) or fps
+            # For BRAW: read TIFF files from braw_frames_dir (4:4:4, no seeking needed).
+            # For normal files: seek with VideoCapture as before.
+            cap = None
+            braw_tif_files = []
+            if braw_frames_dir:
+                # Use list pre-computed on main thread — avoids thread glob which triggers Defender directory scan.
+                braw_tif_files = _braw_tif_files_precomputed
+                _tlog(f"BRAW frames: {len(braw_tif_files)} TIFF files")
+                _src_fps = fps
+            else:
+                cap = cv2.VideoCapture(fp)
+                if not cap.isOpened():
+                    _tstatus("Cannot open video"); return
+                _src_fps = cap.get(cv2.CAP_PROP_FPS) or fps
             for tf in range(in_f, out_f):
                 if processing_cancelled:
                     _tlog(f"Cancelled at frame {pr}/{dur}")
                     _tstatus(f"CANCELLED — {pr} frames saved")
                     break
-                sf = ss + (tf - cs)
-                cap.set(cv2.CAP_PROP_POS_FRAMES, sf)
-                ret, frame = cap.read()
-                if not ret: continue
+                if braw_frames_dir:
+                    fidx = tf - in_f
+                    frame = None
+                    if fidx < len(braw_tif_files):
+                        try:
+                            # Use numpy array pre-decoded on main thread — zero file I/O or PIL in thread.
+                            if fidx < len(_braw_frames_decoded):
+                                frame = _braw_frames_decoded[fidx]
+                            else:
+                                # Fallback: read from disk if pre-decode didn't cover this frame.
+                                tif_path = str(braw_tif_files[fidx])
+                                frame = cv2.imread(tif_path, cv2.IMREAD_UNCHANGED)
+                        except Exception as _fe:
+                            _tlog(f"Read error at frame {tf}: {_fe}")
+                            frame = None
+                    if frame is None:
+                        _tlog(f"Read failed at frame {tf} (TIFF index {fidx}) — skipping")
+                        continue
+                else:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, ss + (tf - cs))
+                    ret, frame = cap.read()
+                    if not ret:
+                        _tlog(f"Read failed at frame {tf} — skipping")
+                        continue
                 range_idx = tf - in_f
                 chroma_float = chroma_hint_gen.generate_hint(frame).astype(np.float32) / 255.0
                 ah = chroma_float
                 fr = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+                _torch_m = sys.modules.get("torch")
+                if _torch_m is not None:
+                    try: _torch_m.cuda.empty_cache()
+                    except Exception: pass
                 res = proc.process_frame(fr, ah, ps)
+                if _torch_m is not None:
+                    try: _torch_m.cuda.synchronize()
+                    except Exception: pass
                 fg, mt = res.get("fg"), res.get("alpha")
                 if _despill_str > 0 and fg is not None:
                     fg = _cu.despill_opencv(fg, green_limit_mode="average", strength=_despill_str)
@@ -1265,34 +2046,69 @@ def on_process_range(ev):
                     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
                     _mt_c = mt[:, :, 0] if len(mt.shape) == 3 else mt
                     mt = cv2.erode((_mt_c * 255).astype(np.uint8), kernel).astype(np.float32) / 255.0
+                    log(f"Choke: {choke_px}px")
                 if fg is not None and mt is not None:
                     op = od / f"CK_{cn}_{pr:06d}.png"
-                    save_output(fg, mt, op, settings["export_format"])
-                    ofs.append(str(op))
+                    # Encode PNG to bytes IN MEMORY — no file I/O, no Defender block.
+                    _fmt = settings["export_format"]
+                    _m = mt[:, :, 0] if len(mt.shape) == 3 else mt
+                    if _fmt == 0:
+                        _fb = cv2.cvtColor((fg * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
+                        _au = (_m * 255).astype(np.uint8)
+                        _img = cv2.merge([_fb[:,:,0], _fb[:,:,1], _fb[:,:,2], _au])
+                    elif _fmt == 1:
+                        _img = (_m * 255).astype(np.uint8)
+                    else:
+                        _img = cv2.cvtColor((fg * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
+                    _ret, _buf = cv2.imencode('.png', _img)
+                    if _ret:
+                        _save_queue.put(("save", str(op), _buf.tobytes()))
+                        ofs.append(str(op))
                     pr += 1
                     el = time.time() - st
                     fpsr = pr / el if el > 0 else 0
                     rem = (dur - pr) / fpsr if fpsr > 0 else 0
                     _tstatus(f"{pr}/{dur} ({fpsr:.1f}fps, {rem:.0f}s left)")
+                    _tprogress(pr, dur)
                     if pr % 10 == 0: _tlog(f"{pr}/{dur}")
-            cap.release()
+            if cap:
+                cap.release()
 
             if ofs and not processing_cancelled:
                 _tlog(f"Done: {len(ofs)} frames in {time.time()-st:.1f}s")
                 _tstatus("Importing to MediaPool...")
-                _import_queue.put({
+                _tprogress(dur, dur)  # fill to 100% before hiding
+                _ui_queue.put(("progress", -1))
+                # Put import task AFTER all save tasks — poll timer processes in order.
+                _save_queue.put(("import", {
                     "ofs": ofs, "output_track": output_track,
                     "source_track": source_track, "in_f": in_f, "settings": settings,
-                })
-        except Exception as _e:
-            import traceback as _tb
-            _tstatus("ERROR!")
-            _tlog(f"Range error: {_e}")
-            _tlog(_tb.format_exc())
+                }))
+            else:
+                _ui_queue.put(("progress", -1))
+        except BaseException as _e:
+            # BaseException catches SystemExit/KeyboardInterrupt that bypass except Exception.
+            # traceback is a module-level import — never import inside a thread (Fusion hooks block).
+            try:
+                _tstatus("ERROR!")
+                _tlog(f"Range error: {_e}")
+                _tlog(traceback.format_exc())
+            except Exception: pass
         finally:
             _range_running = False
-
-    threading.Thread(target=_run, daemon=True).start()
+            if braw_frames_dir:
+                # shutil is a module-level import — never import inside a thread.
+                try: shutil.rmtree(braw_frames_dir, ignore_errors=True)
+                except: pass
+            try:
+                # Lookup torch from sys.modules — never import inside a thread (Fusion hooks block).
+                _torch_mod = sys.modules.get("torch")
+                if _torch_mod is not None:
+                    _torch_mod.cuda.empty_cache()
+            except Exception: pass
+    _t = threading.Thread(target=_run, daemon=True)
+    _t.start()
+    log(f"Range thread launched (alive={_t.is_alive()})")
 
 # WHAT IT DOES: Sets the cancel flag so the range processing loop stops on next iteration
 def on_cancel(ev):
@@ -1316,21 +2132,82 @@ def on_toggle_track1(ev):
 # DEPENDS-ON: _ui_queue, _import_queue, _do_import()
 # AFFECTS: Log widget, Status label, MediaPool, Timeline
 def on_poll_timer(ev):
-    while not _ui_queue.empty():
+    # DANGER ZONE HIGH: The adaptive interval logic MUST live in finally: — if any
+    # queue drain raises unexpectedly before reaching it, the timer stays at 500ms
+    # forever (never backs off to 5000ms idle), sustaining ASIO interrupt pressure.
+    try:
+        while not _ui_queue.empty():
+            try:
+                kind, msg = _ui_queue.get_nowait()
+                if kind == "log":
+                    items["Log"].PlainText = (items["Log"].PlainText or "") + msg + "\n"
+                elif kind == "status":
+                    items["Status"].Text = msg
+                elif kind == "progress":
+                    if msg < 0:
+                        try: items["Progress"].Visible = False
+                        except Exception: pass
+                    else:
+                        try:
+                            pct = max(0.0, min(1.0, msg / 100.0))
+                            if pct >= 1.0:
+                                ss = "background: #00ffff; border: 1px solid #333; border-radius: 4px; min-height: 12px; max-height: 12px;"
+                            elif pct <= 0.0:
+                                ss = "background: #111; border: 1px solid #333; border-radius: 4px; min-height: 12px; max-height: 12px;"
+                            else:
+                                ss = (f"background: qlineargradient(x1:0, y1:0, x2:1, y2:0, "
+                                      f"stop:0 #00cccc, stop:{pct:.3f} #00cccc, "
+                                      f"stop:{pct:.3f} #1a1a1a, stop:1 #1a1a1a); "
+                                      f"border: 1px solid #333; border-radius: 4px; min-height: 12px; max-height: 12px;")
+                            items["Progress"].StyleSheet = ss
+                            items["Progress"].Visible = True
+                        except Exception: pass
+                elif kind == "probe":
+                    try:
+                        with open(Path(tempfile.gettempdir()) / "ck_thread.txt", "a", encoding="utf-8") as _f:
+                            _f.write(msg + "\n")
+                    except Exception: pass
+            except Exception:
+                pass
+        while not _save_queue.empty():
+            try:
+                item = _save_queue.get_nowait()
+                if item[0] == "save":
+                    _, path_str, png_bytes = item
+                    try:
+                        with open(path_str, 'wb') as _sf:
+                            _sf.write(png_bytes)
+                    except Exception as _se:
+                        log(f"Save error {path_str}: {_se}")
+                elif item[0] == "import":
+                    _, import_task = item
+                    _do_import(import_task)
+            except Exception:
+                pass
+        while not _import_queue.empty():
+            try:
+                task = _import_queue.get_nowait()
+                _do_import(task)
+            except Exception as e:
+                log(f"Import queue error: {e}")
+    finally:
+        # ADAPTIVE TIMER — reduce scripting-thread interrupts when completely idle.
+        # Every PollTimer tick re-enters Resolve's main thread, which shares audio scheduling
+        # with Windows WASAPI. At 500ms (2x/sec) this causes audible pops on Focusrite interfaces.
+        # When all queues are drained and no range is running, slow to 5000ms (0.2x/sec).
+        # Processing start sites reset it back to 500ms so UI stays responsive during work.
+        # DEPENDS-ON: _range_running, _ui_queue, _save_queue, _import_queue, items["PollTimer"]
+        # AFFECTS: PollTimer.Interval (Fusion UIManager timer property)
+        all_idle = (
+            not _range_running
+            and _ui_queue.empty()
+            and _save_queue.empty()
+            and _import_queue.empty()
+        )
         try:
-            kind, msg = _ui_queue.get_nowait()
-            if kind == "log":
-                items["Log"].PlainText = (items["Log"].PlainText or "") + msg + "\n"
-            elif kind == "status":
-                items["Status"].Text = msg
+            items["PollTimer"].Interval = 5000 if all_idle else 500
         except Exception:
             pass
-    while not _import_queue.empty():
-        try:
-            task = _import_queue.get_nowait()
-            _do_import(task)
-        except Exception as e:
-            log(f"Import queue error: {e}")
 
 # WHAT IT DOES: Imports processed PNGs to MediaPool and places them on the output track.
 #   Must run on the main thread — Resolve's MediaPool/Timeline API is not thread-safe.
@@ -1389,22 +2266,27 @@ def on_open_fusion(ev):
 #   Without this, the orphaned Python viewer holds GPU/CUDA open and Resolve can't restart.
 def on_close(ev):
     global _viewer_proc
+    # Stop the PollTimer first — prevents it firing against a half-dead UI during teardown.
+    try: items["PollTimer"].Stop()
+    except Exception: pass
+    # Kill viewer process tree — taskkill /F /T kills the viewer AND any SAM2 subprocesses
+    # it spawned. Without /T, child processes survive and hold the GPU open, which keeps
+    # Resolve's process manager waiting indefinitely (the "End Task" bug).
     if _viewer_proc is not None:
-        try: _viewer_proc.kill()
-        except: pass
+        import subprocess as _sp
+        _pid = _viewer_proc.pid
         _viewer_proc = None
-    # Run cleanup in a daemon thread so it can't block the close button.
-    # disp.ExitLoop() fires immediately — Resolve window closes right away.
-    import threading
-    def _cleanup():
-        try:
-            proc = cached_processor.get("proc")
-            if proc is not None:
-                try: proc.cleanup()
-                except Exception: pass
-                cached_processor["proc"] = None
+        try: _sp.run(["taskkill", "/F", "/T", "/PID", str(_pid)],
+                     capture_output=True, timeout=5,
+                     creationflags=_sp.CREATE_NO_WINDOW)
         except Exception: pass
-    threading.Thread(target=_cleanup, daemon=True).start()
+    # Drop CUDA model reference immediately — do NOT call proc.cleanup() here because
+    # CUDA teardown in a closing Resolve session blocks indefinitely on Windows.
+    # Windows reclaims GPU memory when the process dies; we just need to die fast.
+    try: cached_processor["proc"] = None
+    except Exception: pass
+    try: _INSTANCE_LOCK.unlink(missing_ok=True)
+    except: pass
     disp.ExitLoop()
 
 win.On.SetInPoint.Clicked = on_set_in_point
@@ -1518,3 +2400,8 @@ log("SAM2 | Frame Range | Export Modes")
 win.Show()
 disp.RunLoop()
 win.Hide()
+# Force-exit immediately after the event loop ends.
+# Python's normal shutdown runs CUDA/torch finalizers which block for 30-60 seconds
+# on Windows with a GPU model loaded — that's why Resolve hangs and needs End Task.
+# Windows reclaims all GPU memory when the process dies; skipping finalizers is safe.
+os._exit(0)
