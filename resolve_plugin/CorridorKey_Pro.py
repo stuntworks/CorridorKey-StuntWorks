@@ -1426,13 +1426,8 @@ def reprocess_with_cached():
         if fg is not None:
             try: log(f"FG stats — dtype:{fg.dtype} min:{float(fg.min()):.4f} max:{float(fg.max()):.4f} mean R:{float(fg[..., 0].mean()):.4f} G:{float(fg[..., 1].mean()):.4f} B:{float(fg[..., 2].mean()):.4f}")
             except Exception as _e: log(f"FG stat error: {_e}")
-        # Apply SAM2 garbage matte to output alpha (post-keyer)
-        if mt is not None:
-            _gate = _load_sam2_output_gate(frame.shape, settings)
-            if _gate is not None:
-                _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
-                _gated = _mt2d * _gate
-                mt = np.stack([_gated] * mt.shape[2], axis=2) if len(mt.shape) == 3 else _gated
+        # SAM2 gate intentionally NOT applied here — single frame preview shows
+        # clean chroma key only. SAM2 gate is applied only in PROCESS RANGE.
         if fg is not None and mt is not None:
             if len(mt.shape) == 3: mt = mt[:, :, 0]
             last_preview_data["original"] = frame.copy()
@@ -1564,17 +1559,8 @@ def process_current_frame(preview_only=False):
         if fg is not None:
             try: log(f"FG stats — dtype:{fg.dtype} min:{float(fg.min()):.4f} max:{float(fg.max()):.4f} mean R:{float(fg[..., 0].mean()):.4f} G:{float(fg[..., 1].mean()):.4f} B:{float(fg[..., 2].mean()):.4f}")
             except Exception as _e: log(f"FG stat error: {_e}")
-        # Apply SAM2 garbage matte to the neural keyer's OUTPUT alpha.
-        # Doing it here (post-keyer) instead of on the input hint matches how the viewer works
-        # and how traditional garbage mattes work — gate the output, not the input.
-        if mt is not None:
-            _gate = _load_sam2_output_gate(frame.shape, settings)
-            if _gate is not None:
-                import numpy as _np
-                _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
-                _gated = _mt2d * _gate
-                mt = np.stack([_gated] * mt.shape[2], axis=2) if len(mt.shape) == 3 else _gated
-                log(f"SAM2 output gate applied — alpha mean {_mt2d.mean():.3f} -> {_gated.mean():.3f}")
+        # SAM2 gate intentionally NOT applied here — single frame preview shows
+        # clean chroma key only. SAM2 gate is applied only in PROCESS RANGE.
         choke_px = int(settings.get("choke", 0))
         if choke_px > 0 and mt is not None:
             k = choke_px * 2 + 1
