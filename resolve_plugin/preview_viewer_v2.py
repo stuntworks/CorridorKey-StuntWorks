@@ -1163,32 +1163,14 @@ class PersistentWindow(QtWidgets.QWidget):
                     return True
         return super().eventFilter(obj, event)
 
-    # WHAT IT DOES: Clears all SAM click points and resets status bar.
-    #   If a SAM2 mask gate exists, shows a confirm dialog first — CLEAR deletes
-    #   the render gate (sam2_mask.png), not just the visible dots. After clearing,
-    #   Process Frame and Process Range will use NN alpha only with no SAM2 gate.
+    # WHAT IT DOES: Clears all SAM click points, deletes sam2_mask.png gate, and
+    #   restores the NN alpha backup. No confirm dialog — the dialog was invisible
+    #   on Windows with WindowStaysOnTopHint (rendered behind the viewer), causing
+    #   users to click CLEAR 4+ times with no visible response. Status bar confirms.
     # DEPENDS-ON: self._sam_display_pts, _repaint_both to redraw without dots.
     # AFFECTS: self._sam_display_pts emptied, sam2_mask.png deleted, status updated.
     def _clear_sam_points(self):
         sam2_mask_path = self.session.session_dir / "sam2_mask.png"
-        # Warn before deleting the render gate — a stray CLEAR click silently removes
-        # the SAM2 gate from every subsequent frame render.
-        if sam2_mask_path.exists():
-            # QMessageBox.question() inherits WindowStaysOnTopHint from the viewer
-            # and renders BELOW it on Windows — user never sees it. Use an instance
-            # with the flag explicitly set so the dialog appears in front.
-            _dlg = QtWidgets.QMessageBox(self)
-            _dlg.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
-            _dlg.setWindowTitle("Clear SAM2 Mask Gate")
-            _dlg.setText(
-                "CLEAR will delete your SAM2 mask.\n"
-                "Process Frame and Process Range will use NN alpha only.\n\n"
-                "Continue?"
-            )
-            _dlg.setStandardButtons(QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
-            _dlg.setDefaultButton(QtWidgets.QMessageBox.No)
-            if _dlg.exec() != QtWidgets.QMessageBox.Yes:
-                return
         self._sam_display_pts = []
         try:
             if sam2_mask_path.exists():
