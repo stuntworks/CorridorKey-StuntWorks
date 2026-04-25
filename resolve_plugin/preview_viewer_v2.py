@@ -1,4 +1,4 @@
-# Last modified: 2026-04-23 | Change: _live_watcher idle slowdown (50ms→500ms after 2s quiet); singleShot(0)→singleShot(16) in render finally block; HRCS audio-pop pressure reduction
+# Last modified: 2026-04-26 | Change: Clear SAM2 click dots when scrub mode activates — dots only make sense during live preview, not during scrub playback
 """CorridorKey Preview Viewer — two modes.
 
 MODE 1 (one-shot, back-compat with Resolve's existing flow):
@@ -431,6 +431,14 @@ class PersistentWindow(QtWidgets.QWidget):
         self.original_u8 = np.clip(session.fg_rgb * 255.0, 0, 255).astype(np.uint8)
         self.original_scaled = cv2.resize(self.original_u8, (self.disp_w, self.disp_h))
 
+        self._scrub_index_mtime = 0.0
+        self._scrub_count = 0
+        self._scrub_base = None
+        # Retry counter for _on_scrub_slider when frame files aren't written yet.
+        # Keying takes ~2-3 sec/frame; frame 0 may not exist when scrub_index.json
+        # lands. Each retry fires after 300ms; capped at 30 attempts (~9 sec).
+        self._scrub_frame_retry_count = 0
+
         self._build_ui()
         self._render_now()
         # File-watcher bridge — polls <session_dir>/live_params.json every 50ms
@@ -466,6 +474,23 @@ class PersistentWindow(QtWidgets.QWidget):
         if self._live_watcher.interval() != desired_interval:
             self._live_watcher.setInterval(desired_interval)
 
+        # Check for scrub_index.json — runs every tick, independent of live_params changes.
+        # Written by panel when SCRUB RANGE finishes keying N frames.
+        _scrub_path = self.session.session_dir / "scrub_index.json"
+        try:
+            _scrub_mt = _scrub_path.stat().st_mtime
+        except FileNotFoundError:
+            _scrub_mt = 0.0
+        if _scrub_mt != self._scrub_index_mtime:
+            self._scrub_index_mtime = _scrub_mt
+            try:
+                import tempfile as _vt
+                with open(str(Path(_vt.gettempdir()) / "ck_viewer_scrub.txt"), "a") as _vf:
+                    _vf.write(f"scrub_index mtime changed: {_scrub_mt} path={_scrub_path} exists={_scrub_path.exists()}\n")
+            except Exception: pass
+            if _scrub_mt > 0.0:
+                self._enter_scrub_mode(_scrub_path)
+
         try:
             mt = self._live_params_path.stat().st_mtime
         except FileNotFoundError:
@@ -496,6 +521,143 @@ class PersistentWindow(QtWidgets.QWidget):
         # Disk update received — reset activity clock so poll snaps back to 50ms.
         self._last_activity_time = time.perf_counter()
         self.on_update(params)
+
+    def _enter_scrub_mode(self, index_path: Path):
+        # WHAT IT DOES: Shows the scrubber slider and loads the first cached keyed frame.
+        # DEPENDS-ON: SESSION_DIR/scrub_index.json and SESSION_DIR/scrub/NNN/fg.png+alpha.png
+        # AFFECTS: self._scrub_count, self._scrub_base, self._scrub_bar visibility
+        def _vlog(msg):
+            try:
+                import tempfile as _vt2
+                with open(str(Path(_vt2.gettempdir()) / "ck_viewer_scrub.txt"), "a") as _vf2:
+                    _vf2.write(msg + "\n")
+            except Exception: pass
+        _vlog(f"_enter_scrub_mode called: {index_path}")
+        try:
+            with open(index_path) as _f:
+                _data = json.load(_f)
+            self._scrub_count = int(_data["count"])
+            self._scrub_base = self.session.session_dir / _data["base_dir"]
+            _vlog(f"  count={self._scrub_count} base={self._scrub_base}")
+        except Exception as _e:
+            _vlog(f"  FAILED: {_e}")
+            print(f"Scrub mode enter failed: {_e}", file=sys.stderr)
+            return
+        # BUG FIX: Block signals on setRange/setValue so the valueChanged signal does NOT
+        # fire _on_scrub_slider during setup. Without this, setValue(0) fires the slot early
+        # (before _scrub_bar is shown) when the slider's previous value was non-zero, causing
+        # a redundant double-render. We call _on_scrub_slider(0) explicitly below instead.
+        self._scrub_slider.blockSignals(True)
+        self._scrub_slider.setRange(0, max(0, self._scrub_count - 1))
+        self._scrub_slider.setValue(0)
+        self._scrub_slider.blockSignals(False)
+        # Clear SAM2 click dots — they only make sense during live preview, not scrub playback.
+        # The repaint triggered by _on_scrub_slider(0) below will paint the first scrub frame
+        # without dots since _draw_sam_overlay returns early when _sam_display_pts is empty.
+        self._sam_display_pts = []
+        self._scrub_bar.show()
+        _vlog(f"  scrub_bar.show() called — isVisible={self._scrub_bar.isVisible()}")
+        # Resize window taller to accommodate scrub panel, then nudge upward if the
+        # bottom would go off-screen. sizeHint() called AFTER show() so layout is realised.
+        _extra = self._scrub_bar.sizeHint().height() + 8
+        self.resize(self.width(), self.height() + _extra)
+        _screen = QtWidgets.QApplication.primaryScreen().availableGeometry()
+        _win_bottom = self.y() + self.height()
+        if _win_bottom > _screen.bottom():
+            _new_y = max(_screen.top(), _screen.bottom() - self.height())
+            self.move(self.x(), _new_y)
+        # BUG FIX: Snap poll back to 50ms when entering scrub mode — detection may have
+        # happened while the poller was at its 500ms idle rate, and we want stage-2 slider
+        # changes to feel responsive immediately.
+        self._last_activity_time = time.perf_counter()
+        # Reset retry counter so each new scrub session gets a clean slate.
+        self._scrub_frame_retry_count = 0
+        self._on_scrub_slider(0)
+        self.status.setText(f"SCRUB MODE — {self._scrub_count} keyed frames  •  adjust sliders freely")
+
+    def _exit_scrub_mode(self):
+        # WHAT IT DOES: Hides scrubber panel, deletes scrub_index.json, and reloads the
+        #   original single-frame preview.
+        # DEPENDS-ON: self.session (must have valid fg.png + alpha.png, session_dir)
+        # AFFECTS: self._scrub_bar visibility, SESSION_DIR/scrub_index.json,
+        #   self._scrub_index_mtime, reloads session fg/alpha
+        self._scrub_bar.hide()
+        # Reset _scrub_base so _paint_right's guard re-enables SAM dot overlay in live preview.
+        # DANGER ZONE: FRAGILE — must be set to None BEFORE _render_now() below, otherwise
+        #   _paint_right still sees a non-None _scrub_base and suppresses dots after exit.
+        self._scrub_base = None
+        # Delete scrub_index.json so a restarted viewer does not re-enter scrub mode
+        # from a stale file left over from the previous run.
+        # DANGER ZONE: FRAGILE — must reset _scrub_index_mtime too, otherwise the
+        # mtime guard below will think the (now-deleted) file hasn't changed.
+        try:
+            _idx_path = self.session.session_dir / "scrub_index.json"
+            if _idx_path.exists():
+                _idx_path.unlink()
+            self._scrub_index_mtime = 0.0
+        except Exception:
+            pass
+        try:
+            self.session.reload_pngs()
+            self._render_now()
+        except Exception:
+            pass
+        self.status.setText("Ready")
+
+    def _on_scrub_slider(self, idx: int):
+        # WHAT IT DOES: Loads cached fg/alpha for the given scrub frame index and re-renders.
+        #   No neural net involved — pure stage-2 (instant).
+        # DEPENDS-ON: self._scrub_base / f"{idx:03d}" / fg.png + alpha.png
+        # AFFECTS: self.session.fg_rgb, self.session.alpha, triggers re-render
+        # DANGER ZONE: FRAGILE — scrub_index.json is written by the panel as soon as
+        #   keying STARTS, not when it finishes. Frame 0 (and later frames) may not exist
+        #   yet when this fires. See retry logic below.
+        if self._scrub_base is None:
+            return
+        # BUG FIX: Scrub slider drag is user activity — reset the activity clock so the
+        # poller stays at 50ms during scrub. Without this, the poller idles at 500ms and
+        # a stray live_params.json update (e.g. rekeying:false) could overwrite the scrub
+        # frame before the user notices.
+        self._last_activity_time = time.perf_counter()
+        frame_dir = self._scrub_base / f"{idx:03d}"
+        fg_path  = frame_dir / "fg.png"
+        alp_path = frame_dir / "alpha.png"
+        if not fg_path.exists() or not alp_path.exists():
+            # BUG FIX: Frame not written yet — schedule a retry instead of giving up.
+            # The panel writes scrub_index.json at the start of keying, so frame 0 can
+            # arrive 2-3 seconds later. Cap at 30 retries (~9 sec) to avoid spinning
+            # forever if keying fails. Each retry resets _scrub_frame_retry_count to 0
+            # so a manual slider drag on the same frame also gets fresh retries.
+            _MAX_RETRIES = 30
+            if self._scrub_frame_retry_count < _MAX_RETRIES:
+                self._scrub_frame_retry_count += 1
+                remaining = _MAX_RETRIES - self._scrub_frame_retry_count
+                self.status.setText(
+                    f"Scrub frame {idx+1} keying... "
+                    f"({self._scrub_frame_retry_count}/{_MAX_RETRIES})"
+                )
+                QtCore.QTimer.singleShot(300, lambda: self._on_scrub_slider(idx))
+            else:
+                self.status.setText(
+                    f"Scrub frame {idx+1} not available after {_MAX_RETRIES} retries — "
+                    f"keying may have failed"
+                )
+            return
+        # Frame files are present — reset retry counter so the next "not ready" hit
+        # (on a different frame) also gets the full 30 attempts.
+        self._scrub_frame_retry_count = 0
+        fg_bgr = _read_png_any_depth(fg_path)
+        if fg_bgr is None:
+            return
+        self.session.fg_rgb = cv2.cvtColor(_to_float01(fg_bgr), cv2.COLOR_BGR2RGB)
+        alp_img = _read_png_any_depth(alp_path)
+        if alp_img is None:
+            return
+        if alp_img.ndim == 3:
+            alp_img = cv2.cvtColor(alp_img, cv2.COLOR_BGR2GRAY)
+        self.session.alpha = _to_float01(alp_img)
+        self._scrub_frame_lbl.setText(f"Frame {idx + 1} / {self._scrub_count}")
+        self._render_now()
 
     def _build_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
@@ -658,6 +820,45 @@ class PersistentWindow(QtWidgets.QWidget):
             "font-size: 12px;"
         )
         layout.addWidget(self.status)
+
+        # Scrubber panel — hidden until panel writes scrub_index.json
+        self._scrub_bar = QtWidgets.QWidget()
+        self._scrub_bar.setStyleSheet("background: #111; border-top: 1px solid #333; padding: 4px;")
+        _sb_layout = QtWidgets.QVBoxLayout(self._scrub_bar)
+        _sb_layout.setContentsMargins(4, 4, 4, 4)
+        _sb_layout.setSpacing(4)
+        _sb_hdr = QtWidgets.QLabel("SCRUB PREVIEW — drag to check key quality across frames")
+        _sb_hdr.setAlignment(QtCore.Qt.AlignCenter)
+        _sb_hdr.setStyleSheet("color: #a5f; font-size: 11px; font-weight: bold;")
+        _sb_layout.addWidget(_sb_hdr)
+        self._scrub_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self._scrub_slider.setRange(0, 9)
+        self._scrub_slider.setValue(0)
+        self._scrub_slider.setStyleSheet(
+            "QSlider::groove:horizontal { height: 8px; background: #333; border-radius: 4px; } "
+            "QSlider::handle:horizontal { background: #a5f; width: 20px; height: 20px; border-radius: 10px; margin: -6px 0; } "
+            "QSlider::sub-page:horizontal { background: #a5f; border-radius: 4px; }"
+        )
+        self._scrub_slider.valueChanged.connect(self._on_scrub_slider)
+        _sb_layout.addWidget(self._scrub_slider)
+        self._scrub_frame_lbl = QtWidgets.QLabel("Frame 1 / 10")
+        self._scrub_frame_lbl.setAlignment(QtCore.Qt.AlignCenter)
+        self._scrub_frame_lbl.setStyleSheet("color: #0dcaf0; font-size: 11px;")
+        _sb_layout.addWidget(self._scrub_frame_lbl)
+        self._scrub_hint = QtWidgets.QLabel("Drag slider • Adjust Margin/Soften/Despill sliders above — changes apply instantly")
+        self._scrub_hint.setAlignment(QtCore.Qt.AlignCenter)
+        self._scrub_hint.setStyleSheet("color: #666; font-size: 10px;")
+        _sb_layout.addWidget(self._scrub_hint)
+        _sb_exit = QtWidgets.QPushButton("EXIT SCRUB MODE")
+        _sb_exit.setStyleSheet(
+            "QPushButton { background: transparent; color: #f66; border: 1px solid #f66; "
+            "padding: 6px; border-radius: 3px; font-size: 11px; font-weight: bold; } "
+            "QPushButton:hover { background: rgba(255,102,102,0.15); }"
+        )
+        _sb_exit.clicked.connect(self._exit_scrub_mode)
+        _sb_layout.addWidget(_sb_exit)
+        layout.addWidget(self._scrub_bar)
+        self._scrub_bar.hide()
 
         # Default size — single pane, compact
         self.resize(self.disp_w + 24, self.disp_h + 140)
@@ -927,6 +1128,16 @@ class PersistentWindow(QtWidgets.QWidget):
         self._params = merged
         if params.get("rekeying") is False:
             self._overlay.hide()
+            # BUG FIX: If we're in scrub mode, do NOT reload the single-frame PNGs —
+            # that would overwrite session.fg_rgb/alpha with the original frame and wipe
+            # the scrub frame the user is looking at. Just re-render with the current
+            # scrub frame using the newly-merged params (margin, soften, despill, etc.).
+            if self._scrub_base is not None:
+                if not self._painting:
+                    self._render_now()
+                else:
+                    self._pending = merged
+                return
             # Panel signals cache is done — PNGs are fully written, safe to read.
             rekey_rendered = False
             try:
@@ -1094,7 +1305,9 @@ class PersistentWindow(QtWidgets.QWidget):
 
     def _paint_right(self, full_img):
         self._paint_into(self.right_label, full_img)
-        if self._sam_display_pts:
+        # Skip SAM dots during scrub mode — dots are anchor-frame-only and would
+        # be misleading on other frames. _scrub_base is non-None while scrub is active.
+        if self._sam_display_pts and self._scrub_base is None:
             self._draw_sam_overlay()
 
     def _place_original(self):
@@ -1570,7 +1783,144 @@ QSlider::add-page:horizontal {
 """
 
 
+# ===== BRAW Scrubber Window =====
+# WHAT IT DOES: Shows exported TIFF frames from a BRAW range with a scrubber slider.
+#   Lets the user verify frame content (lighting, subject position, screen cleanliness)
+#   across the full IN→OUT range before committing to Process Range.
+# DEPENDS-ON: cv2, numpy, PySide6. Frames exported by on_scrub_range() in CorridorKey.py.
+# AFFECTS: display only — reads TIFFs, writes nothing.
+class BrawScrubberWindow(QtWidgets.QWidget):
+    """Frame scrubber for BRAW TIFF sequences. No keying — raw camera frames only."""
+
+    def __init__(self, frames_dir: Path, parent_pid: int = 0):
+        super().__init__()
+        self._frames_dir = Path(frames_dir)
+        self._parent_pid = parent_pid
+        self._frame_paths = sorted(self._frames_dir.glob("*.tif*"))
+        self._n_frames = len(self._frame_paths)
+        self._current_idx = 0
+        self._build_ui()
+        if self._n_frames > 0:
+            self._show_frame(0)
+        else:
+            self._info_label.setText("No TIFF frames found in export directory")
+
+    def _build_ui(self):
+        self.setWindowTitle(f"CorridorKey — SCRUB RANGE  ({self._n_frames} frames)")
+        self.setStyleSheet("background: #1a1a1a; color: #ccc;")
+        self.setMinimumSize(900, 560)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(6)
+
+        # Header
+        hdr = QtWidgets.QLabel("SCRUB RANGE — verify frames before processing")
+        hdr.setAlignment(QtCore.Qt.AlignCenter)
+        hdr.setStyleSheet("color: #a5f; font-size: 13px; font-weight: bold; padding: 4px;")
+        layout.addWidget(hdr)
+
+        # Frame display
+        self._image_label = QtWidgets.QLabel()
+        self._image_label.setAlignment(QtCore.Qt.AlignCenter)
+        self._image_label.setMinimumHeight(400)
+        self._image_label.setStyleSheet("border: 1px solid #333; background: #111;")
+        layout.addWidget(self._image_label, stretch=1)
+
+        # Frame counter
+        self._info_label = QtWidgets.QLabel("Loading…")
+        self._info_label.setAlignment(QtCore.Qt.AlignCenter)
+        self._info_label.setStyleSheet("color: #0dcaf0; font-size: 12px; font-weight: bold; padding: 2px;")
+        layout.addWidget(self._info_label)
+
+        # Scrubber slider
+        self._slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self._slider.setRange(0, max(0, self._n_frames - 1))
+        self._slider.setValue(0)
+        self._slider.setStyleSheet("""
+            QSlider::groove:horizontal { height: 8px; background: #333; border-radius: 4px; }
+            QSlider::handle:horizontal { background: #a5f; width: 20px; height: 20px;
+                                         border-radius: 10px; margin: -6px 0; }
+            QSlider::sub-page:horizontal { background: #a5f; border-radius: 4px; }
+        """)
+        self._slider.valueChanged.connect(self._show_frame)
+        layout.addWidget(self._slider)
+
+        # Step hint
+        hint = QtWidgets.QLabel("Drag slider to scrub through frames  •  Check lighting, screen cleanliness, and subject position")
+        hint.setAlignment(QtCore.Qt.AlignCenter)
+        hint.setStyleSheet("color: #666; font-size: 10px;")
+        layout.addWidget(hint)
+
+        # Close button
+        close_btn = QtWidgets.QPushButton("CLOSE SCRUBBER")
+        close_btn.setStyleSheet(
+            "QPushButton { background: transparent; color: #f66; border: 1px solid #f66; "
+            "padding: 8px; border-radius: 3px; font-size: 12px; font-weight: bold; } "
+            "QPushButton:hover { background: rgba(255,102,102,0.2); }"
+        )
+        close_btn.clicked.connect(self.close)
+        layout.addWidget(close_btn)
+
+    def _show_frame(self, idx: int):
+        if not self._frame_paths or idx >= self._n_frames:
+            return
+        fp = self._frame_paths[idx]
+        img = cv2.imread(str(fp), cv2.IMREAD_UNCHANGED)
+        if img is None:
+            self._info_label.setText(f"Cannot read: {fp.name}")
+            return
+        # Normalise to 8-bit for display
+        if img.dtype == np.uint16:
+            img = (img >> 8).astype(np.uint8)
+        elif img.dtype != np.uint8:
+            img = np.clip(img.astype(np.float32) * 255, 0, 255).astype(np.uint8)
+        # Convert colour space to RGB for Qt
+        if img.ndim == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+        elif img.shape[2] == 3:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        elif img.shape[2] >= 4:
+            img = cv2.cvtColor(img[:, :, :3], cv2.COLOR_BGR2RGB)
+        h, w = img.shape[:2]
+        q_img = QtGui.QImage(img.data.tobytes(), w, h, 3 * w, QtGui.QImage.Format_RGB888)
+        pix = QtGui.QPixmap.fromImage(q_img)
+        label_size = self._image_label.size()
+        if label_size.width() > 0 and label_size.height() > 0:
+            pix = pix.scaled(label_size, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+        self._image_label.setPixmap(pix)
+        self._info_label.setText(f"Frame {idx + 1} / {self._n_frames}   —   {fp.name}")
+        self._current_idx = idx
+
+
 # ===== main =====
+def _run_braw_scrubber(frames_dir: str, parent_pid: int):
+    # WHAT IT DOES: Launches the BrawScrubberWindow as the sole Qt window.
+    #   Called when preview_viewer_v2.py is invoked with --braw-scrubber <dir>.
+    # DEPENDS-ON: BrawScrubberWindow, _parent_alive.
+    # AFFECTS: opens a Qt window. Exits when user closes it.
+    app = QtWidgets.QApplication(sys.argv)
+    app.setStyle("Fusion")
+    win = BrawScrubberWindow(Path(frames_dir), parent_pid)
+    screen = app.primaryScreen()
+    if screen is not None:
+        geo = screen.availableGeometry()
+        fr = win.frameGeometry()
+        win.move(
+            geo.left() + (geo.width() - fr.width()) // 2,
+            geo.top() + (geo.height() - fr.height()) // 2,
+        )
+    win.show()
+    win.raise_()
+    if parent_pid > 0:
+        watchdog = QtCore.QTimer()
+        watchdog.setInterval(1000)
+        watchdog.timeout.connect(
+            lambda: app.quit() if not _parent_alive(parent_pid) else None
+        )
+        watchdog.start()
+    sys.exit(app.exec())
+
+
 def _run_persistent(session_dir: str, parent_pid: int):
     cu = _import_color_utils()
     session = Session(Path(session_dir))
@@ -1650,13 +2000,35 @@ def main():
             print("ERROR: --persistent requires --session <dir>", file=sys.stderr)
             sys.exit(2)
         _run_persistent(session_dir, parent_pid)
+    elif args and args[0] == "--braw-scrubber":
+        # --braw-scrubber <frames_dir> [--session <dir>] [--parent-pid N]
+        # The <frames_dir> is the first positional arg after --braw-scrubber.
+        frames_dir = None
+        parent_pid = 0
+        i = 1
+        while i < len(args):
+            if args[i] == "--session" and i + 1 < len(args):
+                i += 2  # session dir not needed for scrubber — skip
+            elif args[i] == "--parent-pid" and i + 1 < len(args):
+                try:
+                    parent_pid = int(args[i + 1])
+                except ValueError:
+                    parent_pid = 0
+                i += 2
+            else:
+                frames_dir = args[i]; i += 1
+        if not frames_dir:
+            print("ERROR: --braw-scrubber requires a frames directory", file=sys.stderr)
+            sys.exit(2)
+        _run_braw_scrubber(frames_dir, parent_pid)
     elif args:
         _run_oneshot(args[0])
     else:
         print(
             "Usage:\n"
-            "  preview_viewer.py <json-paths>                          # one-shot\n"
-            "  preview_viewer.py --persistent --session <dir> [--parent-pid N]  # live",
+            "  preview_viewer.py <json-paths>                              # one-shot\n"
+            "  preview_viewer.py --persistent --session <dir> [--parent-pid N]  # live\n"
+            "  preview_viewer.py --braw-scrubber <frames_dir> [--parent-pid N]  # scrubber",
             file=sys.stderr,
         )
         sys.exit(2)
