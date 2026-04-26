@@ -83,7 +83,9 @@ function ae_getFrameInfo() {
         if (!layer.source || !layer.source.file) return JSON.stringify({ ok: false, error: "Selected layer has no source file" });
 
         var fps = 1.0 / comp.frameDuration;
-        var sourceTime = comp.time - layer.startTime;
+        // AE reports comp.time at the END of the current frame — subtract one frame
+        // to match what the user is looking at (same fix applied to ppro_getFrameInfo).
+        var sourceTime = comp.time - layer.startTime - comp.frameDuration;
         if (sourceTime < 0) sourceTime = 0;
         var sourceFrame = Math.round(sourceTime * fps);
         if (sourceFrame < 0) sourceFrame = 0;
