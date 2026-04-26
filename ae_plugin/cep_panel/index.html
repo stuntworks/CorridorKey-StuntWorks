@@ -217,6 +217,9 @@
             <input type="range" id="refiner" min="0" max="100" value="100">
             <span class="slider-value" id="refinerVal">1.00</span>
         </div>
+        <div style="color:#778;font-size:10px;margin-top:4px;line-height:1.4;">
+            NN edge cleanup pass. Most clips don't need to touch this — leave at 1.0. Effect is subtle and only shows on noisy / weak-chroma keys.
+        </div>
         <div style="color:#556;font-size:9px;margin-top:3px;text-align:center;">
             Despill / Despeckle / Choke — drag sliders in the preview window
         </div>
@@ -233,6 +236,11 @@
     <button id="btn-preview" class="btn-preview" onclick="previewFrameLive()">PREVIEW FRAME (LIVE)</button>
     <button id="btn-process" class="btn-process" onclick="processFrame(false)">KEY CURRENT FRAME</button>
     <button id="btn-batch"   class="btn-batch"   onclick="processBatch()">PROCESS WORK AREA</button>
+    <button id="btn-scrub"   class="btn-batch"   onclick="processScrub()">KEY SCRUB (WORK AREA)</button>
+    <div style="display:flex;align-items:center;gap:6px;margin:4px 0 0 2px;">
+        <label for="scrubMaxFrames" style="font-size:10px;color:#aaa;margin:0;">Max scrub frames (0 = all):</label>
+        <input type="number" id="scrubMaxFrames" min="0" max="9999" value="0" style="width:60px;font-size:11px;background:#222;color:#ddd;border:1px solid #333;padding:2px 4px;">
+    </div>
     <div style="display:flex;align-items:center;gap:6px;margin:4px 0 0 2px;">
         <input type="checkbox" id="hideSourceLayer" checked>
         <label for="hideSourceLayer" style="font-size:10px;color:#aaa;margin:0;cursor:pointer;">Hide source layer after batch</label>
@@ -338,6 +346,8 @@ function setBusy(busy, source) {
     // (:disabled kills CSS animations in Chromium.)
     document.getElementById('btn-process').disabled = busy;
     document.getElementById('btn-batch').disabled = busy;
+    const _scrubBtn = document.getElementById('btn-scrub');
+    if (_scrubBtn) _scrubBtn.disabled = busy;
     if (busy) {
         previewBtn.disabled = false;  // keep enabled so animation works
         previewBtn.classList.add('btn-working');
@@ -467,10 +477,13 @@ function runPython(args, onProgressLine) {
     logLine('exec: ' + python + ' ' + args.join(' '));
 
     // execFileSync with arg array — no shell is invoked. windowsHide keeps the console off-screen.
+    // CORRIDORKEY_ROOT must be in env so ae_processor.py can locate sam2_weights/ for batch-scrub.
+    // Without it, __file__.parent.parent resolves to the CEP extensions dir, not the engine root.
     const res = childProcess.spawnSync(python, [processor].concat(args), {
         encoding: 'utf8',
         windowsHide: true,
-        maxBuffer: 64 * 1024 * 1024
+        maxBuffer: 64 * 1024 * 1024,
+        env: Object.assign({}, process.env, { CORRIDORKEY_ROOT: ckRoot })
     });
 
     if (res.stdout) {
@@ -727,8 +740,13 @@ function previewFrameLive() {
             const stableFramePng = path.join(sessionDir, 'source.png');
             fs.copyFileSync(framePng, stableFramePng);
             LAST_FRAME_PNG = stableFramePng;
-            paramsPath = writeParamsFile(settings);
-            runPython(['cache', framePng, sessionDir, '--params', paramsPath]);
+            // Pass sourceFrame so cmd_cache can write frame_num into meta.json.
+            // Viewer reads meta.frame_num and writes it as sam_anchor_frame in
+            // live_params.json. cmd_batch_scrub uses that as the SAM2 video
+            // predictor anchor — without this the anchor defaults to scrub
+            // range frame 0 and SAM2 propagates from the wrong pose.
+            paramsPath = writeParamsFile(Object.assign({}, settings, { sourceFrame: info.sourceFrame }));
+            runPython(['cache', stableFramePng, sessionDir, '--params', paramsPath]);
 
             // Step 3 — spawn the viewer. Kill any existing viewer first so the
             // new one watches the correct session dir's live_params.json (the
@@ -898,6 +916,92 @@ function processBatch() {
                 } catch (e) {
                     logLine('fatal: ' + e.message, true);
                     status('Error — check log');
+                    setBusy(false);
+                }
+            }, 50);
+        } catch (e) {
+            logLine('fatal: ' + e.message, true);
+            status('Error — check log');
+            setBusy(false);
+        }
+    });
+}
+
+// ============================================================
+// SCRUB FLOW (KEY N FRAMES INTO LIVE PREVIEW)
+// ============================================================
+// WHAT IT DOES: Keys N consecutive frames starting at the current AE frame
+//   and writes them to <CURRENT_SESSION_DIR>/scrub/NNN/. The running viewer
+//   polls for scrub_index.json and switches to scrub mode automatically.
+// DEPENDS-ON: Live Preview must already be running (sets CURRENT_SESSION_DIR
+//   and spawns the viewer). Calls ae_getFrameInfo for source path + frame.
+// AFFECTS: Writes scrub/ subdirs and scrub_index.json under
+//   CURRENT_SESSION_DIR. Does NOT import frames to the AE timeline — they
+//   stay on disk for the viewer to scrub through.
+function processScrub() {
+    if (!CURRENT_SESSION_DIR || !VIEWER_PROC) {
+        flashButtonError('btn-scrub', 'CLICK PREVIEW FRAME FIRST');
+        return;
+    }
+    if (HOST_APP === 'ppro') {
+        flashButtonError('btn-scrub', 'NOT SUPPORTED ON PREMIERE');
+        return;
+    }
+    const settings = getSettings();
+    setBusy(true, 'batch');
+    status('Reading work area...');
+
+    // Pull the AE work area (in/out markers) — same range PROCESS WORK AREA uses.
+    // The Max scrub frames input caps it (0 = no cap, use whole work area).
+    jsxCall('ae_getWorkAreaInfo', [], (info) => {
+        if (!info.ok) { logLine('host error: ' + info.error, true); setBusy(false); flashButtonError('btn-scrub', 'SELECT A LAYER'); return; }
+        try {
+            const scrubDir = path.join(CURRENT_SESSION_DIR, 'scrub');
+            fs.mkdirSync(scrubDir, { recursive: true });
+
+            const workAreaCount = Math.max(1, info.endFrame - info.startFrame);
+            const rawCap = parseInt(document.getElementById('scrubMaxFrames').value, 10);
+            const cap = (isFinite(rawCap) && rawCap > 0) ? rawCap : workAreaCount;
+            const frameCount = Math.min(workAreaCount, cap);
+
+            const rangeFields = {
+                startFrame: info.startFrame,
+                count: frameCount,
+                fps: info.fps
+            };
+            const paramsPath = writeParamsFile(Object.assign({}, settings, rangeFields));
+
+            const scrubBtn = document.getElementById('btn-scrub');
+            scrubBtn.textContent = 'KEYING ' + frameCount + ' FRAMES...';
+            status('Keying ' + frameCount + ' scrub frames... DO NOT CLOSE');
+
+            // setTimeout(50) gives CEP one repaint cycle so button text and
+            // status bar render BEFORE the blocking spawnSync.
+            setTimeout(() => {
+                try {
+                    runPython(
+                        ['batch-scrub', info.sourceFile, scrubDir, '--params', paramsPath],
+                        (line) => {
+                            const m = line.match(/PROGRESS\s+(\d+)\/(\d+)/);
+                            if (m) {
+                                const pct = (parseInt(m[1], 10) / parseInt(m[2], 10)) * 100;
+                                setProgress(pct);
+                                status('Keyed ' + m[1] + '/' + m[2]);
+                            }
+                        }
+                    );
+                    try { fs.unlinkSync(paramsPath); } catch (_) {}
+
+                    const indexPath = path.join(CURRENT_SESSION_DIR, 'scrub_index.json');
+                    if (!fs.existsSync(indexPath)) throw new Error('Scrub index not written');
+                    status('Scrub ready — drag slider in Live Preview viewer');
+                    logLine('Scrub frames written to ' + scrubDir);
+                    scrubBtn.textContent = 'KEY SCRUB (WORK AREA)';
+                    setBusy(false);
+                } catch (e) {
+                    logLine('fatal: ' + e.message, true);
+                    status('Error — check log');
+                    scrubBtn.textContent = 'KEY SCRUB (WORK AREA)';
                     setBusy(false);
                 }
             }, 50);
