@@ -1,4 +1,4 @@
-# Last modified: 2026-04-24 | Change: sliders; progress bar fills + frame count text; SAM2→"Click to Mask" rename; hint text readable; Resolve shutdown hang fix | Full history: git log
+# Last modified: 2026-04-27 | Change: SAM2 quality gate — when propagation loses tracking mid-range and returns a near-empty mask, fall back to a no-op gate (ones) so the NN alpha passes through ungated for that frame instead of being multiplied to black. Fixes the "matte goes black halfway through the range" bug seen on long stunt clips with many click points. | Full history: git log
 """CorridorKey Pro - Neural Green Screen for DaVinci Resolve
 Enhanced with SAM2 Click-to-Mask, Frame Range, Export Modes
 
@@ -144,9 +144,27 @@ _main_thread_id = threading.get_ident()
 last_preview_data = {"original": None, "keyed": None, "alpha": None}
 cached_source = {"frame": None, "file_path": None, "frame_num": None}
 cached_processor = {"proc": None}  # Holds loaded AI model to avoid reloading every frame
+# WHAT IT DOES: Holds a CPU-only processor pre-inited at LIVE PREVIEW time for SCRUB RANGE use.
+#   Avoids creating a new CPU proc inside the background thread (which triggers torch.compile
+#   at img_size=2048 on CPU — a 6+ minute hang). Populated once; reused for all scrub runs.
+# DEPENDS-ON: CorridorKeyProcessor(device="cpu"), CORRIDORKEY_SKIP_COMPILE=1 env flag
+# AFFECTS: _start_scrub_keying worker (reads this instead of creating its own)
+cached_scrub_cpu_proc = {"proc": None}  # CPU proc for SCRUB RANGE — pre-inited, never CUDA
 sam_points = {"positive": [], "negative": [], "frame": None}
 frame_range = {"in_frame": None, "out_frame": None}
-_viewer_proc = None  # Tracks preview viewer subprocess — killed on plugin close
+_viewer_proc = None      # Tracks Live Preview subprocess — stays alive while scrubber is open
+_scrubber_proc = None   # Tracks SCRUB RANGE subprocess — separate from live preview
+_scrubber_frames_dir = None    # TIFF temp dir for scrubber — cleaned up on close/new scrub
+_scrub_pending = []          # frames queued for Phase 1 timer-based export (list of (fi, tl_frame))
+_scrub_pending_buffers = []  # accumulated BytesIO results from Phase 1
+_scrub_pending_ctx = {}      # state dict from on_scrub_range, consumed by on_poll_timer
+# Phase 2 keying — main-thread one-frame-per-tick (avoids background thread CUDA deadlock)
+_scrub_key_queue   = []      # list of (frame_idx, BytesIO) waiting to be keyed
+_scrub_key_ctx     = {}      # keying context: proc, ps, hint_gen, scrub_dir, settings, despill
+_scrub_key_done    = 0       # frames successfully keyed so far
+_scrub_key_total   = 0       # total frames to key in this run
+_proxy_mpi        = None   # MediaPoolItem waiting for Resolve to finish optimized media generation
+_proxy_mode_saved = None   # proxy mode value before we enabled it — restored after scrub finishes
 
 # WHAT IT DOES: Guarantees cleanup when Resolve shuts down — kills the preview viewer
 #   subprocess and releases the CUDA context held by the cached neural-net model.
@@ -179,11 +197,23 @@ def _cleanup_on_exit():
                     import subprocess as _sp
                     _sp.run(
                         ["taskkill", "/F", "/T", "/PID", str(pid)],
-                        capture_output=True, timeout=3
+                        stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, timeout=3
                     )
                 except Exception:
                     pass
             _viewer_proc = None
+    except Exception:
+        pass
+    try:
+        if _scrubber_proc is not None and _scrubber_proc.poll() is None:
+            _scrubber_proc.kill()
+            try: _scrubber_proc.wait(timeout=2)
+            except Exception: pass
+    except Exception:
+        pass
+    try:
+        if _scrubber_frames_dir and Path(_scrubber_frames_dir).exists():
+            shutil.rmtree(_scrubber_frames_dir, ignore_errors=True)
     except Exception:
         pass
     # Skip CUDA/torch finalizers — they block 30-60 s on Windows when Resolve terminates
@@ -210,60 +240,45 @@ def _save_output_path(p):
     try: _config_path.write_text(p)
     except: pass
 
-winLayout = ui.VGroup({"Spacing": 14}, [
+winLayout = ui.VGroup({"Spacing": 4}, [
     ui.HGroup({"Weight": 0, "Spacing": 0}, [
-        ui.Button({"ID": "HeaderCK", "Text": "CorridorKey Pro", "Weight": 1, "StyleSheet": "QPushButton { background: transparent; color: #0ff; font-size: 14px; font-weight: bold; border: none; padding: 2px; } QPushButton:hover { color: #5ff; }"}),
-        ui.Label({"Text": "—", "Weight": 0, "StyleSheet": "color: #0ff; font-size: 14px; font-weight: bold;"}),
-        ui.Button({"ID": "HeaderSW", "Text": "StuntWorks Action Cinema", "Weight": 1, "StyleSheet": "QPushButton { background: transparent; color: #0ff; font-size: 14px; font-weight: bold; border: none; padding: 2px; } QPushButton:hover { color: #5ff; }"}),
+        ui.Button({"ID": "HeaderCK", "Text": "CorridorKey Pro ↗", "Weight": 1, "ToolTip": "Visit CorridorKey Pro website", "StyleSheet": "QPushButton { background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 rgba(13, 202, 240, 0.20), stop:1 transparent); border: none; border-left: 3px solid #0dcaf0; color: #0dcaf0; font-size: 20px; font-weight: bold; padding: 10px 16px; text-align: left; } QPushButton:hover { background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 rgba(13, 202, 240, 0.40), stop:1 transparent); color: #fff; border-left: 3px solid #fff; text-decoration: underline; }"}),
+    ]),
+    ui.HGroup({"Weight": 0, "Spacing": 0}, [
+        ui.Button({"ID": "HeaderSW", "Text": "by Stuntworks Cinema ↗", "Weight": 1, "ToolTip": "Visit StuntWorks Cinema on YouTube", "StyleSheet": "QPushButton { background-color: transparent; border: none; border-left: 2px solid #5af; color: #5af; font-size: 13px; padding: 6px 16px; text-align: left; } QPushButton:hover { background-color: rgba(85, 170, 255, 0.15); color: #8cf; text-decoration: underline; }"}),
     ]),
     ui.HGroup({"Weight": 0, "Spacing": 4}, [
-        ui.Button({"ID": "YouTubeBtn", "Text": "▶ YouTube", "Weight": 1, "StyleSheet": "QPushButton { background-color: #1a1a1a; color: #cc3300; font-size: 11px; font-weight: bold; border-radius: 4px; padding: 4px; border: 1px solid #cc3300; } QPushButton:hover { background-color: #cc3300; color: #fff; }"}),
-        ui.Button({"ID": "KofiBtn", "Text": "☕ Ko-fi", "Weight": 1, "StyleSheet": "QPushButton { background-color: #1a1a1a; color: #FF5E5B; font-size: 11px; font-weight: bold; border-radius: 4px; padding: 4px; border: 1px solid #FF5E5B; } QPushButton:hover { background-color: #FF5E5B; color: #fff; }"}),
-        ui.Button({"ID": "AboutBtn", "Text": "About", "Weight": 1, "StyleSheet": "QPushButton { background-color: #1a1a1a; color: #888; font-size: 11px; border-radius: 4px; padding: 4px; } QPushButton:hover { background-color: #444; color: #fff; }"}),
+        ui.Button({"ID": "YouTubeBtn", "Text": "▶ YouTube", "Weight": 1, "StyleSheet": "QPushButton { background-color: transparent; color: #cc3300; font-size: 11px; font-weight: bold; border-radius: 2px; padding: 4px 12px; border: 1px solid #cc3300; } QPushButton:hover { background-color: #cc3300; color: #fff; }"}),
+        ui.Button({"ID": "KofiBtn", "Text": "☕ Ko-fi", "Weight": 1, "StyleSheet": "QPushButton { background-color: transparent; color: #FF5E5B; font-size: 11px; font-weight: bold; border-radius: 2px; padding: 4px 12px; border: 1px solid #FF5E5B; } QPushButton:hover { background-color: #FF5E5B; color: #fff; }"}),
+        ui.Button({"ID": "AboutBtn", "Text": "About", "Weight": 1, "StyleSheet": "QPushButton { background-color: transparent; color: #888; font-size: 11px; border-radius: 2px; padding: 4px 12px; border: 1px solid #333; } QPushButton:hover { background-color: #1a1a1a; color: #ccc; border-color: #555; }"}),
     ]),
     ui.HGroup({"Weight": 0, "Spacing": 8}, [
-        ui.Label({"Text": "Mask Mode:", "Weight": 0}),
-        ui.ComboBox({"ID": "AlphaMethod", "Weight": 2}),
         ui.Label({"Text": "Screen:", "Weight": 0}),
-        ui.ComboBox({"ID": "ScreenType", "Weight": 2}),
+        ui.ComboBox({"ID": "ScreenType", "Weight": 2, "StyleSheet": "QComboBox { background-color: #1a1a1a; border: 1px solid #333; border-radius: 3px; padding: 4px 8px; color: #ccc; } QComboBox:hover { border-color: #0dcaf0; background-color: #222; } QComboBox::drop-down { border-left: 1px solid #333; width: 24px; } QComboBox::down-arrow { border-top: 5px solid #0dcaf0; border-left: 4px solid transparent; border-right: 4px solid transparent; width: 0; height: 0; }"}),
     ]),
     ui.HGroup({"Weight": 0, "Spacing": 6}, [
         ui.Label({"Text": "Refiner:", "Weight": 0}),
-        ui.Slider({"ID": "RefinerStrength", "Minimum": 0, "Maximum": 100, "Value": 100, "Weight": 3,
-                   "Orientation": "Horizontal", "SingleStep": 1}),
-        ui.SpinBox({"ID": "RefinerInput", "Minimum": 0, "Maximum": 100, "Value": 100, "Weight": 0,
-                    "StyleSheet": "background: #222; color: #ccc; border: 1px solid #444; border-radius: 3px; max-width: 48px;"}),
+        ui.Slider({"ID": "RefinerStrength", "Minimum": 0, "Maximum": 100, "Value": 75, "Weight": 3,
+                   "Orientation": "Horizontal", "SingleStep": 1,
+                   "StyleSheet": "QSlider::groove:horizontal { height: 6px; background: #222; border-radius: 3px; } QSlider::sub-page:horizontal { background: #0dcaf0; border-radius: 3px; } QSlider::handle:horizontal { background: #fff; border: 2px solid #0dcaf0; width: 14px; height: 14px; margin: -4px 0; border-radius: 7px; } QSlider::handle:horizontal:hover { background: #0dcaf0; border-color: #fff; }"}),
+        ui.SpinBox({"ID": "RefinerInput", "Minimum": 0, "Maximum": 100, "Value": 75, "Weight": 0,
+                    "StyleSheet": "QSpinBox { background-color: #1a1a1a; color: #ccc; border: 1px solid #333; padding: 4px; border-radius: 3px; min-width: 50px; } QSpinBox::up-button, QSpinBox::down-button { background-color: #2a2a2a; border: none; width: 16px; } QSpinBox::up-button:hover, QSpinBox::down-button:hover { background-color: #0dcaf0; }"}),
         ui.Label({"Text": "%", "Weight": 0, "StyleSheet": "color: #888; font-size: 11px;"}),
     ]),
     ui.Label({"Text": "Edge detail. Re-run Process Range after changing.", "Weight": 0,
               "StyleSheet": "color: #888; font-size: 10px; padding-left: 2px;"}),
-    ui.HGroup({"Weight": 0, "Spacing": 6}, [
-        ui.Label({"Text": "Mask Margin:", "Weight": 0, "StyleSheet": "color: #aaa; font-size: 11px;"}),
-        ui.Slider({"ID": "Sam2Margin", "Minimum": 0, "Maximum": 80, "Value": 5, "Weight": 3,
-                   "Orientation": "Horizontal", "SingleStep": 1}),
-        ui.SpinBox({"ID": "Sam2MarginInput", "Minimum": 0, "Maximum": 80, "Value": 5, "Weight": 0,
-                    "StyleSheet": "background: #222; color: #ccc; border: 1px solid #444; border-radius: 3px; max-width: 48px;"}),
-        ui.Label({"Text": "px", "Weight": 0, "StyleSheet": "color: #888; font-size: 11px;"}),
-    ]),
-    ui.Label({"Text": "Mask Adjustments — controls how tight or loose the mask fits the subject.", "Weight": 0,
-              "StyleSheet": "color: #888; font-size: 10px; padding-left: 2px;"}),
-    ui.HGroup({"Weight": 0, "Spacing": 6}, [
-        ui.Label({"Text": "Soften:", "Weight": 0, "StyleSheet": "color: #aaa; font-size: 11px;"}),
-        ui.Slider({"ID": "Sam2Soften", "Minimum": 0, "Maximum": 20, "Value": 0, "Weight": 3,
-                   "Orientation": "Horizontal", "SingleStep": 1}),
-        ui.SpinBox({"ID": "Sam2SoftenInput", "Minimum": 0, "Maximum": 20, "Value": 0, "Weight": 0,
-                    "StyleSheet": "background: #222; color: #ccc; border: 1px solid #444; border-radius: 3px; max-width: 48px;"}),
-        ui.Label({"Text": "px", "Weight": 0, "StyleSheet": "color: #888; font-size: 11px;"}),
-    ]),
-    ui.Label({"Text": "Feathers the mask edge — 0 is sharp, higher values create a soft fade.", "Weight": 0,
-              "StyleSheet": "color: #888; font-size: 10px; padding-left: 2px;"}),
+    # Mask Margin and Soften sliders moved to the live preview viewer
+    # (preview_viewer_v2.py) where they belong — that's where the user dials
+    # them in real time against a visible matte. Panel-side duplicates were
+    # removed 2026-04-26 per Berto. The viewer writes the values to
+    # live_params.json which _merge_live_params reads at render time.
     ui.HGroup({"Weight": 0, "Spacing": 5}, [
         ui.Label({"Text": "Export:", "Weight": 0}),
-        ui.ComboBox({"ID": "ExportFormat", "Weight": 2}),
+        ui.ComboBox({"ID": "ExportFormat", "Weight": 2, "StyleSheet": "QComboBox { background-color: #1a1a1a; border: 1px solid #333; border-radius: 3px; padding: 4px 8px; color: #ccc; } QComboBox:hover { border-color: #0dcaf0; background-color: #222; } QComboBox::drop-down { border-left: 1px solid #333; width: 24px; } QComboBox::down-arrow { border-top: 5px solid #0dcaf0; border-left: 4px solid transparent; border-right: 4px solid transparent; width: 0; height: 0; }"}),
     ]),
     ui.HGroup({"Weight": 0, "Spacing": 5}, [
         ui.Label({"Text": "Output:", "Weight": 0}),
-        ui.ComboBox({"ID": "OutputMode", "Weight": 2}),
+        ui.ComboBox({"ID": "OutputMode", "Weight": 2, "StyleSheet": "QComboBox { background-color: #1a1a1a; border: 1px solid #333; border-radius: 3px; padding: 4px 8px; color: #ccc; } QComboBox:hover { border-color: #0dcaf0; background-color: #222; } QComboBox::drop-down { border-left: 1px solid #333; width: 24px; } QComboBox::down-arrow { border-top: 5px solid #0dcaf0; border-left: 4px solid transparent; border-right: 4px solid transparent; width: 0; height: 0; }"}),
     ]),
     ui.HGroup({"Weight": 0, "Spacing": 5}, [
         ui.Label({"Text": "Save To:", "Weight": 0}),
@@ -274,10 +289,10 @@ winLayout = ui.VGroup({"Spacing": 14}, [
     ui.Label({"Text": "Frame Range:", "Weight": 0, "StyleSheet": "color: #0ff; font-weight: bold;"}),
     ui.HGroup({"Weight": 0, "Spacing": 5}, [
         ui.Button({"ID": "SetInPoint", "Text": "IN", "Weight": 1, "StyleSheet": "QPushButton { background-color: #3a5a6a; color: #7ab; border-radius: 4px; padding: 4px; font-weight: bold; }"}),
-        ui.Label({"ID": "InPointLabel", "Text": "---", "Weight": 0, "StyleSheet": "color: #7ab;"}),
+        ui.Label({"ID": "InPointLabel", "Text": "FULL", "Weight": 0, "StyleSheet": "color: #7ab;"}),
         ui.Button({"ID": "SetOutPoint", "Text": "OUT", "Weight": 1, "StyleSheet": "QPushButton { background-color: #3a5a6a; color: #7ab; border-radius: 4px; padding: 4px; font-weight: bold; }"}),
-        ui.Label({"ID": "OutPointLabel", "Text": "---", "Weight": 0, "StyleSheet": "color: #7ab;"}),
-        ui.Button({"ID": "ClearRange", "Text": "Clear", "Weight": 1, "StyleSheet": "QPushButton { background-color: #222; color: #667; border-radius: 4px; padding: 4px; }"}),
+        ui.Label({"ID": "OutPointLabel", "Text": "FULL", "Weight": 0, "StyleSheet": "color: #7ab;"}),
+        ui.Button({"ID": "ClearRange", "Text": "Clear", "Weight": 1, "StyleSheet": "QPushButton { background-color: transparent; color: #f66; font-size: 11px; border-radius: 3px; padding: 4px; border: 1px solid #f66; } QPushButton:hover { background-color: rgba(255, 102, 102, 0.2); }"}),
     ]),
     ui.HGroup({"Weight": 0}, [
         ui.CheckBox({"ID": "DisableTrack1", "Text": "Disable source clip after processing  (uncheck to leave source visible)", "Checked": True,
@@ -290,22 +305,53 @@ winLayout = ui.VGroup({"Spacing": 14}, [
     ui.Label({"ID": "Progress", "Text": "", "Weight": 0,
         "StyleSheet": "background: #111; border: 1px solid #333; border-radius: 4px; min-height: 20px; max-height: 20px; color: #fff; font-size: 10px;"}),
     ui.VGap(2),
-    ui.HGroup({"Weight": 0, "Spacing": 5}, [
-        ui.Button({"ID": "ShowPreview", "Text": "PREVIEW", "Weight": 1, "StyleSheet": "QPushButton { background-color: #1a3a4a; color: #5df; font-weight: bold; border-radius: 5px; padding: 6px; border: 1px solid #5df; }"}),
-        ui.Button({"ID": "ProcessFrame", "Text": "SINGLE FRAME", "Weight": 1, "StyleSheet": "QPushButton { background-color: #1a3a5a; color: #5af; font-weight: bold; border-radius: 5px; padding: 6px; border: 1px solid #5af; }"}),
+    # ── STEP 1 — LIVE PREVIEW ──────────────────────────────────────────────
+    ui.Label({"Text": "STEP 1 — LIVE PREVIEW", "Weight": 0,
+              "StyleSheet": "color: #0dcaf0; font-size: 11px; font-weight: bold; padding: 2px 0 0 2px;"}),
+    ui.Button({"ID": "ShowPreview", "Text": "LIVE PREVIEW", "Weight": 0,
+        "StyleSheet": "QPushButton { background-color: transparent; color: #0dcaf0; font-size: 13px; font-weight: bold; padding: 10px 14px; border: 2px solid #0dcaf0; border-radius: 3px; } QPushButton:hover { background-color: rgba(13, 202, 240, 0.15); color: #5ff; border-color: #5ff; }"}),
+    # ── STEP 2 — PAINT MASK (optional) ────────────────────────────────────
+    ui.VGap(2),
+    ui.Label({"Text": "STEP 2 — PAINT MASK  (optional)", "Weight": 0,
+              "StyleSheet": "color: #a5f; font-size: 11px; font-weight: bold; padding: 2px 0 0 2px;"}),
+    ui.Label({"Text": "Open Live Preview → click the person to isolate them from the green screen", "Weight": 0,
+              "StyleSheet": "color: #888; font-size: 10px; padding-left: 2px;"}),
+    # ── STEP 3 — SCRUB RANGE (optional) ───────────────────────────────────
+    ui.VGap(2),
+    ui.Label({"Text": "STEP 3 — SCRUB RANGE  (optional)", "Weight": 0,
+              "StyleSheet": "color: #a5f; font-size: 11px; font-weight: bold; padding: 2px 0 0 2px;"}),
+    ui.Button({"ID": "ScrubRange", "Text": "SCRUB RANGE", "Weight": 0,
+        "ToolTip": "Keys every frame in your IN/OUT range so you can drag through the result.\nTIP: Much faster when Resolve Optimized Media is generated for this clip.",
+        "StyleSheet": "QPushButton { background-color: transparent; color: #a5f; font-size: 14px; font-weight: bold; padding: 12px; border: 2px solid #a5f; border-radius: 3px; } QPushButton:hover { background-color: rgba(170, 85, 255, 0.2); color: #c9f; } QPushButton:pressed { background-color: rgba(170, 85, 255, 0.4); }"}),
+    ui.HGroup({"Weight": 0, "Spacing": 6}, [
+        ui.Label({"Text": "Max frames:", "Weight": 0,
+            "StyleSheet": "color: #888; font-size: 10px; padding-left: 4px;"}),
+        ui.SpinBox({"ID": "ScrubMaxFrames", "Minimum": 0, "Maximum": 9999, "Value": 0, "Weight": 1,
+            "ToolTip": "0 = all frames in range (frame-accurate).\nSet a number to sample evenly — useful for long clips.",
+            "StyleSheet": "color: #ccc; font-size: 10px;"}),
+        ui.Label({"Text": "  (0 = all frames)", "Weight": 0,
+            "StyleSheet": "color: #555; font-size: 10px;"}),
     ]),
-    ui.Label({"Text": "Click to Mask: open Preview → paint the person to isolate them", "Weight": 0,
-              "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #888; font-size: 10px;"}),
+    ui.Label({"Text": "Tip: Generate Optimized Media in Resolve first for faster scrubbing", "Weight": 0,
+        "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #ccb84a; font-size: 10px; font-style: italic;"}),
+    ui.Label({"Text": "Preview every frame in your range before committing to a full render", "Weight": 0,
+        "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #aaa; font-size: 10px;"}),
+    # ── STEP 4 — PROCESS RANGE ────────────────────────────────────────────
     ui.VGap(2),
-    ui.Button({"ID": "ProcessRange", "Text": "PROCESS RANGE", "Weight": 0, "StyleSheet": "QPushButton { background-color: #1a4a2a; color: #5b5; font-size: 15px; font-weight: bold; border-radius: 6px; padding: 10px; border: 1px solid #5b5; }"}),
-    ui.Button({"ID": "Cancel", "Text": "CANCEL", "Weight": 0, "StyleSheet": "QPushButton { background-color: #4a1a1a; color: #f66; font-weight: bold; border-radius: 5px; padding: 4px; border: 1px solid #f66; }"}),
+    ui.Label({"Text": "STEP 4 — PROCESS RANGE", "Weight": 0,
+              "StyleSheet": "color: #5b5; font-size: 11px; font-weight: bold; padding: 2px 0 0 2px;"}),
+    ui.Button({"ID": "ProcessRange", "Text": "PROCESS RANGE", "Weight": 0, "StyleSheet": "QPushButton { background-color: #5b5; color: #000; font-size: 15px; font-weight: bold; padding: 16px; border: none; border-radius: 3px; } QPushButton:hover { background-color: #6c6; } QPushButton:pressed { background-color: #4a4; }"}),
+    ui.Button({"ID": "Cancel", "Text": "CANCEL", "Weight": 0, "StyleSheet": "QPushButton { background-color: transparent; color: #f66; font-size: 12px; padding: 10px; border: 1px solid #f66; border-radius: 3px; } QPushButton:hover { background-color: rgba(255, 102, 102, 0.2); }"}),
+    # ── Utility ───────────────────────────────────────────────────────────
+    ui.Button({"ID": "ProcessFrame", "Text": "SINGLE FRAME", "Weight": 0,
+        "StyleSheet": "QPushButton { background-color: transparent; color: #5af; font-size: 11px; font-weight: bold; padding: 6px 14px; border: 1px solid #5af; border-radius: 3px; } QPushButton:hover { background-color: rgba(85, 170, 255, 0.15); color: #8cf; border-color: #8cf; }"}),
     ui.VGap(2),
     ui.HGroup({"Weight": 0, "Spacing": 5}, [
-        ui.Button({"ID": "ToggleTrack1", "Text": "TOGGLE TRACK 1", "Weight": 1, "StyleSheet": "QPushButton { background-color: #222; color: #667; border-radius: 4px; padding: 3px; }"}),
-        ui.Button({"ID": "OpenFusion", "Text": "OPEN FUSION", "Weight": 1, "StyleSheet": "QPushButton { background-color: #3a3a1a; color: #a85; border-radius: 4px; padding: 3px; border: 1px solid #a85; }"}),
+        ui.Button({"ID": "ToggleTrack1", "Text": "TOGGLE TRACK 1", "Weight": 1, "StyleSheet": "QPushButton { background-color: transparent; color: #7ab; font-size: 11px; font-weight: bold; border-radius: 3px; padding: 6px; border: 1px solid #7ab; } QPushButton:hover { background-color: rgba(119, 170, 187, 0.2); color: #9cf; border-color: #9cf; }"}),
+        ui.Button({"ID": "OpenFusion", "Text": "OPEN FUSION", "Weight": 1, "StyleSheet": "QPushButton { background-color: transparent; color: #a85; font-size: 11px; font-weight: bold; border-radius: 3px; padding: 6px; border: 1px solid #a85; } QPushButton:hover { background-color: rgba(170, 136, 85, 0.2); color: #cb9; border-color: #cb9; }"}),
     ]),
     ui.VGap(2),
-    ui.TextEdit({"ID": "Log", "ReadOnly": True, "Weight": 3, "StyleSheet": "background: #111; color: #0ff; font-family: monospace; font-size: 10px; border-radius: 4px; border: 1px solid #222;"}),
+    ui.TextEdit({"ID": "Log", "ReadOnly": True, "Weight": 1, "StyleSheet": "background: #111; color: #0ff; font-family: monospace; font-size: 10px; border-radius: 4px; border: 1px solid #222; min-height: 60px; max-height: 120px;"}),
     ui.Label({"Text": "AI: Niko Pueringer / Corridor Digital  •  Plugin: Roberto & Elvis Lopez / StuntWorks", "Weight": 0, "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #666; font-size: 10px;"}),
     ui.VGap(4),
     ui.Timer({"ID": "PollTimer", "Interval": 500}),
@@ -313,7 +359,7 @@ winLayout = ui.VGroup({"Spacing": 14}, [
         ui.Button({"ID": "KillViewer", "Text": "KILL VIEWER", "Weight": 1,
                    "StyleSheet": "background-color: #3a1a1a; color: #f55; padding: 5px 14px; border: 1px solid #f55; border-radius: 12px; font-size: 12px; font-weight: 600;"}),
         ui.Button({"ID": "ClosePanel", "Text": "CLOSE PANEL", "Weight": 1,
-                   "StyleSheet": "background-color: #2a2a2a; color: #aaa; padding: 5px 14px; border: 1px solid #555; border-radius: 12px; font-size: 12px; font-weight: 600;"}),
+                   "StyleSheet": "QPushButton { background-color: transparent; color: #aaa; padding: 5px 14px; border: 1px solid #aaa; border-radius: 12px; font-size: 12px; font-weight: 600; } QPushButton:hover { background-color: rgba(170, 170, 170, 0.15); color: #fff; border-color: #fff; }"}),
     ]),
 ])
 
@@ -353,11 +399,10 @@ def _check_single_instance():
 
 _check_single_instance()
 
-win = disp.AddWindow({"ID": "CK", "WindowTitle": "CorridorKey Pro", "Geometry": [100, 50, 500, 750]}, winLayout)
+win = disp.AddWindow({"ID": "CK", "WindowTitle": "CorridorKey Pro", "Geometry": [100, 50, 500, 950]}, winLayout)
 
 items = win.GetItems()
-items["AlphaMethod"].AddItem("Simple Chroma Key")
-items["AlphaMethod"].AddItem("SAM2 Click-to-Mask")
+
 items["ScreenType"].AddItem("Green Screen")
 items["ScreenType"].AddItem("Blue Screen")
 items["ExportFormat"].AddItem("RGBA (Full)")
@@ -397,7 +442,7 @@ def status(msg):
 # DEPENDS-ON: Combo boxes and checkboxes in the panel
 def get_settings():
     return {
-        "alpha_method": items["AlphaMethod"].CurrentIndex,
+        "alpha_method": 0,
         "screen_type": "green" if items["ScreenType"].CurrentIndex == 0 else "blue",
         "despill_strength": 0.5,    # viewer-owned; overridden by _merge_live_params
         "refiner_strength": max(0.0, min(1.0, int(items["RefinerStrength"].Value) / 100.0)),
@@ -405,8 +450,10 @@ def get_settings():
         "despeckle_size": 400,      # viewer-owned; overridden by _merge_live_params
         "export_format": items["ExportFormat"].CurrentIndex,
         "output_mode": items["OutputMode"].CurrentIndex,
-        "sam2_margin": int(items["Sam2Margin"].Value),
-        "sam2_soften": int(items["Sam2Soften"].Value),
+        # margin/soften sliders moved to viewer; defaults of 0 are overridden by
+        # _merge_live_params() which pulls the actual values from live_params.json
+        "sam2_margin": 0.0,
+        "sam2_soften": 0.0,
     }
 
 # WHAT IT DOES: Overrides panel's despill / despeckle settings with the v2 viewer's
@@ -433,6 +480,12 @@ def _merge_live_params(settings):
             out["despeckle_enabled"] = bool(lp["despeckle"])
         if "despeckleSize" in lp:
             try: out["despeckle_size"] = max(50, min(2000, int(lp["despeckleSize"])))
+            except (ValueError, TypeError): pass
+        if "sam2_margin" in lp:
+            try: out["sam2_margin"] = max(0.0, float(lp["sam2_margin"]))
+            except (ValueError, TypeError): pass
+        if "sam2_soften" in lp:
+            try: out["sam2_soften"] = max(0.0, float(lp["sam2_soften"]))
             except (ValueError, TypeError): pass
         if "sam_positive" in lp or "sam_negative" in lp:
             sam_points["positive"] = [tuple(p) for p in lp.get("sam_positive", [])]
@@ -499,7 +552,7 @@ def on_set_out_point(ev):
 # WHAT IT DOES: Clears both IN and OUT points, resets labels to "---"
 def on_clear_range(ev):
     frame_range["in_frame"] = frame_range["out_frame"] = None
-    items["InPointLabel"].Text = items["OutPointLabel"].Text = "---"
+    items["InPointLabel"].Text = items["OutPointLabel"].Text = "FULL"
     log("Range cleared")
 
 # WHAT IT DOES: Opens a folder picker for the user to choose where keyed frames are saved
@@ -526,7 +579,7 @@ def _dilate_sam2_mask(mask_float32, margin=SAM2_MATTE_MARGIN):
     import cv2, numpy as np
     if margin <= 0:
         return mask_float32
-    sz = margin * 2 + 1
+    sz = int(margin) * 2 + 1
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (sz, sz))
     mask_u8 = (mask_float32 * 255).astype(np.uint8)
     dilated = cv2.dilate(mask_u8, kernel, iterations=1)
@@ -542,7 +595,7 @@ def _soften_sam2_mask(mask_float32, soften=0):
     if soften <= 0:
         return mask_float32
     # Kernel must be odd — multiply by 2+1 so soften=1 → 3px, soften=5 → 11px, etc.
-    sz = soften * 2 + 1
+    sz = int(soften) * 2 + 1
     blurred = cv2.GaussianBlur(mask_float32, (sz, sz), sigmaX=soften * 0.5)
     return blurred
 
@@ -555,9 +608,33 @@ def _soften_sam2_mask(mask_float32, soften=0):
 # DEPENDS-ON: AlphaHintGenerator
 # AFFECTS: Neural keyer input quality — this is the primary alpha signal into process_frame()
 def generate_alpha_hint(frame, settings):
+    # WHAT IT DOES: Generates the alpha-hint mask fed to the NN. Mirrors AE's
+    #   generate_chroma_hint EXACTLY — inline RGB chroma test + 5x5 Gaussian.
+    #   Float32 in [0,1] so the NN sees smooth partial-alpha at hair edges.
+    # DANGER ZONE FRAGILE/HIGH/CRITICAL: Do NOT swap to AlphaHintGenerator (HSV).
+    #   HSV path flags tan/khaki/olive fabric as screen color (memory:
+    #   corridorkey_alpha_hint_hsv_trap.md) AND its morph CLOSE+OPEN at 5x5
+    #   collapses hair strands into a binary blob — the NN can't recover detail
+    #   the hint already destroyed. AE uses RGB inline; matching that is what
+    #   gives DaVinci the same hair-strand sharpness.
+    # AFFECTS: NN input quality → matte sharpness, hair detail.
     import numpy as np, cv2
-    from core.alpha_hint_generator import AlphaHintGenerator
-    return AlphaHintGenerator(screen_type=settings["screen_type"]).generate_hint(frame)
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    if frame_rgb.dtype == np.uint8:
+        img = frame_rgb.astype(np.float32) / 255.0
+    elif frame_rgb.dtype == np.uint16:
+        img = frame_rgb.astype(np.float32) / 65535.0
+    else:
+        img = frame_rgb.astype(np.float32)
+    if settings.get("screen_type", "green") == "green":
+        red, green, blue = img[:, :, 0], img[:, :, 1], img[:, :, 2]
+        screen_mask = (green > 0.3) & (green > red * 1.2) & (green > blue * 1.2)
+    else:
+        red, green, blue = img[:, :, 0], img[:, :, 1], img[:, :, 2]
+        screen_mask = (blue > 0.3) & (blue > red * 1.2) & (blue > green * 1.2)
+    alpha_hint = (~screen_mask).astype(np.float32)
+    alpha_hint = cv2.GaussianBlur(alpha_hint, (5, 5), 0)
+    return alpha_hint
 
 
 # WHAT IT DOES: Loads the SAM2 binary mask from sam2_mask.png and returns it dilated,
@@ -729,14 +806,28 @@ def run_sam2_video_propagation(fp, ss, cs, in_f, out_f, pos_pts, neg_pts, anchor
             status("SAM2: forward pass...")
             log(f"SAM2 video: forward pass (anchor={anchor_rel} → frame {dur-1})")
             forward_count = 0
+            collapsed_count = 0
+            # DANGER ZONE FRAGILE: SAM2 silently returns near-empty masks when it
+            # loses tracking mid-range (long clips, fast motion, too many click
+            # points). Without this gate, an empty mask multiplies the NN alpha
+            # to zero at the call sites and the matte goes black. Threshold of 100
+            # active pixels treats anything smaller as "lost"; ones-mask falls
+            # through cleanly so the caller's `mt = mt * gate` becomes a no-op
+            # for that frame and NN alpha passes through.
+            # breaks: change ones_like → zeros_like and propagation will black-out
+            # every frame after SAM2 loses the actor.
             for frame_idx, _obj_ids, mask_logits in predictor.propagate_in_video(state):
                 mask = (mask_logits[0] > 0.0).squeeze().cpu().numpy().astype(np.float32)
+                if mask.sum() < 100:
+                    mask = np.ones_like(mask)
+                    collapsed_count += 1
                 masks[frame_idx] = mask
                 forward_count += 1
                 if frame_idx % 20 == 0:
                     log(f"SAM2 forward: frame {frame_idx}/{dur}")
                     status(f"SAM2 forward: {frame_idx}/{dur} frames")
-            log(f"SAM2 forward pass done — {forward_count} masks")
+            log(f"SAM2 forward pass done — {forward_count} masks "
+                f"({collapsed_count} fell back to NN-only)")
 
             # --- Backward pass: anchor → first frame ---
             # Only needed when the anchor is not the first frame. Frames already
@@ -745,17 +836,24 @@ def run_sam2_video_propagation(fp, ss, cs, in_f, out_f, pos_pts, neg_pts, anchor
                 status("SAM2: backward pass...")
                 log(f"SAM2 video: backward pass (anchor={anchor_rel} → frame 0)")
                 backward_count = 0
+                back_collapsed_count = 0
                 for frame_idx, _obj_ids, mask_logits in predictor.propagate_in_video(
                         state, reverse=True):
                     if frame_idx not in masks:
                         mask = (mask_logits[0] > 0.0).squeeze().cpu().numpy().astype(np.float32)
+                        # Same collapse-detection as the forward pass — see the
+                        # DANGER ZONE comment there for why the threshold matters.
+                        if mask.sum() < 100:
+                            mask = np.ones_like(mask)
+                            back_collapsed_count += 1
                         masks[frame_idx] = mask
                     backward_count += 1
                     if frame_idx % 20 == 0:
                         log(f"SAM2 backward: frame {frame_idx}")
                         status(f"SAM2 backward: {frame_idx} frames")
                 log(f"SAM2 backward pass done — {backward_count} frames visited, "
-                    f"{sum(1 for k in masks if k < anchor_rel)} new masks added")
+                    f"{sum(1 for k in masks if k < anchor_rel)} new masks added "
+                    f"({back_collapsed_count} fell back to NN-only)")
             else:
                 log("SAM2 video: anchor is frame 0 — backward pass skipped")
 
@@ -1123,6 +1221,34 @@ def _try_braw_decode_exe(fp, src_start, src_end):
 #   in_f is the absolute timeline frame where the BRAW range begins (same coordinate
 #   system as clip.GetStart()). fps must match the project frame rate.
 #   Resolve does NOT steal the mouse because SetCurrentTimeline is never called.
+# WHAT IT DOES: Fires Resolve's built-in optimized media generator for a BRAW clip.
+#   Non-blocking — Resolve transcodes in background using its own BRAW engine.
+#   on_poll_timer detects completion and switches proxy playback mode on automatically.
+#   No ffmpeg, no OpenCV file path needed, no audio driver touch.
+# DEPENDS-ON: media_pool (Resolve API), mpi (MediaPoolItem), Resolve 18+.
+# AFFECTS: _proxy_mpi global only. Resolve manages all storage.
+def _trigger_resolve_proxy(mpi, media_pool_obj):
+    global _proxy_mpi
+    try:
+        _has_fn = getattr(media_pool_obj, 'HasOptimizedMedia', None)
+        _gen_fn = getattr(media_pool_obj, 'GenerateOptimizedMedia', None)
+        if not callable(_has_fn) or not callable(_gen_fn):
+            log("GenerateOptimizedMedia not in this Resolve version — proxy skipped")
+            return
+        already_done = _has_fn([mpi])
+        if already_done:
+            log("Optimized media exists — poll_timer will enable proxy mode")
+        else:
+            ok = _gen_fn([mpi])
+            if not ok:
+                log("GenerateOptimizedMedia returned False — proxy skipped"); return
+            log("GenerateOptimizedMedia queued — poll_timer will detect completion")
+            status("Resolve generating proxy in background...")
+        _proxy_mpi = mpi
+    except Exception as _pe:
+        log(f"Proxy trigger error: {_pe}")
+
+
 def _export_braw_range_to_frames(mpi, src_start, src_end, timeline, in_f, fps):
     import time as _t2, tempfile as _tf, shutil as _sh
     import traceback as _tb_fb
@@ -1130,16 +1256,20 @@ def _export_braw_range_to_frames(mpi, src_start, src_end, timeline, in_f, fps):
         log("BRAW range export: mpi is None"); return None
 
     # Fast path: direct SDK decode via braw-decode.exe — no Resolve render queue needed.
+    # DANGER ZONE: if braw_fp is empty (GetMediaPoolItem returned None, or property key
+    # mismatch), we must NOT return None here — the Resolve seek+still fallback below does
+    # NOT need the file path at all.  Only skip the exe sub-path; always fall through.
     exe_result = None
     braw_fp = ""
     try:
-        props = mpi.GetClipProperty()
+        _mpi_media = mpi.GetMediaPoolItem()
+        props = _mpi_media.GetClipProperty() if _mpi_media else {}
         braw_fp = (props.get("File Path") or props.get("Clip Path") or "") if props else ""
         if not braw_fp:
-            status("ERROR: Cannot read BRAW file path from Resolve. Check media is online.")
-            log("BRAW range export: cannot get file path from mpi")
-            return None
-        exe_result = _try_braw_decode_exe(braw_fp, src_start, src_end)
+            log("BRAW range export: cannot get file path from mpi — skipping exe path, using Resolve fallback")
+            # Do NOT return None here — fall through to the Resolve seek+still fallback below.
+        else:
+            exe_result = _try_braw_decode_exe(braw_fp, src_start, src_end)
     except Exception as _ep:
         log(f"BRAW range export: exe path exception: {_ep}")
         # Fall through to the Resolve still-export fallback below.
@@ -1149,6 +1279,8 @@ def _export_braw_range_to_frames(mpi, src_start, src_end, timeline, in_f, fps):
 
     # -----------------------------------------------------------------------
     # FALLBACK: Resolve ExportCurrentFrameAsStill — seek current timeline, no blink.
+    # NOTE: when proxy mode is active (_proxy_mode_saved is set), Resolve exports proxy
+    # frames here instead of full BRAW — drops from ~6 sec/frame to <1 sec automatically.
     # WHY THIS AND NOT THE RENDER QUEUE: Resolve's StartRendering() resets the
     # Windows audio engine, killing Focusrite and any other ASIO/WDM device.
     # ExportCurrentFrameAsStill does NOT trigger that reset, and — critically —
@@ -1171,6 +1303,15 @@ def _export_braw_range_to_frames(mpi, src_start, src_end, timeline, in_f, fps):
     # Clamp fps to a sensible minimum to avoid divide-by-zero on broken project settings.
     safe_fps = max(float(fps), 1.0)
 
+    import time as _t3
+    _diag_path = str(Path(_tf.gettempdir()) / "ck_scrub_diag.txt")
+    def _diag(msg):
+        try:
+            with open(_diag_path, "a", encoding="utf-8") as _df:
+                _df.write(f"[{_t3.time():.2f}] {msg}\n")
+        except Exception: pass
+
+    _diag(f"START dur={dur} in_f={in_f} fps={fps}")
     written = 0
     for fidx in range(dur):
         # tl_frame is the absolute timeline frame to seek to — same coordinate as in_f.
@@ -1188,8 +1329,12 @@ def _export_braw_range_to_frames(mpi, src_start, src_end, timeline, in_f, fps):
             # Seek the current timeline playhead — NO timeline switch, NO mouse steal.
             # DANGER ZONE HIGH: some Resolve builds return None/False even on success.
             # Proceed regardless and trust file existence, not the return value.
-            timeline.SetCurrentTimecode(tc_str)
+            _diag(f"BEFORE SetCurrentTimecode tc={tc_str}")
+            seek_ok = timeline.SetCurrentTimecode(tc_str)
+            _diag(f"AFTER SetCurrentTimecode seek_ok={seek_ok}")
+            _t3.sleep(0.4)  # let Resolve finish the seek before capturing the still
             ok = project.ExportCurrentFrameAsStill(out_path)
+            _diag(f"AFTER ExportCurrentFrameAsStill ok={ok} exists={Path(out_path).exists()}")
             if Path(out_path).exists():
                 written += 1
                 log(f"BRAW fallback frame {written}/{dur} (tl={tl_frame} tc={tc_str}) ok={ok}")
@@ -1319,15 +1464,25 @@ def show_preview_window(orig_bgr, keyed_rgb, alpha):
             json.dump(data, f, indent=2)
         os.replace(tmp, str(path))
 
-    # fg.png — write the ORIGINAL SOURCE frame (full green spill intact) so the
-    # viewer's despill slider has real work to do. The NN's predicted fg is too
-    # clean: despill_opencv against it produces a sub-1/255 change per pixel
-    # (invisible). Compositing math: comp = fg * alpha + bg * (1-alpha). Since
-    # alpha is the NN's smart matte (hair, edges), the composite quality still
-    # comes from the NN — we're just using raw source as the color source for
-    # the despill-able part. This matches how dedicated keyers show live despill.
-    _atomic_imwrite(SESSION_DIR / "fg.png", orig_bgr)
+    # fg.png — write the NN's CLEAN PREDICTED FG (matches AE viewer exactly).
+    # Earlier this wrote orig_bgr (raw greenscreen) so the despill slider would
+    # have visible work to do, BUT: at the soft-alpha falloff (MARGIN/SOFTEN),
+    # the raw green pixels showed through the matte edge. Despill on raw green
+    # leaves a magenta/purple residue under cyan-cast stage lighting → soft
+    # edges came out PURPLE instead of black. AE writes the NN's clean fg and
+    # never has this artifact. The despill slider in the viewer still functions
+    # for fine-tuning; the NN already despills internally.
+    # keyed_rgb is uint8 RGB (caller does (fg * 255).astype(uint8)) — convert to BGR.
+    keyed_bgr = cv2.cvtColor(keyed_rgb, cv2.COLOR_RGB2BGR)
+    _atomic_imwrite(SESSION_DIR / "fg.png", keyed_bgr)
     _atomic_imwrite(SESSION_DIR / "alpha.png", matte_vis)
+    # original.png — RAW source frame (greenscreen, pre-key) for the viewer's
+    # "Original" view tab. Written EVERY panel run so a new clip overwrites
+    # any stale original.png left over from a previous session.
+    # DANGER ZONE: if this write is removed, switching clips leaves the viewer
+    #   showing the previous clip's source in the Original/Split tabs while
+    #   Composite shows the new clip — looks like cache/memory bug to user.
+    _atomic_imwrite(SESSION_DIR / "original.png", orig_bgr)
 
     # Optional V1 underlay — viewer's BG:V1 button composites over it
     if bg_frame is not None:
@@ -1395,6 +1550,14 @@ def show_preview_window(orig_bgr, keyed_rgb, alpha):
             except Exception:
                 pass
         _viewer_proc = None
+    # Clear stale scrub data so the viewer starts clean, not in scrub mode from last session.
+    try:
+        _stale_idx = SESSION_DIR / "scrub_index.json"
+        if _stale_idx.exists():
+            _stale_idx.unlink()
+            log("Cleared stale scrub_index.json from previous session")
+    except Exception:
+        pass
     env = os.environ.copy()
     env["CORRIDORKEY_PARENT_PID"] = str(os.getpid())
     _viewer_proc = subprocess.Popen(
@@ -1445,6 +1608,8 @@ def reprocess_with_cached():
             return
         settings = _merge_live_params(get_settings())
         status("Updating...")
+        # Signal viewer to show Re-keying overlay before CUDA inference blocks the panel
+        _write_live_params_slider({"rekeying": True})
         from core.corridorkey_processor import CorridorKeyProcessor, ProcessingSettings
         # BLOCKER FIX: reuse the cached model instead of reloading weights per slider drag.
         # Without this, every slider change spawned a fresh CUDA processor (seconds of reload + VRAM churn).
@@ -1562,11 +1727,30 @@ def process_current_frame(preview_only=False):
         # needs timeline position to know if the playhead moved.
         cached_source["timeline_frame"] = cf
         log(f"Size: {frame.shape[1]}x{frame.shape[0]}")
+        # Trigger Resolve's built-in optimized media generation for BRAW clips.
+        # Non-blocking — Resolve transcodes in background using its own BRAW engine.
+        if fp.lower().endswith('.braw') and mpi is not None:
+            _trigger_resolve_proxy(mpi, media_pool)
         from core.corridorkey_processor import CorridorKeyProcessor, ProcessingSettings
         if cached_processor["proc"] is None:
             log("Loading AI (first time)...")
             cached_processor["proc"] = CorridorKeyProcessor(device="cuda")
             log("Model loaded!")
+            # Pre-init the CPU proc for SCRUB RANGE in a background thread while
+            # the model file is warm in OS cache. Runs async so LIVE PREVIEW doesn't
+            # freeze. CORRIDORKEY_SKIP_COMPILE=1 is required — without it, torch.compile
+            # fires max-autotune at img_size=2048 on CPU and hangs 6+ minutes.
+            if cached_scrub_cpu_proc["proc"] is None:
+                def _init_cpu_proc():
+                    try:
+                        os.environ["CORRIDORKEY_SKIP_COMPILE"] = "1"
+                        cached_scrub_cpu_proc["proc"] = CorridorKeyProcessor(device="cpu")
+                        log("CPU scrub proc ready — SCRUB RANGE will use CPU inference.")
+                    except Exception as _cpu_e:
+                        log(f"CPU scrub proc failed (scrub will use CUDA fallback): {_cpu_e}")
+                import threading as _cpu_thr
+                _cpu_thr.Thread(target=_init_cpu_proc, daemon=True).start()
+                log("CPU scrub proc loading in background...")
         else:
             log("AI ready (cached)")
         proc = cached_processor["proc"]
@@ -1698,6 +1882,438 @@ processing_cancelled = False
 # breaks: if user closes Resolve during processing, or if disk fills up mid-range
 _range_running = False  # Guard — prevents double-click while processing
 
+
+# WHAT IT DOES: Returns the current project's frame rate as a float.
+# DEPENDS-ON: Resolve API — project must be open.
+# AFFECTS: nothing — pure read.
+def fps_of_timeline():
+    try:
+        resolve = app.GetResolve() if hasattr(app, 'GetResolve') else bmd.scriptapp("Resolve")
+        project = resolve.GetProjectManager().GetCurrentProject()
+        fps_str = project.GetSetting("timelineFrameRate")
+        return float(fps_str)
+    except Exception:
+        return 24.0
+
+
+# WHAT IT DOES: Launches preview_viewer_v2.py in --braw-scrubber mode pointing at
+#   the given TIFF frames directory. Kills any existing scrubber process first.
+#   Session dir is SESSION_DIR — same as regular viewer, so sam2_mask.png is shared.
+# DEPENDS-ON: CK_PYTHON, CK_ROOT, SESSION_DIR, subprocess.
+# AFFECTS: global _scrubber_proc. Live Preview (_viewer_proc) is NOT touched — both windows
+#   stay open so the user can tweak sliders in Live Preview while scrubbing frames.
+def launch_braw_scrubber(frames_dir):
+    global _scrubber_proc
+    # Kill previous scrubber if still alive — one scrubber at a time, live preview untouched.
+    if _scrubber_proc is not None and _scrubber_proc.poll() is None:
+        try:
+            _scrubber_proc.terminate()
+            _scrubber_proc.wait(timeout=2)
+        except Exception:
+            try: _scrubber_proc.kill()
+            except Exception: pass
+    _scrubber_proc = None
+    viewer_script = str(CK_ROOT / "resolve_plugin" / "preview_viewer_v2.py")
+    if not os.path.exists(viewer_script):
+        viewer_script = r"D:\New AI Projects\CorridorKey-Plugin\resolve_plugin\preview_viewer_v2.py"
+    _scrubber_proc = subprocess.Popen(
+        [str(CK_PYTHON), viewer_script,
+         "--braw-scrubber", str(frames_dir),
+         "--parent-pid", str(os.getpid())],
+        creationflags=subprocess.CREATE_NO_WINDOW,
+        close_fds=True,
+    )
+    log(f"BRAW scrubber launched: {Path(frames_dir).name}")
+
+
+# WHAT IT DOES: Queues SCRUB RANGE Phase 2 keying work for the main-thread timer.
+#   Background threads in Fusion's Python deadlock on _ui_queue.put and CUDA calls.
+#   Instead we load frames into _scrub_key_queue; on_poll_timer keys one frame per tick.
+# DEPENDS-ON: tif_buffers (list of BytesIO/None), ctx dict with proc/settings/paths.
+# AFFECTS: _scrub_key_queue, _scrub_key_ctx, _scrub_key_done, _scrub_key_total, _range_running.
+def _start_scrub_keying(tif_buffers, ctx):
+    global _range_running, _scrub_key_queue, _scrub_key_ctx, _scrub_key_done, _scrub_key_total
+    try:
+        from CorridorKeyModule.core import color_utils as _cu_sk
+    except ImportError:
+        _cu_sk = None
+    _scrub_key_queue  = [(i, b) for i, b in enumerate(tif_buffers) if b is not None]
+    _scrub_key_done   = 0
+    _scrub_key_total  = len(_scrub_key_queue)
+    _scrub_key_ctx    = {
+        "proc":             ctx["proc"],
+        "ps":               ctx["ps"],
+        "hint_gen":         ctx["chroma_hint_gen"],
+        "despill":          ctx["_despill_str"],
+        "settings":         ctx["settings"],
+        "scrub_dir":        ctx["scrub_dir"],
+        "N":                ctx["N"],
+        "cu":               _cu_sk,
+        "sam2_video_masks": ctx.get("sam2_video_masks", {}),
+    }
+    _range_running = True
+    log(f"SCRUB: {_scrub_key_total} frames queued for main-thread keying")
+    status(f"Scrub: keying frame 1 / {_scrub_key_total}...")
+
+
+# WHAT IT DOES: Keys ONE frame from _scrub_key_queue on the main thread (called by on_poll_timer).
+#   Runs the neural net for one frame, writes fg.png+alpha.png, updates progress.
+#   When queue empties: writes scrub_index.json and resets _range_running.
+# DEPENDS-ON: _scrub_key_queue, _scrub_key_ctx, cached_processor["proc"], cv2, numpy.
+# AFFECTS: SESSION_DIR/scrub/NNN/, SESSION_DIR/scrub_index.json, _scrub_key_done, _range_running.
+# DANGER ZONE HIGH: runs on main thread — each call blocks the UI for ~2-5 sec during inference.
+def _key_one_scrub_frame():
+    global _scrub_key_queue, _scrub_key_done, _scrub_key_total, _range_running
+    import cv2 as _cv2, numpy as _np, json as _json, tempfile as _tmp, os as _os
+    if not _scrub_key_queue:
+        return
+    if processing_cancelled:
+        _scrub_key_queue.clear()
+        _range_running = False
+        status("Scrub cancelled.")
+        return
+    frame_idx, buf = _scrub_key_queue.pop(0)
+    ctx = _scrub_key_ctx
+    status(f"Scrub: keying frame {frame_idx + 1} / {ctx['N']}...")
+    try:
+        _tmp_tif = _os.path.join(_tmp.gettempdir(), f"ck_scrub_{frame_idx}.tif")
+        with open(_tmp_tif, "wb") as _f: _f.write(buf.getvalue())
+        _arr = _cv2.imread(_tmp_tif, _cv2.IMREAD_UNCHANGED)
+        try: _os.unlink(_tmp_tif)
+        except Exception: pass
+        if _arr is None:
+            log(f"Scrub frame {frame_idx}: cv2 read None — skipping"); return
+        if _arr.dtype == _np.uint16:
+            _arr = (_arr >> 8).astype(_np.uint8)
+        elif _arr.dtype != _np.uint8:
+            _arr = (_arr.astype(_np.float64) / float(_np.iinfo(_arr.dtype).max) * 255).clip(0, 255).astype(_np.uint8)
+        if len(_arr.shape) == 2:
+            _arr = _cv2.cvtColor(_arr, _cv2.COLOR_GRAY2BGR)
+        if _arr.shape[0] > 720:
+            _sc = 720.0 / _arr.shape[0]
+            _arr = _cv2.resize(_arr, (int(_arr.shape[1] * _sc), 720), interpolation=_cv2.INTER_AREA)
+        frame_bgr = _np.ascontiguousarray(_arr); del _arr
+    except Exception as _e:
+        log(f"Scrub frame {frame_idx}: decode failed: {_e}"); return
+    try:
+        chroma = ctx["hint_gen"].generate_hint(frame_bgr).astype(_np.float32) / 255.0
+        fr     = _cv2.cvtColor(frame_bgr, _cv2.COLOR_BGR2RGB).astype(_np.float32) / 255.0
+        res    = ctx["proc"].process_frame(fr, chroma, ctx["ps"])
+        fg, mt = res.get("fg"), res.get("alpha")
+        if ctx["despill"] > 0 and fg is not None and ctx["cu"] is not None:
+            fg = ctx["cu"].despill_opencv(fg, green_limit_mode="average", strength=ctx["despill"])
+        if mt is not None and len(mt.shape) == 3:
+            mt = mt[:, :, 0]
+        # WHAT IT DOES: Apply per-frame SAM2 propagation mask so the person is keyed on
+        #   every scrub frame, not just the anchor. Gate is 2D float32 same shape as mt.
+        #   Resize needed because scrub frames are downscaled to 720p but masks are full-res.
+        # DEPENDS-ON: ctx["sam2_video_masks"] built by on_scrub_range before keying starts.
+        # AFFECTS: mt — multiplied by gate, zeroing pixels outside tracked region.
+        _s2_masks = ctx.get("sam2_video_masks", {})
+        if mt is not None and _s2_masks and frame_idx in _s2_masks:
+            # Save raw alpha (before gate) and raw SAM2 mask (before dilate/soften)
+            out_dir = ctx["scrub_dir"] / f"{frame_idx:03d}"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            _mt_raw2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
+            _al_raw16 = (_mt_raw2d * 65535).clip(0, 65535).astype(_np.uint16)
+            _cv2.imwrite(str(out_dir / "alpha_raw.png"), _al_raw16)
+            _s2_raw = _s2_masks[frame_idx]
+            _s2_raw8 = (_s2_raw * 255).clip(0, 255).astype(_np.uint8)
+            _cv2.imwrite(str(out_dir / "sam2_gate_raw.png"), _s2_raw8)
+            _gate = _dilate_sam2_mask(_s2_masks[frame_idx],
+                                      margin=ctx["settings"].get("sam2_margin", SAM2_MATTE_MARGIN))
+            _gate = _soften_sam2_mask(_gate, soften=ctx["settings"].get("sam2_soften", 0))
+            if _gate.shape != mt.shape:
+                _gate = _cv2.resize(_gate, (mt.shape[1], mt.shape[0]),
+                                    interpolation=_cv2.INTER_LINEAR)
+            mt = mt * _gate
+        if fg is not None and mt is not None:
+            out_dir = ctx["scrub_dir"] / f"{frame_idx:03d}"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            fg_16 = (fg * 65535).clip(0, 65535).astype(_np.uint16)
+            _cv2.imwrite(str(out_dir / "fg.png"),    _cv2.cvtColor(fg_16, _cv2.COLOR_RGB2BGR))
+            mt2d  = mt[:, :, 0] if len(mt.shape) == 3 else mt
+            al_16 = (mt2d * 65535).clip(0, 65535).astype(_np.uint16)
+            _cv2.imwrite(str(out_dir / "alpha.png"), al_16)
+            _scrub_key_done += 1
+    except Exception as _ke:
+        log(f"Scrub frame {frame_idx}: keying failed: {_ke}")
+    # When the queue is empty write the index and signal done.
+    if not _scrub_key_queue:
+        import json as _json2
+        try:
+            with open(str(SESSION_DIR / "scrub_index.json"), "w") as _jf:
+                _json2.dump({"count": _scrub_key_done, "base_dir": "scrub/"}, _jf)
+            log(f"SCRUB: wrote scrub_index.json count={_scrub_key_done}")
+        except Exception as _we:
+            log(f"Scrub index write error: {_we}")
+        if _scrub_key_done > 0:
+            status(f"Scrub ready — {_scrub_key_done}/{ctx['N']} frames keyed. Drag slider in Live Preview.")
+        else:
+            status("Scrub: no frames keyed — check clip and green screen settings.")
+        _range_running = False
+
+
+# WHAT IT DOES: Samples N evenly-spaced frames from the IN→OUT range.
+#   Phase 1 (main thread): exports each frame as a single TIFF, pre-reads into BytesIO.
+#     Takes ~5-10 sec — panel freezes briefly but recovers.
+#   Phase 2 (background thread): keys each cached TIFF through the neural net, writes
+#     fg.png + alpha.png to SESSION_DIR/scrub/NNN/, writes scrub_index.json when done.
+#     Panel stays FULLY RESPONSIVE during keying — close button works at any time.
+#   The persistent Live Preview viewer detects scrub_index.json and adds a purple scrub
+#   slider — dragging it swaps the cached fg/alpha instantly (no re-keying needed).
+# DEPENDS-ON: frame_range, _export_braw_range_to_frames, cached_processor, SESSION_DIR,
+#   AlphaHintGenerator, ProcessingSettings, _load_sam2_output_gate, _ui_queue, _viewer_proc.
+# AFFECTS: SESSION_DIR/scrub/ directory, SESSION_DIR/scrub_index.json, _range_running.
+# DANGER ZONE HIGH: Phase 1 BRAW exports run on the main thread — brief freeze per frame.
+def on_scrub_range(ev):
+    global _scrubber_frames_dir, _range_running, processing_cancelled
+    processing_cancelled = False
+    log("SCRUB RANGE: button pressed")
+    import cv2, numpy as np, json as _json, threading as _thr
+    try:
+        from PIL import Image as _PILImage
+    except ImportError:
+        _PILImage = None
+    # --- Guards ---
+    if cached_processor["proc"] is None:
+        status("Click LIVE PREVIEW first to load the AI model"); return
+    log("SCRUB: model loaded OK")
+    if _range_running:
+        status("Process Range is running — wait or cancel"); return
+    log("SCRUB: not already running")
+    # Flush any stale messages from a previous run so ghost "Scrub ready" messages
+    # don't appear and confuse the user before the new run completes.
+    while not _ui_queue.empty():
+        try: _ui_queue.get_nowait()
+        except Exception: break
+    if _viewer_proc is None or _viewer_proc.poll() is not None:
+        log(f"SCRUB: viewer guard triggered — _viewer_proc={_viewer_proc} poll={_viewer_proc.poll() if _viewer_proc else 'N/A'}")
+        status("Open LIVE PREVIEW first — scrub results display there"); return
+    log("SCRUB: viewer alive")
+    # Delete stale scrub_index.json so viewer exits any previous scrub mode cleanly.
+    try:
+        _stale = SESSION_DIR / "scrub_index.json"
+        if _stale.exists(): _stale.unlink()
+    except Exception: pass
+    log("SCRUB: cleared stale index")
+    # --- Validate in/out range ---
+    in_f  = frame_range.get("in_frame")
+    out_f = frame_range.get("out_frame")
+    if in_f is not None and out_f is not None and out_f <= in_f:
+        status("OUT must be after IN"); return
+    # --- Get clip info ---
+    try:
+        resolve = app.GetResolve() if hasattr(app, 'GetResolve') else bmd.scriptapp("Resolve")
+        project = resolve.GetProjectManager().GetCurrentProject()
+        timeline = project.GetCurrentTimeline()
+        mpi = timeline.GetCurrentVideoItem()
+        if mpi is None:
+            status("No clip selected — click on a clip in the timeline first"); return
+    except Exception as e:
+        status(f"Cannot read timeline: {e}"); return
+    # --- Check clip type ---
+    try:
+        mi  = mpi.GetMediaPoolItem()
+        props = mi.GetClipProperty() if mi else {}
+        fp  = (props.get("File Path") or props.get("Clip Path") or "").lower()
+    except Exception:
+        fp = ""
+    # All formats supported — BRAW/camera-raw uses SDK decoder, everything else uses
+    # Resolve's native ExportCurrentFrameAsStill (handles any format Resolve can open).
+    _is_camera_raw = fp.endswith(('.braw', '.cin', '.dng', '.ari'))
+    # --- Resolve full-clip defaults if no IN/OUT set ---
+    cs = mpi.GetStart()
+    ce = mpi.GetEnd()
+    if in_f is None: in_f = cs
+    if out_f is None: out_f = ce
+    in_f, out_f = max(in_f, cs), min(out_f, ce)
+    if out_f <= in_f:
+        status("No frames in range — check IN/OUT points"); return
+    ss  = mpi.GetLeftOffset()
+    fps = fps_of_timeline()
+    log(f"SCRUB: clip {fp} cs={cs} ce={ce} ss={ss}")
+    # --- Guard: warn if Live Preview is not open (BrawScrubberWindow launches separately,
+    #     but we use the viewer process check as a proxy for whether the session is live) ---
+    # NOTE: scrub window opens automatically at the end — this is just an early warning.
+    if _viewer_proc is None or _viewer_proc.poll() is not None:
+        log(f"SCRUB: second viewer guard triggered — _viewer_proc={_viewer_proc} poll={_viewer_proc.poll() if _viewer_proc else 'N/A'}")
+        status("TIP: Open Live Preview first so the Scrub window has a session to anchor to.")
+        # Non-fatal — continue anyway; the BrawScrubberWindow opens standalone.
+    # --- Load processor + settings ---
+    settings = _merge_live_params(get_settings())
+    from core.corridorkey_processor import CorridorKeyProcessor, ProcessingSettings
+    proc = cached_processor["proc"]
+    ps = ProcessingSettings(
+        screen_type=settings["screen_type"],
+        despill_strength=0.0,
+        refiner_strength=settings["refiner_strength"],
+        despeckle_enabled=settings["despeckle_enabled"],
+        despeckle_size=settings["despeckle_size"],
+    )
+    from CorridorKeyModule.core import color_utils as _cu
+    _despill_str = float(settings.get("despill_strength", 0.5))
+    from core.alpha_hint_generator import AlphaHintGenerator
+    chroma_hint_gen = AlphaHintGenerator(screen_type=settings["screen_type"])
+    # --- Build frame list — all frames by default, capped if user set Max Frames ---
+    dur = out_f - in_f
+    try:
+        max_frames = int(items["ScrubMaxFrames"].Value)
+    except Exception:
+        max_frames = 0
+    if max_frames <= 0 or max_frames >= dur:
+        N = dur
+        sampled_tl_frames = list(range(in_f, out_f))
+    else:
+        N = max_frames
+        sampled_tl_frames = [int(in_f + round(i * (dur - 1) / (N - 1))) for i in range(N)]
+    log(f"SCRUB: sampling {N} frames: {sampled_tl_frames}")
+    # --- PHASE 1: blocking export loop (Resolve API must run on main thread) ---
+    # UI freezes during export (~2 sec per frame). Panel unfreezes after all frames done.
+    _scrubber_frames_dir = None
+    scrub_dir = SESSION_DIR / "scrub"
+    if scrub_dir.exists():
+        try: shutil.rmtree(str(scrub_dir))
+        except Exception: pass
+    scrub_dir.mkdir(parents=True, exist_ok=True)
+    _range_running = True
+    tif_buffers = []
+    for _si, _stl in enumerate(sampled_tl_frames):
+        _ssrc = ss + (_stl - cs)
+        status(f"Scrub: exporting frame {_si+1}/{N}...")
+        log(f"SCRUB export: frame {_si+1}/{N} tl={_stl} src={_ssrc} camera_raw={_is_camera_raw}")
+        _sbuf = None
+        try:
+            if _is_camera_raw:
+                # BRAW / CinemaDNG / ARRI — existing SDK decoder path (untouched)
+                _sfdir = _export_braw_range_to_frames(mpi, _ssrc, _ssrc + 1, timeline, _stl, fps)
+                if _sfdir is not None:
+                    _stifs = sorted(Path(_sfdir).glob("*.tif*"))
+                    if _stifs:
+                        with open(str(_stifs[0]), "rb") as _sf:
+                            _sbuf = io.BytesIO(_sf.read())
+                    shutil.rmtree(_sfdir, ignore_errors=True)
+            else:
+                # All other formats (H.264, H.265, ProRes, MP4, MOV, PNG seq, etc.)
+                # cv2.VideoCapture handles H.264/H.265 on Windows reliably.
+                # Note: CreateTimelineFromClips fails for non-raw clips via Resolve scripting API,
+                # so we decode directly from the source file instead.
+                import cv2 as _cv2
+                _frame_bgr = None
+                if fp:
+                    _cap = _cv2.VideoCapture(fp)
+                    if _cap.isOpened():
+                        _cap.set(_cv2.CAP_PROP_POS_FRAMES, _ssrc)
+                        _ret, _frame_bgr = _cap.read()
+                        _cap.release()
+                        if not _ret:
+                            _frame_bgr = None
+                            log(f"SCRUB export: frame {_si+1} cv2 read failed at frame {_ssrc}")
+                        else:
+                            log(f"SCRUB export: frame {_si+1} decoded via cv2 shape={_frame_bgr.shape}")
+                    else:
+                        log(f"SCRUB export: frame {_si+1} cv2 could not open: {fp}")
+                if _frame_bgr is not None:
+                    _, _tif_enc = _cv2.imencode(".tif", _frame_bgr)
+                    _sbuf = io.BytesIO(_tif_enc.tobytes())
+                else:
+                    log(f"SCRUB export: frame {_si+1} all decoders failed")
+        except Exception as _sex:
+            log(f"SCRUB export error frame {_si+1}: {_sex}")
+        tif_buffers.append(_sbuf)
+        log(f"SCRUB export: frame {_si+1} buf={'OK' if _sbuf else 'NONE'}")
+    _range_running = False
+    good = sum(1 for b in tif_buffers if b is not None)
+    log(f"SCRUB: export done — {good}/{N} frames captured. Starting keying thread...")
+    if good == 0:
+        status("Scrub export failed — no frames captured. Check log.")
+        return
+
+    # WHAT IT DOES: Run SAM2 video propagation across the N sampled scrub frames so the
+    #   tracking mask follows the person on each frame instead of using a static anchor gate.
+    #   Writes BytesIO frames to a temp dir, calls run_sam2_video_propagation, maps result
+    #   indices back to original buffer positions (handles None/failed exports cleanly).
+    # DEPENDS-ON: sam_points (global), run_sam2_video_propagation, tif_buffers, sampled_tl_frames
+    # AFFECTS: scrub_sam2_masks — consumed by _start_scrub_keying → _key_one_scrub_frame
+    # DANGER ZONE HIGH: runs synchronously on main thread — adds ~20-60s for N frames on GPU.
+    scrub_sam2_masks = {}
+    if settings.get("alpha_method") == 1:
+        _pos = sam_points.get("positive", [])
+        _neg = sam_points.get("negative", [])
+        if _pos or _neg:
+            import tempfile as _stmp2, shutil as _ssh2
+            _sam_tmp = Path(_stmp2.mkdtemp(prefix="ck_sam2_scrub_"))
+            try:
+                _good_orig_idxs = []
+                for _si2, _sbuf2 in enumerate(tif_buffers):
+                    if _sbuf2 is None: continue
+                    _sbuf2.seek(0)
+                    with open(str(_sam_tmp / f"{len(_good_orig_idxs):06d}.tif"), "wb") as _sf2:
+                        _sf2.write(_sbuf2.read())
+                    _sbuf2.seek(0)
+                    _good_orig_idxs.append(_si2)
+                _n_good = len(_good_orig_idxs)
+                if _n_good > 0:
+                    _anch_abs = sam_points.get("frame")
+                    if _anch_abs is not None and sampled_tl_frames:
+                        _good_tl = [sampled_tl_frames[i] for i in _good_orig_idxs]
+                        _dists   = [abs(f - _anch_abs) for f in _good_tl]
+                        _anchor_rel = _dists.index(min(_dists))
+                    else:
+                        _anchor_rel = 0
+                    status("SAM2: propagating mask across scrub frames...")
+                    log(f"SAM2 scrub: {_n_good} frames, anchor_rel={_anchor_rel}")
+                    _raw_masks = run_sam2_video_propagation(
+                        str(_sam_tmp), 0, 0, 0, _n_good, _pos, _neg, _anchor_rel,
+                    )
+                    scrub_sam2_masks = {_good_orig_idxs[k]: v
+                                        for k, v in _raw_masks.items()
+                                        if k < len(_good_orig_idxs)}
+                    log(f"SAM2 scrub: {len(scrub_sam2_masks)} per-frame masks ready")
+                else:
+                    log("SAM2 scrub: no good frames exported — skipping propagation")
+            except Exception as _spe:
+                log(f"SAM2 scrub propagation failed: {_spe}")
+                import traceback as _stb2; log(_stb2.format_exc())
+                scrub_sam2_masks = {}
+            finally:
+                _ssh2.rmtree(str(_sam_tmp), ignore_errors=True)
+
+    # Wait up to 30 sec for the background CPU proc init to finish (it started when
+    # LIVE PREVIEW loaded the CUDA model). Export took 60+ sec so it's usually ready.
+    if cached_scrub_cpu_proc["proc"] is None:
+        status("Waiting for CPU scrub proc to finish loading...")
+        import time as _tw
+        for _ in range(60):
+            if cached_scrub_cpu_proc["proc"] is not None: break
+            _tw.sleep(0.5)
+        if cached_scrub_cpu_proc["proc"] is None:
+            log("SCRUB: CPU proc still not ready after 30s — using CUDA fallback")
+        else:
+            log("SCRUB: CPU proc ready")
+    status(f"Scrub: keying {good}/{N} frames...")
+    _ctx = {"N": N, "mpi": mpi, "cs": cs, "ss": ss, "timeline": timeline, "fps": fps,
+            "proc": proc, "ps": ps, "chroma_hint_gen": chroma_hint_gen,
+            "_despill_str": _despill_str, "settings": settings, "scrub_dir": scrub_dir,
+            "sam2_video_masks": scrub_sam2_masks}
+    _start_scrub_keying(tif_buffers, _ctx)
+    # DANGER ZONE HIGH: Key all frames synchronously here on the main thread.
+    # After 90+ seconds of blocking export, Fusion pauses timer dispatch so on_poll_timer
+    # never fires — timer-based keying never ran. Synchronous keying works the same way
+    # Live Preview runs inference: main-thread CUDA, UI frozen but recovers when done.
+    log("SCRUB: keying frames on main thread (UI will freeze ~2-5 sec per frame)...")
+    _keyed_count = 0
+    while _scrub_key_queue:
+        status(f"Scrub: keying frame {_keyed_count + 1} / {_scrub_key_total}...")
+        _key_one_scrub_frame()
+        _keyed_count += 1
+    try:
+        items["PollTimer"].Interval = 500
+    except Exception:
+        pass
+    log("SCRUB: synchronous keying done.")
+
+
 def on_process_range(ev):
     # WHAT IT DOES: Starts range processing in a background thread so the UI stays
     #   live and the Cancel button works between frames.
@@ -1787,6 +2403,20 @@ def on_process_range(ev):
         status("Loading AI...")
         cached_processor["proc"] = CorridorKeyProcessor(device="cuda")
         log("Model loaded!")
+        # Pre-init CPU scrub proc in background while model file is warm in OS cache.
+        # CORRIDORKEY_SKIP_COMPILE=1 is required — torch.compile on CPU with max-autotune
+        # runs a 2048x2048 dummy forward that hangs 6+ minutes without this flag.
+        if cached_scrub_cpu_proc["proc"] is None:
+            def _init_cpu_proc_b():
+                try:
+                    os.environ["CORRIDORKEY_SKIP_COMPILE"] = "1"
+                    cached_scrub_cpu_proc["proc"] = CorridorKeyProcessor(device="cpu")
+                    log("CPU scrub proc ready — SCRUB RANGE will use CPU inference.")
+                except Exception as _cpu_e2:
+                    log(f"CPU scrub proc failed (scrub will use CUDA fallback): {_cpu_e2}")
+            import threading as _cpu_thr2
+            _cpu_thr2.Thread(target=_init_cpu_proc_b, daemon=True).start()
+            log("CPU scrub proc loading in background...")
     else:
         log("AI ready (cached)")
     proc = cached_processor["proc"]
@@ -2252,7 +2882,11 @@ def on_process_range(ev):
 def on_cancel(ev):
     global processing_cancelled, _range_running
     processing_cancelled = True
-    _range_running = False  # Unlock immediately so user can restart right away
+    _range_running = False
+    _scrub_pending.clear()
+    _scrub_pending_buffers.clear()
+    _scrub_pending_ctx.clear()
+    _scrub_key_queue.clear()
     status("Cancelling — wait for current frame to finish...")
     log("Cancelling...")
 
@@ -2273,7 +2907,89 @@ def on_poll_timer(ev):
     # DANGER ZONE HIGH: The adaptive interval logic MUST live in finally: — if any
     # queue drain raises unexpectedly before reaching it, the timer stays at 500ms
     # forever (never backs off to 5000ms idle), sustaining ASIO interrupt pressure.
+    global _range_running, _proxy_mpi, _proxy_mode_saved
     try:
+        import time as _pt, tempfile as _pt_tf
+        try:
+            with open(str(Path(_pt_tf.gettempdir()) / "ck_timer_diag.txt"), "a", encoding="utf-8") as _ptf:
+                _ptf.write(f"[{_pt.time():.2f}] tick pending={len(_scrub_pending)} running={_range_running} cancelled={processing_cancelled}\n")
+        except Exception: pass
+        # Refiner debounce: if slider moved 800ms ago and viewer is open, re-key
+        global _refiner_rekey_pending
+        import time as _rpt
+        if _refiner_rekey_pending > 0 and (_rpt.time() - _refiner_rekey_pending) > 0.8:
+            if _viewer_proc is not None and _viewer_proc.poll() is None:
+                _refiner_rekey_pending = 0.0
+                try:
+                    reprocess_with_cached()
+                except Exception as _rpe:
+                    log(f"Refiner reprocess error: {_rpe}")
+            else:
+                _refiner_rekey_pending = 0.0
+        # --- SCRUB Phase 1: export one frame per tick so close/cancel stay responsive ---
+        # Each export blocks this tick for ~2 sec (Resolve API, unavoidable).
+        # Between exports the event loop runs — CLOSE PANEL / CANCEL process normally.
+        if _scrub_pending:
+            if processing_cancelled:
+                _scrub_pending.clear()
+                _scrub_pending_buffers.clear()
+                _scrub_pending_ctx.clear()
+                _scrub_key_queue.clear()
+                _range_running = False
+                items["Status"].Text = "Scrub cancelled"
+            else:
+                try:
+                    _sp_fi, _sp_tl = _scrub_pending.pop(0)
+                    _sp_ctx  = _scrub_pending_ctx
+                    _sp_N    = _sp_ctx["N"]
+                    _sp_src  = _sp_ctx["ss"] + (_sp_tl - _sp_ctx["cs"])
+                    log(f"SCRUB timer: exporting frame {_sp_fi+1}/{_sp_N} tl={_sp_tl} src={_sp_src}")
+                    items["Status"].Text = f"Scrub: exporting frame {_sp_fi+1}/{_sp_N}..."
+                    _sp_fdir = _export_braw_range_to_frames(
+                        _sp_ctx["mpi"], _sp_src, _sp_src + 1, _sp_ctx["timeline"], _sp_tl, _sp_ctx["fps"])
+                    log(f"SCRUB timer: frame {_sp_fi+1} export done — fdir={_sp_fdir is not None}")
+                    _sp_buf = None
+                    if _sp_fdir is not None:
+                        _sp_tifs = sorted(Path(_sp_fdir).glob("*.tif*"))
+                        log(f"SCRUB timer: found {len(_sp_tifs)} tifs in {_sp_fdir}")
+                        if _sp_tifs:
+                            try:
+                                with open(str(_sp_tifs[0]), "rb") as _sp_f:
+                                    _sp_buf = io.BytesIO(_sp_f.read())
+                            except Exception: pass
+                        shutil.rmtree(_sp_fdir, ignore_errors=True)
+                    _scrub_pending_buffers.append(_sp_buf)
+                    if not _scrub_pending:
+                        # All frames exported — hand off to keying thread.
+                        _bufs = list(_scrub_pending_buffers)
+                        _ctx  = dict(_scrub_pending_ctx)
+                        _scrub_pending_buffers.clear()
+                        _scrub_pending_ctx.clear()
+                        _scrub_key_queue.clear()
+                        items["Status"].Text = f"Scrub: keying {_sp_N} frames (panel stays responsive)..."
+                        _start_scrub_keying(_bufs, _ctx)
+                except Exception as _scrub_ex:
+                    import traceback as _scrub_tb
+                    log(f"SCRUB timer ERROR: {_scrub_ex}")
+                    log(_scrub_tb.format_exc())
+                    _scrub_pending.clear()
+                    _scrub_pending_buffers.clear()
+                    _scrub_pending_ctx.clear()
+                    _scrub_key_queue.clear()
+                    _range_running = False
+                    items["Status"].Text = f"Scrub error: {_scrub_ex}"
+        # Poll for Resolve optimized media completion — when ready, enable proxy playback.
+        # Save whatever proxy mode was set before so we can restore it after scrub finishes.
+        if _proxy_mpi is not None and _proxy_mode_saved is None:
+            try:
+                if media_pool and media_pool.HasOptimizedMedia([_proxy_mpi]):
+                    _proxy_mpi = None
+                    _proxy_mode_saved = project.GetSetting("proxyMediaMode") or "0"
+                    project.SetSetting("proxyMediaMode", "1")
+                    log(f"Proxy mode ON (was: {_proxy_mode_saved}) — ExportCurrentFrameAsStill now uses proxy frames")
+                    items["Status"].Text = "Proxy ready — SCRUB RANGE will be faster"
+            except Exception:
+                pass
         while not _ui_queue.empty():
             try:
                 kind, msg = _ui_queue.get_nowait()
@@ -2281,6 +2997,15 @@ def on_poll_timer(ev):
                     items["Log"].PlainText = (items["Log"].PlainText or "") + msg + "\n"
                 elif kind == "status":
                     items["Status"].Text = msg
+                elif kind == "restore_proxy":
+                    # Scrub keying finished — restore proxy mode to whatever it was before
+                    if _proxy_mode_saved is not None:
+                        try:
+                            project.SetSetting("proxyMediaMode", _proxy_mode_saved)
+                            log(f"Proxy mode restored: {_proxy_mode_saved}")
+                        except Exception as _rpe:
+                            log(f"Proxy mode restore error: {_rpe}")
+                        _proxy_mode_saved = None
                 elif kind == "progress":
                     if msg < 0:
                         try: items["Progress"].Visible = False
@@ -2335,6 +3060,17 @@ def on_poll_timer(ev):
         # Every PollTimer tick re-enters Resolve's main thread, which shares audio scheduling
         # with Windows WASAPI. At 500ms (2x/sec) this causes audible pops on Focusrite interfaces.
         # When all queues are drained and no range is running, slow to 5000ms (0.2x/sec).
+        # --- SCRUB Phase 2: key one frame per timer tick on the main thread ---
+        # Background threads deadlock in Fusion's Python runtime. Main-thread keying
+        # works fine — the CUDA proc was initialized here and inference runs ~2-5 sec/frame.
+        if _scrub_key_queue:
+            try:
+                _key_one_scrub_frame()
+            except Exception as _kex:
+                import traceback as _ktb
+                log(f"SCRUB key error: {_kex}\n{_ktb.format_exc()}")
+                _scrub_key_queue.clear()
+                _range_running = False
         # Processing start sites reset it back to 500ms so UI stays responsive during work.
         # DEPENDS-ON: _range_running, _ui_queue, _save_queue, _import_queue, items["PollTimer"]
         # AFFECTS: PollTimer.Interval (Fusion UIManager timer property)
@@ -2343,6 +3079,7 @@ def on_poll_timer(ev):
             and _ui_queue.empty()
             and _save_queue.empty()
             and _import_queue.empty()
+            and not _scrub_key_queue
         )
         try:
             items["PollTimer"].Interval = 5000 if all_idle else 500
@@ -2405,21 +3142,31 @@ def on_open_fusion(ev):
 # WHAT IT DOES: Kills any running preview viewer, then exits the Fusion event loop.
 #   Without this, the orphaned Python viewer holds GPU/CUDA open and Resolve can't restart.
 def on_close(ev):
-    global _viewer_proc
+    global _viewer_proc, _scrubber_proc, processing_cancelled, _range_running
+    # Signal any running scrub/range worker thread to stop on its next iteration check.
+    # Must happen BEFORE killing subprocesses so the thread doesn't try to spawn new ones.
+    # DANGER ZONE — CRITICAL: set this FIRST; the worker checks it every frame decode cycle.
+    processing_cancelled = True
+    _range_running = False
+    _scrub_pending.clear()
+    _scrub_pending_buffers.clear()
+    _scrub_pending_ctx.clear()
+    _scrub_key_queue.clear()
     # Stop the PollTimer first — prevents it firing against a half-dead UI during teardown.
     try: items["PollTimer"].Stop()
     except Exception: pass
     # Kill viewer process tree — taskkill /F /T kills the viewer AND any SAM2 subprocesses
     # it spawned. Without /T, child processes survive and hold the GPU open, which keeps
     # Resolve's process manager waiting indefinitely (the "End Task" bug).
-    if _viewer_proc is not None:
-        import subprocess as _sp
-        _pid = _viewer_proc.pid
-        _viewer_proc = None
-        try: _sp.run(["taskkill", "/F", "/T", "/PID", str(_pid)],
-                     capture_output=True, timeout=5,
-                     creationflags=_sp.CREATE_NO_WINDOW)
-        except Exception: pass
+    import subprocess as _sp
+    for _proc in [_viewer_proc, _scrubber_proc]:
+        if _proc is not None:
+            try: _sp.run(["taskkill", "/F", "/T", "/PID", str(_proc.pid)],
+                         stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, timeout=5,
+                         creationflags=_sp.CREATE_NO_WINDOW)
+            except Exception: pass
+    _viewer_proc = None
+    _scrubber_proc = None
     # Drop CUDA model reference immediately — do NOT call proc.cleanup() here because
     # CUDA teardown in a closing Resolve session blocks indefinitely on Windows.
     # Windows reclaims GPU memory when the process dies; we just need to die fast.
@@ -2439,6 +3186,7 @@ win.On.ClearRange.Clicked = on_clear_range
 win.On.BrowseOutput.Clicked = on_browse_output
 win.On.ShowPreview.Clicked = on_show_preview
 win.On.ProcessFrame.Clicked = on_process_frame
+win.On.ScrubRange.Clicked = on_scrub_range
 win.On.ProcessRange.Clicked = on_process_range
 win.On.Cancel.Clicked = on_cancel
 win.On.ToggleTrack1.Clicked = on_toggle_track1
@@ -2465,15 +3213,39 @@ def on_kill_viewer(ev):
 
 win.On.KillViewer.Clicked = on_kill_viewer
 win.On.ClosePanel.Clicked = lambda ev: on_close(ev)
+win.On.CK.Close = on_close  # X button on the window title bar
 win.On.PollTimer.Timeout = on_poll_timer
 
-# WHAT IT DOES: Keeps the slider and spinbox in sync for Refiner and Mask Margin.
+# WHAT IT DOES: Keeps the Refiner slider and spinbox in sync.
 #   Guards prevent infinite loops when one updates the other.
-# DEPENDS-ON: items["RefinerStrength"], items["RefinerInput"],
-#   items["Sam2Margin"], items["Sam2MarginInput"]
+#   Margin/Soften sync was removed 2026-04-26 — those sliders now live only in
+#   the live preview viewer (preview_viewer_v2.py), not the panel.
+# DEPENDS-ON: items["RefinerStrength"], items["RefinerInput"]
 # AFFECTS: display and the value actually read at process time (slider.Value)
+
+def _write_live_params_slider(updates):
+    # WHAT IT DOES: Merges 'updates' dict into SESSION_DIR/live_params.json atomically.
+    #   Used by the live re-key path to signal "rekeying:true" / "rekeying:false"
+    #   to the viewer so it can show/hide its overlay during CUDA inference.
+    # DEPENDS-ON: SESSION_DIR
+    # AFFECTS: live_params.json on disk
+    import json as _lpj
+    lp_path = SESSION_DIR / "live_params.json"
+    try:
+        lp = _lpj.loads(lp_path.read_text(encoding="utf-8")) if lp_path.exists() else {}
+    except Exception:
+        lp = {}
+    lp.update(updates)
+    tmp = str(lp_path) + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as _f:
+            _lpj.dump(lp, _f, indent=2)
+        import os as _os2; _os2.replace(tmp, str(lp_path))
+    except Exception:
+        pass
+
+_refiner_rekey_pending = 0.0   # nonzero = timestamp of last refiner slider move
 _syncing_refiner = False
-_syncing_margin  = False
 
 def on_refiner_changed(ev):
     global _syncing_refiner
@@ -2482,6 +3254,10 @@ def on_refiner_changed(ev):
     try: items["RefinerInput"].Value = items["RefinerStrength"].Value
     except Exception: pass
     _syncing_refiner = False
+    global _refiner_rekey_pending
+    import time as _rt; _refiner_rekey_pending = _rt.time()
+    try: items["PollTimer"].Interval = 500  # wake timer fast so debounce fires in ~1.3s
+    except Exception: pass
 
 def on_refiner_input(ev):
     global _syncing_refiner
@@ -2490,53 +3266,19 @@ def on_refiner_input(ev):
     try: items["RefinerStrength"].Value = items["RefinerInput"].Value
     except Exception: pass
     _syncing_refiner = False
-
-def on_sam2_margin_changed(ev):
-    global _syncing_margin
-    if _syncing_margin: return
-    _syncing_margin = True
-    try: items["Sam2MarginInput"].Value = items["Sam2Margin"].Value
+    global _refiner_rekey_pending
+    import time as _rt; _refiner_rekey_pending = _rt.time()
+    try: items["PollTimer"].Interval = 500  # wake timer fast so debounce fires in ~1.3s
     except Exception: pass
-    _syncing_margin = False
-
-def on_sam2_margin_input(ev):
-    global _syncing_margin
-    if _syncing_margin: return
-    _syncing_margin = True
-    try: items["Sam2Margin"].Value = items["Sam2MarginInput"].Value
-    except Exception: pass
-    _syncing_margin = False
 
 win.On.RefinerStrength.ValueChanged  = on_refiner_changed
 win.On.RefinerInput.ValueChanged     = on_refiner_input
-win.On.Sam2Margin.ValueChanged       = on_sam2_margin_changed
-win.On.Sam2MarginInput.ValueChanged  = on_sam2_margin_input
-
-_syncing_soften = False
-def on_soften_changed(ev):
-    global _syncing_soften
-    if _syncing_soften: return
-    _syncing_soften = True
-    try: items["Sam2SoftenInput"].Value = items["Sam2Soften"].Value
-    except Exception: pass
-    _syncing_soften = False
-
-def on_soften_input(ev):
-    global _syncing_soften
-    if _syncing_soften: return
-    _syncing_soften = True
-    try: items["Sam2Soften"].Value = items["Sam2SoftenInput"].Value
-    except Exception: pass
-    _syncing_soften = False
-
-win.On.Sam2Soften.ValueChanged      = on_soften_changed
-win.On.Sam2SoftenInput.ValueChanged = on_soften_input
 
 # WHAT IT DOES: Shows the About dialog with credits, how-to-use guide, and Ko-fi link.
 #   Credits Niko Pueringer/Corridor Digital (engine) and Roberto+Elvis Lopez/StuntWorks (plugin).
 # ISOLATED: self-contained dialog, no side effects
 def on_about(ev):
-    about_win = disp.AddWindow({"ID": "About", "WindowTitle": "About CorridorKey Pro", "Geometry": [200, 150, 460, 620]}, [
+    about_win = disp.AddWindow({"ID": "About", "WindowTitle": "About CorridorKey Pro", "Geometry": [200, 100, 480, 860]}, [
         ui.VGroup({"Spacing": 8, "Margin": 16}, [
             ui.Label({"Text": "CorridorKey Pro", "Alignment": {"AlignHCenter": True}, "Font": ui.Font({"PixelSize": 22, "Bold": True}), "StyleSheet": "color: #4CAF50;"}),
             ui.Label({"Text": "AI-Powered Green Screen Keyer for DaVinci Resolve", "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #aaa; font-size: 12px;"}),
@@ -2547,8 +3289,27 @@ def on_about(ev):
             ui.Label({"Text": "─────────────────────────────", "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #333;"}),
             ui.Label({"Text": "DaVinci Resolve Plugin", "Alignment": {"AlignHCenter": True}, "Font": ui.Font({"PixelSize": 14, "Bold": True}), "StyleSheet": "color: #FF9800;"}),
             ui.Label({"Text": "by Roberto Lopez & Elvis Lopez", "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #ddd;"}),
-            ui.Label({"Text": "StuntWorks Action Cinema", "Alignment": {"AlignHCenter": True}, "Font": ui.Font({"PixelSize": 13, "Bold": True}), "StyleSheet": "color: #E91E63;"}),
+            ui.Label({"Text": "Stuntworks Cinema", "Alignment": {"AlignHCenter": True}, "Font": ui.Font({"PixelSize": 13, "Bold": True}), "StyleSheet": "color: #E91E63;"}),
             ui.Label({"Text": "github.com/stuntworks/CorridorKey-Plugin", "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #2196F3; font-size: 11px;"}),
+            ui.Label({"Text": "─────────────────────────────", "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #333;"}),
+            ui.Label({"Text": "What Makes This Unique", "Alignment": {"AlignHCenter": True}, "Font": ui.Font({"PixelSize": 14, "Bold": True}), "StyleSheet": "color: #FF9800;"}),
+            ui.Label({"Text": "This plugin combines two independent AI systems\n"
+                              "into a single one-click workflow:\n\n"
+                              "CorridorKey — a neural keyer trained on real VFX\n"
+                              "footage that produces clean chroma mattes.\n\n"
+                              "Subject Mask — Meta AI object tracking that locks\n"
+                              "a precise mask to your subject across any range,\n"
+                              "even through motion blur and partial occlusion.\n\n"
+                              "Together they solve what neither can alone:\n"
+                              "a clean chroma key that stays locked to the\n"
+                              "subject on every frame.",
+                      "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #ccc; font-size: 11px;", "WordWrap": True}),
+            ui.Label({"Text": "─────────────────────────────", "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #333;"}),
+            ui.Label({"Text": "Open Source Credits", "Alignment": {"AlignHCenter": True}, "Font": ui.Font({"PixelSize": 13, "Bold": True}), "StyleSheet": "color: #9E9E9E;"}),
+            ui.Label({"Text": "Subject Mask is powered by SAM2\n"
+                              "(Segment Anything Model 2)  ©  Meta AI\n"
+                              "Used under the Apache 2.0 open source license.",
+                      "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #777; font-size: 10px;", "WordWrap": True}),
             ui.Label({"Text": "─────────────────────────────", "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #333;"}),
             ui.Label({"Text": "StuntWorks is a professional stunt rigging company.\nIn our spare time we build the tools we wish existed —\nfree plugins, automation, and workflow helpers.\nIf you find this useful, a coffee helps us keep building.",
                       "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #ccc; font-size: 11px; font-style: italic;", "WordWrap": True}),
@@ -2556,17 +3317,36 @@ def on_about(ev):
             ui.Label({"Text": "─────────────────────────────", "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #333;"}),
             ui.Label({"Text": "How To Use", "Alignment": {"AlignHCenter": True}, "Font": ui.Font({"PixelSize": 14, "Bold": True}), "StyleSheet": "color: #FF9800;"}),
             ui.Label({"Text": "1. Place green screen footage on your timeline\n"
-                              "2. Set Alpha Method (Simple or SAM2 Click-to-Mask)\n"
+                              "2. Set Alpha Method — Simple or Subject Mask\n"
                               "3. Choose Green or Blue screen type\n"
                               "4. Click SHOW PREVIEW to check the key\n"
-                              "5. Adjust Despill and Refiner sliders as needed\n"
+                              "5. Adjust Mask Margin and Soften as needed\n"
                               "6. Set IN/OUT points for your range\n"
                               "7. Click PROCESS RANGE to render\n"
                               "8. Keyed output goes to Track 2 automatically\n\n"
                               "Tip: Place a background plate on the track below\n"
                               "your green screen clip to see the real composite\n"
-                              "in the preview window.",
+                              "in the preview window.\n\n"
+                              "Refiner note: The Refiner improves fine edge\n"
+                              "detail such as hair and soft edges. It has no\n"
+                              "effect when Subject Mask is active — the mask\n"
+                              "already clips away the fine edges the Refiner\n"
+                              "works on. Use Refiner on simple chroma keys\n"
+                              "without Subject Mask for best results.",
                       "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #ccc; font-size: 11px;", "WordWrap": True}),
+            ui.Label({"Text": "─────────────────────────────", "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #333;"}),
+            ui.Label({"Text": "Watch the Tutorials", "Alignment": {"AlignHCenter": True}, "Font": ui.Font({"PixelSize": 14, "Bold": True}), "StyleSheet": "color: #FF9800;"}),
+            ui.Label({"Text": "Step-by-step video tutorials — coming soon!\n"
+                              "Subscribe so you don't miss them.",
+                      "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #ccc; font-size: 11px;", "WordWrap": True}),
+            ui.Label({"Text": "youtube.com/@StuntWorksCinema", "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #cc3300; font-size: 12px; font-weight: bold;"}),
+            ui.Label({"Text": "─────────────────────────────", "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #333;"}),
+            ui.Label({"Text": "Free Test Footage", "Alignment": {"AlignHCenter": True}, "Font": ui.Font({"PixelSize": 14, "Bold": True}), "StyleSheet": "color: #FF9800;"}),
+            ui.Label({"Text": "Download free green screen clips to test\n"
+                              "CorridorKey Pro — includes BRAW, MOV, and\n"
+                              "H.264 samples. Link on the YouTube channel.",
+                      "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #ccc; font-size: 11px;", "WordWrap": True}),
+            ui.Label({"Text": "─────────────────────────────", "Alignment": {"AlignHCenter": True}, "StyleSheet": "color: #333;"}),
             ui.Button({"ID": "CloseAbout", "Text": "Close", "MinimumSize": [0, 30], "StyleSheet": "background: #607D8B; color: white;"})])
     ])
     def close_about(ev): disp.ExitLoop()
@@ -2581,10 +3361,10 @@ def on_header_ck(ev):
     import subprocess
     subprocess.Popen(["cmd", "/c", "start", "https://corridordigital.com"], creationflags=subprocess.CREATE_NO_WINDOW)
 
-# WHAT IT DOES: Header link — StuntWorks Action Cinema → YouTube channel
+# WHAT IT DOES: Header link — Stuntworks Cinema → YouTube channel
 def on_header_sw(ev):
     import subprocess
-    subprocess.Popen(["cmd", "/c", "start", "https://www.youtube.com/@StuntworksActionCinema"], creationflags=subprocess.CREATE_NO_WINDOW)
+    subprocess.Popen(["cmd", "/c", "start", "https://www.youtube.com/@StuntWorksCinema"], creationflags=subprocess.CREATE_NO_WINDOW)
 
 win.On.HeaderCK.Clicked = on_header_ck
 win.On.HeaderSW.Clicked = on_header_sw
@@ -2592,7 +3372,7 @@ win.On.HeaderSW.Clicked = on_header_sw
 # WHAT IT DOES: Opens StuntWorks YouTube channel in the system browser
 def on_youtube(ev):
     import subprocess
-    subprocess.Popen(["cmd", "/c", "start", "https://www.youtube.com/@StuntworksActionCinema"], creationflags=subprocess.CREATE_NO_WINDOW)
+    subprocess.Popen(["cmd", "/c", "start", "https://www.youtube.com/@StuntWorksCinema"], creationflags=subprocess.CREATE_NO_WINDOW)
 
 # WHAT IT DOES: Opens the StuntWorks Ko-fi tip jar in the system browser
 def on_kofi(ev):
@@ -2604,6 +3384,11 @@ win.On.KofiBtn.Clicked = on_kofi
 win.On.AboutBtn.Clicked = on_about
 win.On.CK.Close = on_close
 
+try: items["Log"].PlainText = ""
+except Exception: pass
+try:
+    with open(_ck_debug_log, "w", encoding="utf-8") as _clf: pass
+except Exception: pass
 log("CorridorKey Pro Ready")
 log("SAM2 | Frame Range | Export Modes")
 win.Show()
