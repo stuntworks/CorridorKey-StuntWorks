@@ -1,4 +1,4 @@
-# Last modified: 2026-04-26 | Change: Clear SAM2 click dots when scrub mode activates — dots only make sense during live preview, not during scrub playback
+# Last modified: 2026-04-27 | Change: viewer sam2_margin/sam2_soften defaults dropped from 5.0/1.0 to 0.0/0.0 to match the panel's get_settings() defaults. The viewer was leaking 5/1 into live_params.json on every fresh open which the panel then read back via _merge_live_params, baking a 5px dilate + 1px soften into PROCESS RANGE without the user touching anything — the documented "halo bug" cause. Prior fixes preserved: tan-vest alpha hint, saturation ramp on logits, full-res masks, "SAM2 = garbage matte only" trimap simplification.
 """CorridorKey Preview Viewer — two modes.
 
 MODE 1 (one-shot, back-compat with Resolve's existing flow):
@@ -189,6 +189,84 @@ def _to_float01(img):
     return img.astype(np.float32)
 
 
+def _dilate_mask(mask_f32, margin):
+    # Expands the mask boundary by margin pixels. Sub-pixel via lerp between adjacent dilations.
+    # DEPENDS-ON: numpy, cv2
+    # AFFECTS: returns a new float32 mask array, input unchanged
+    margin = float(margin)
+    if margin <= 0:
+        return mask_f32
+    int_m = int(margin)
+    frac = margin - int_m
+    mask_u8 = (np.clip(mask_f32, 0, 1) * 255).astype(np.uint8)
+    if int_m > 0:
+        k_lo = int_m * 2 + 1
+        lo = cv2.dilate(mask_u8, cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (k_lo, k_lo))).astype(np.float32) / 255.0
+    else:
+        lo = mask_f32.copy()
+    if frac > 0:
+        k_hi = (int_m + 1) * 2 + 1
+        hi = cv2.dilate(mask_u8, cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (k_hi, k_hi))).astype(np.float32) / 255.0
+        return lo * (1.0 - frac) + hi * frac
+    return lo
+
+
+def _soften_mask(mask_f32, soften):
+    # Blurs mask edges with a Gaussian. Float soften for sub-pixel control.
+    # DEPENDS-ON: numpy, cv2
+    # AFFECTS: returns a new float32 mask array, input unchanged
+    soften = float(soften)
+    if soften <= 0:
+        return mask_f32
+    k = int(soften * 6) | 1
+    if k < 3:
+        k = 3
+    return cv2.GaussianBlur(mask_f32, (k, k), sigmaX=soften, sigmaY=soften)
+
+
+# Morphological close kernel (px) applied to the SAM2 binary mask before
+# multiplying with alpha_raw. With many user dots, SAM2 finds internal
+# "edges" along fabric creases / shadows / motion blur and drops the gate to
+# 0 between dots — which would poke black holes in the body. Close fills
+# those gaps. 101px on 4K is ~2.5% of frame width — large enough to bridge
+# wide inter-dot dips, while real arm/torso gaps are protected separately
+# by the alpha_raw multiply (alpha_raw is 0 in genuine holes, so anything ×
+# 0 = 0 regardless of how aggressive the close is). Push higher if interior
+# holes persist.
+GATE_BRIDGE_PX = 0
+# Edge feather kernel + sigma for the SAM2 boundary. Small Gaussian on the
+# binary close result gives a 2-3px anti-aliased silhouette so the matte
+# doesn't have a paper-cut edge from the binary threshold.
+EDGE_FEATHER_KSIZE = 11
+EDGE_FEATHER_SIGMA = 2.5
+
+
+def _trimap_fuse(alpha_raw, gate):
+    # WHAT IT DOES: Uses SAM2 as a pure GARBAGE MATTE — crops the background
+    #   without touching alpha_raw values inside the actor. The NN alpha is now
+    #   reliably solid inside the body (post tan-vest alpha-hint fix), so this
+    #   step should NOT try to force, multiply, or threshold interior values.
+    #   Steps: (1) binarize the gate at 0.5; (2) close with a large kernel to
+    #   bridge inter-dot confidence dips; (3) soften the edge with a small
+    #   Gaussian; (4) multiply with alpha_raw. Real holes survive because
+    #   alpha_raw is 0 in them.
+    # DEPENDS-ON: numpy, cv2 (morphology + Gaussian), alpha_raw and gate same
+    #   shape, both float32 [0..1].
+    # AFFECTS: returns a new float32 array; inputs unchanged.
+    binary = (gate > 0.5).astype(np.uint8) * 255
+    if GATE_BRIDGE_PX >= 3:
+        kernel = np.ones((GATE_BRIDGE_PX, GATE_BRIDGE_PX), np.uint8)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    soft = cv2.GaussianBlur(
+        binary.astype(np.float32) / 255.0,
+        (EDGE_FEATHER_KSIZE, EDGE_FEATHER_KSIZE),
+        EDGE_FEATHER_SIGMA,
+    )
+    return (alpha_raw * soft).astype(np.float32)
+
+
 # ===== Persistent session state =====
 class Session:
     """Holds cached NN output for one keyed frame. Reused across slider updates."""
@@ -212,6 +290,20 @@ class Session:
         if alpha_img.ndim == 3:
             alpha_img = cv2.cvtColor(alpha_img, cv2.COLOR_BGR2GRAY)
         self.alpha = _to_float01(alpha_img)
+        # alpha_raw is the pre-gate NN alpha used by margin/soften.
+        # The Resolve engine only writes alpha.png (not alpha_raw.png),
+        # so we use alpha.png as the raw source — same as the AE version does.
+        self.alpha_raw = self.alpha.copy()
+        self.sam2_gate_raw = None
+        # original.png is the RAW source frame (with green spill, before NN). The
+        # Original view mode displays this. Falls back to fg_rgb if not present
+        # (older sessions / AE which doesn't write it).
+        orig_path = self.session_dir / "original.png"
+        self.original_rgb = None
+        if orig_path.exists():
+            o_bgr = _read_png_any_depth(orig_path)
+            if o_bgr is not None:
+                self.original_rgb = cv2.cvtColor(_to_float01(o_bgr), cv2.COLOR_BGR2RGB)
         v1_path = self.session_dir / "v1_underlay.png"
         self.v1_underlay = None
         if v1_path.exists():
@@ -247,10 +339,30 @@ class Session:
         if alpha_img.ndim == 3:
             alpha_img = cv2.cvtColor(alpha_img, cv2.COLOR_BGR2GRAY)
         alpha = _to_float01(alpha_img)
+        # Reload original.png too so re-keys (different playhead) update the
+        # Original view mode. Optional file — falls back to fg_rgb if absent.
+        orig_path = self.session_dir / "original.png"
+        new_original = None
+        if orig_path.exists():
+            o_bgr = _read_png_any_depth(orig_path)
+            if o_bgr is not None:
+                new_original = cv2.cvtColor(_to_float01(o_bgr), cv2.COLOR_BGR2RGB)
         # Only assign after both reads succeed so a partial write doesn't leave
         # the viewer in an inconsistent state.
         self.fg_rgb = fg_rgb
         self.alpha = alpha
+        self.original_rgb = new_original
+        # alpha_raw is the pre-gate NN alpha used by margin/soften.
+        # The Resolve engine only writes alpha.png (not alpha_raw.png),
+        # so we derive alpha_raw directly from the freshly loaded alpha —
+        # same as the AE version does.
+        self.alpha_raw = alpha.copy()
+        # Always clear the SAM2 gate when a new frame loads. The leftover
+        # sam2_gate_raw.png in the session dir is from the previous frame's
+        # pose — auto-applying it to a new frame produces a wrong-shape choke
+        # (the "fish" still cutting into the body). User must click Apply Mask
+        # fresh on each new frame to regenerate the gate for that frame.
+        self.sam2_gate_raw = None
 
 
 # ===== Post-processing pipeline =====
@@ -268,13 +380,43 @@ def render_composite(cu, session: Session, params: dict):
 
     h, w = session.shape_hw
 
-    choke_px = int(params.get("choke", 0))
-    alpha = session.alpha.copy()
+    choke_px = float(params.get("choke", 0))
+    sam2_margin = float(params.get("sam2_margin", 0))
+    sam2_soften = float(params.get("sam2_soften", 0))
+    if session.alpha_raw is not None and session.sam2_gate_raw is not None:
+        _gate = session.sam2_gate_raw.copy()
+        if _gate.shape != session.alpha_raw.shape:
+            _gate = cv2.resize(_gate, (session.alpha_raw.shape[1], session.alpha_raw.shape[0]),
+                               interpolation=cv2.INTER_LINEAR)
+        # Trimap fusion: solid 1.0 inside SAM2 confident core where NN saw
+        # something; multiply-as-before everywhere else (including real holes
+        # inside actor, which keep alpha=0). See _trimap_fuse.
+        alpha = _trimap_fuse(session.alpha_raw, _gate)
+        if sam2_margin > 0:
+            alpha = _dilate_mask(alpha, sam2_margin)
+        if sam2_soften > 0:
+            alpha = _soften_mask(alpha, sam2_soften)
+    else:
+        alpha = session.alpha.copy()
+        if sam2_margin > 0:
+            alpha = _dilate_mask(alpha, sam2_margin)
+        if sam2_soften > 0:
+            alpha = _soften_mask(alpha, sam2_soften)
     if choke_px > 0:
-        k = choke_px * 2 + 1
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        int_choke = int(choke_px)
+        frac = choke_px - int_choke
         a8 = (np.clip(alpha, 0, 1) * 255).astype(np.uint8)
-        alpha = cv2.erode(a8, kernel).astype(np.float32) / 255.0
+        alpha_lo = cv2.erode(a8, cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (int_choke * 2 + 1, int_choke * 2 + 1)
+        )).astype(np.float32) / 255.0 if int_choke > 0 else alpha.copy()
+        if frac > 0:
+            k2 = (int_choke + 1) * 2 + 1
+            alpha_hi = cv2.erode(a8, cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (k2, k2)
+            )).astype(np.float32) / 255.0
+            alpha = alpha_lo * (1.0 - frac) + alpha_hi * frac
+        else:
+            alpha = alpha_lo
     if despeckle_on and despeckle_size > 0:
         # clean_matte_opencv expects area threshold in pixels
         alpha = cu.clean_matte_opencv(alpha, area_threshold=despeckle_size)
@@ -364,12 +506,25 @@ class PersistentWindow(QtWidgets.QWidget):
         self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
 
         self._view_mode = "Composite"
+        # WHAT IT DOES: Default values written to live_params.json on first
+        #   open. Must match the panel's get_settings() defaults — otherwise
+        #   the viewer leaks its values back into the panel via
+        #   _merge_live_params and overrides the panel's intended defaults
+        #   without the user ever touching a slider.
+        # DEPENDS-ON: panel get_settings() in CorridorKey_Pro.py — keep in sync.
+        # AFFECTS: PROCESS RANGE, BRAW PROCESS RANGE, SCRUB RANGE all read
+        #   live_params.json. Wrong defaults here = wrong matte everywhere.
+        # DANGER ZONE FRAGILE: do NOT bump sam2_margin or sam2_soften here
+        #   "for a nicer default" — the panel will inherit your value silently.
+        #   breaks: matte gets dilated/softened on first run with no visible UI cause.
         self._params = {
             "despill": 1.0,
             "despeckle": True,
             "despeckleSize": 400,
             "background": "checker",
             "choke": 0,
+            "sam2_margin": 0.0,
+            "sam2_soften": 0.0,
         }
         # Drop-stale: if a new update comes in while we're painting, we only keep
         # the latest one. _pending is None when idle, or a dict when a render is
@@ -418,7 +573,7 @@ class PersistentWindow(QtWidgets.QWidget):
 
         # SAM click-to-mask state
         self._sam_mode = False
-        self._sam_display_pts = []  # (nx, ny, is_positive) normalized 0..1 image coords
+        self._sam_display_pts = []  # (nx, ny, is_positive, frame_num) — frame_num is the absolute timeline frame the click was placed on (read from meta.json at click time). None if meta not available.
         self._last_right_geom = None  # cached paint geometry for coord mapping
 
         h, w = session.shape_hw
@@ -428,7 +583,12 @@ class PersistentWindow(QtWidgets.QWidget):
         self.scale = min(1.0, 480.0 / w, 360.0 / h)
         self.disp_w = max(240, int(w * self.scale))
         self.disp_h = max(180, int(h * self.scale))
-        self.original_u8 = np.clip(session.fg_rgb * 255.0, 0, 255).astype(np.uint8)
+        # Prefer the raw source frame (original.png) over fg.png for Original
+        # view mode — fg.png is the NN-clean FG (greens are black) which is NOT
+        # what users want when they click Original. Falls back to fg_rgb if
+        # original.png wasn't written by the host plugin.
+        _orig_src = session.original_rgb if session.original_rgb is not None else session.fg_rgb
+        self.original_u8 = np.clip(_orig_src * 255.0, 0, 255).astype(np.uint8)
         self.original_scaled = cv2.resize(self.original_u8, (self.disp_w, self.disp_h))
 
         self._scrub_index_mtime = 0.0
@@ -655,7 +815,45 @@ class PersistentWindow(QtWidgets.QWidget):
             return
         if alp_img.ndim == 3:
             alp_img = cv2.cvtColor(alp_img, cv2.COLOR_BGR2GRAY)
-        self.session.alpha = _to_float01(alp_img)
+        alpha_loaded = _to_float01(alp_img)
+        # WHAT IT DOES: Load alpha_raw.png + sam2_gate_raw.png if the panel wrote
+        #   them for this scrub frame, so render_composite uses the same NN×gate
+        #   formula as live preview and MARGIN/SOFTEN sliders work during scrub.
+        # WHY: panel's keying loop multiplies NN × SAM2 gate and saves the product
+        #   as alpha.png. When SAM2 returns an empty mask for a frame, the product
+        #   is all zeros and the viewer shows a blank matte. Falling back to the
+        #   pre-gate NN alpha lets the user still scrub through the keyed body
+        #   even when SAM2 fails on that frame — the live preview already does this.
+        # AFFECTS: self.session.alpha_raw, self.session.sam2_gate_raw, self.session.alpha.
+        alpha_raw_path = frame_dir / "alpha_raw.png"
+        gate_path      = frame_dir / "sam2_gate_raw.png"
+        alpha_raw = None
+        if alpha_raw_path.exists():
+            _ar_img = _read_png_any_depth(alpha_raw_path)
+            if _ar_img is not None:
+                if _ar_img.ndim == 3:
+                    _ar_img = cv2.cvtColor(_ar_img, cv2.COLOR_BGR2GRAY)
+                alpha_raw = _to_float01(_ar_img)
+        gate = None
+        if gate_path.exists():
+            _g_img = _read_png_any_depth(gate_path)
+            if _g_img is not None:
+                if _g_img.ndim == 3:
+                    _g_img = cv2.cvtColor(_g_img, cv2.COLOR_BGR2GRAY)
+                _gate_f = _to_float01(_g_img)
+                # Only treat the gate as valid when it actually has nonzero
+                # pixels — an all-zero gate (SAM2 produced no mask for this
+                # frame) would zero out the entire matte if we used it.
+                if float(_gate_f.max()) > 0.0:
+                    gate = _gate_f
+        self.session.alpha_raw      = alpha_raw
+        self.session.sam2_gate_raw  = gate
+        # If alpha.png is empty (the typical SAM2-empty-mask case) but we have
+        # a real alpha_raw, swap it in so the basic display works.
+        if alpha_loaded.max() == 0.0 and alpha_raw is not None:
+            self.session.alpha = alpha_raw.copy()
+        else:
+            self.session.alpha = alpha_loaded
         self._scrub_frame_lbl.setText(f"Frame {idx + 1} / {self._scrub_count}")
         self._render_now()
 
@@ -902,6 +1100,11 @@ class PersistentWindow(QtWidgets.QWidget):
                 "background-color: #111; color: #667; padding: 6px 12px; "
                 "border: 1px solid #2a2a2a; border-radius: 12px; font-size: 12px;"
             )
+            # Mirror the widen on entry — without this the window stays wide
+            # forever after a single Split toggle. Clamp to a sane minimum
+            # so we never resize below the layout's own minimum.
+            _new_w = max(self.minimumWidth(), self.width() - self.disp_w)
+            self.resize(_new_w, self.height())
         self._repaint_both()
 
     # WHAT IT DOES: Builds the in-viewer slider panel — despill, despeckle on/off,
@@ -978,6 +1181,28 @@ class PersistentWindow(QtWidgets.QWidget):
         self.choke_value_label.setMinimumWidth(42)
         grid.addWidget(self.choke_value_label, 2, 2)
 
+        # --- Mask Margin: 0.0-80.0 px in 0.1 steps (slider 0-800, ÷10). ---
+        grid.addWidget(_label("MARGIN"), 3, 0)
+        self.margin_slider = JumpSlider(QtCore.Qt.Horizontal)
+        self.margin_slider.setRange(0, 800)
+        self.margin_slider.setValue(int(float(self._params["sam2_margin"]) * 10))
+        self.margin_slider.valueChanged.connect(self._on_margin_changed)
+        grid.addWidget(self.margin_slider, 3, 1)
+        self.margin_value_label = _label(f"{float(self._params['sam2_margin']):.1f}", "#0ff")
+        self.margin_value_label.setMinimumWidth(42)
+        grid.addWidget(self.margin_value_label, 3, 2)
+
+        # --- Soften: 0.0-20.0 px in 0.1 steps (slider 0-200, ÷10). ---
+        grid.addWidget(_label("SOFTEN"), 4, 0)
+        self.soften_slider = JumpSlider(QtCore.Qt.Horizontal)
+        self.soften_slider.setRange(0, 200)
+        self.soften_slider.setValue(int(float(self._params["sam2_soften"]) * 10))
+        self.soften_slider.valueChanged.connect(self._on_soften_changed)
+        grid.addWidget(self.soften_slider, 4, 1)
+        self.soften_value_label = _label(f"{float(self._params['sam2_soften']):.1f}", "#0ff")
+        self.soften_value_label.setMinimumWidth(42)
+        grid.addWidget(self.soften_value_label, 4, 2)
+
         grid.setColumnStretch(1, 1)
         parent_layout.addWidget(panel)
 
@@ -1020,7 +1245,27 @@ class PersistentWindow(QtWidgets.QWidget):
     def _on_choke_changed(self, value: int):
         self._params["choke"] = int(value)
         self.choke_value_label.setText(f"{value}")
-        self._render_now()
+        # Use throttled render — same reason as FIX B above. Each render on a
+        # 4K frame is 50-300ms; calling _render_now() per slider tick blocks
+        # the Qt event loop so the slider can't track the mouse cursor. The
+        # _schedule_render() cooldown caps renders at ~16fps and keeps drag responsive.
+        self._schedule_render()
+        self._schedule_save()
+
+    def _on_margin_changed(self, value: int):
+        # Slider 0-800; divide by 10 → 0.0-80.0 px in 0.1 steps.
+        v = value / 10.0
+        self._params["sam2_margin"] = v
+        self.margin_value_label.setText(f"{v:.1f}")
+        self._schedule_render()
+        self._schedule_save()
+
+    def _on_soften_changed(self, value: int):
+        # Slider 0-200; divide by 10 → 0.0-20.0 px in 0.1 steps.
+        v = value / 10.0
+        self._params["sam2_soften"] = v
+        self.soften_value_label.setText(f"{v:.1f}")
+        self._schedule_render()
         self._schedule_save()
 
     # WHAT IT DOES: Debounces live_params.json writes. Every slider move calls this;
@@ -1058,18 +1303,39 @@ class PersistentWindow(QtWidgets.QWidget):
             # Write SAM2 click points so the panel can use them during render
             if self._sam_display_pts:
                 ih, iw = self.session.shape_hw
-                payload["sam_positive"] = [[int(nx * iw), int(ny * ih)] for nx, ny, v in self._sam_display_pts if v]
-                payload["sam_negative"] = [[int(nx * iw), int(ny * ih)] for nx, ny, v in self._sam_display_pts if not v]
+                # Each click stores its OWN frame_num (the frame the user was viewing
+                # when they placed it). This lets the panel place each click on its
+                # correct frame during SAM2 video propagation, instead of forcing
+                # all clicks onto a single global anchor frame. Fixes the bug where
+                # adding a refining click after the playhead moved invalidated the
+                # original clicks (because they got re-anchored to the new frame).
+                payload["sam_clicks"] = [
+                    {"x": int(nx * iw), "y": int(ny * ih), "label": 1 if v else 0,
+                     "frame": fr}
+                    for nx, ny, v, fr in self._sam_display_pts
+                ]
+                # Legacy fields for back-compat with code paths that haven't been
+                # updated yet. sam_anchor_frame falls back to the FIRST click's
+                # frame (the original anchor). Most paths will read sam_clicks.
+                payload["sam_positive"] = [[int(nx * iw), int(ny * ih)] for nx, ny, v, _ in self._sam_display_pts if v]
+                payload["sam_negative"] = [[int(nx * iw), int(ny * ih)] for nx, ny, v, _ in self._sam_display_pts if not v]
                 payload["alpha_method"] = 1
-                try:
-                    meta_path = self.session.session_dir / "meta.json"
-                    if meta_path.exists():
-                        import json as _json
-                        meta = _json.loads(meta_path.read_text())
-                        payload["sam_anchor_frame"] = meta.get("frame_num")
-                except Exception:
-                    pass
+                _frames = [fr for _, _, _, fr in self._sam_display_pts if fr is not None]
+                if _frames:
+                    payload["sam_anchor_frame"] = _frames[0]
+                else:
+                    # Fall back to current meta.frame_num if no click had a frame
+                    # captured (shouldn't happen post-fix, but be safe).
+                    try:
+                        meta_path = self.session.session_dir / "meta.json"
+                        if meta_path.exists():
+                            import json as _json
+                            meta = _json.loads(meta_path.read_text())
+                            payload["sam_anchor_frame"] = meta.get("frame_num")
+                    except Exception:
+                        pass
             else:
+                payload["sam_clicks"] = []
                 payload["sam_positive"] = []
                 payload["sam_negative"] = []
             with open(tmp, "w", encoding="utf-8") as f:
@@ -1142,8 +1408,11 @@ class PersistentWindow(QtWidgets.QWidget):
             rekey_rendered = False
             try:
                 self.session.reload_pngs()
+                _orig_src = (self.session.original_rgb
+                             if self.session.original_rgb is not None
+                             else self.session.fg_rgb)
                 self.original_u8 = np.clip(
-                    self.session.fg_rgb * 255.0, 0, 255
+                    _orig_src * 255.0, 0, 255
                 ).astype(np.uint8)
                 self._place_original()
                 self._set_view_mode("Composite")
@@ -1168,7 +1437,10 @@ class PersistentWindow(QtWidgets.QWidget):
             self.status.setText(f"Reload failed: {e}")
             return
         self.session = new_session
-        self.original_u8 = np.clip(new_session.fg_rgb * 255.0, 0, 255).astype(np.uint8)
+        _orig_src = (new_session.original_rgb
+                     if new_session.original_rgb is not None
+                     else new_session.fg_rgb)
+        self.original_u8 = np.clip(_orig_src * 255.0, 0, 255).astype(np.uint8)
         self._place_original()
         self._render_now()
 
@@ -1210,9 +1482,38 @@ class PersistentWindow(QtWidgets.QWidget):
                     )
                 img = np.clip(fg_rgb * 255.0, 0, 255).astype(np.uint8)
             else:  # Matte
-                # Apply despeckle (matte is what it edits) and show as grayscale RGB
+                # Show the same alpha the composite uses: gate ceiling + margin + soften
                 params_for_matte = dict(self._params)
-                alpha = self.session.alpha.copy()
+                matte_margin = float(params_for_matte.get("sam2_margin", 0))
+                matte_soften = float(params_for_matte.get("sam2_soften", 0))
+                if (self.session.alpha_raw is not None
+                        and self.session.sam2_gate_raw is not None):
+                    _gate = self.session.sam2_gate_raw.copy()
+                    # SAM2 logits return at 256x256 — must resize to alpha shape or
+                    # the multiply throws ValueError (silently caught by the outer
+                    # try/except, leaving the matte view blank). The Composite
+                    # branch in render_composite handles this; the Matte branch was
+                    # missing the resize. Fixed 2026-04-26.
+                    if _gate.shape != self.session.alpha_raw.shape:
+                        _gate = cv2.resize(
+                            _gate,
+                            (self.session.alpha_raw.shape[1],
+                             self.session.alpha_raw.shape[0]),
+                            interpolation=cv2.INTER_LINEAR,
+                        )
+                    # Trimap fusion: solid 1.0 inside SAM2 confident core where
+                    # NN saw something; multiply elsewhere. Real holes preserved.
+                    alpha = _trimap_fuse(self.session.alpha_raw, _gate)
+                    if matte_margin > 0:
+                        alpha = _dilate_mask(alpha, matte_margin)
+                    if matte_soften > 0:
+                        alpha = _soften_mask(alpha, matte_soften)
+                else:
+                    alpha = self.session.alpha.copy()
+                    if matte_margin > 0:
+                        alpha = _dilate_mask(alpha, matte_margin)
+                    if matte_soften > 0:
+                        alpha = _soften_mask(alpha, matte_soften)
                 if params_for_matte.get("despeckle", True):
                     alpha = self.cu.clean_matte_opencv(
                         alpha, area_threshold=int(params_for_matte.get("despeckleSize", 400))
@@ -1368,8 +1669,19 @@ class PersistentWindow(QtWidgets.QWidget):
                         if 0 <= px < g["tw"] and 0 <= py < g["th"]:
                             nx = (g["x0"] + px * g["cw"] / g["tw"]) / g["iw"]
                             ny = (g["y0"] + py * g["ch"] / g["th"]) / g["ih"]
-                            self._sam_display_pts.append((nx, ny, bool(is_pos)))
-                    pos_count = sum(1 for _, _, v in self._sam_display_pts if v)
+                            # Read meta.json fresh — session.meta is only loaded at
+                            # __init__ and won't reflect a later PREVIEW that updated
+                            # the playhead. Each click captures the current frame.
+                            _click_frame = None
+                            try:
+                                _meta_path = self.session.session_dir / "meta.json"
+                                if _meta_path.exists():
+                                    _meta = json.loads(_meta_path.read_text(encoding="utf-8"))
+                                    _click_frame = _meta.get("frame_num")
+                            except Exception:
+                                pass
+                            self._sam_display_pts.append((nx, ny, bool(is_pos), _click_frame))
+                    pos_count = sum(1 for t in self._sam_display_pts if t[2])
                     neg_count = len(self._sam_display_pts) - pos_count
                     self.status.setText(f"SAM points: {pos_count}+ {neg_count}−  (right-click=exclude)")
                     self._draw_sam_overlay()
@@ -1426,14 +1738,15 @@ class PersistentWindow(QtWidgets.QWidget):
         try:
             import cv2, numpy as np, torch, os
             ih, iw = self.session.shape_hw
-            pos_pts = [(int(nx * iw), int(ny * ih)) for nx, ny, v in self._sam_display_pts if v]
-            neg_pts = [(int(nx * iw), int(ny * ih)) for nx, ny, v in self._sam_display_pts if not v]
+            pos_pts = [(int(nx * iw), int(ny * ih)) for nx, ny, v, _ in self._sam_display_pts if v]
+            neg_pts = [(int(nx * iw), int(ny * ih)) for nx, ny, v, _ in self._sam_display_pts if not v]
             all_pts = [[p[0], p[1]] for p in pos_pts] + [[p[0], p[1]] for p in neg_pts]
             labels  = [1] * len(pos_pts) + [0] * len(neg_pts)
             if not all_pts:
                 self.status.setText("No valid points in image bounds")
                 return
             # Source image for SAM2: uint8 RGB (session stores float32 RGB 0..1)
+            # Tried feeding original.png (raw greenscreen) — didn't help, reverted.
             frame_rgb = np.clip(self.session.fg_rgb * 255.0, 0, 255).astype(np.uint8)
             # CK_ROOT is two levels up from this script (resolve_plugin/ → engine root)
             ck_root = Path(__file__).parent.parent
@@ -1445,33 +1758,66 @@ class PersistentWindow(QtWidgets.QWidget):
             model = build_sam2(cfg, ckpt, device=device)
             pred  = SAM2ImagePredictor(model)
             pred.set_image(frame_rgb)
-            masks, scores, _ = pred.predict(
+            # return_logits=True returns full-res raw logits (clamped to [-32, +32]
+            # by SAM2). Use masks[best_idx] — the full-res slot — not low_res_masks
+            # (256x256), because upscaling soft sigmoid values 15x bakes 256-grid
+            # banding into the matte.
+            masks, scores, _low_res = pred.predict(
                 point_coords=np.array(all_pts),
                 point_labels=np.array(labels),
                 multimask_output=True,
+                return_logits=True,
             )
             del pred, model
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            best = masks[int(np.argmax(scores))].astype(np.float32)
-            alpha_u8 = (best * 255).astype(np.uint8)
-            # Backup the NN alpha before SAM2 overwrites alpha.png.
+            best_idx = int(np.argmax(scores))
+            # SATURATION RAMP, not sigmoid.
+            #
+            # WHY NOT SIGMOID: SAM2 mask-decoder logits in confident interior pixels
+            # often sit in the +2..+6 range (not +20..+30). Sigmoid maps that to
+            # 0.88..0.998 — with subtle per-pixel variation that tracks image texture.
+            # Multiplied by the solid-white NN alpha, that variation prints as
+            # horizontal banding + checker artifacts inside the body silhouette.
+            #
+            # WHAT THE RAMP DOES: linear ramp on raw logits.
+            #   logit >= +2  ->  1.0  (solid interior, kills all decoder texture)
+            #   logit <= -2  ->  0.0  (solid background)
+            #   -2 < L < +2  ->  linear ramp (soft anti-aliased edge at the
+            #                    SAM2 decision boundary)
+            # slope=0.25 -> 4 logit-units across the soft band -> typically 2-4 px
+            # of feather at full-res, since SAM2 logits transition over 1-3 px.
+            logits = masks[best_idx].astype(np.float32)
+            best = np.clip(0.5 + logits * 0.25, 0.0, 1.0)
+            # Backup the NN alpha if it exists and hasn't been backed up yet.
             # CLEAR restores this backup so the actress comes back without re-processing.
-            alpha_path   = self.session.session_dir / "alpha.png"
-            nn_backup    = self.session.session_dir / "alpha_nn_backup.png"
-            tmp_path     = self.session.session_dir / "alpha.tmp.png"
+            alpha_path = self.session.session_dir / "alpha.png"
+            nn_backup  = self.session.session_dir / "alpha_nn_backup.png"
             if alpha_path.exists() and not nn_backup.exists():
                 import shutil as _shutil
                 _shutil.copy2(str(alpha_path), str(nn_backup))
-            cv2.imwrite(str(tmp_path), alpha_u8)
-            os.replace(str(tmp_path), str(alpha_path))
-            # Write sam2_mask.png as the permanent gate for the panel's Process Frame.
-            # alpha.png gets overwritten when Preview Frame re-runs; sam2_mask.png does not.
+            # Save soft gate as uint16 PNG so the 0..1 precision survives the
+            # save/load roundtrip (uint8 would quantize to 256 levels and undo
+            # the soft-edge benefit). _to_float01 handles uint16 on read.
+            gate_u16  = (best * 65535.0).astype(np.uint16)
+            gate_path = self.session.session_dir / "sam2_gate_raw.png"
+            gate_tmp  = self.session.session_dir / "sam2_gate_raw.tmp.png"
+            cv2.imwrite(str(gate_tmp), gate_u16)
+            os.replace(str(gate_tmp), str(gate_path))
+            # sam2_mask.png stays binary uint8 — it's consumed by the panel's
+            # batch path which expects the legacy hard-mask contract.
+            sam2_mask_u8   = (best > 0.5).astype(np.uint8) * 255
             sam2_mask_path = self.session.session_dir / "sam2_mask.png"
             sam2_tmp_path  = self.session.session_dir / "sam2_mask.tmp.png"
-            cv2.imwrite(str(sam2_tmp_path), alpha_u8)
+            cv2.imwrite(str(sam2_tmp_path), sam2_mask_u8)
             os.replace(str(sam2_tmp_path), str(sam2_mask_path))
+            # reload_pngs() must run BEFORE assigning the new gate — it
+            # unconditionally clears sam2_gate_raw to None (so a new frame
+            # never inherits the previous frame's gate). Calling it after
+            # the assignment would wipe the gate we just computed and
+            # Apply Mask would silently do nothing.
             self.session.reload_pngs()
+            self.session.sam2_gate_raw = best.copy()
             # Keep points visible so the user can add/refine and re-apply —
             # each predict() takes ALL current points, so wiping them here
             # forced users to re-click everything. CLEAR button wipes manually.
@@ -1500,7 +1846,7 @@ class PersistentWindow(QtWidgets.QWidget):
             return
         painter = QtGui.QPainter(pixmap)
         painter.setRenderHint(QtGui.QPainter.Antialiasing)
-        for nx, ny, is_pos in self._sam_display_pts:
+        for nx, ny, is_pos, _ in self._sam_display_pts:
             # Normalized image → source image coords
             src_x = nx * g["iw"] - g["x0"]
             src_y = ny * g["ih"] - g["y0"]
