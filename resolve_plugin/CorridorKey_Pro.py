@@ -1,4 +1,4 @@
-# Last modified: 2026-04-27 | Change: SAM2 quality gate — when propagation loses tracking mid-range and returns a near-empty mask, fall back to a no-op gate (ones) so the NN alpha passes through ungated for that frame instead of being multiplied to black. Fixes the "matte goes black halfway through the range" bug seen on long stunt clips with many click points. | Full history: git log
+# Last modified: 2026-04-27 | Change: SAM2 propagation now applies a 101px morphological close to bridge inter-dot confidence dips (fixes interior body holes seen in PROCESS RANGE / SCRUB RANGE that LIVE PREVIEW didn't show as badly because of the viewer's Gaussian feather). Also refined the quality gate from prior commit: only substitute ones-mask for INTERIOR empty frames (mid-range collapse). Tail empty frames at the start/end of the range = actor entering/leaving frame; leave those empty so call sites correctly zero out non-green set elements. | Full history: git log
 """CorridorKey Pro - Neural Green Screen for DaVinci Resolve
 Enhanced with SAM2 Click-to-Mask, Frame Range, Export Modes
 
@@ -803,59 +803,105 @@ def run_sam2_video_propagation(fp, ss, cs, in_f, out_f, pos_pts, neg_pts, anchor
             # pass must reuse the same state object so the tracker memory from the forward
             # pass carries over. Reinitialising state between passes loses anchor context.
             # breaks: if state is reset between passes, backward masks drift from forward.
+            # WHAT IT DOES: Bridges inter-dot confidence dips inside the
+            #   actor silhouette. With many positives placed on joints, SAM2
+            #   sometimes drops confidence between adjacent dots along fabric
+            #   creases, shadows, or motion blur — producing black holes in
+            #   the matte. Closing with a kernel ~size of the longest plausible
+            #   inter-dot gap (~100 px on a 4K subject) fills those holes
+            #   without bloating the silhouette outward into hair / background.
+            # AFFECTS: every non-empty propagated mask (forward and backward).
+            CLOSE_KERNEL_PX = 101
+            _close_kernel = np.ones((CLOSE_KERNEL_PX, CLOSE_KERNEL_PX), np.uint8)
+
+            def _bridge_holes(mask):
+                # Convert float [0..1] → uint8 [0..255] for cv2 morphology, close,
+                # then return as float [0..1]. Inputs unchanged.
+                binary = (mask * 255.0).astype(np.uint8)
+                closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, _close_kernel)
+                return (closed.astype(np.float32) / 255.0)
+
             status("SAM2: forward pass...")
             log(f"SAM2 video: forward pass (anchor={anchor_rel} → frame {dur-1})")
             forward_count = 0
-            collapsed_count = 0
-            # DANGER ZONE FRAGILE: SAM2 silently returns near-empty masks when it
-            # loses tracking mid-range (long clips, fast motion, too many click
-            # points). Without this gate, an empty mask multiplies the NN alpha
-            # to zero at the call sites and the matte goes black. Threshold of 100
-            # active pixels treats anything smaller as "lost"; ones-mask falls
-            # through cleanly so the caller's `mt = mt * gate` becomes a no-op
-            # for that frame and NN alpha passes through.
-            # breaks: change ones_like → zeros_like and propagation will black-out
-            # every frame after SAM2 loses the actor.
+            forward_empty_frames = []  # frame indices where SAM2 returned empty
             for frame_idx, _obj_ids, mask_logits in predictor.propagate_in_video(state):
                 mask = (mask_logits[0] > 0.0).squeeze().cpu().numpy().astype(np.float32)
                 if mask.sum() < 100:
-                    mask = np.ones_like(mask)
-                    collapsed_count += 1
-                masks[frame_idx] = mask
+                    # Empty frame — defer "collapse vs actor-exit" decision to
+                    # the post-pass step which has visibility across all frames.
+                    masks[frame_idx] = mask  # store empty; resolved below
+                    forward_empty_frames.append(frame_idx)
+                else:
+                    masks[frame_idx] = _bridge_holes(mask)
                 forward_count += 1
                 if frame_idx % 20 == 0:
                     log(f"SAM2 forward: frame {frame_idx}/{dur}")
                     status(f"SAM2 forward: {frame_idx}/{dur} frames")
             log(f"SAM2 forward pass done — {forward_count} masks "
-                f"({collapsed_count} fell back to NN-only)")
+                f"({len(forward_empty_frames)} empty, resolved post-pass)")
 
             # --- Backward pass: anchor → first frame ---
             # Only needed when the anchor is not the first frame. Frames already
             # written by the forward pass are not overwritten (forward wins on overlap).
+            backward_empty_frames = []
             if anchor_rel > 0:
                 status("SAM2: backward pass...")
                 log(f"SAM2 video: backward pass (anchor={anchor_rel} → frame 0)")
                 backward_count = 0
-                back_collapsed_count = 0
                 for frame_idx, _obj_ids, mask_logits in predictor.propagate_in_video(
                         state, reverse=True):
                     if frame_idx not in masks:
                         mask = (mask_logits[0] > 0.0).squeeze().cpu().numpy().astype(np.float32)
-                        # Same collapse-detection as the forward pass — see the
-                        # DANGER ZONE comment there for why the threshold matters.
                         if mask.sum() < 100:
-                            mask = np.ones_like(mask)
-                            back_collapsed_count += 1
-                        masks[frame_idx] = mask
+                            masks[frame_idx] = mask  # store empty; resolved post-pass
+                            backward_empty_frames.append(frame_idx)
+                        else:
+                            masks[frame_idx] = _bridge_holes(mask)
                     backward_count += 1
                     if frame_idx % 20 == 0:
                         log(f"SAM2 backward: frame {frame_idx}")
                         status(f"SAM2 backward: {frame_idx} frames")
                 log(f"SAM2 backward pass done — {backward_count} frames visited, "
                     f"{sum(1 for k in masks if k < anchor_rel)} new masks added "
-                    f"({back_collapsed_count} fell back to NN-only)")
+                    f"({len(backward_empty_frames)} empty, resolved post-pass)")
             else:
                 log("SAM2 video: anchor is frame 0 — backward pass skipped")
+
+            # WHAT IT DOES: Resolves which empty frames are mid-range collapses
+            #   (fall back to NN-only via ones-mask) vs tail empties at the start
+            #   or end of the range (actor entering / leaving the frame — leave
+            #   empty so the call site's `mt = mt * gate` correctly zeros out
+            #   non-green set elements that would otherwise show through).
+            # DEPENDS-ON: masks dict populated by both forward and backward passes
+            # AFFECTS: masks dict — substitutes ones-mask for interior empty
+            #   frames; leaves tail empties unchanged.
+            # DANGER ZONE FRAGILE: do NOT substitute ones for ALL empty frames.
+            #   That re-introduces the "non-green set comes back at end of range"
+            #   regression seen on 2026-04-27 stunt clip after first quality-gate
+            #   fix.
+            sorted_frame_keys = sorted(masks.keys())
+            collapsed_count = 0
+            tail_empty_count = 0
+            if sorted_frame_keys:
+                first_substantial = next(
+                    (f for f in sorted_frame_keys if masks[f].sum() >= 100), None)
+                last_substantial = next(
+                    (f for f in reversed(sorted_frame_keys) if masks[f].sum() >= 100), None)
+                if first_substantial is not None and last_substantial is not None:
+                    for f in sorted_frame_keys:
+                        if masks[f].sum() >= 100:
+                            continue  # mask is real, leave alone
+                        if first_substantial <= f <= last_substantial:
+                            # Interior empty = mid-range tracking collapse → ones-mask
+                            masks[f] = np.ones_like(masks[f])
+                            collapsed_count += 1
+                        else:
+                            # Tail empty = actor not in frame → leave empty
+                            tail_empty_count += 1
+            log(f"SAM2 propagation post-pass: {collapsed_count} interior "
+                f"empties → NN-only fallback, {tail_empty_count} tail empties "
+                f"left empty (actor entering/leaving frame).")
 
             # reset_state releases SAM2's internal CUDA buffers before we drop
             # the predictor — prevents the GPU memory leak on Windows (issue #258).
