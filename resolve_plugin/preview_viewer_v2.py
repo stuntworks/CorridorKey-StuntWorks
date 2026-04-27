@@ -1,4 +1,4 @@
-# Last modified: 2026-04-27 | Change: viewer sam2_margin/sam2_soften defaults dropped from 5.0/1.0 to 0.0/0.0 to match the panel's get_settings() defaults. The viewer was leaking 5/1 into live_params.json on every fresh open which the panel then read back via _merge_live_params, baking a 5px dilate + 1px soften into PROCESS RANGE without the user touching anything — the documented "halo bug" cause. Prior fixes preserved: tan-vest alpha hint, saturation ramp on logits, full-res masks, "SAM2 = garbage matte only" trimap simplification.
+# Last modified: 2026-04-27 | Change: Margin and Soften sliders are now SAM2-ONLY everywhere — they no longer apply to NN alpha when SAM2 is off (was a viewer-only behavior that didn't match render output and silently misled users). Sliders also grey out in the UI when no SAM2 mask is active, so the user can see the controls aren't doing anything until they engage SAM2. Net effect: live preview and rendered output now agree completely on Margin/Soften behavior. Prior fixes preserved.
 """CorridorKey Preview Viewer — two modes.
 
 MODE 1 (one-shot, back-compat with Resolve's existing flow):
@@ -397,11 +397,13 @@ def render_composite(cu, session: Session, params: dict):
         if sam2_soften > 0:
             alpha = _soften_mask(alpha, sam2_soften)
     else:
+        # SAM2 inactive — Margin and Soften are SAM2-only controls and do
+        # nothing here. The sliders grey out in the viewer UI to make this
+        # visible to the user. Render output (PROCESS RANGE / SCRUB RANGE)
+        # has always behaved this way; the previous viewer-only branch that
+        # applied margin/soften to NN alpha was a parity bug — preview
+        # showed the user something the render couldn't deliver.
         alpha = session.alpha.copy()
-        if sam2_margin > 0:
-            alpha = _dilate_mask(alpha, sam2_margin)
-        if sam2_soften > 0:
-            alpha = _soften_mask(alpha, sam2_soften)
     if choke_px > 0:
         int_choke = int(choke_px)
         frac = choke_px - int_choke
@@ -1268,6 +1270,28 @@ class PersistentWindow(QtWidgets.QWidget):
         self._schedule_render()
         self._schedule_save()
 
+    # WHAT IT DOES: Greys out the SAM2-only controls (Margin, Soften) when
+    #   no SAM2 mask is active. This makes it visually obvious to the user
+    #   that those sliders aren't doing anything until they engage SAM2.
+    #   "Active" = self.session.sam2_gate_raw exists (i.e. APPLY MASK has
+    #   been pressed and produced a mask, or the panel wrote one for the
+    #   current scrub frame).
+    # DEPENDS-ON: self.margin_slider, self.margin_value_label,
+    #   self.soften_slider, self.soften_value_label, self.session.
+    # AFFECTS: setEnabled state on those four widgets only.
+    # DANGER ZONE FRAGILE: do NOT also disable the close-kernel slider here
+    #   if/when it gets added — it should follow the same pattern in its
+    #   own helper, since adding more SAM2 controls means this list grows.
+    def _update_sam2_slider_state(self):
+        sam2_active = (self.session is not None
+                       and self.session.sam2_gate_raw is not None)
+        for w in (self.margin_slider, self.margin_value_label,
+                  self.soften_slider, self.soften_value_label):
+            try:
+                w.setEnabled(sam2_active)
+            except Exception:
+                pass
+
     # WHAT IT DOES: Debounces live_params.json writes. Every slider move calls this;
     #   the actual disk write happens 250ms after the LAST move. Prevents filesystem
     #   thrash on rapid drags.
@@ -1509,11 +1533,9 @@ class PersistentWindow(QtWidgets.QWidget):
                     if matte_soften > 0:
                         alpha = _soften_mask(alpha, matte_soften)
                 else:
+                    # SAM2 inactive — Matte view shows the raw NN alpha
+                    # without margin/soften (those are SAM2-only controls).
                     alpha = self.session.alpha.copy()
-                    if matte_margin > 0:
-                        alpha = _dilate_mask(alpha, matte_margin)
-                    if matte_soften > 0:
-                        alpha = _soften_mask(alpha, matte_soften)
                 if params_for_matte.get("despeckle", True):
                     alpha = self.cu.clean_matte_opencv(
                         alpha, area_threshold=int(params_for_matte.get("despeckleSize", 400))
@@ -1524,6 +1546,10 @@ class PersistentWindow(QtWidgets.QWidget):
             # re-running stage-2. Then paint it at the current label size.
             self._last_right_full = img
             self._paint_right(img)
+            # Sync SAM2-only slider enabled state with whether SAM2 actually
+            # produced a mask for this frame. Cheap (4 setEnabled calls);
+            # safe to do every render.
+            self._update_sam2_slider_state()
             dt_ms = (time.perf_counter() - t0) * 1000.0
             # meanRGB is the cheapest possible proof that slider changes actually
             # move pixels. If these three numbers don't change between slider
