@@ -1184,14 +1184,19 @@ class PersistentWindow(QtWidgets.QWidget):
         grid.addWidget(self.choke_value_label, 2, 2)
 
         # --- Mask Margin: 0.0-80.0 px in 0.1 steps (slider 0-800, ÷10). ---
+        # SAM2-only. Tooltip explains the grey-out state when no mask active.
+        _SAM2_TOOLTIP = ("SAM2 must be active for this control to work.\n"
+                         "Click on the actor and press APPLY MASK first.")
         grid.addWidget(_label("MARGIN"), 3, 0)
         self.margin_slider = JumpSlider(QtCore.Qt.Horizontal)
         self.margin_slider.setRange(0, 800)
         self.margin_slider.setValue(int(float(self._params["sam2_margin"]) * 10))
         self.margin_slider.valueChanged.connect(self._on_margin_changed)
+        self.margin_slider.setToolTip(_SAM2_TOOLTIP)
         grid.addWidget(self.margin_slider, 3, 1)
         self.margin_value_label = _label(f"{float(self._params['sam2_margin']):.1f}", "#0ff")
         self.margin_value_label.setMinimumWidth(42)
+        self.margin_value_label.setToolTip(_SAM2_TOOLTIP)
         grid.addWidget(self.margin_value_label, 3, 2)
 
         # --- Soften: 0.0-20.0 px in 0.1 steps (slider 0-200, ÷10). ---
@@ -1200,9 +1205,11 @@ class PersistentWindow(QtWidgets.QWidget):
         self.soften_slider.setRange(0, 200)
         self.soften_slider.setValue(int(float(self._params["sam2_soften"]) * 10))
         self.soften_slider.valueChanged.connect(self._on_soften_changed)
+        self.soften_slider.setToolTip(_SAM2_TOOLTIP)
         grid.addWidget(self.soften_slider, 4, 1)
         self.soften_value_label = _label(f"{float(self._params['sam2_soften']):.1f}", "#0ff")
         self.soften_value_label.setMinimumWidth(42)
+        self.soften_value_label.setToolTip(_SAM2_TOOLTIP)
         grid.addWidget(self.soften_value_label, 4, 2)
 
         grid.setColumnStretch(1, 1)
