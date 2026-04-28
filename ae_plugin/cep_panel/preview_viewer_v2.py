@@ -1,4 +1,4 @@
-# Last modified: 2026-04-28 | Change: Matte view shape-mismatch fix — SAM2 gate (256x256) is now resized to alpha_nn.shape before the multiply in the Matte branch of _render_now, matching the Composite branch's render_composite. Without this, the multiply threw "operands could not be broadcast together" and the Matte view went blank / Split view showed a render error. Bug pattern noted in code as fixed 2026-04-26 but the fix was not present in the file when re-checked 2026-04-28 — apparently lost in an intervening cleanup. Now restored and committed so it stays.
+# Last modified: 2026-04-28 | Change: SATURATION RAMP replaces sigmoid in _apply_sam_mask. SAM2 mask-decoder logits in confident interior pixels were producing 0.88..0.998 sigmoid output — invisible at 1080p but at 4K+ the per-pixel variation scaled up into a visible checker pattern when multiplied with NN alpha. Same fix Resolve plugin shipped earlier; ported to AE here. Plus matte-branch gate-resize fix (carried over from prior commit). Engine + NN unchanged.
 """CorridorKey Preview Viewer — two modes.
 
 MODE 1 (one-shot, back-compat with Resolve's existing flow):
@@ -1444,12 +1444,28 @@ class PersistentWindow(QtWidgets.QWidget):
             del pred, model
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            # Pick the highest-IoU candidate, then sigmoid the logits to get a
-            # smooth 0..1 probability map. Multiplying NN by this soft gate
-            # preserves NN's continuous edge falloff instead of clipping to a step.
+            # Pick the highest-IoU candidate, then convert logits to a soft 0..1
+            # gate using a SATURATION RAMP (not sigmoid).
+            #
+            # WHY NOT SIGMOID: SAM2 mask-decoder logits in confident interior
+            # pixels often sit in the +2..+6 range (not +20..+30). Sigmoid maps
+            # that to 0.88..0.998 — with subtle per-pixel variation that tracks
+            # image texture. Multiplied by the solid-white NN alpha, that
+            # variation prints as horizontal banding + checker artifacts inside
+            # the body silhouette. The artifact is invisible at 1080p but very
+            # visible at 4K and above (the gate's 256x256 native res, when
+            # upsampled, makes the variation block-sized).
+            #
+            # WHAT THE RAMP DOES: linear ramp on raw logits.
+            #   logit >= +2  -> 1.0  (solid interior, kills decoder texture)
+            #   logit <= -2  -> 0.0  (solid background)
+            #   -2 < L < +2  -> linear ramp (soft edge band, ~2-4 px feather)
+            #
+            # Same fix Resolve plugin shipped earlier — porting to AE now.
+            # Berto verified the checker artifact on 4K footage 2026-04-28.
             best_idx = int(np.argmax(scores))
-            best = 1.0 / (1.0 + np.exp(-logits[best_idx].astype(np.float32)))
-            best = np.clip(best, 0.0, 1.0)
+            logits_best = logits[best_idx].astype(np.float32)
+            best = np.clip(0.5 + logits_best * 0.25, 0.0, 1.0)
             # Save soft gate as uint16 PNG so the 0..1 precision survives the
             # save/load roundtrip (uint8 would quantize to 256 levels and undo
             # the soft-edge benefit). _to_float01 handles uint16 on read.
