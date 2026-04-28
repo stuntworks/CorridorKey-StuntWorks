@@ -1,4 +1,4 @@
-# Last modified: 2026-04-21 | Change: despeckle checkbox saves immediately (fix: cycling required before Process Frame saw new state)
+# Last modified: 2026-04-28 | Change: Matte view shape-mismatch fix — SAM2 gate (256x256) is now resized to alpha_nn.shape before the multiply in the Matte branch of _render_now, matching the Composite branch's render_composite. Without this, the multiply threw "operands could not be broadcast together" and the Matte view went blank / Split view showed a render error. Bug pattern noted in code as fixed 2026-04-26 but the fix was not present in the file when re-checked 2026-04-28 — apparently lost in an intervening cleanup. Now restored and committed so it stays.
 """CorridorKey Preview Viewer — two modes.
 
 MODE 1 (one-shot, back-compat with Resolve's existing flow):
@@ -1197,6 +1197,20 @@ class PersistentWindow(QtWidgets.QWidget):
                 _s = int(params_for_matte.get("sam2_soften", 0))
                 if self.session.alpha_nn is not None and self.session.sam2_gate_raw is not None:
                     _gate = self.session.sam2_gate_raw.copy()
+                    # SAM2 returns the gate at 256x256 — must resize to alpha
+                    # shape or the multiply throws "operands could not be
+                    # broadcast together" and the Matte view goes blank /
+                    # the Split view shows a render error. The Composite
+                    # branch (render_composite) has this resize already; the
+                    # Matte branch was missing it. Fix re-applied 2026-04-28
+                    # after a cleanup revert that wiped it.
+                    if _gate.shape != self.session.alpha_nn.shape:
+                        _gate = cv2.resize(
+                            _gate,
+                            (self.session.alpha_nn.shape[1],
+                             self.session.alpha_nn.shape[0]),
+                            interpolation=cv2.INTER_LINEAR,
+                        )
                     alpha = np.clip(self.session.alpha_nn * _gate, 0.0, 1.0)
                 else:
                     alpha = self.session.alpha.copy()
