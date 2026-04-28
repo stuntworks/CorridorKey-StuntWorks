@@ -1754,12 +1754,20 @@ class PersistentWindow(QtWidgets.QWidget):
     # AFFECTS: self._sam_display_pts emptied, sam2_mask.png deleted, status updated.
     def _clear_sam_points(self):
         sam2_mask_path = self.session.session_dir / "sam2_mask.png"
+        sam2_gate_path = self.session.session_dir / "sam2_gate_raw.png"
         self._sam_display_pts = []
-        try:
-            if sam2_mask_path.exists():
-                sam2_mask_path.unlink()
-        except Exception:
-            pass
+        # Delete BOTH the binary mask AND the raw gate. Previously only
+        # sam2_mask.png was deleted; sam2_gate_raw.png lingered on disk and
+        # render paths kept reading it, producing a "weird black mass" over
+        # the body and corrupted Composite/Matte views — the user had to
+        # close + reopen the viewer to fully reset. Deleting both files is
+        # the only way to land in a true "no SAM2" state.
+        for _p in (sam2_mask_path, sam2_gate_path):
+            try:
+                if _p.exists():
+                    _p.unlink()
+            except Exception:
+                pass
         # Restore the NN alpha that _apply_sam_mask backed up before overwriting alpha.png.
         # Without this, CLEAR leaves alpha.png as the SAM2 binary → actress disappears.
         nn_backup = self.session.session_dir / "alpha_nn_backup.png"
@@ -1775,7 +1783,22 @@ class PersistentWindow(QtWidgets.QWidget):
             self.session.reload_pngs()
         except Exception:
             pass
+        # Belt-and-suspenders: reload_pngs() already clears in-memory
+        # sam2_gate_raw to None, but if reload_pngs threw above the gate
+        # might still point at the previous SAM2 result. Force-clear here
+        # so the next render unconditionally takes the no-SAM2 branch.
+        try:
+            self.session.sam2_gate_raw = None
+        except Exception:
+            pass
         self._save_live_params_now()
+        # Sync the SAM2-only slider grey-out immediately — without this,
+        # the user sees MARGIN/SOFTEN stay enabled until the next render
+        # tick, which is confusing (CLEAR is supposed to be instantaneous).
+        try:
+            self._update_sam2_slider_state()
+        except Exception:
+            pass
         self.status.setText("SAM2 mask cleared — NN alpha restored")
         self._render_now()
 
