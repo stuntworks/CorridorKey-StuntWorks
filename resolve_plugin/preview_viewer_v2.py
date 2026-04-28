@@ -1317,9 +1317,11 @@ class PersistentWindow(QtWidgets.QWidget):
             try: self.soften_label_widget.setText("SOFTEN")
             except Exception: pass
         else:
-            try: self.margin_label_widget.setText("MARGIN — OFF (needs Click to Mask)")
+            # Short suffix — long phrasing crowded the slider row. Tooltip still
+            # carries the full "needs Click to Mask" explanation on hover.
+            try: self.margin_label_widget.setText("MARGIN (mask)")
             except Exception: pass
-            try: self.soften_label_widget.setText("SOFTEN — OFF (needs Click to Mask)")
+            try: self.soften_label_widget.setText("SOFTEN (mask)")
             except Exception: pass
 
     # WHAT IT DOES: Debounces live_params.json writes. Every slider move calls this;
