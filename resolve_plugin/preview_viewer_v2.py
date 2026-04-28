@@ -1187,7 +1187,13 @@ class PersistentWindow(QtWidgets.QWidget):
         # SAM2-only. Tooltip explains the grey-out state when no mask active.
         _SAM2_TOOLTIP = ("SAM2 must be active for this control to work.\n"
                          "Click on the actor and press APPLY MASK first.")
-        grid.addWidget(_label("MARGIN"), 3, 0)
+        # Store references to the left-side labels so _update_sam2_slider_state
+        # can swap their text between "MARGIN" and "MARGIN — OFF" depending on
+        # whether SAM2 is active. Qt's default disabled look is too subtle for
+        # the user to notice; explicit text makes the off-state unmissable.
+        self.margin_label_widget = _label("MARGIN")
+        self.margin_label_widget.setToolTip(_SAM2_TOOLTIP)
+        grid.addWidget(self.margin_label_widget, 3, 0)
         self.margin_slider = JumpSlider(QtCore.Qt.Horizontal)
         self.margin_slider.setRange(0, 800)
         self.margin_slider.setValue(int(float(self._params["sam2_margin"]) * 10))
@@ -1200,7 +1206,9 @@ class PersistentWindow(QtWidgets.QWidget):
         grid.addWidget(self.margin_value_label, 3, 2)
 
         # --- Soften: 0.0-20.0 px in 0.1 steps (slider 0-200, ÷10). ---
-        grid.addWidget(_label("SOFTEN"), 4, 0)
+        self.soften_label_widget = _label("SOFTEN")
+        self.soften_label_widget.setToolTip(_SAM2_TOOLTIP)
+        grid.addWidget(self.soften_label_widget, 4, 0)
         self.soften_slider = JumpSlider(QtCore.Qt.Horizontal)
         self.soften_slider.setRange(0, 200)
         self.soften_slider.setValue(int(float(self._params["sam2_soften"]) * 10))
@@ -1293,11 +1301,26 @@ class PersistentWindow(QtWidgets.QWidget):
         sam2_active = (self.session is not None
                        and self.session.sam2_gate_raw is not None)
         for w in (self.margin_slider, self.margin_value_label,
-                  self.soften_slider, self.soften_value_label):
+                  self.soften_slider, self.soften_value_label,
+                  self.margin_label_widget, self.soften_label_widget):
             try:
                 w.setEnabled(sam2_active)
             except Exception:
                 pass
+        # Make the OFF state unmissable — Qt's default disabled-look is too
+        # subtle to read at a glance. Swap the left-label text so the user
+        # sees "MARGIN — OFF (needs Click to Mask)" instead of just a slightly
+        # dimmer "MARGIN". When SAM2 engages, restore the plain labels.
+        if sam2_active:
+            try: self.margin_label_widget.setText("MARGIN")
+            except Exception: pass
+            try: self.soften_label_widget.setText("SOFTEN")
+            except Exception: pass
+        else:
+            try: self.margin_label_widget.setText("MARGIN — OFF (needs Click to Mask)")
+            except Exception: pass
+            try: self.soften_label_widget.setText("SOFTEN — OFF (needs Click to Mask)")
+            except Exception: pass
 
     # WHAT IT DOES: Debounces live_params.json writes. Every slider move calls this;
     #   the actual disk write happens 250ms after the LAST move. Prevents filesystem
