@@ -1,4 +1,4 @@
-# Last modified: 2026-04-27 | Change: SAM2 propagation now applies a 101px morphological close to bridge inter-dot confidence dips (fixes interior body holes seen in PROCESS RANGE / SCRUB RANGE that LIVE PREVIEW didn't show as badly because of the viewer's Gaussian feather). Also refined the quality gate from prior commit: only substitute ones-mask for INTERIOR empty frames (mid-range collapse). Tail empty frames at the start/end of the range = actor entering/leaving frame; leave those empty so call sites correctly zero out non-green set elements. | Full history: git log
+# Last modified: 2026-04-27 | Change: Despeckle parity — render path (SINGLE FRAME, BRAW PROCESS RANGE, PROCESS RANGE) now applies the same matte despeckle the viewer applies via render_composite. Previously the despeckle slider in the viewer changed what the user saw but had zero effect on rendered output. Also previously: SAM2 propagation now applies 101px morphological close to bridge inter-dot dips (interior holes), and quality gate is tail-aware so actor-exit frames stay empty instead of being mistaken for mid-range collapse. | Full history: git log
 """CorridorKey Pro - Neural Green Screen for DaVinci Resolve
 Enhanced with SAM2 Click-to-Mask, Frame Range, Export Modes
 
@@ -598,6 +598,38 @@ def _soften_sam2_mask(mask_float32, soften=0):
     sz = int(soften) * 2 + 1
     blurred = cv2.GaussianBlur(mask_float32, (sz, sz), sigmaX=soften * 0.5)
     return blurred
+
+
+# WHAT IT DOES: Applies the same matte despeckle the viewer uses, so what the
+#   user dialed in via the Despeckle slider in the live preview is what the
+#   client actually receives in the rendered output. Without this, the viewer's
+#   live preview cleans the matte but the rendered alpha skipped the cleanup,
+#   silently lying to the user about what their settings produced. Mirrors
+#   render_composite() in preview_viewer_v2.py:422-424 exactly.
+# DEPENDS-ON: CorridorKeyModule.core.color_utils.clean_matte_opencv
+#   settings dict carrying "despeckle_enabled" (bool) and "despeckle_size" (int).
+# AFFECTS: returns possibly-cleaned matte; original mt unchanged on failure or
+#   when despeckle is off / size is 0 (passes mt through unchanged).
+# DANGER ZONE FRAGILE: do NOT bypass the settings check — the viewer can have
+#   despeckle off, in which case the render must also leave the matte alone.
+def _apply_despeckle_to_alpha(mt, settings):
+    if mt is None:
+        return mt
+    if not settings.get("despeckle_enabled", True):
+        return mt
+    ds_size = int(settings.get("despeckle_size", 400))
+    if ds_size <= 0:
+        return mt
+    try:
+        from CorridorKeyModule.core import color_utils as _cu
+        mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
+        return _cu.clean_matte_opencv(mt2d, area_threshold=ds_size)
+    except Exception as _e:
+        try:
+            log(f"Despeckle skipped: {_e}")
+        except Exception:
+            pass
+        return mt
 
 
 # WHAT IT DOES: Generates a chroma-key alpha hint for the neural keyer.
@@ -1835,7 +1867,11 @@ def process_current_frame(preview_only=False):
             mt = cv2.erode((_mt_c * 255).astype(np.uint8), kernel).astype(np.float32) / 255.0
             log(f"Choke: {choke_px}px")
         if fg is not None and mt is not None:
-            save_output(fg, mt, op, settings["export_format"])
+            # Despeckle for the saved file (parity with viewer's render_composite).
+            # Use a local copy so the unchanged mt below reaches show_preview_window
+            # untouched — the viewer applies despeckle live on its own slider.
+            mt_for_save = _apply_despeckle_to_alpha(mt, settings)
+            save_output(fg, mt_for_save, op, settings["export_format"])
             log(f"Saved: {op.name}")
         if len(mt.shape) == 3: mt = mt[:, :, 0]
         last_preview_data["original"], last_preview_data["keyed"], last_preview_data["alpha"] = frame.copy(), (fg * 255).astype(np.uint8), mt.copy()
@@ -2645,6 +2681,8 @@ def on_process_range(ev):
                     _mt_c = mt[:, :, 0] if len(mt.shape) == 3 else mt
                     mt = cv2.erode((_mt_c * 255).astype(np.uint8), _kernel).astype(np.float32) / 255.0
                     log(f"Choke: {choke_px}px")
+                # Despeckle for the rendered output (parity with viewer's render_composite).
+                mt = _apply_despeckle_to_alpha(mt, settings)
                 if fg is not None and mt is not None:
                     op = od / f"CK_{cn}_{pr:06d}.png"
                     save_output(fg, mt, op, settings["export_format"])
@@ -2861,6 +2899,8 @@ def on_process_range(ev):
                     _mt_c = mt[:, :, 0] if len(mt.shape) == 3 else mt
                     mt = cv2.erode((_mt_c * 255).astype(np.uint8), kernel).astype(np.float32) / 255.0
                     log(f"Choke: {choke_px}px")
+                # Despeckle for the rendered output (parity with viewer's render_composite).
+                mt = _apply_despeckle_to_alpha(mt, settings)
                 if fg is not None and mt is not None:
                     op = od / f"CK_{cn}_{pr:06d}.png"
                     # Encode PNG to bytes IN MEMORY — no file I/O, no Defender block.
