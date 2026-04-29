@@ -454,6 +454,11 @@ def get_settings():
         # _merge_live_params() which pulls the actual values from live_params.json
         "sam2_margin": 0.0,
         "sam2_soften": 0.0,
+        # FG SOURCE: "nn" (default = model FG, original behavior) | "source"
+        # (use the original plate inside the matte — Mocha-style; rescues warm
+        # wardrobe like yellow shirts that the NN paints pink) | "blend" (50/50).
+        # Viewer-owned; overridden by _merge_live_params.
+        "fg_source": "nn",
     }
 
 # WHAT IT DOES: Overrides panel's despill / despeckle settings with the v2 viewer's
@@ -487,6 +492,10 @@ def _merge_live_params(settings):
         if "sam2_soften" in lp:
             try: out["sam2_soften"] = max(0.0, float(lp["sam2_soften"]))
             except (ValueError, TypeError): pass
+        if "fg_source" in lp:
+            _v = str(lp["fg_source"]).lower()
+            if _v in ("nn", "source", "blend"):
+                out["fg_source"] = _v
         if "sam_positive" in lp or "sam_negative" in lp:
             sam_points["positive"] = [tuple(p) for p in lp.get("sam_positive", [])]
             sam_points["negative"] = [tuple(p) for p in lp.get("sam_negative", [])]
@@ -1698,8 +1707,8 @@ def reprocess_with_cached():
         ah = generate_alpha_hint(frame, settings)
         fr = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         ah = ah.astype(np.float32) / 255.0 if ah.dtype == np.uint8 else ah
-        ps = ProcessingSettings(screen_type=settings["screen_type"], despill_strength=0.0, refiner_strength=settings["refiner_strength"], despeckle_enabled=settings["despeckle_enabled"], despeckle_size=settings["despeckle_size"])
-        log(f"Settings: despeckle_enabled={ps.despeckle_enabled} despeckle_size={ps.despeckle_size} despill={ps.despill_strength} refiner={ps.refiner_strength}")
+        ps = ProcessingSettings(screen_type=settings["screen_type"], despill_strength=0.0, refiner_strength=settings["refiner_strength"], despeckle_enabled=settings["despeckle_enabled"], despeckle_size=settings["despeckle_size"], fg_source=settings.get("fg_source", "nn"))
+        log(f"Settings: despeckle_enabled={ps.despeckle_enabled} despeckle_size={ps.despeckle_size} despill={ps.despill_strength} refiner={ps.refiner_strength} fg_source={ps.fg_source}")
         res = proc.process_frame(fr, ah, ps)
         fg, mt = res.get("fg"), res.get("alpha")
         if fg is not None:
@@ -1838,8 +1847,8 @@ def process_current_frame(preview_only=False):
         log("Processing...")
         fr = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         ah = ah.astype(np.float32) / 255.0 if ah.dtype == np.uint8 else ah
-        ps = ProcessingSettings(screen_type=settings["screen_type"], despill_strength=0.0, refiner_strength=settings["refiner_strength"], despeckle_enabled=settings["despeckle_enabled"], despeckle_size=settings["despeckle_size"])
-        log(f"Settings: despeckle_enabled={ps.despeckle_enabled} despeckle_size={ps.despeckle_size} despill={ps.despill_strength} refiner={ps.refiner_strength}")
+        ps = ProcessingSettings(screen_type=settings["screen_type"], despill_strength=0.0, refiner_strength=settings["refiner_strength"], despeckle_enabled=settings["despeckle_enabled"], despeckle_size=settings["despeckle_size"], fg_source=settings.get("fg_source", "nn"))
+        log(f"Settings: despeckle_enabled={ps.despeckle_enabled} despeckle_size={ps.despeckle_size} despill={ps.despill_strength} refiner={ps.refiner_strength} fg_source={ps.fg_source}")
         if ps.despeckle_enabled:
             log(f"Despeckle: ON (size {ps.despeckle_size})")
         res = proc.process_frame(fr, ah, ps)
@@ -2233,6 +2242,7 @@ def on_scrub_range(ev):
         refiner_strength=settings["refiner_strength"],
         despeckle_enabled=settings["despeckle_enabled"],
         despeckle_size=settings["despeckle_size"],
+        fg_source=settings.get("fg_source", "nn"),
     )
     from CorridorKeyModule.core import color_utils as _cu
     _despill_str = float(settings.get("despill_strength", 0.5))
@@ -2505,8 +2515,9 @@ def on_process_range(ev):
     proc = cached_processor["proc"]
     ps = ProcessingSettings(screen_type=settings["screen_type"], despill_strength=0.0,
                             refiner_strength=settings["refiner_strength"], despeckle_enabled=settings["despeckle_enabled"],
-                            despeckle_size=settings["despeckle_size"])
-    log(f"Settings: despill={ps.despill_strength} refiner={ps.refiner_strength} despeckle={ps.despeckle_enabled}")
+                            despeckle_size=settings["despeckle_size"],
+                            fg_source=settings.get("fg_source", "nn"))
+    log(f"Settings: despill={ps.despill_strength} refiner={ps.refiner_strength} despeckle={ps.despeckle_enabled} fg_source={ps.fg_source}")
     if ps.despeckle_enabled:
         log(f"Despeckle: ON (size {ps.despeckle_size})")
     from CorridorKeyModule.core import color_utils as _cu
