@@ -42,6 +42,7 @@ class ProcessingSettings:
     despeckle_size: int = 400  # Min pixel area
     refiner_strength: float = 1.0
     input_is_srgb: bool = True  # True for video/PNG, False for EXR
+    fg_source: str = "nn"  # "nn" | "source" | "blend" — warm-wardrobe FG rescue
 
 
 # WHAT IT DOES: Wraps the CorridorKey neural keyer — loads model, processes frames, manages GPU memory
@@ -104,6 +105,7 @@ class CorridorKeyProcessor:
             auto_despeckle=settings.despeckle_enabled,
             despeckle_size=settings.despeckle_size,
             refiner_scale=settings.refiner_strength,
+            fg_source=settings.fg_source,
         )
         return result
 

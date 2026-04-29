@@ -331,6 +331,7 @@ class _MLXEngineAdapter:
         despill_strength=1.0,
         auto_despeckle=True,
         despeckle_size=400,
+        fg_source="nn",
         **_kwargs,
     ):
         """Delegate to MLX engine, then normalize output to Torch contract."""
@@ -360,7 +361,26 @@ class _MLXEngineAdapter:
             despeckle_size=despeckle_size,
         )
 
-        return _wrap_mlx_output(raw, despill_strength, auto_despeckle, despeckle_size)
+        out = _wrap_mlx_output(raw, despill_strength, auto_despeckle, despeckle_size)
+        # FG SOURCE substitution for the MLX path. Torch backend does this inside
+        # the engine; MLX adapter applies it here on the wrapped output to keep
+        # behavior identical across backends. Default "nn" leaves fg untouched.
+        if fg_source != "nn":
+            try:
+                # image_u8 is the source plate (already converted at the top of
+                # this function). Convert to float [0,1] sRGB matching out["fg"].
+                src_f = image_u8.astype(np.float32) / 255.0
+                if src_f.shape[:2] != out["fg"].shape[:2]:
+                    import cv2 as _cv2
+                    src_f = _cv2.resize(src_f, (out["fg"].shape[1], out["fg"].shape[0]),
+                                        interpolation=_cv2.INTER_LANCZOS4)
+                if fg_source == "source":
+                    out["fg"] = src_f
+                elif fg_source == "blend":
+                    out["fg"] = (0.5 * out["fg"] + 0.5 * src_f).astype(np.float32)
+            except Exception:
+                pass
+        return out
 
 
 DEFAULT_MLX_TILE_SIZE = 512

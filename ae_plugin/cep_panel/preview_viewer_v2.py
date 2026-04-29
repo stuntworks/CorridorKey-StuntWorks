@@ -252,6 +252,16 @@ class Session:
                 if gate_img.ndim == 3:
                     gate_img = cv2.cvtColor(gate_img, cv2.COLOR_BGR2GRAY)
                 self.sam2_gate_raw = _to_float01(gate_img)
+        # original.png — RAW source frame (greenscreen, pre-key). Used by the
+        # FG SOURCE = "source" toggle to substitute the model's FG color with
+        # the source plate inside the matte. Optional: AE host doesn't write
+        # this today, so the substitution is a no-op until original.png lands.
+        orig_path = self.session_dir / "original.png"
+        self.original_rgb = None
+        if orig_path.exists():
+            o_bgr = _read_png_any_depth(orig_path)
+            if o_bgr is not None:
+                self.original_rgb = cv2.cvtColor(_to_float01(o_bgr), cv2.COLOR_BGR2RGB)
         v1_path = self.session_dir / "v1_underlay.png"
         self.v1_underlay = None
         if v1_path.exists():
@@ -287,11 +297,20 @@ class Session:
         if alpha_img.ndim == 3:
             alpha_img = cv2.cvtColor(alpha_img, cv2.COLOR_BGR2GRAY)
         alpha = _to_float01(alpha_img)
+        # Reload original.png too so re-keys at a different playhead update
+        # the FG SOURCE substitution. Optional file — None if absent.
+        orig_path = self.session_dir / "original.png"
+        new_original = None
+        if orig_path.exists():
+            o_bgr = _read_png_any_depth(orig_path)
+            if o_bgr is not None:
+                new_original = cv2.cvtColor(_to_float01(o_bgr), cv2.COLOR_BGR2RGB)
         # Only assign after both reads succeed so a partial write doesn't leave
         # the viewer in an inconsistent state.
         self.fg_rgb = fg_rgb
         self.alpha = alpha
         self.alpha_nn = alpha.copy()
+        self.original_rgb = new_original
         gate_path = self.session_dir / "sam2_gate_raw.png"
         if gate_path.exists():
             gate_img = _read_png_any_depth(gate_path)
@@ -355,7 +374,25 @@ def render_composite(cu, session: Session, params: dict):
         # clean_matte_opencv expects area threshold in pixels
         alpha = cu.clean_matte_opencv(alpha, area_threshold=despeckle_size)
 
-    fg_rgb = session.fg_rgb.copy()
+    # FG SOURCE — substitute the model's FG color with the original source plate
+    # (or a 50/50 blend) BEFORE despill. The matte is unchanged. Used to rescue
+    # warm wardrobe (yellow shirts) that the NN paints pink. Default "nn" keeps
+    # current behavior. Falls through silently when original_rgb wasn't loaded
+    # (AE host doesn't write original.png today — toggle has no effect there).
+    fg_source = str(params.get("fg_source", "nn")).lower()
+    if fg_source != "nn" and getattr(session, "original_rgb", None) is not None:
+        _orig = session.original_rgb
+        if _orig.shape[:2] != session.fg_rgb.shape[:2]:
+            _orig = cv2.resize(_orig, (session.fg_rgb.shape[1], session.fg_rgb.shape[0]),
+                               interpolation=cv2.INTER_LINEAR)
+        if fg_source == "source":
+            fg_rgb = _orig.astype(np.float32, copy=True)
+        elif fg_source == "blend":
+            fg_rgb = (0.5 * session.fg_rgb + 0.5 * _orig).astype(np.float32)
+        else:
+            fg_rgb = session.fg_rgb.copy()
+    else:
+        fg_rgb = session.fg_rgb.copy()
     if despill_strength > 0:
         fg_rgb = cu.despill_opencv(fg_rgb, green_limit_mode="average", strength=despill_strength)
 
@@ -422,6 +459,10 @@ class PersistentWindow(QtWidgets.QWidget):
             "sam2_margin": 0,
             "sam2_soften": 0,
             "choke": 0,
+            # FG SOURCE: "nn" = model FG (default, original behavior)
+            #            "source" = original plate inside the matte (yellow-shirt rescue)
+            #            "blend" = 50/50 NN + source (built but not exposed in UI yet)
+            "fg_source": "nn",
         }
         # Drop-stale: if a new update comes in while we're painting, we only keep
         # the latest one. _pending is None when idle, or a dict when a render is
@@ -887,6 +928,50 @@ class PersistentWindow(QtWidgets.QWidget):
         self.sam2_soften_value_label.setMinimumWidth(42)
         grid.addWidget(self.sam2_soften_value_label, 4, 2)
 
+        # --- FG SOURCE: NN vs SOURCE radio buttons ---
+        # Path A "warm wardrobe rescue" (yellow shirts going pink). NN = current
+        # behavior (model paints the FG); SOURCE = use the original plate inside
+        # the matte and let despill clean any green spill (Mocha/Keylight style).
+        # BLEND is built into the engine but intentionally not exposed in v1 UI.
+        # Default NN — render output stays bit-identical until the user opts in.
+        # NOTE: AE host doesn't write original.png today, so SOURCE has no
+        # visible effect in AE until the host saves the source plate.
+        _FGSRC_TOOLTIP = ("FG SOURCE — what color goes inside the matte.\n"
+                          "NN: model's predicted FG (default). Can paint warm wardrobe pink.\n"
+                          "SOURCE: original plate, despilled. Real color, more spill risk.")
+        self.fg_source_label_widget = _label("FG SOURCE")
+        self.fg_source_label_widget.setToolTip(_FGSRC_TOOLTIP)
+        grid.addWidget(self.fg_source_label_widget, 5, 0)
+        _fgsrc_row = QtWidgets.QWidget()
+        _fgsrc_row.setStyleSheet("background: transparent; border: none;")
+        _fgsrc_layout = QtWidgets.QHBoxLayout(_fgsrc_row)
+        _fgsrc_layout.setContentsMargins(0, 0, 0, 0)
+        _fgsrc_layout.setSpacing(8)
+        self.fg_source_group = QtWidgets.QButtonGroup(self)
+        self.fg_source_btn_nn = QtWidgets.QRadioButton("NN")
+        self.fg_source_btn_src = QtWidgets.QRadioButton("SOURCE")
+        for _b in (self.fg_source_btn_nn, self.fg_source_btn_src):
+            _b.setStyleSheet(
+                "QRadioButton { color: #8ab; border: none; background: transparent; "
+                "font-size: 12px; font-weight: 600; letter-spacing: 0.5px; } "
+                "QRadioButton::indicator { width: 12px; height: 12px; border: 1px solid "
+                "#2a6a7a; border-radius: 6px; background: #001a28; } "
+                "QRadioButton::indicator:checked { background: #0ff; border-color: #0ff; }"
+            )
+            _b.setToolTip(_FGSRC_TOOLTIP)
+        self.fg_source_group.addButton(self.fg_source_btn_nn, 0)
+        self.fg_source_group.addButton(self.fg_source_btn_src, 1)
+        _cur_fg = str(self._params.get("fg_source", "nn")).lower()
+        if _cur_fg == "source":
+            self.fg_source_btn_src.setChecked(True)
+        else:
+            self.fg_source_btn_nn.setChecked(True)
+        self.fg_source_group.buttonClicked.connect(self._on_fg_source_changed)
+        _fgsrc_layout.addWidget(self.fg_source_btn_nn)
+        _fgsrc_layout.addWidget(self.fg_source_btn_src)
+        _fgsrc_layout.addStretch(1)
+        grid.addWidget(_fgsrc_row, 5, 1, 1, 2)
+
         grid.setColumnStretch(1, 1)
         parent_layout.addWidget(panel)
 
@@ -939,6 +1024,23 @@ class PersistentWindow(QtWidgets.QWidget):
         self.sam2_soften_value_label.setText(str(value))
         self._render_now()
         self._schedule_save()
+
+    # WHAT IT DOES: FG SOURCE radio handler. Switches between NN (model FG —
+    #   default) and SOURCE (original plate inside the matte — Mocha-style
+    #   warm-wardrobe rescue). Writes to live_params.json immediately so the
+    #   host's batch render picks up the choice.
+    # DEPENDS-ON: self.fg_source_group ids — 0=NN, 1=SOURCE.
+    # AFFECTS: self._params["fg_source"], repaints, persists to disk.
+    def _on_fg_source_changed(self, btn):
+        try:
+            _id = self.fg_source_group.id(btn)
+        except Exception:
+            _id = 0
+        v = "source" if _id == 1 else "nn"
+        self._params["fg_source"] = v
+        self._local_change_time = time.perf_counter()
+        self._render_now()
+        self._save_live_params_now()  # discrete control — save immediately so host sees it
 
     # WHAT IT DOES: Debounces live_params.json writes. Every slider move calls this;
     #   the actual disk write happens 250ms after the LAST move. Prevents filesystem
@@ -1020,7 +1122,7 @@ class PersistentWindow(QtWidgets.QWidget):
                     pass  # PNGs unreadable — stale view is better than a crash
         merged = dict(self._params)
         for k, v in params.items():
-            if k in ("despill", "despeckle", "despeckleSize", "background", "sam2_margin", "sam2_soften"):
+            if k in ("despill", "despeckle", "despeckleSize", "background", "sam2_margin", "sam2_soften", "fg_source"):
                 merged[k] = v
         if self._painting:
             self._pending = merged
