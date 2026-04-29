@@ -969,6 +969,48 @@ def run_sam2_video_propagation(fp, ss, cs, in_f, out_f, pos_pts, neg_pts, anchor
         shutil.rmtree(str(tmp_dir), ignore_errors=True)
 
 
+# WHAT IT DOES: Probes a video file's FourCC codec via cv2.VideoCapture and returns True for HEVC/H.265.
+#   Result is cached per file path so repeated calls (per-frame loops) don't re-probe.
+# WHY THIS EXISTS: cv2's HEVC decoder mishandles color-space metadata on Nikon Z and other cameras
+#   that ship HEVC in BT.709 / Display P3 / BT.2020 — the FFmpeg backend defaults to a generic
+#   conversion that drops the color matrix, producing a yellow→pink shift on warm wardrobe.
+#   Confirmed 2026-04-29: same H.265 file is YELLOW in DaVinci's normal viewer but PINK when
+#   read via cv2.VideoCapture in CorridorKey's "Original" view (raw plate, before any model).
+#   Caller routes HEVC through Resolve's own decoder via _read_frame_via_resolve_render or
+#   _export_braw_range_to_frames(skip_braw_exe=True) instead.
+# DEPENDS-ON: cv2.VideoCapture.get(cv2.CAP_PROP_FOURCC). Module-level cache _hevc_codec_cache.
+# AFFECTS: Opens and immediately closes a VideoCapture once per unique file path.
+# DANGER ZONE: If FOURCC returns 0 (unknown — e.g. some MOV containers), we report False and
+#   let cv2 try. Better to ship a known-good codec via cv2 than misroute everything to slow
+#   Resolve render. The downside is HEVC files whose FOURCC tag is missing won't be caught;
+#   in that case the user still sees the pink shift and we can extend detection later.
+_hevc_codec_cache = {}
+def _is_hevc_file(fp):
+    if not fp: return False
+    fp_key = str(fp).lower()
+    if fp_key in _hevc_codec_cache:
+        return _hevc_codec_cache[fp_key]
+    import cv2
+    is_hevc = False
+    try:
+        _probe = cv2.VideoCapture(fp)
+        if _probe.isOpened():
+            fourcc_int = int(_probe.get(cv2.CAP_PROP_FOURCC))
+            # Decode 32-bit int to 4-char ASCII tag (little-endian byte order in cv2).
+            tag = "".join(chr((fourcc_int >> (8 * i)) & 0xFF) for i in range(4))
+            tag_norm = tag.strip().lower()
+            # Known HEVC/H.265 FourCC variants.
+            if tag_norm in ("hev1", "hvc1", "hevc", "h265"):
+                is_hevc = True
+            log(f"HEVC probe: {os.path.basename(fp)} fourcc={tag!r} hevc={is_hevc}")
+        _probe.release()
+    except Exception as _hp:
+        log(f"HEVC probe failed for {os.path.basename(fp)}: {_hp} — assuming non-HEVC")
+        is_hevc = False
+    _hevc_codec_cache[fp_key] = is_hevc
+    return is_hevc
+
+
 # WHAT IT DOES: Last-resort frame reader for formats OpenCV cannot decode (BRAW, CinemaDNG, etc).
 #   Three-path strategy, fastest first:
 #   A) ExportCurrentFrameAsStill() — no render queue, TIFF output, Resolve 18.5+ (AiConsensus find)
@@ -1336,7 +1378,7 @@ def _trigger_resolve_proxy(mpi, media_pool_obj):
         log(f"Proxy trigger error: {_pe}")
 
 
-def _export_braw_range_to_frames(mpi, src_start, src_end, timeline, in_f, fps):
+def _export_braw_range_to_frames(mpi, src_start, src_end, timeline, in_f, fps, skip_braw_exe=False):
     import time as _t2, tempfile as _tf, shutil as _sh
     import traceback as _tb_fb
     if mpi is None:
@@ -1346,20 +1388,23 @@ def _export_braw_range_to_frames(mpi, src_start, src_end, timeline, in_f, fps):
     # DANGER ZONE: if braw_fp is empty (GetMediaPoolItem returned None, or property key
     # mismatch), we must NOT return None here — the Resolve seek+still fallback below does
     # NOT need the file path at all.  Only skip the exe sub-path; always fall through.
+    # skip_braw_exe=True is set by HEVC callers — braw-decode.exe only handles BRAW and
+    # would burn a 30-second timeout per range probing a non-BRAW file.
     exe_result = None
     braw_fp = ""
-    try:
-        _mpi_media = mpi.GetMediaPoolItem()
-        props = _mpi_media.GetClipProperty() if _mpi_media else {}
-        braw_fp = (props.get("File Path") or props.get("Clip Path") or "") if props else ""
-        if not braw_fp:
-            log("BRAW range export: cannot get file path from mpi — skipping exe path, using Resolve fallback")
-            # Do NOT return None here — fall through to the Resolve seek+still fallback below.
-        else:
-            exe_result = _try_braw_decode_exe(braw_fp, src_start, src_end)
-    except Exception as _ep:
-        log(f"BRAW range export: exe path exception: {_ep}")
-        # Fall through to the Resolve still-export fallback below.
+    if not skip_braw_exe:
+        try:
+            _mpi_media = mpi.GetMediaPoolItem()
+            props = _mpi_media.GetClipProperty() if _mpi_media else {}
+            braw_fp = (props.get("File Path") or props.get("Clip Path") or "") if props else ""
+            if not braw_fp:
+                log("BRAW range export: cannot get file path from mpi — skipping exe path, using Resolve fallback")
+                # Do NOT return None here — fall through to the Resolve seek+still fallback below.
+            else:
+                exe_result = _try_braw_decode_exe(braw_fp, src_start, src_end)
+        except Exception as _ep:
+            log(f"BRAW range export: exe path exception: {_ep}")
+            # Fall through to the Resolve still-export fallback below.
 
     if exe_result is not None:
         return exe_result
@@ -1494,8 +1539,10 @@ def grab_background_frame():
                     fp = props.get("File Path", "")
                     if not fp: continue
                     fn = c.GetLeftOffset() + (cf - c.GetStart())
-                    # BRAW (and other camera-raw formats) cannot be decoded by OpenCV
-                    if fp.lower().endswith(('.braw', '.cin', '.dng', '.ari')):
+                    # BRAW (and other camera-raw formats) cannot be decoded by OpenCV.
+                    # HEVC: cv2 decodes but mishandles color metadata (yellow→pink shift) —
+                    # route through Resolve's decoder for correct color.
+                    if fp.lower().endswith(('.braw', '.cin', '.dng', '.ari')) or _is_hevc_file(fp):
                         bg_frame = _read_frame_via_resolve_render(mpi, fn)
                         if bg_frame is not None:
                             log(f"BG plate from V{track_idx} via Resolve render: {os.path.basename(fp)}")
@@ -1771,34 +1818,47 @@ def process_current_frame(preview_only=False):
         log(f"Source: {os.path.basename(fp)}")
         fn = clip.GetLeftOffset() + (cf - cs)
         if fn < 0: fn = 0
-        cap = cv2.VideoCapture(fp)
-        opened = cap.isOpened()
-        if not opened:
-            log(f"ERROR: OpenCV could not open the file. BRAW requires Blackmagic Desktop Video codecs.")
-            status("ERROR: Cannot open source file"); return
-        _src_fps = cap.get(cv2.CAP_PROP_FPS) or fps
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        log(f"SEEK: cf={cf} cs={cs} leftoff={clip.GetLeftOffset()} fn={fn} total={total_frames}")
-        seek_ok = cap.set(cv2.CAP_PROP_POS_FRAMES, fn)
-        if not seek_ok:
-            # BRAW does not support CAP_PROP_POS_FRAMES random-access — try millisecond seek.
-            ms = (fn / _src_fps) * 1000.0 + 0.01
-            seek_ok2 = cap.set(cv2.CAP_PROP_POS_MSEC, ms)
-            log(f"SEEK POS_MSEC fallback: ms={ms:.3f} ok={seek_ok2}")
-        ret, frame = cap.read()
-        if not ret:
-            # Last resort: sequential read. Reads every frame from 0 to fn in order.
-            # Slow (seconds for deep frames) but works on BRAW which can't random-seek.
-            log(f"SEEK sequential: reading {fn+1} frames in order (random seek not supported)")
-            cap.release()
+        # HEVC decode-routing: cv2's HEVC decoder mishandles BT.709/BT.2020 metadata and
+        # produces a yellow→pink color shift on Nikon Z (and similar) clips. Route H.265
+        # files through Resolve's own decoder upfront — same path BRAW uses as a fallback.
+        # Confirmed root cause 2026-04-29 — see _is_hevc_file() docstring.
+        frame = None
+        if _is_hevc_file(fp):
+            log(f"HEVC detected — routing single-frame preview through Resolve render decoder")
+            status("Reading HEVC via Resolve decoder...")
+            frame = _read_frame_via_resolve_render(mpi, fn, try_direct=True)
+            if frame is None:
+                log(f"ERROR: HEVC Resolve render returned no frame for {os.path.basename(fp)}")
+                status("ERROR: Cannot read HEVC frame via Resolve"); return
+        else:
             cap = cv2.VideoCapture(fp)
-            frame = None
-            for _i in range(fn + 1):
-                ret, frame = cap.read()
-                if not ret:
-                    log(f"Sequential read failed at frame {_i}")
-                    frame = None; break
-        cap.release()
+            opened = cap.isOpened()
+            if not opened:
+                log(f"ERROR: OpenCV could not open the file. BRAW requires Blackmagic Desktop Video codecs.")
+                status("ERROR: Cannot open source file"); return
+            _src_fps = cap.get(cv2.CAP_PROP_FPS) or fps
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            log(f"SEEK: cf={cf} cs={cs} leftoff={clip.GetLeftOffset()} fn={fn} total={total_frames}")
+            seek_ok = cap.set(cv2.CAP_PROP_POS_FRAMES, fn)
+            if not seek_ok:
+                # BRAW does not support CAP_PROP_POS_FRAMES random-access — try millisecond seek.
+                ms = (fn / _src_fps) * 1000.0 + 0.01
+                seek_ok2 = cap.set(cv2.CAP_PROP_POS_MSEC, ms)
+                log(f"SEEK POS_MSEC fallback: ms={ms:.3f} ok={seek_ok2}")
+            ret, frame = cap.read()
+            if not ret:
+                # Last resort: sequential read. Reads every frame from 0 to fn in order.
+                # Slow (seconds for deep frames) but works on BRAW which can't random-seek.
+                log(f"SEEK sequential: reading {fn+1} frames in order (random seek not supported)")
+                cap.release()
+                cap = cv2.VideoCapture(fp)
+                frame = None
+                for _i in range(fn + 1):
+                    ret, frame = cap.read()
+                    if not ret:
+                        log(f"Sequential read failed at frame {_i}")
+                        frame = None; break
+            cap.release()
         if frame is None:
             # All OpenCV methods failed (BRAW has no OpenCV decoder). Use Resolve's render queue
             # to export the frame as a PNG and read that instead.
@@ -2214,6 +2274,11 @@ def on_scrub_range(ev):
     # All formats supported — BRAW/camera-raw uses SDK decoder, everything else uses
     # Resolve's native ExportCurrentFrameAsStill (handles any format Resolve can open).
     _is_camera_raw = fp.endswith(('.braw', '.cin', '.dng', '.ari'))
+    # HEVC routing: cv2's decoder produces a yellow→pink color shift on Nikon Z and other
+    # cameras that ship HEVC with BT.709/BT.2020 metadata. Route HEVC clips through the
+    # Resolve seek+still path (skip_braw_exe=True so we don't waste a 30s timeout per frame
+    # probing a non-BRAW file with braw-decode.exe).
+    _is_hevc = _is_hevc_file(fp) if fp else False
     # --- Resolve full-clip defaults if no IN/OUT set ---
     cs = mpi.GetStart()
     ce = mpi.GetEnd()
@@ -2274,12 +2339,16 @@ def on_scrub_range(ev):
     for _si, _stl in enumerate(sampled_tl_frames):
         _ssrc = ss + (_stl - cs)
         status(f"Scrub: exporting frame {_si+1}/{N}...")
-        log(f"SCRUB export: frame {_si+1}/{N} tl={_stl} src={_ssrc} camera_raw={_is_camera_raw}")
+        log(f"SCRUB export: frame {_si+1}/{N} tl={_stl} src={_ssrc} camera_raw={_is_camera_raw} hevc={_is_hevc}")
         _sbuf = None
         try:
-            if _is_camera_raw:
-                # BRAW / CinemaDNG / ARRI — existing SDK decoder path (untouched)
-                _sfdir = _export_braw_range_to_frames(mpi, _ssrc, _ssrc + 1, timeline, _stl, fps)
+            if _is_camera_raw or _is_hevc:
+                # BRAW / CinemaDNG / ARRI — existing SDK decoder path.
+                # HEVC — same Resolve seek+still path but skip braw-decode.exe (30s timeout otherwise).
+                _sfdir = _export_braw_range_to_frames(
+                    mpi, _ssrc, _ssrc + 1, timeline, _stl, fps,
+                    skip_braw_exe=_is_hevc,
+                )
                 if _sfdir is not None:
                     _stifs = sorted(Path(_sfdir).glob("*.tif*"))
                     if _stifs:
@@ -2476,17 +2545,25 @@ def on_process_range(ev):
     # For BRAW/camera-raw, OpenCV cannot decode the file. Export the full range as a
     # single H.264 .mov first (one render job for all frames = fast), then the background
     # thread reads TIFF files from that directory instead of the source BRAW.
+    # HEVC: cv2 mishandles BT.709/BT.2020 metadata (yellow→pink shift). Same TIFF pre-export
+    # path — skip_braw_exe=True so we don't waste a 30s timeout per range probing a non-BRAW
+    # file with braw-decode.exe.
     braw_frames_dir = None
-    if fp.lower().endswith(('.braw', '.cin', '.dng', '.ari')):
+    _is_hevc_clip = _is_hevc_file(fp)
+    if fp.lower().endswith(('.braw', '.cin', '.dng', '.ari')) or _is_hevc_clip:
         src_start = ss + (in_f - cs)
         src_end   = ss + (out_f - cs) + 1  # +1: Resolve timeline end is exclusive
-        log(f"BRAW detected — exporting source frames {src_start}-{src_end} to TIFF sequence...")
-        status(f"Exporting BRAW range ({dur} frames) — please wait...")
-        braw_frames_dir = _export_braw_range_to_frames(mpi, src_start, src_end, timeline, in_f, fps)
+        _kind = "HEVC" if _is_hevc_clip else "BRAW"
+        log(f"{_kind} detected — exporting source frames {src_start}-{src_end} to TIFF sequence...")
+        status(f"Exporting {_kind} range ({dur} frames) — please wait...")
+        braw_frames_dir = _export_braw_range_to_frames(
+            mpi, src_start, src_end, timeline, in_f, fps,
+            skip_braw_exe=_is_hevc_clip,
+        )
         if braw_frames_dir is None:
-            status("ERROR: BRAW range export failed — see log"); return
+            status(f"ERROR: {_kind} range export failed — see log"); return
         n_tifs = len(sorted(Path(braw_frames_dir).glob("*.tif*")))
-        log(f"BRAW range export done: {n_tifs} TIFF frames in {Path(braw_frames_dir).name}")
+        log(f"{_kind} range export done: {n_tifs} TIFF frames in {Path(braw_frames_dir).name}")
     # Kill viewer on main thread before background thread opens VideoCapture.
     # Reuses on_kill_viewer to avoid global scoping issues with nested _run() closure.
     on_kill_viewer(None)
