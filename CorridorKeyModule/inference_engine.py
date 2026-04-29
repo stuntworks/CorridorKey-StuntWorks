@@ -253,6 +253,8 @@ class CorridorKeyEngine:
         auto_despeckle: bool,
         despeckle_size: int,
         generate_comp: bool,
+        src_srgb: torch.Tensor | None = None,
+        fg_source: str = "nn",
     ) -> dict[str, np.ndarray]:
         # 6. Post-Process (Resize Back to Original Resolution)
         # We use Lanczos4 for high-quality resampling to minimize blur when going back to 4K/Original.
@@ -272,11 +274,30 @@ class CorridorKeyEngine:
         else:
             processed_alpha = res_alpha
 
-        # B. Despill FG
+        # B. FG SOURCE substitution — replace model FG color with the original
+        #    source plate (or a 50/50 blend) BEFORE despill. The alpha matte is
+        #    unchanged. Used as a "warm wardrobe" rescue: model FG paints yellow
+        #    shirts pink; using the source plate keeps real color and lets the
+        #    alpha do the keying. Default "nn" = no change.
+        if fg_source != "nn" and src_srgb is not None:
+            try:
+                src_np = src_srgb.permute(1, 2, 0).cpu().numpy()
+                if src_np.shape[:2] != (h, w):
+                    src_np = cv2.resize(src_np, (w, h), interpolation=cv2.INTER_LANCZOS4)
+                src_np = src_np.astype(res_fg.dtype, copy=False)
+                if fg_source == "source":
+                    res_fg = src_np
+                elif fg_source == "blend":
+                    res_fg = (0.5 * res_fg + 0.5 * src_np).astype(res_fg.dtype, copy=False)
+            except Exception:
+                # Fall back silently to NN FG — never crash the render.
+                pass
+
+        # C. Despill FG
         # res_fg is sRGB.
         fg_despilled = cu.despill_opencv(res_fg, green_limit_mode="average", strength=despill_strength)
 
-        # C. Premultiply (for EXR Output)
+        # D. Premultiply (for EXR Output)
         # CONVERT TO LINEAR FIRST! EXRs must house linear color premultiplied by linear alpha.
         fg_despilled_lin = cu.srgb_to_linear(fg_despilled)
         fg_premul_lin = cu.premultiply(fg_despilled_lin, processed_alpha)
@@ -321,6 +342,8 @@ class CorridorKeyEngine:
         auto_despeckle: bool,
         despeckle_size: int,
         generate_comp: bool,
+        src_srgb: torch.Tensor | None = None,
+        fg_source: str = "nn",
     ) -> list[dict[str, np.ndarray]]:
         """Post-process on GPU, transfer final results to CPU.
 
@@ -349,10 +372,33 @@ class CorridorKeyEngine:
         else:
             processed_alpha = alpha
 
-        # B. Despill on GPU
+        # B. FG SOURCE substitution — replace model FG color with the original
+        #    source plate (or a 50/50 blend) BEFORE despill. The alpha matte is
+        #    unchanged. Used as a "warm wardrobe" rescue: model FG paints yellow
+        #    shirts pink; using the source plate keeps real color and lets the
+        #    alpha do the keying. Default "nn" = no change.
+        if fg_source != "nn" and src_srgb is not None:
+            try:
+                _src = src_srgb
+                if _src.shape[-2:] != (h, w):
+                    _src = TF.resize(
+                        _src,
+                        [h, w],
+                        interpolation=torchvision.transforms.InterpolationMode.BILINEAR,
+                    )
+                _src = _src.to(fg.dtype).to(fg.device)
+                if fg_source == "source":
+                    fg = _src
+                elif fg_source == "blend":
+                    fg = 0.5 * fg + 0.5 * _src
+            except Exception:
+                # Fall back silently to NN FG — never crash the render.
+                pass
+
+        # C. Despill on GPU
         processed_fg = cu.despill_torch(fg, despill_strength)
 
-        # C. sRGB → linear on GPU
+        # D. sRGB → linear on GPU
         processed_fg_lin = cu.srgb_to_linear(processed_fg)
 
         # D. Premultiply on GPU
@@ -404,6 +450,7 @@ class CorridorKeyEngine:
         despeckle_size: int = 400,
         generate_comp: bool = True,
         post_process_on_gpu: bool = True,
+        fg_source: str = "nn",
     ) -> dict[str, np.ndarray] | list[dict[str, np.ndarray]]:
         """
         Process a single frame.
@@ -446,6 +493,19 @@ class CorridorKeyEngine:
             scale=True,
         ).to(self.device, non_blocking=True)
 
+        # Capture source-resolution sRGB tensor BEFORE preprocess for the optional
+        # FG SOURCE substitution in post-processing. Per-channel sRGB->linear and
+        # back-and-forth never shifts hue, so converting linear input to sRGB here
+        # matches the colour space of the model's FG output. Skipped (set to None)
+        # when fg_source=="nn" to avoid the memory copy on the default code path.
+        if fg_source != "nn":
+            if input_is_linear:
+                src_srgb_full = cu.linear_to_srgb(image)
+            else:
+                src_srgb_full = image
+        else:
+            src_srgb_full = None
+
         inp_t = self._preprocess_input(image, mask_linear, input_is_linear)
 
         # Free up unused VRAM in order to keep peak usage down and avoid OOM errors
@@ -481,11 +541,14 @@ class CorridorKeyEngine:
                 auto_despeckle,
                 despeckle_size,
                 generate_comp,
+                src_srgb=src_srgb_full,
+                fg_source=fg_source,
             )
         else:
             # Move prediction to CPU before post-processing
             pred_alpha = prediction["alpha"].cpu().float()
             pred_fg = prediction["fg"].cpu().float()
+            src_srgb_cpu = src_srgb_full.cpu().float() if src_srgb_full is not None else None
 
             out = []
             for i in range(bs):
@@ -499,6 +562,8 @@ class CorridorKeyEngine:
                     auto_despeckle,
                     despeckle_size,
                     generate_comp,
+                    src_srgb=src_srgb_cpu[i] if src_srgb_cpu is not None else None,
+                    fg_source=fg_source,
                 )
                 out.append(result)
 
