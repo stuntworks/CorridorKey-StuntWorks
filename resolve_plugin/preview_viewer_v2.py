@@ -38,11 +38,12 @@ import numpy as np
 from PySide6 import QtWidgets, QtGui, QtCore
 
 # Add CK_ROOT (engine repo root) to sys.path so we can import the shared
-# CorridorKeyModule.core.sam2_combine helper. The viewer otherwise avoids
-# importing from CorridorKeyModule to skip torch's 40-60s import; sam2_combine
-# is numpy-only and safe to import here.
+# sam2_combine helper. CRITICAL: the helper lives at the REPO ROOT, NOT
+# inside CorridorKeyModule — importing CorridorKeyModule.anything triggers
+# the package __init__ which loads torch (40-60s) and breaks the viewer's
+# subprocess that doesn't have torch in its env.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from CorridorKeyModule.core.sam2_combine import apply_sam2_gate
+from sam2_combine import apply_sam2_gate
 
 # WHAT IT DOES: Installs diagnostic crash / exception loggers as early as possible.
 #   faulthandler dumps Python tracebacks on native signals (SIGSEGV, stack overflow,
