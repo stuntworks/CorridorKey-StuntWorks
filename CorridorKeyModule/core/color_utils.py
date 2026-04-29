@@ -208,7 +208,16 @@ def despill_opencv(
     image: np.ndarray | torch.Tensor, green_limit_mode: str = "average", strength: float = 1.0
 ) -> np.ndarray | torch.Tensor:
     """
-    Removes green spill from an RGB image using a luminance-preserving method.
+    Removes green spill from an RGB image. Subtractive only — green is removed
+    from the green channel; R and B are NOT boosted. The previous "luminance-
+    preserving" formula (boost R and B by 0.5 * spill) caused yellow shirts to
+    shift pink and blue ink splotches on warm wardrobe even with the warm-
+    wardrobe guard, because real green spill on yellow fabric briefly makes G > R
+    and the pixel slips past the guard, then gets the wrong color shift.
+
+    Subtract-only is the standard professional behavior (Mocha, Nuke). Pixels
+    with real green spill lose a small amount of brightness but no color shift.
+
     image: RGB float (0-1).
     green_limit_mode: 'average' ((R+B)/2) or 'max' (max(R, B)).
     strength: 0.0 to 1.0 multiplier for the despill effect.
@@ -237,9 +246,28 @@ def despill_opencv(
         # Numpy Impl
         spill_amount = np.maximum(g - limit, 0.0)
 
+    # WHAT IT DOES: Zeros spill on warm-wardrobe pixels (R >= G) — prevents
+    # spurious "spill" being calculated on yellow/tan/orange fabric that has
+    # no actual green contamination. Without this guard, despill subtracts
+    # green from warm pixels and makes yellow shifts toward orange.
+    # AFFECTS: spill_amount only.
+    if isinstance(image, torch.Tensor):
+        spill_amount = torch.where(r >= g, torch.zeros_like(spill_amount), spill_amount)
+    else:
+        spill_amount = np.where(r >= g, 0.0, spill_amount)
+
+    # SUBTRACTIVE despill: remove green only, do NOT boost R or B.
+    # DANGER ZONE FRAGILE — DO NOT REINTRODUCE THE R/B BOOST.
+    #   The old formula (r_new = r + spill * 0.5, b_new = b + spill * 0.5)
+    #   was meant to be luminance-preserving but caused yellow shirts to
+    #   shift pink and produced blue ink splotches on warm wardrobe whenever
+    #   the warm-wardrobe guard above missed a pixel (which happens when
+    #   real green spill briefly makes G > R on yellow fabric). Verified
+    #   against yellow-shirt clip 2026-04-29. Linked memory:
+    #   corridorkey_yellow_shirt_despill.md.
     g_new = g - spill_amount
-    r_new = r + (spill_amount * 0.5)
-    b_new = b + (spill_amount * 0.5)
+    r_new = r
+    b_new = b
 
     despilled = _stack([r_new, g_new, b_new])
 
@@ -250,15 +278,21 @@ def despill_opencv(
 
 
 def despill_torch(image: torch.Tensor, strength: float) -> torch.Tensor:
-    """GPU despill — keeps data on device."""
+    """GPU despill — keeps data on device. Subtractive only (no R/B boost) to
+    prevent yellow shirts from shifting pink. Mirror of despill_opencv; see
+    that function's docstring for the full rationale."""
     if strength <= 0.0:
         return image
     r, g, b = image[:, 0], image[:, 1], image[:, 2]
     limit = (r + b) / 2.0
     spill = torch.clamp(g - limit, min=0.0)
+    # Warm-wardrobe guard — see despill_opencv for full comment.
+    spill = torch.where(r >= g, torch.zeros_like(spill), spill)
+    # SUBTRACTIVE despill: do NOT reintroduce the r + spill*0.5 / b + spill*0.5
+    # boost. It causes yellow->pink shift on warm wardrobe. See despill_opencv.
     g_new = g - spill
-    r_new = r + spill * 0.5
-    b_new = b + spill * 0.5
+    r_new = r
+    b_new = b
     despilled = torch.stack([r_new, g_new, b_new], dim=1)
     if strength < 1.0:
         return image * (1.0 - strength) + despilled * strength
