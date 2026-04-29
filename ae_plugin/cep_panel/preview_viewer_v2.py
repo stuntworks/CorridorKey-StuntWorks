@@ -37,6 +37,14 @@ import cv2
 import numpy as np
 from PySide6 import QtWidgets, QtGui, QtCore
 
+# Add CK_ROOT (engine repo root) to sys.path so we can import the shared
+# CorridorKeyModule.core.sam2_combine helper. The viewer otherwise avoids
+# importing from CorridorKeyModule to skip torch's 40-60s import; sam2_combine
+# is numpy-only and safe to import here. CK_ROOT is three levels up:
+# ae_plugin/cep_panel/preview_viewer_v2.py -> ae_plugin/cep_panel -> ae_plugin -> repo root.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+from CorridorKeyModule.core.sam2_combine import apply_sam2_gate
+
 # WHAT IT DOES: Installs diagnostic crash / exception loggers as early as possible.
 #   faulthandler dumps Python tracebacks on native signals (SIGSEGV, stack overflow,
 #   access violations that Windows translates into exit code 0xC0000409 etc). The
@@ -320,7 +328,7 @@ def render_composite(cu, session: Session, params: dict):
         if _gate.shape != session.alpha_nn.shape:
             _gate = cv2.resize(_gate, (session.alpha_nn.shape[1], session.alpha_nn.shape[0]),
                                interpolation=cv2.INTER_LINEAR)
-        alpha = np.clip(session.alpha_nn * _gate, 0.0, 1.0)
+        alpha = np.clip(apply_sam2_gate(session.alpha_nn, _gate, invert=False), 0.0, 1.0)
     else:
         alpha = session.alpha.copy()
     if sam2_margin > 0:

@@ -2108,7 +2108,8 @@ def _key_one_scrub_frame():
             if _gate.shape != mt.shape:
                 _gate = _cv2.resize(_gate, (mt.shape[1], mt.shape[0]),
                                     interpolation=_cv2.INTER_LINEAR)
-            mt = mt * _gate
+            from CorridorKeyModule.core.sam2_combine import apply_sam2_gate
+            mt = apply_sam2_gate(mt, _gate, invert=False)
         if fg is not None and mt is not None:
             out_dir = ctx["scrub_dir"] / f"{frame_idx:03d}"
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -2666,14 +2667,15 @@ def on_process_range(ev):
                 # DEPENDS-ON: _braw_sam2_video_masks (propagation), _braw_sam2_gate (fallback)
                 # AFFECTS: mt for this frame only
                 if mt is not None:
+                    from CorridorKeyModule.core.sam2_combine import apply_sam2_gate
                     if _braw_sam2_video_masks and fidx in _braw_sam2_video_masks:
                         _gate = _dilate_sam2_mask(_braw_sam2_video_masks[fidx], margin=settings.get("sam2_margin", SAM2_MATTE_MARGIN))
                         _gate = _soften_sam2_mask(_gate, soften=settings.get("sam2_soften", 0))
                         _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
-                        mt = _mt2d * _gate
+                        mt = apply_sam2_gate(_mt2d, _gate, invert=False)
                     elif _braw_sam2_gate is not None:
                         _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
-                        mt = _mt2d * _braw_sam2_gate
+                        mt = apply_sam2_gate(_mt2d, _braw_sam2_gate, invert=False)
                 choke_px = int(settings.get("choke", 0))
                 if choke_px > 0 and mt is not None:
                     _k = choke_px * 2 + 1
@@ -2875,12 +2877,13 @@ def on_process_range(ev):
                 # DEPENDS-ON: sam2_video_masks, _static_sam2_gate, _load_sam2_output_gate
                 # AFFECTS: mt (alpha) — multiplied by gate, zeroing pixels outside the matte.
                 if mt is not None:
+                    from CorridorKeyModule.core.sam2_combine import apply_sam2_gate
                     if sam2_video_masks and range_idx in sam2_video_masks:
                         # Normal path — per-frame mask from video propagation.
                         _gate = _dilate_sam2_mask(sam2_video_masks[range_idx], margin=settings.get("sam2_margin", SAM2_MATTE_MARGIN))
                         _gate = _soften_sam2_mask(_gate, soften=settings.get("sam2_soften", 0))
                         _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
-                        mt = _mt2d * _gate
+                        mt = apply_sam2_gate(_mt2d, _gate, invert=False)
                     else:
                         # Fallback path — static gate loaded lazily on first frame so we have
                         # real frame.shape for the resize check inside _load_sam2_output_gate.
@@ -2891,7 +2894,7 @@ def on_process_range(ev):
                                 _tlog("SAM2 static gate loaded — applying same mask to all range frames (no propagation)")
                         if _static_sam2_gate is not None:
                             _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
-                            mt = _mt2d * _static_sam2_gate
+                            mt = apply_sam2_gate(_mt2d, _static_sam2_gate, invert=False)
                 choke_px = int(settings.get("choke", 0))
                 if choke_px > 0 and mt is not None:
                     k = choke_px * 2 + 1
