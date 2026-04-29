@@ -2108,7 +2108,7 @@ def _key_one_scrub_frame():
             if _gate.shape != mt.shape:
                 _gate = _cv2.resize(_gate, (mt.shape[1], mt.shape[0]),
                                     interpolation=_cv2.INTER_LINEAR)
-            from CorridorKeyModule.core.sam2_combine import apply_sam2_gate
+            from sam2_combine import apply_sam2_gate
             mt = apply_sam2_gate(mt, _gate, invert=False)
         if fg is not None and mt is not None:
             out_dir = ctx["scrub_dir"] / f"{frame_idx:03d}"
@@ -2667,7 +2667,7 @@ def on_process_range(ev):
                 # DEPENDS-ON: _braw_sam2_video_masks (propagation), _braw_sam2_gate (fallback)
                 # AFFECTS: mt for this frame only
                 if mt is not None:
-                    from CorridorKeyModule.core.sam2_combine import apply_sam2_gate
+                    from sam2_combine import apply_sam2_gate
                     if _braw_sam2_video_masks and fidx in _braw_sam2_video_masks:
                         _gate = _dilate_sam2_mask(_braw_sam2_video_masks[fidx], margin=settings.get("sam2_margin", SAM2_MATTE_MARGIN))
                         _gate = _soften_sam2_mask(_gate, soften=settings.get("sam2_soften", 0))
@@ -2877,7 +2877,7 @@ def on_process_range(ev):
                 # DEPENDS-ON: sam2_video_masks, _static_sam2_gate, _load_sam2_output_gate
                 # AFFECTS: mt (alpha) — multiplied by gate, zeroing pixels outside the matte.
                 if mt is not None:
-                    from CorridorKeyModule.core.sam2_combine import apply_sam2_gate
+                    from sam2_combine import apply_sam2_gate
                     if sam2_video_masks and range_idx in sam2_video_masks:
                         # Normal path — per-frame mask from video propagation.
                         _gate = _dilate_sam2_mask(sam2_video_masks[range_idx], margin=settings.get("sam2_margin", SAM2_MATTE_MARGIN))
