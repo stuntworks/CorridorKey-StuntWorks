@@ -44,7 +44,7 @@ from PySide6 import QtWidgets, QtGui, QtCore
 # that doesn't have torch in its env. CK_ROOT is three levels up:
 # ae_plugin/cep_panel/preview_viewer_v2.py -> ae_plugin/cep_panel -> ae_plugin -> repo root.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-from sam2_combine import apply_sam2_gate
+from sam2_combine import apply_sam2_gate, trim_gate_by_chroma
 
 # WHAT IT DOES: Installs diagnostic crash / exception loggers as early as possible.
 #   faulthandler dumps Python tracebacks on native signals (SIGSEGV, stack overflow,
@@ -349,16 +349,21 @@ def render_composite(cu, session: Session, params: dict):
     sam2_margin = int(params.get("sam2_margin", 0))
     sam2_soften = int(params.get("sam2_soften", 0))
     halo_px = int(params.get("halo_px", 0))
+    trim_chroma = int(params.get("trim_chroma", 0))
     # DaVinci formula exactly: multiply NN × gate first, then dilate+soften the result.
     # Dilating the product spreads existing NN alpha values outward so MARGIN visibly
     # grows the body. Gate cuts background bleed. SOFTEN feathers the expanded edge.
     # halo_px>0 dilates the gate inside apply_sam2_gate so a band of NN values around
     # the SAM2 silhouette survives — recovers hair / motion-blur detail at the edge.
+    # trim_chroma>0 removes screen-colored pixels from the gate before combine.
     if session.alpha_nn is not None and session.sam2_gate_raw is not None:
         _gate = session.sam2_gate_raw.copy()
         if _gate.shape != session.alpha_nn.shape:
             _gate = cv2.resize(_gate, (session.alpha_nn.shape[1], session.alpha_nn.shape[0]),
                                interpolation=cv2.INTER_LINEAR)
+        if trim_chroma > 0:
+            _src_rgb = session.original_rgb if session.original_rgb is not None else session.fg_rgb
+            _gate = trim_gate_by_chroma(_gate, _src_rgb, "green", trim_chroma)
         alpha = np.clip(apply_sam2_gate(session.alpha_nn, _gate, invert=False, halo_px=halo_px), 0.0, 1.0)
     else:
         alpha = session.alpha.copy()
@@ -474,6 +479,11 @@ class PersistentWindow(QtWidgets.QWidget):
             # NN values around the silhouette survives — recovers hair /
             # motion-blur detail at the SAM2 edge. SAM2-only control.
             "halo_px": 0,
+            # TRIM SAM2: chroma-aware mask refinement. 0 = off (bit-identical).
+            # >0 removes screen-colored pixels from the SAM2 gate before
+            # combine — kills "holes" at silhouette edges where SAM2 claims
+            # green but NN keyed transparent. SAM2-only control.
+            "trim_chroma": 0,
             "choke": 0,
             # FG SOURCE: "nn" = model FG (default, original behavior)
             #            "source" = original plate inside the matte (yellow-shirt rescue)
@@ -948,7 +958,8 @@ class PersistentWindow(QtWidgets.QWidget):
         # SAM2-only. Dilates the SAM2 gate so a band of NN-driven alpha values
         # around the silhouette survives the gate multiply — recovers hair and
         # motion-blur detail at the SAM2 edge. 0 = current behavior.
-        grid.addWidget(_label("HALO"), 5, 0)
+        self.halo_label_widget = _label("HALO")
+        grid.addWidget(self.halo_label_widget, 5, 0)
         self.halo_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.halo_slider.setRange(0, 150)
         self.halo_slider.setValue(int(self._params["halo_px"]))
@@ -957,6 +968,26 @@ class PersistentWindow(QtWidgets.QWidget):
         self.halo_value_label = _label(f"{int(self._params['halo_px'])}", "#0ff")
         self.halo_value_label.setMinimumWidth(42)
         grid.addWidget(self.halo_value_label, 5, 2)
+
+        # --- TRIM SAM2: chroma-aware mask refinement (slider 0-100 integer). ---
+        # SAM2-only. Removes screen-colored pixels from the SAM2 gate before
+        # combine — kills "holes" at silhouette edges where SAM2 claims green
+        # but NN keyed transparent. NN edge detail preserved. 0 = bit-identical.
+        _TRIM_TOOLTIP = ("TRIM SAM2 — removes screen-colored pixels from SAM2 mask edges.\n"
+                         "0 = off (bit-identical). 30-60 typical. Higher = more aggressive trim.")
+        self.trim_chroma_label_widget = _label("TRIM SAM2")
+        self.trim_chroma_label_widget.setToolTip(_TRIM_TOOLTIP)
+        grid.addWidget(self.trim_chroma_label_widget, 6, 0)
+        self.trim_chroma_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.trim_chroma_slider.setRange(0, 100)
+        self.trim_chroma_slider.setValue(int(self._params["trim_chroma"]))
+        self.trim_chroma_slider.valueChanged.connect(self._on_trim_chroma_changed)
+        self.trim_chroma_slider.setToolTip(_TRIM_TOOLTIP)
+        grid.addWidget(self.trim_chroma_slider, 6, 1)
+        self.trim_chroma_value_label = _label(f"{int(self._params['trim_chroma'])}", "#0ff")
+        self.trim_chroma_value_label.setMinimumWidth(42)
+        self.trim_chroma_value_label.setToolTip(_TRIM_TOOLTIP)
+        grid.addWidget(self.trim_chroma_value_label, 6, 2)
 
         # --- FG SOURCE: NN vs SOURCE radio buttons ---
         # Path A "warm wardrobe rescue" (yellow shirts going pink). NN = current
@@ -971,7 +1002,7 @@ class PersistentWindow(QtWidgets.QWidget):
                           "SOURCE: original plate, despilled. Real color, more spill risk.")
         self.fg_source_label_widget = _label("FG SOURCE")
         self.fg_source_label_widget.setToolTip(_FGSRC_TOOLTIP)
-        grid.addWidget(self.fg_source_label_widget, 6, 0)
+        grid.addWidget(self.fg_source_label_widget, 7, 0)
         _fgsrc_row = QtWidgets.QWidget()
         _fgsrc_row.setStyleSheet("background: transparent; border: none;")
         _fgsrc_layout = QtWidgets.QHBoxLayout(_fgsrc_row)
@@ -1000,7 +1031,7 @@ class PersistentWindow(QtWidgets.QWidget):
         _fgsrc_layout.addWidget(self.fg_source_btn_nn)
         _fgsrc_layout.addWidget(self.fg_source_btn_src)
         _fgsrc_layout.addStretch(1)
-        grid.addWidget(_fgsrc_row, 6, 1, 1, 2)
+        grid.addWidget(_fgsrc_row, 7, 1, 1, 2)
 
         grid.setColumnStretch(1, 1)
         parent_layout.addWidget(panel)
@@ -1060,6 +1091,15 @@ class PersistentWindow(QtWidgets.QWidget):
         # active SAM2 mask. Mirrors Resolve viewer's _on_halo_changed.
         self._params["halo_px"] = int(value)
         self.halo_value_label.setText(str(int(value)))
+        self._render_now()
+        self._schedule_save()
+
+    def _on_trim_chroma_changed(self, value: int):
+        # Slider 0-100 integer. SAM2-only — visible effect requires an active
+        # SAM2 mask. Mirrors Resolve viewer's _on_trim_chroma_changed.
+        # 0 = bit-identical to no-trim path.
+        self._params["trim_chroma"] = int(value)
+        self.trim_chroma_value_label.setText(str(int(value)))
         self._render_now()
         self._schedule_save()
 
@@ -1160,7 +1200,7 @@ class PersistentWindow(QtWidgets.QWidget):
                     pass  # PNGs unreadable — stale view is better than a crash
         merged = dict(self._params)
         for k, v in params.items():
-            if k in ("despill", "despeckle", "despeckleSize", "background", "sam2_margin", "sam2_soften", "halo_px", "fg_source"):
+            if k in ("despill", "despeckle", "despeckleSize", "background", "sam2_margin", "sam2_soften", "halo_px", "trim_chroma", "fg_source"):
                 merged[k] = v
         if self._painting:
             self._pending = merged
@@ -1345,6 +1385,7 @@ class PersistentWindow(QtWidgets.QWidget):
                 _m = int(params_for_matte.get("sam2_margin", 0))
                 _s = int(params_for_matte.get("sam2_soften", 0))
                 _halo = int(params_for_matte.get("halo_px", 0))
+                _trim = int(params_for_matte.get("trim_chroma", 0))
                 if self.session.alpha_nn is not None and self.session.sam2_gate_raw is not None:
                     _gate = self.session.sam2_gate_raw.copy()
                     # SAM2 returns the gate at 256x256 — must resize to alpha
@@ -1361,6 +1402,11 @@ class PersistentWindow(QtWidgets.QWidget):
                              self.session.alpha_nn.shape[0]),
                             interpolation=cv2.INTER_LINEAR,
                         )
+                    if _trim > 0:
+                        _src_rgb_m = (self.session.original_rgb
+                                      if self.session.original_rgb is not None
+                                      else self.session.fg_rgb)
+                        _gate = trim_gate_by_chroma(_gate, _src_rgb_m, "green", _trim)
                     alpha = np.clip(apply_sam2_gate(self.session.alpha_nn, _gate, invert=False, halo_px=_halo), 0.0, 1.0)
                 else:
                     alpha = self.session.alpha.copy()
