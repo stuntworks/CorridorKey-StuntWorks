@@ -2104,29 +2104,18 @@ class PersistentWindow(QtWidgets.QWidget):
                 point_coords=np.array(all_pts),
                 point_labels=np.array(labels),
                 multimask_output=True,
-                return_logits=True,
             )
             del pred, model
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             best_idx = int(np.argmax(scores))
-            # SATURATION RAMP, not sigmoid.
-            #
-            # WHY NOT SIGMOID: SAM2 mask-decoder logits in confident interior pixels
-            # often sit in the +2..+6 range (not +20..+30). Sigmoid maps that to
-            # 0.88..0.998 — with subtle per-pixel variation that tracks image texture.
-            # Multiplied by the solid-white NN alpha, that variation prints as
-            # horizontal banding + checker artifacts inside the body silhouette.
-            #
-            # WHAT THE RAMP DOES: linear ramp on raw logits.
-            #   logit >= +2  ->  1.0  (solid interior, kills all decoder texture)
-            #   logit <= -2  ->  0.0  (solid background)
-            #   -2 < L < +2  ->  linear ramp (soft anti-aliased edge at the
-            #                    SAM2 decision boundary)
-            # slope=0.25 -> 4 logit-units across the soft band -> typically 2-4 px
-            # of feather at full-res, since SAM2 logits transition over 1-3 px.
-            logits = masks[best_idx].astype(np.float32)
-            best = np.clip(0.5 + logits * 0.25, 0.0, 1.0)
+            # Standard SAM2 sigmoid output. The earlier saturation ramp
+            # (commit bcb376c) hard-clipped logits below -2 to zero, which
+            # erased subject regions separated by visual boundaries (e.g.
+            # an actor's butt across a stunt-rig strap). Sigmoid keeps those
+            # regions at low-but-nonzero alpha so they survive the multiply
+            # and can be recovered with HALO/MARGIN if needed.
+            best = masks[best_idx].astype(np.float32)
             # Backup the NN alpha if it exists and hasn't been backed up yet.
             # CLEAR restores this backup so the actress comes back without re-processing.
             alpha_path = self.session.session_dir / "alpha.png"
