@@ -989,11 +989,11 @@ class PersistentWindow(QtWidgets.QWidget):
             "border: 1px solid #d55; border-radius: 12px; font-size: 12px; font-weight: 600;"
         )
         self._sam_invert_btn.setToolTip(
-            "INVERT MASK — SAM2 removes what you click instead of keeping it.\n"
-            "Use for imperfect green screens: click on garbage (floor, props, crew, taped seams)\n"
-            "to subtract them from the matte. The NN still handles the actor edges.\n"
-            "DO NOT click on the actor while INVERT is on — you'll cut a hole in them.\n"
-            "Toggling this auto-clears existing dots."
+            "INVERT MASK — flips the SAM2 mask polarity.\n"
+            "OFF: mask KEEPS what your dots cover (default subject mask).\n"
+            "ON:  mask REMOVES what your dots cover (anti-mask / garbage matte).\n"
+            "Toggle does NOT clear your dots — same dots, opposite result.\n"
+            "For garbage-matte workflow: CLEAR first, INVERT on, then click on junk."
         )
         self._sam_invert_btn.setChecked(bool(self._params.get("sam_invert", False)))
         self._sam_invert_btn.clicked.connect(self._on_sam_invert_clicked)
@@ -1871,28 +1871,30 @@ class PersistentWindow(QtWidgets.QWidget):
                     return True
         return super().eventFilter(obj, event)
 
-    # WHAT IT DOES: Toggles SAM2 INVERT MASK mode. When ON, SAM2's mask
-    #   SUBTRACTS from the NN matte instead of gating it (garbage-matte mode
-    #   for imperfect green screens — click on floor / crew / props / seams).
-    #   Toggling auto-clears existing dots because the same dots mean the
-    #   opposite thing (positive click = "keep this" in NN mode → "remove
-    #   this" in INVERT mode); without auto-clear the user would silently
-    #   get the inverse of their intent.
-    # DEPENDS-ON: self._sam_invert_btn checked state, self._params,
-    #   self._clear_sam_points (handles save + re-render).
-    # AFFECTS: self._params["sam_invert"], dots cleared, gate cleared, repaint.
+    # WHAT IT DOES: Toggles SAM2 INVERT MASK mode. Pure polarity flip — does
+    #   NOT clear dots or reset SAM2 state. The button changes the math at
+    #   composite time: alpha × gate (off) vs alpha × (1 - gate) (on). User
+    #   sees the result flip instantly from "what you keep" to "what you
+    #   remove" using the same SAM2 mask.
+    #   Earlier version auto-cleared dots on toggle (per the original "garbage
+    #   matte mode" plan). Live-tested 2026-04-29: that produced the surprising
+    #   "everything just sprung back" symptom (dots gone → NN-only matte → on
+    #   weak NN clips, full background returns). Berto's mental model was
+    #   "flip the result, leave my dots alone" — that's what this implements.
+    #   To use garbage-matte workflow (click on junk to remove it), user
+    #   manually clicks CLEAR first, then INVERT, then clicks on garbage.
+    # DEPENDS-ON: self._sam_invert_btn checked state, self._params.
+    # AFFECTS: self._params["sam_invert"], live_params.json, repaint.
     def _on_sam_invert_clicked(self, checked):
         self._params["sam_invert"] = bool(checked)
-        # Clear existing SAM2 state — flipping polarity changes the meaning
-        # of every existing click. _clear_sam_points handles _save_live_params_now
-        # and _render_now() for us.
-        self._clear_sam_points()
-        # Update status to confirm the mode flip (overwrites the "cleared"
-        # message _clear_sam_points just set).
+        # Persist immediately so panel render-range path sees the new value.
+        self._save_live_params_now()
+        # Re-render so the live preview reflects the polarity flip.
+        self._render_now()
         if checked:
-            self.status.setText("INVERT ON — SAM2 will REMOVE what you click. Click on garbage, NOT actor.")
+            self.status.setText("INVERT ON — mask polarity flipped (same dots, opposite result).")
         else:
-            self.status.setText("INVERT OFF — SAM2 will KEEP what you click (default).")
+            self.status.setText("INVERT OFF — back to normal SAM2 mask.")
 
     # WHAT IT DOES: Clears all SAM click points, deletes sam2_mask.png gate, and
     #   restores the NN alpha backup. No confirm dialog — the dialog was invisible
