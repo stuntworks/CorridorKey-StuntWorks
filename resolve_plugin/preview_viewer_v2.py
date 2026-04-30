@@ -43,7 +43,7 @@ from PySide6 import QtWidgets, QtGui, QtCore
 # the package __init__ which loads torch (40-60s) and breaks the viewer's
 # subprocess that doesn't have torch in its env.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from sam2_combine import apply_sam2_gate, apply_sam2_gate_additive, trim_gate_by_chroma, fill_holes_color_aware
+from sam2_combine import apply_sam2_gate, apply_sam2_gate_additive, apply_sam2_gate_weighted, trim_gate_by_chroma, fill_holes_color_aware
 
 # WHAT IT DOES: Installs diagnostic crash / exception loggers as early as possible.
 #   faulthandler dumps Python tracebacks on native signals (SIGSEGV, stack overflow,
@@ -418,13 +418,22 @@ def render_composite(cu, session: Session, params: dict):
     trim_chroma = int(params.get("trim_chroma", 0))
     fill_holes = int(params.get("fill_holes", 0))
     sam2_additive = bool(params.get("sam2_additive", False))
+    sam2_weighted = bool(params.get("sam2_weighted", False))
     if session.alpha_raw is not None and session.sam2_gate_raw is not None:
         _gate = session.sam2_gate_raw.copy()
         if _gate.shape != session.alpha_raw.shape:
             _gate = cv2.resize(_gate, (session.alpha_raw.shape[1], session.alpha_raw.shape[0]),
                                interpolation=cv2.INTER_LINEAR)
         _src_rgb = session.original_rgb if session.original_rgb is not None else session.fg_rgb
-        if sam2_additive:
+        if sam2_weighted:
+            # SMART BLEND: per-pixel weighted combine — NN trusted in green
+            # regions (preserves hair / butt-across-strap detail), SAM2 trusted
+            # off-green (kills floor / props NN can't see). Skips _trimap_fuse
+            # and additive paths; trim/fill_holes/halo intentionally not applied
+            # (the chroma-derived weight handles boundary blending).
+            alpha = apply_sam2_gate_weighted(session.alpha_raw, _gate, _src_rgb,
+                                             screen_type="green")
+        elif sam2_additive:
             # ADDITIVE mode: alpha = max(NN, gate * non_screen). SAM2 can ADD
             # confidence where NN missed but never SUBTRACT NN's correct alpha.
             # Trim/fill_holes don't apply here (no multiplicative combine to
@@ -630,6 +639,11 @@ class PersistentWindow(QtWidgets.QWidget):
             # Preserves subject regions SAM2 misses across visual boundaries
             # (straps, props). Off = bit-identical to current behavior.
             "sam2_additive": False,
+            # SAM2 SMART BLEND: when True, per-pixel blends NN and SAM2 by
+            # green-presence (chroma-derived weight). NN trusted where green
+            # exists, SAM2 trusted off-green. Wins over sam2_additive when
+            # both are checked. Off = bit-identical to current behavior.
+            "sam2_weighted": False,
         }
         # Drop-stale: if a new update comes in while we're painting, we only keep
         # the latest one. _pending is None when idle, or a dict when a render is
@@ -1458,6 +1472,36 @@ class PersistentWindow(QtWidgets.QWidget):
         self.sam2_additive_checkbox.toggled.connect(self._on_sam2_additive_changed)
         grid.addWidget(self.sam2_additive_checkbox, 9, 1, 1, 2)
 
+        # --- SAM2 SMART BLEND: weighted combine toggle (checkbox) ---
+        # Per-pixel blends NN alpha and SAM2 gate by chroma-derived weight:
+        # NN trusted where green-presence is high (preserves hair, butt-across-
+        # strap, fine detail), SAM2 trusted off-green (kills floor, props,
+        # equipment NN can't see). OFF = bit-identical to previous behavior.
+        # Wins over SAM2 ADDITIVE when both are checked. SAM2-only — greyed
+        # out when SAM2 is inactive.
+        _SAM2_WEIGHTED_TOOLTIP = (
+            "SMART BLEND — auto-blend NN and SAM2 per pixel. NN owns "
+            "green-screen regions (preserves fine detail like hair and "
+            "butt-across-strap). SAM2 owns non-green regions (kills "
+            "off-screen floor and props NN can't see). Off = bit-identical "
+            "to before."
+        )
+        self.sam2_weighted_label_widget = _label("SMART BLEND")
+        self.sam2_weighted_label_widget.setToolTip(_SAM2_WEIGHTED_TOOLTIP)
+        grid.addWidget(self.sam2_weighted_label_widget, 10, 0)
+        self.sam2_weighted_checkbox = QtWidgets.QCheckBox("")
+        self.sam2_weighted_checkbox.setStyleSheet(
+            "QCheckBox { color: #8ab; border: none; background: transparent; "
+            "font-size: 12px; font-weight: 600; letter-spacing: 0.5px; } "
+            "QCheckBox::indicator { width: 12px; height: 12px; border: 1px solid "
+            "#2a6a7a; border-radius: 2px; background: #001a28; } "
+            "QCheckBox::indicator:checked { background: #0ff; border-color: #0ff; }"
+        )
+        self.sam2_weighted_checkbox.setChecked(bool(self._params.get("sam2_weighted", False)))
+        self.sam2_weighted_checkbox.setToolTip(_SAM2_WEIGHTED_TOOLTIP)
+        self.sam2_weighted_checkbox.toggled.connect(self._on_sam2_weighted_changed)
+        grid.addWidget(self.sam2_weighted_checkbox, 10, 1, 1, 2)
+
         grid.setColumnStretch(1, 1)
         parent_layout.addWidget(panel)
 
@@ -1580,6 +1624,18 @@ class PersistentWindow(QtWidgets.QWidget):
         self._render_now()
         self._save_live_params_now()
 
+    # WHAT IT DOES: SMART BLEND checkbox handler. Toggles per-pixel weighted
+    #   NN/SAM2 combine. Wins over sam2_additive when both checked. Discrete
+    #   control — saves immediately so PROCESS RANGE sees the choice.
+    # DEPENDS-ON: self._params, _render_now, _save_live_params_now.
+    # AFFECTS: self._params["sam2_weighted"], repaint, persists to disk.
+    def _on_sam2_weighted_changed(self, checked: bool):
+        self._params["sam2_weighted"] = bool(checked)
+        self._local_change_time = time.perf_counter()
+        self._last_activity_time = self._local_change_time
+        self._render_now()
+        self._save_live_params_now()
+
     # WHAT IT DOES: Greys out the SAM2-only controls (Margin, Soften) when
     #   no SAM2 mask is active. This makes it visually obvious to the user
     #   that those sliders aren't doing anything until they engage SAM2.
@@ -1605,7 +1661,9 @@ class PersistentWindow(QtWidgets.QWidget):
                   self.fill_holes_slider, self.fill_holes_value_label,
                   self.fill_holes_label_widget,
                   self.sam2_additive_checkbox,
-                  self.sam2_additive_label_widget):
+                  self.sam2_additive_label_widget,
+                  self.sam2_weighted_checkbox,
+                  self.sam2_weighted_label_widget):
             try:
                 w.setEnabled(sam2_active)
             except Exception:
@@ -1748,7 +1806,7 @@ class PersistentWindow(QtWidgets.QWidget):
         # with the correct state.
         merged = dict(self._params)
         for k, v in params.items():
-            if k in ("despill", "despeckle", "despeckleSize", "background", "fg_source", "trim_chroma", "fill_holes", "sam2_additive"):
+            if k in ("despill", "despeckle", "despeckleSize", "background", "fg_source", "trim_chroma", "fill_holes", "sam2_additive", "sam2_weighted"):
                 merged[k] = v
         # Sync checkbox UI and self._params NOW — before any render fires — so that
         # every code path below uses the correct despeckle value. blockSignals prevents
@@ -1861,6 +1919,7 @@ class PersistentWindow(QtWidgets.QWidget):
                 matte_trim = int(params_for_matte.get("trim_chroma", 0))
                 matte_fill = int(params_for_matte.get("fill_holes", 0))
                 matte_additive = bool(params_for_matte.get("sam2_additive", False))
+                matte_weighted = bool(params_for_matte.get("sam2_weighted", False))
                 if (self.session.alpha_raw is not None
                         and self.session.sam2_gate_raw is not None):
                     _gate = self.session.sam2_gate_raw.copy()
@@ -1879,7 +1938,14 @@ class PersistentWindow(QtWidgets.QWidget):
                     _src_rgb_m = (self.session.original_rgb
                                   if self.session.original_rgb is not None
                                   else self.session.fg_rgb)
-                    if matte_additive:
+                    if matte_weighted:
+                        # SMART BLEND mirror of Composite branch — per-pixel
+                        # weighted NN/SAM2 by chroma. trim/fill_holes/halo
+                        # intentionally not applied here either.
+                        alpha = apply_sam2_gate_weighted(self.session.alpha_raw,
+                                                         _gate, _src_rgb_m,
+                                                         screen_type="green")
+                    elif matte_additive:
                         # ADDITIVE mode mirrors the Composite branch. HALO still
                         # functional but its semantics shift (extends additive
                         # contribution outward rather than preserving NN edge band).
