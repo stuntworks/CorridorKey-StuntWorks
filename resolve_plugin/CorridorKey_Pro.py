@@ -258,10 +258,10 @@ winLayout = ui.VGroup({"Spacing": 4}, [
     ]),
     ui.HGroup({"Weight": 0, "Spacing": 6}, [
         ui.Label({"Text": "Refiner:", "Weight": 0}),
-        ui.Slider({"ID": "RefinerStrength", "Minimum": 0, "Maximum": 100, "Value": 75, "Weight": 3,
+        ui.Slider({"ID": "RefinerStrength", "Minimum": 0, "Maximum": 100, "Value": 100, "Weight": 3,
                    "Orientation": "Horizontal", "SingleStep": 1,
                    "StyleSheet": "QSlider::groove:horizontal { height: 6px; background: #222; border-radius: 3px; } QSlider::sub-page:horizontal { background: #0dcaf0; border-radius: 3px; } QSlider::handle:horizontal { background: #fff; border: 2px solid #0dcaf0; width: 14px; height: 14px; margin: -4px 0; border-radius: 7px; } QSlider::handle:horizontal:hover { background: #0dcaf0; border-color: #fff; }"}),
-        ui.SpinBox({"ID": "RefinerInput", "Minimum": 0, "Maximum": 100, "Value": 75, "Weight": 0,
+        ui.SpinBox({"ID": "RefinerInput", "Minimum": 0, "Maximum": 100, "Value": 100, "Weight": 0,
                     "StyleSheet": "QSpinBox { background-color: #1a1a1a; color: #ccc; border: 1px solid #333; padding: 4px; border-radius: 3px; min-width: 50px; } QSpinBox::up-button, QSpinBox::down-button { background-color: #2a2a2a; border: none; width: 16px; } QSpinBox::up-button:hover, QSpinBox::down-button:hover { background-color: #0dcaf0; }"}),
         ui.Label({"Text": "%", "Weight": 0, "StyleSheet": "color: #888; font-size: 11px;"}),
     ]),
@@ -1119,9 +1119,11 @@ def _read_frame_via_resolve_render(mpi, fn, try_direct=False):
             still_exists = Path(still_path).exists()
             log(f"Resolve render fallback: ExportCurrentFrameAsStill ok={ok} file_exists={still_exists}")
             if still_exists:
-                frame = cv2.imread(still_path, cv2.IMREAD_COLOR)
+                # IMREAD_UNCHANGED preserves 16-bit TIF depth (RGB16LZW from Resolve).
+                # IMREAD_COLOR truncated to uint8 BGR, losing 8 bits of precision per channel.
+                frame = cv2.imread(still_path, cv2.IMREAD_UNCHANGED)
                 if frame is not None:
-                    log(f"Resolve render fallback: OK (Path A — still) shape={frame.shape}")
+                    log(f"Resolve render fallback: OK (Path A — still) shape={frame.shape} dtype={frame.dtype}")
                     try: Path(still_path).unlink()
                     except: pass
                     return frame   # finally block still runs and cleans up
@@ -1188,8 +1190,10 @@ def _read_frame_via_resolve_render(mpi, fn, try_direct=False):
                     break
 
             if img_file:
-                frame = cv2.imread(str(img_file), cv2.IMREAD_COLOR)
-                log(f"Resolve render fallback: OK (Path B — image) shape={frame.shape if frame is not None else 'None'}")
+                # IMREAD_UNCHANGED preserves 16-bit TIF depth (RGB16LZW from Resolve).
+                # IMREAD_COLOR truncated to uint8 BGR, losing 8 bits of precision per channel.
+                frame = cv2.imread(str(img_file), cv2.IMREAD_UNCHANGED)
+                log(f"Resolve render fallback: OK (Path B — image) shape={frame.shape if frame is not None else 'None'} dtype={frame.dtype if frame is not None else 'None'}")
                 for m in sorted(temp_dir.glob(f"{temp_name}*")):
                     try: m.unlink()
                     except: pass
@@ -1595,13 +1599,11 @@ def show_preview_window(orig_bgr, keyed_rgb, alpha):
     import cv2, numpy as np, subprocess, json
     a2d = alpha[:, :, 0] if len(alpha.shape) == 3 else alpha
     log(f"Matte debug — dtype:{a2d.dtype} min:{a2d.min():.4f} max:{a2d.max():.4f} mean:{a2d.mean():.4f}")
-    if a2d.dtype in (np.float32, np.float64):
-        matte_vis = (np.clip(a2d / max(a2d.max(), 1e-6), 0, 1) * 255).astype(np.uint8)
-    else:
-        if a2d.max() > 0 and a2d.max() < 255:
-            matte_vis = (a2d.astype(np.float32) / a2d.max() * 255).astype(np.uint8)
-        else:
-            matte_vis = a2d.astype(np.uint8)
+    # Write 16-bit alpha for full precision (matches AE engine).
+    # Drop the /a2d.max() auto-normalization — it was wrong on its own.
+    if a2d.dtype not in (np.float32, np.float64):
+        a2d = a2d.astype(np.float32) / (255.0 if a2d.dtype == np.uint8 else 65535.0)
+    matte_vis = (np.clip(a2d, 0, 1) * 65535.0).astype(np.uint16)
     log(f"Matte after norm — min:{matte_vis.min()} max:{matte_vis.max()} mean:{matte_vis.mean():.1f}")
     bg_frame = grab_background_frame()
     SESSION_DIR.mkdir(parents=True, exist_ok=True)
@@ -1772,7 +1774,14 @@ def reprocess_with_cached():
             proc = CorridorKeyProcessor(device="cuda")
             cached_processor["proc"] = proc
         ah = generate_alpha_hint(frame, settings)
-        fr = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        # Bit-depth aware normalization — HEVC routing now returns uint16 16-bit TIFs.
+        _frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        if _frame_rgb.dtype == np.uint16:
+            fr = _frame_rgb.astype(np.float32) / 65535.0
+        elif _frame_rgb.dtype == np.uint8:
+            fr = _frame_rgb.astype(np.float32) / 255.0
+        else:
+            fr = _frame_rgb.astype(np.float32)
         ah = ah.astype(np.float32) / 255.0 if ah.dtype == np.uint8 else ah
         ps = ProcessingSettings(screen_type=settings["screen_type"], despill_strength=0.0, refiner_strength=settings["refiner_strength"], despeckle_enabled=settings["despeckle_enabled"], despeckle_size=settings["despeckle_size"], fg_source=settings.get("fg_source", "nn"))
         log(f"Settings: despeckle_enabled={ps.despeckle_enabled} despeckle_size={ps.despeckle_size} despill={ps.despill_strength} refiner={ps.refiner_strength} fg_source={ps.fg_source}")
@@ -1925,7 +1934,14 @@ def process_current_frame(preview_only=False):
         settings["_render_frame"] = cf
         ah = generate_alpha_hint(frame, settings)
         log("Processing...")
-        fr = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        # Bit-depth aware normalization — HEVC routing now returns uint16 16-bit TIFs.
+        _frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        if _frame_rgb.dtype == np.uint16:
+            fr = _frame_rgb.astype(np.float32) / 65535.0
+        elif _frame_rgb.dtype == np.uint8:
+            fr = _frame_rgb.astype(np.float32) / 255.0
+        else:
+            fr = _frame_rgb.astype(np.float32)
         ah = ah.astype(np.float32) / 255.0 if ah.dtype == np.uint8 else ah
         ps = ProcessingSettings(screen_type=settings["screen_type"], despill_strength=0.0, refiner_strength=settings["refiner_strength"], despeckle_enabled=settings["despeckle_enabled"], despeckle_size=settings["despeckle_size"], fg_source=settings.get("fg_source", "nn"))
         log(f"Settings: despeckle_enabled={ps.despeckle_enabled} despeckle_size={ps.despeckle_size} despill={ps.despill_strength} refiner={ps.refiner_strength} fg_source={ps.fg_source}")

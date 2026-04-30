@@ -358,15 +358,17 @@ class CorridorKeyEngine:
         ``.resolve()`` to get the numpy dict later.
         """
         # Resize on GPU using torchvision (much faster than cv2 at 4K)
+        # BICUBIC preserves high-frequency edge detail (flyaway hair) better than BILINEAR;
+        # closer to the upstream baseline cv2.INTER_LANCZOS4 while keeping GPU acceleration.
         alpha = TF.resize(
             pred_alpha.float(),
             [h, w],
-            interpolation=torchvision.transforms.InterpolationMode.BILINEAR,
+            interpolation=torchvision.transforms.InterpolationMode.BICUBIC,
         )
         fg = TF.resize(
             pred_fg.float(),
             [h, w],
-            interpolation=torchvision.transforms.InterpolationMode.BILINEAR,
+            interpolation=torchvision.transforms.InterpolationMode.BICUBIC,
         )
 
         del pred_fg, pred_alpha
