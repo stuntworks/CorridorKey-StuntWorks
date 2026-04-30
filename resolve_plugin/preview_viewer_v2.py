@@ -43,7 +43,7 @@ from PySide6 import QtWidgets, QtGui, QtCore
 # the package __init__ which loads torch (40-60s) and breaks the viewer's
 # subprocess that doesn't have torch in its env.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from sam2_combine import apply_sam2_gate, trim_gate_by_chroma
+from sam2_combine import apply_sam2_gate, trim_gate_by_chroma, fill_holes_color_aware
 
 # WHAT IT DOES: Installs diagnostic crash / exception loggers as early as possible.
 #   faulthandler dumps Python tracebacks on native signals (SIGSEGV, stack overflow,
@@ -259,7 +259,7 @@ EDGE_FEATHER_KSIZE = 11
 EDGE_FEATHER_SIGMA = 2.5
 
 
-def _trimap_fuse(alpha_raw, gate, source_rgb=None, screen_type="green", trim_chroma=0, halo_px=0):
+def _trimap_fuse(alpha_raw, gate, source_rgb=None, screen_type="green", trim_chroma=0, halo_px=0, fill_holes=0):
     # WHAT IT DOES: Uses SAM2 as a pure GARBAGE MATTE — crops the background
     #   without touching alpha_raw values inside the actor. The NN alpha is now
     #   reliably solid inside the body (post tan-vest alpha-hint fix), so this
@@ -271,6 +271,9 @@ def _trimap_fuse(alpha_raw, gate, source_rgb=None, screen_type="green", trim_chr
     #   (3) soften the edge with a small Gaussian; (4) multiply with alpha_raw
     #   via apply_sam2_gate (which applies the trimap halo dilation when
     #   halo_px > 0). Real holes survive because alpha_raw is 0 in them.
+    #   (5) optional FILL HOLES — when fill_holes > 0 and source_rgb provided,
+    #   alpha=0 pixels inside the gate that are NOT screen-colored are flipped
+    #   to alpha=1. Rescues NN dropouts on yellow shirts / skin / red.
     # DEPENDS-ON: numpy, cv2 (morphology + Gaussian), alpha_raw and gate same
     #   shape, both float32 [0..1]. halo_px forwarded to apply_sam2_gate.
     # AFFECTS: returns a new float32 array; inputs unchanged.
@@ -285,7 +288,14 @@ def _trimap_fuse(alpha_raw, gate, source_rgb=None, screen_type="green", trim_chr
         (EDGE_FEATHER_KSIZE, EDGE_FEATHER_KSIZE),
         EDGE_FEATHER_SIGMA,
     )
-    return apply_sam2_gate(alpha_raw, soft, invert=False, halo_px=halo_px).astype(np.float32)
+    combined = apply_sam2_gate(alpha_raw, soft, invert=False, halo_px=halo_px).astype(np.float32)
+    # FILL HOLES: bit-identical when fill_holes <= 0 (helper short-circuits).
+    # Use the SAME soft gate that fed the combine so fill respects whatever
+    # TRIM SAM2 / edge-softening did. fill is applied on the COMBINED alpha,
+    # not the raw NN alpha.
+    if fill_holes and fill_holes > 0 and source_rgb is not None:
+        combined = fill_holes_color_aware(combined, soft, source_rgb, screen_type, fill_holes)
+    return combined
 
 
 # ===== Persistent session state =====
@@ -406,6 +416,7 @@ def render_composite(cu, session: Session, params: dict):
     sam2_soften = float(params.get("sam2_soften", 0))
     halo_px = int(params.get("halo_px", 0))
     trim_chroma = int(params.get("trim_chroma", 0))
+    fill_holes = int(params.get("fill_holes", 0))
     if session.alpha_raw is not None and session.sam2_gate_raw is not None:
         _gate = session.sam2_gate_raw.copy()
         if _gate.shape != session.alpha_raw.shape:
@@ -416,10 +427,13 @@ def render_composite(cu, session: Session, params: dict):
         # inside actor, which keep alpha=0). halo_px>0 dilates the gate so a
         # band of NN values around the SAM2 silhouette survives — recovers
         # hair / motion-blur detail. trim_chroma>0 removes screen-colored
-        # pixels from the gate first. See _trimap_fuse and apply_sam2_gate.
+        # pixels from the gate first. fill_holes>0 fills alpha=0 holes inside
+        # the gate at non-screen-color pixels (rescues yellow/skin/red NN
+        # dropouts). See _trimap_fuse and apply_sam2_gate.
         _src_rgb = session.original_rgb if session.original_rgb is not None else session.fg_rgb
         alpha = _trimap_fuse(session.alpha_raw, _gate, source_rgb=_src_rgb,
-                             screen_type="green", trim_chroma=trim_chroma, halo_px=halo_px)
+                             screen_type="green", trim_chroma=trim_chroma, halo_px=halo_px,
+                             fill_holes=fill_holes)
         if sam2_margin > 0:
             alpha = _dilate_mask(alpha, sam2_margin)
         if sam2_soften > 0:
@@ -582,6 +596,12 @@ class PersistentWindow(QtWidgets.QWidget):
             # combine — kills "holes" at silhouette edges where SAM2 claims
             # green but NN keyed transparent. SAM2-only control.
             "trim_chroma": 0,
+            # FILL HOLES: color-aware interior alpha-zero fill. 0 = off
+            # (bit-identical). >0 fills alpha=0 holes inside the SAM2 gate at
+            # non-screen-color pixels — rescues NN dropouts on yellow shirts,
+            # skin, red. Higher = more lenient on what counts as "non-screen".
+            # SAM2-only control.
+            "fill_holes": 0,
             # FG SOURCE: "nn" = model FG (default, original behavior)
             #            "source" = original plate inside the matte (yellow-shirt rescue)
             #            "blend" = 50/50 NN + source (built but not exposed in UI yet)
@@ -1321,6 +1341,29 @@ class PersistentWindow(QtWidgets.QWidget):
         self.trim_chroma_value_label.setToolTip(_TRIM_TOOLTIP)
         grid.addWidget(self.trim_chroma_value_label, 6, 2)
 
+        # --- FILL HOLES: color-aware interior alpha-zero fill (slider 0-100 integer). ---
+        # SAM2-only. Fills alpha=0 holes INSIDE the SAM2 gate at pixels whose
+        # source RGB is NOT screen-colored — rescues NN dropouts on yellow
+        # shirts / skin / red while leaving correctly-killed green pixels alone.
+        # 0 = bit-identical. Higher = more lenient (more pixels qualify as
+        # "non-screen"). Differs from TRIM SAM2: trim removes pixels FROM the
+        # gate (invisible 0×1→0×0); fill flips alpha at low-alpha pixels (visible).
+        _FILL_TOOLTIP = ("FILL HOLES — fills NN alpha=0 dropouts inside SAM2 mask, but only for non-screen-color pixels.\n"
+                         "0 = off (bit-identical). 30-60 typical. Higher = more aggressive.")
+        self.fill_holes_label_widget = _label("FILL HOLES")
+        self.fill_holes_label_widget.setToolTip(_FILL_TOOLTIP)
+        grid.addWidget(self.fill_holes_label_widget, 7, 0)
+        self.fill_holes_slider = JumpSlider(QtCore.Qt.Horizontal)
+        self.fill_holes_slider.setRange(0, 100)
+        self.fill_holes_slider.setValue(int(self._params["fill_holes"]))
+        self.fill_holes_slider.valueChanged.connect(self._on_fill_holes_changed)
+        self.fill_holes_slider.setToolTip(_FILL_TOOLTIP)
+        grid.addWidget(self.fill_holes_slider, 7, 1)
+        self.fill_holes_value_label = _label(f"{int(self._params['fill_holes'])}", "#0ff")
+        self.fill_holes_value_label.setMinimumWidth(42)
+        self.fill_holes_value_label.setToolTip(_FILL_TOOLTIP)
+        grid.addWidget(self.fill_holes_value_label, 7, 2)
+
         # --- FG SOURCE: NN vs SOURCE radio buttons ---
         # Path A "warm wardrobe rescue" (yellow shirts going pink). NN = current
         # behavior (model paints the FG); SOURCE = use the original plate inside
@@ -1332,7 +1375,7 @@ class PersistentWindow(QtWidgets.QWidget):
                           "SOURCE: original plate, despilled. Real color, more spill risk.")
         self.fg_source_label_widget = _label("FG SOURCE")
         self.fg_source_label_widget.setToolTip(_FGSRC_TOOLTIP)
-        grid.addWidget(self.fg_source_label_widget, 7, 0)
+        grid.addWidget(self.fg_source_label_widget, 8, 0)
         _fgsrc_row = QtWidgets.QWidget()
         _fgsrc_row.setStyleSheet("background: transparent; border: none;")
         _fgsrc_layout = QtWidgets.QHBoxLayout(_fgsrc_row)
@@ -1361,7 +1404,7 @@ class PersistentWindow(QtWidgets.QWidget):
         _fgsrc_layout.addWidget(self.fg_source_btn_nn)
         _fgsrc_layout.addWidget(self.fg_source_btn_src)
         _fgsrc_layout.addStretch(1)
-        grid.addWidget(_fgsrc_row, 7, 1, 1, 2)
+        grid.addWidget(_fgsrc_row, 8, 1, 1, 2)
 
         grid.setColumnStretch(1, 1)
         parent_layout.addWidget(panel)
@@ -1445,6 +1488,15 @@ class PersistentWindow(QtWidgets.QWidget):
         self._schedule_render()
         self._schedule_save()
 
+    def _on_fill_holes_changed(self, value: int):
+        # Slider 0-100 integer. SAM2-only — visible effect requires an active
+        # SAM2 mask (greyed-out otherwise via _update_sam2_slider_state).
+        # 0 = bit-identical (helper short-circuits before any work).
+        self._params["fill_holes"] = int(value)
+        self.fill_holes_value_label.setText(f"{int(value)}")
+        self._schedule_render()
+        self._schedule_save()
+
     # WHAT IT DOES: FG SOURCE radio handler. Switches between NN (model FG —
     #   default) and SOURCE (original plate inside the matte — Mocha-style
     #   warm-wardrobe rescue). Writes to live_params.json immediately so a
@@ -1484,7 +1536,9 @@ class PersistentWindow(QtWidgets.QWidget):
                   self.halo_slider, self.halo_value_label,
                   self.halo_label_widget,
                   self.trim_chroma_slider, self.trim_chroma_value_label,
-                  self.trim_chroma_label_widget):
+                  self.trim_chroma_label_widget,
+                  self.fill_holes_slider, self.fill_holes_value_label,
+                  self.fill_holes_label_widget):
             try:
                 w.setEnabled(sam2_active)
             except Exception:
@@ -1502,6 +1556,8 @@ class PersistentWindow(QtWidgets.QWidget):
             except Exception: pass
             try: self.trim_chroma_label_widget.setText("TRIM SAM2")
             except Exception: pass
+            try: self.fill_holes_label_widget.setText("FILL HOLES")
+            except Exception: pass
         else:
             # Short suffix — long phrasing crowded the slider row. Tooltip still
             # carries the full "needs Click to Mask" explanation on hover.
@@ -1512,6 +1568,8 @@ class PersistentWindow(QtWidgets.QWidget):
             try: self.halo_label_widget.setText("HALO (mask)")
             except Exception: pass
             try: self.trim_chroma_label_widget.setText("TRIM SAM2 (mask)")
+            except Exception: pass
+            try: self.fill_holes_label_widget.setText("FILL HOLES (mask)")
             except Exception: pass
 
     # WHAT IT DOES: Debounces live_params.json writes. Every slider move calls this;
@@ -1623,7 +1681,7 @@ class PersistentWindow(QtWidgets.QWidget):
         # with the correct state.
         merged = dict(self._params)
         for k, v in params.items():
-            if k in ("despill", "despeckle", "despeckleSize", "background", "fg_source", "trim_chroma"):
+            if k in ("despill", "despeckle", "despeckleSize", "background", "fg_source", "trim_chroma", "fill_holes"):
                 merged[k] = v
         # Sync checkbox UI and self._params NOW — before any render fires — so that
         # every code path below uses the correct despeckle value. blockSignals prevents
@@ -1734,6 +1792,7 @@ class PersistentWindow(QtWidgets.QWidget):
                 matte_soften = float(params_for_matte.get("sam2_soften", 0))
                 matte_halo = int(params_for_matte.get("halo_px", 0))
                 matte_trim = int(params_for_matte.get("trim_chroma", 0))
+                matte_fill = int(params_for_matte.get("fill_holes", 0))
                 if (self.session.alpha_raw is not None
                         and self.session.sam2_gate_raw is not None):
                     _gate = self.session.sam2_gate_raw.copy()
@@ -1756,7 +1815,8 @@ class PersistentWindow(QtWidgets.QWidget):
                                   else self.session.fg_rgb)
                     alpha = _trimap_fuse(self.session.alpha_raw, _gate,
                                          source_rgb=_src_rgb_m, screen_type="green",
-                                         trim_chroma=matte_trim, halo_px=matte_halo)
+                                         trim_chroma=matte_trim, halo_px=matte_halo,
+                                         fill_holes=matte_fill)
                     if matte_margin > 0:
                         alpha = _dilate_mask(alpha, matte_margin)
                     if matte_soften > 0:
