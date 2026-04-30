@@ -471,6 +471,14 @@ def cmd_cache(input_path, session_dir, settings):
 
         cv2.imwrite(str(sess / "fg.png"), fg_bgr_u16)
         cv2.imwrite(str(sess / "alpha.png"), alpha_u16)
+        # Also write the raw source plate as original.png so the viewer's
+        # FG SOURCE toggle (NN / SOURCE / BLEND) can substitute true source
+        # color for the model's FG output. Mirrors what the Resolve panel
+        # writes; without this, AE viewer's SOURCE mode silently falls
+        # through to NN. uint16 BGR to match fg.png format/precision.
+        orig_u16 = (np.clip(img_rgb, 0, 1) * 65535.0).astype(np.uint16)
+        orig_bgr_u16 = cv2.cvtColor(orig_u16, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(str(sess / "original.png"), orig_bgr_u16)
 
         meta = {
             "source": str(input_path),
