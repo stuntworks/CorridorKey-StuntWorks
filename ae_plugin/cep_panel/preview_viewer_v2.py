@@ -686,11 +686,11 @@ class PersistentWindow(QtWidgets.QWidget):
             "border: 1px solid #d55; border-radius: 12px; font-size: 12px; font-weight: 600;"
         )
         self._sam_invert_btn.setToolTip(
-            "INVERT MASK — flips the SAM2 mask polarity.\n"
-            "OFF: mask KEEPS what your dots cover (default subject mask).\n"
-            "ON:  mask REMOVES what your dots cover (anti-mask / garbage matte).\n"
-            "Toggle does NOT clear your dots — same dots, opposite result.\n"
-            "For garbage-matte workflow: CLEAR first, INVERT on, then click on junk."
+            "INVERT MASK — SAM2 removes what you click instead of keeping it.\n"
+            "Use for imperfect green screens: click on garbage (floor, props, crew, taped seams)\n"
+            "to subtract them from the matte. The NN still handles the actor edges.\n"
+            "DO NOT click on the actor while INVERT is on — you'll cut a hole in them.\n"
+            "Toggling this auto-clears existing dots."
         )
         self._sam_invert_btn.setChecked(bool(self._params.get("sam_invert", False)))
         self._sam_invert_btn.clicked.connect(self._on_sam_invert_clicked)
@@ -1522,26 +1522,33 @@ class PersistentWindow(QtWidgets.QWidget):
                     return True
         return super().eventFilter(obj, event)
 
-    # WHAT IT DOES: Toggles SAM2 INVERT MASK mode. Pure polarity flip — does
-    #   NOT clear dots or reset SAM2 state. Mirrors Resolve viewer's
-    #   _on_sam_invert_clicked — keep behavior identical for plugin parity.
-    #   See Resolve viewer for full design rationale (auto-clear was
-    #   live-tested 2026-04-29 and produced confusing "everything sprung back"
-    #   behavior on clips with weak NN matte; polarity-only flip matches
-    #   user's "flip the result" mental model).
-    # DEPENDS-ON: self._sam_invert_btn checked state, self._params.
-    # AFFECTS: self._params["sam_invert"], live_params.json, repaint.
+    # WHAT IT DOES: Toggles SAM2 INVERT MASK mode. When ON, SAM2's mask
+    #   SUBTRACTS from the NN matte instead of gating it (garbage-matte mode
+    #   for imperfect green screens — click on floor / crew / props / seams).
+    #   Toggling auto-clears existing dots because the same dots mean the
+    #   opposite thing (positive click = "keep this" in NN mode → "remove
+    #   this" in INVERT mode); without auto-clear the user would silently
+    #   get the inverse of their intent.
+    # DEPENDS-ON: self._sam_invert_btn checked state, self._params,
+    #   self._clear_sam_points (handles dots/gate clear + re-render).
+    # AFFECTS: self._params["sam_invert"], dots cleared, gate cleared, repaint.
+    # Mirrors Resolve viewer's _on_sam_invert_clicked — keep behavior identical.
     def _on_sam_invert_clicked(self, checked):
         self._params["sam_invert"] = bool(checked)
+        # Clear existing SAM2 state — flipping polarity changes the meaning
+        # of every existing click. _clear_sam_points handles re-render.
+        self._clear_sam_points()
+        # Persist immediately so panel-side consumers see the new value.
         try:
             self._save_live_params_now()
         except Exception:
             pass
-        self._render_now()
+        # Update status to confirm the mode flip (overwrites the "cleared"
+        # message _clear_sam_points just set).
         if checked:
-            self.status.setText("INVERT ON — mask polarity flipped (same dots, opposite result).")
+            self.status.setText("INVERT ON — SAM2 will REMOVE what you click. Click on garbage, NOT actor.")
         else:
-            self.status.setText("INVERT OFF — back to normal SAM2 mask.")
+            self.status.setText("INVERT OFF — SAM2 will KEEP what you click (default).")
 
     # WHAT IT DOES: Clears all SAM click points and resets status bar.
     # DEPENDS-ON: self._sam_display_pts, _repaint_both to redraw without dots.
