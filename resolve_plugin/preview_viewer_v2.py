@@ -259,15 +259,17 @@ EDGE_FEATHER_KSIZE = 11
 EDGE_FEATHER_SIGMA = 2.5
 
 
-def _trimap_fuse(alpha_raw, gate):
+def _trimap_fuse(alpha_raw, gate, invert: bool = False):
     # WHAT IT DOES: Uses SAM2 as a pure GARBAGE MATTE — crops the background
     #   without touching alpha_raw values inside the actor. The NN alpha is now
     #   reliably solid inside the body (post tan-vest alpha-hint fix), so this
     #   step should NOT try to force, multiply, or threshold interior values.
     #   Steps: (1) binarize the gate at 0.5; (2) close with a large kernel to
     #   bridge inter-dot confidence dips; (3) soften the edge with a small
-    #   Gaussian; (4) multiply with alpha_raw. Real holes survive because
-    #   alpha_raw is 0 in them.
+    #   Gaussian; (4) multiply with alpha_raw — OR (1 - soft) when invert=True
+    #   so SAM2 SUBTRACTS the clicked region instead of keeping it (garbage-
+    #   matte mode: click on floor/crew/props to remove them, NN matte handles
+    #   the actor edges).
     # DEPENDS-ON: numpy, cv2 (morphology + Gaussian), alpha_raw and gate same
     #   shape, both float32 [0..1].
     # AFFECTS: returns a new float32 array; inputs unchanged.
@@ -280,7 +282,7 @@ def _trimap_fuse(alpha_raw, gate):
         (EDGE_FEATHER_KSIZE, EDGE_FEATHER_KSIZE),
         EDGE_FEATHER_SIGMA,
     )
-    return apply_sam2_gate(alpha_raw, soft, invert=False).astype(np.float32)
+    return apply_sam2_gate(alpha_raw, soft, invert=invert).astype(np.float32)
 
 
 # ===== Persistent session state =====
@@ -407,7 +409,10 @@ def render_composite(cu, session: Session, params: dict):
         # Trimap fusion: solid 1.0 inside SAM2 confident core where NN saw
         # something; multiply-as-before everywhere else (including real holes
         # inside actor, which keep alpha=0). See _trimap_fuse.
-        alpha = _trimap_fuse(session.alpha_raw, _gate)
+        # invert: when sam_invert is on, SAM2 acts as garbage matte — clicked
+        # region is REMOVED instead of kept. The NN matte still owns the edges.
+        _sam_invert = bool(params.get("sam_invert", False))
+        alpha = _trimap_fuse(session.alpha_raw, _gate, invert=_sam_invert)
         if sam2_margin > 0:
             alpha = _dilate_mask(alpha, sam2_margin)
         if sam2_soften > 0:
@@ -564,6 +569,10 @@ class PersistentWindow(QtWidgets.QWidget):
             #            "source" = original plate inside the matte (yellow-shirt rescue)
             #            "blend" = 50/50 NN + source (built but not exposed in UI yet)
             "fg_source": "nn",
+            # SAM2 INVERT: False = keep what you click (default, original).
+            #              True = REMOVE what you click (garbage-matte mode for
+            #              imperfect screens — click floor/crew/props/seams).
+            "sam_invert": False,
         }
         # Drop-stale: if a new update comes in while we're painting, we only keep
         # the latest one. _pending is None when idle, or a dict when a render is
@@ -970,6 +979,25 @@ class PersistentWindow(QtWidgets.QWidget):
         )
         self._sam_apply_btn.clicked.connect(self._apply_sam_mask)
         sam_row.addWidget(self._sam_apply_btn)
+        # INVERT MASK — turns SAM2 into a garbage matte (clicked region is
+        # REMOVED instead of kept). Toggling this auto-clears existing dots
+        # because the same dots mean the opposite thing.
+        self._sam_invert_btn = QtWidgets.QPushButton("INVERT")
+        self._sam_invert_btn.setCheckable(True)
+        self._sam_invert_btn.setStyleSheet(
+            "background-color: #111; color: #d55; padding: 5px 12px; "
+            "border: 1px solid #d55; border-radius: 12px; font-size: 12px; font-weight: 600;"
+        )
+        self._sam_invert_btn.setToolTip(
+            "INVERT MASK — SAM2 removes what you click instead of keeping it.\n"
+            "Use for imperfect green screens: click on garbage (floor, props, crew, taped seams)\n"
+            "to subtract them from the matte. The NN still handles the actor edges.\n"
+            "DO NOT click on the actor while INVERT is on — you'll cut a hole in them.\n"
+            "Toggling this auto-clears existing dots."
+        )
+        self._sam_invert_btn.setChecked(bool(self._params.get("sam_invert", False)))
+        self._sam_invert_btn.clicked.connect(self._on_sam_invert_clicked)
+        sam_row.addWidget(self._sam_invert_btn)
         sam_row.addStretch(1)  # closing stretch
         layout.addLayout(sam_row)
 
@@ -1842,6 +1870,29 @@ class PersistentWindow(QtWidgets.QWidget):
                     self._draw_sam_overlay()
                     return True
         return super().eventFilter(obj, event)
+
+    # WHAT IT DOES: Toggles SAM2 INVERT MASK mode. When ON, SAM2's mask
+    #   SUBTRACTS from the NN matte instead of gating it (garbage-matte mode
+    #   for imperfect green screens — click on floor / crew / props / seams).
+    #   Toggling auto-clears existing dots because the same dots mean the
+    #   opposite thing (positive click = "keep this" in NN mode → "remove
+    #   this" in INVERT mode); without auto-clear the user would silently
+    #   get the inverse of their intent.
+    # DEPENDS-ON: self._sam_invert_btn checked state, self._params,
+    #   self._clear_sam_points (handles save + re-render).
+    # AFFECTS: self._params["sam_invert"], dots cleared, gate cleared, repaint.
+    def _on_sam_invert_clicked(self, checked):
+        self._params["sam_invert"] = bool(checked)
+        # Clear existing SAM2 state — flipping polarity changes the meaning
+        # of every existing click. _clear_sam_points handles _save_live_params_now
+        # and _render_now() for us.
+        self._clear_sam_points()
+        # Update status to confirm the mode flip (overwrites the "cleared"
+        # message _clear_sam_points just set).
+        if checked:
+            self.status.setText("INVERT ON — SAM2 will REMOVE what you click. Click on garbage, NOT actor.")
+        else:
+            self.status.setText("INVERT OFF — SAM2 will KEEP what you click (default).")
 
     # WHAT IT DOES: Clears all SAM click points, deletes sam2_mask.png gate, and
     #   restores the NN alpha backup. No confirm dialog — the dialog was invisible

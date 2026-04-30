@@ -459,6 +459,11 @@ def get_settings():
         # wardrobe like yellow shirts that the NN paints pink) | "blend" (50/50).
         # Viewer-owned; overridden by _merge_live_params.
         "fg_source": "nn",
+        # SAM2 INVERT: False (default) = SAM2 KEEPS what you click (subject mask).
+        # True = SAM2 REMOVES what you click (garbage matte for imperfect screens —
+        # click on floor / crew / props / taped seams). Viewer-owned; overridden
+        # by _merge_live_params.
+        "sam_invert": False,
     }
 
 # WHAT IT DOES: Overrides panel's despill / despeckle settings with the v2 viewer's
@@ -496,6 +501,9 @@ def _merge_live_params(settings):
             _v = str(lp["fg_source"]).lower()
             if _v in ("nn", "source", "blend"):
                 out["fg_source"] = _v
+        if "sam_invert" in lp:
+            try: out["sam_invert"] = bool(lp["sam_invert"])
+            except (ValueError, TypeError): pass
         if "sam_positive" in lp or "sam_negative" in lp:
             sam_points["positive"] = [tuple(p) for p in lp.get("sam_positive", [])]
             sam_points["negative"] = [tuple(p) for p in lp.get("sam_negative", [])]
@@ -2178,7 +2186,7 @@ def _key_one_scrub_frame():
                 _gate = _cv2.resize(_gate, (mt.shape[1], mt.shape[0]),
                                     interpolation=_cv2.INTER_LINEAR)
             from sam2_combine import apply_sam2_gate
-            mt = apply_sam2_gate(mt, _gate, invert=False)
+            mt = apply_sam2_gate(mt, _gate, invert=bool(settings.get("sam_invert", False)))
         if fg is not None and mt is not None:
             out_dir = ctx["scrub_dir"] / f"{frame_idx:03d}"
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -2760,10 +2768,10 @@ def on_process_range(ev):
                         _gate = _dilate_sam2_mask(_braw_sam2_video_masks[fidx], margin=settings.get("sam2_margin", SAM2_MATTE_MARGIN))
                         _gate = _soften_sam2_mask(_gate, soften=settings.get("sam2_soften", 0))
                         _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
-                        mt = apply_sam2_gate(_mt2d, _gate, invert=False)
+                        mt = apply_sam2_gate(_mt2d, _gate, invert=bool(settings.get("sam_invert", False)))
                     elif _braw_sam2_gate is not None:
                         _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
-                        mt = apply_sam2_gate(_mt2d, _braw_sam2_gate, invert=False)
+                        mt = apply_sam2_gate(_mt2d, _braw_sam2_gate, invert=bool(settings.get("sam_invert", False)))
                 choke_px = int(settings.get("choke", 0))
                 if choke_px > 0 and mt is not None:
                     _k = choke_px * 2 + 1
@@ -2971,7 +2979,7 @@ def on_process_range(ev):
                         _gate = _dilate_sam2_mask(sam2_video_masks[range_idx], margin=settings.get("sam2_margin", SAM2_MATTE_MARGIN))
                         _gate = _soften_sam2_mask(_gate, soften=settings.get("sam2_soften", 0))
                         _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
-                        mt = apply_sam2_gate(_mt2d, _gate, invert=False)
+                        mt = apply_sam2_gate(_mt2d, _gate, invert=bool(settings.get("sam_invert", False)))
                     else:
                         # Fallback path — static gate loaded lazily on first frame so we have
                         # real frame.shape for the resize check inside _load_sam2_output_gate.
@@ -2982,7 +2990,7 @@ def on_process_range(ev):
                                 _tlog("SAM2 static gate loaded — applying same mask to all range frames (no propagation)")
                         if _static_sam2_gate is not None:
                             _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
-                            mt = apply_sam2_gate(_mt2d, _static_sam2_gate, invert=False)
+                            mt = apply_sam2_gate(_mt2d, _static_sam2_gate, invert=bool(settings.get("sam_invert", False)))
                 choke_px = int(settings.get("choke", 0))
                 if choke_px > 0 and mt is not None:
                     k = choke_px * 2 + 1
