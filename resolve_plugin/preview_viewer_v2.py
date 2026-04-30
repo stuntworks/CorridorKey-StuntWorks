@@ -1442,10 +1442,10 @@ class PersistentWindow(QtWidgets.QWidget):
             "SAM2 misses across visual boundaries (straps, props). Off = "
             "bit-identical to before."
         )
-        self.sam2_additive_label_widget = _label("SAM2 ADD")
+        self.sam2_additive_label_widget = _label("SAM2 ON/OFF")
         self.sam2_additive_label_widget.setToolTip(_SAM2_ADDITIVE_TOOLTIP)
         grid.addWidget(self.sam2_additive_label_widget, 9, 0)
-        self.sam2_additive_checkbox = QtWidgets.QCheckBox("SAM2 ADDITIVE")
+        self.sam2_additive_checkbox = QtWidgets.QCheckBox("")
         self.sam2_additive_checkbox.setStyleSheet(
             "QCheckBox { color: #8ab; border: none; background: transparent; "
             "font-size: 12px; font-weight: 600; letter-spacing: 0.5px; } "
