@@ -454,6 +454,9 @@ def get_settings():
         # _merge_live_params() which pulls the actual values from live_params.json
         "sam2_margin": 0.0,
         "sam2_soften": 0.0,
+        # HALO: trimap-guided halo band width (px). Viewer-owned default 0 =
+        # bit-identical to no-halo behavior; overridden by _merge_live_params.
+        "halo_px": 0,
         # FG SOURCE: "nn" (default = model FG, original behavior) | "source"
         # (use the original plate inside the matte — Mocha-style; rescues warm
         # wardrobe like yellow shirts that the NN paints pink) | "blend" (50/50).
@@ -491,6 +494,9 @@ def _merge_live_params(settings):
             except (ValueError, TypeError): pass
         if "sam2_soften" in lp:
             try: out["sam2_soften"] = max(0.0, float(lp["sam2_soften"]))
+            except (ValueError, TypeError): pass
+        if "halo_px" in lp:
+            try: out["halo_px"] = max(0, int(lp["halo_px"]))
             except (ValueError, TypeError): pass
         if "fg_source" in lp:
             _v = str(lp["fg_source"]).lower()
@@ -2178,7 +2184,7 @@ def _key_one_scrub_frame():
                 _gate = _cv2.resize(_gate, (mt.shape[1], mt.shape[0]),
                                     interpolation=_cv2.INTER_LINEAR)
             from sam2_combine import apply_sam2_gate
-            mt = apply_sam2_gate(mt, _gate, invert=False)
+            mt = apply_sam2_gate(mt, _gate, invert=False, halo_px=int(ctx["settings"].get("halo_px", 0)))
         if fg is not None and mt is not None:
             out_dir = ctx["scrub_dir"] / f"{frame_idx:03d}"
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -2756,14 +2762,15 @@ def on_process_range(ev):
                 # AFFECTS: mt for this frame only
                 if mt is not None:
                     from sam2_combine import apply_sam2_gate
+                    _halo_px = int(settings.get("halo_px", 0))
                     if _braw_sam2_video_masks and fidx in _braw_sam2_video_masks:
                         _gate = _dilate_sam2_mask(_braw_sam2_video_masks[fidx], margin=settings.get("sam2_margin", SAM2_MATTE_MARGIN))
                         _gate = _soften_sam2_mask(_gate, soften=settings.get("sam2_soften", 0))
                         _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
-                        mt = apply_sam2_gate(_mt2d, _gate, invert=False)
+                        mt = apply_sam2_gate(_mt2d, _gate, invert=False, halo_px=_halo_px)
                     elif _braw_sam2_gate is not None:
                         _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
-                        mt = apply_sam2_gate(_mt2d, _braw_sam2_gate, invert=False)
+                        mt = apply_sam2_gate(_mt2d, _braw_sam2_gate, invert=False, halo_px=_halo_px)
                 choke_px = int(settings.get("choke", 0))
                 if choke_px > 0 and mt is not None:
                     _k = choke_px * 2 + 1
@@ -2966,12 +2973,13 @@ def on_process_range(ev):
                 # AFFECTS: mt (alpha) — multiplied by gate, zeroing pixels outside the matte.
                 if mt is not None:
                     from sam2_combine import apply_sam2_gate
+                    _halo_px = int(settings.get("halo_px", 0))
                     if sam2_video_masks and range_idx in sam2_video_masks:
                         # Normal path — per-frame mask from video propagation.
                         _gate = _dilate_sam2_mask(sam2_video_masks[range_idx], margin=settings.get("sam2_margin", SAM2_MATTE_MARGIN))
                         _gate = _soften_sam2_mask(_gate, soften=settings.get("sam2_soften", 0))
                         _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
-                        mt = apply_sam2_gate(_mt2d, _gate, invert=False)
+                        mt = apply_sam2_gate(_mt2d, _gate, invert=False, halo_px=_halo_px)
                     else:
                         # Fallback path — static gate loaded lazily on first frame so we have
                         # real frame.shape for the resize check inside _load_sam2_output_gate.
@@ -2982,7 +2990,7 @@ def on_process_range(ev):
                                 _tlog("SAM2 static gate loaded — applying same mask to all range frames (no propagation)")
                         if _static_sam2_gate is not None:
                             _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
-                            mt = apply_sam2_gate(_mt2d, _static_sam2_gate, invert=False)
+                            mt = apply_sam2_gate(_mt2d, _static_sam2_gate, invert=False, halo_px=_halo_px)
                 choke_px = int(settings.get("choke", 0))
                 if choke_px > 0 and mt is not None:
                     k = choke_px * 2 + 1
