@@ -43,7 +43,7 @@ from PySide6 import QtWidgets, QtGui, QtCore
 # the package __init__ which loads torch (40-60s) and breaks the viewer's
 # subprocess that doesn't have torch in its env.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from sam2_combine import apply_sam2_gate
+from sam2_combine import apply_sam2_gate, trim_gate_by_chroma
 
 # WHAT IT DOES: Installs diagnostic crash / exception loggers as early as possible.
 #   faulthandler dumps Python tracebacks on native signals (SIGSEGV, stack overflow,
@@ -259,19 +259,23 @@ EDGE_FEATHER_KSIZE = 11
 EDGE_FEATHER_SIGMA = 2.5
 
 
-def _trimap_fuse(alpha_raw, gate, halo_px=0):
+def _trimap_fuse(alpha_raw, gate, source_rgb=None, screen_type="green", trim_chroma=0, halo_px=0):
     # WHAT IT DOES: Uses SAM2 as a pure GARBAGE MATTE — crops the background
     #   without touching alpha_raw values inside the actor. The NN alpha is now
     #   reliably solid inside the body (post tan-vest alpha-hint fix), so this
     #   step should NOT try to force, multiply, or threshold interior values.
-    #   Steps: (1) binarize the gate at 0.5; (2) close with a large kernel to
-    #   bridge inter-dot confidence dips; (3) soften the edge with a small
-    #   Gaussian; (4) multiply with alpha_raw via apply_sam2_gate (which
-    #   applies the trimap halo dilation when halo_px > 0). Real holes
-    #   survive because alpha_raw is 0 in them.
+    #   Steps: (0) optional chroma-aware trim (TRIM SAM2 slider) on the gate
+    #   when trim_chroma > 0 and source_rgb provided — removes screen-colored
+    #   pixels from the gate before edge softening; (1) binarize the gate at
+    #   0.5; (2) close with a large kernel to bridge inter-dot confidence dips;
+    #   (3) soften the edge with a small Gaussian; (4) multiply with alpha_raw
+    #   via apply_sam2_gate (which applies the trimap halo dilation when
+    #   halo_px > 0). Real holes survive because alpha_raw is 0 in them.
     # DEPENDS-ON: numpy, cv2 (morphology + Gaussian), alpha_raw and gate same
     #   shape, both float32 [0..1]. halo_px forwarded to apply_sam2_gate.
     # AFFECTS: returns a new float32 array; inputs unchanged.
+    if trim_chroma and trim_chroma > 0 and source_rgb is not None:
+        gate = trim_gate_by_chroma(gate, source_rgb, screen_type, trim_chroma)
     binary = (gate > 0.5).astype(np.uint8) * 255
     if GATE_BRIDGE_PX >= 3:
         kernel = np.ones((GATE_BRIDGE_PX, GATE_BRIDGE_PX), np.uint8)
@@ -401,6 +405,7 @@ def render_composite(cu, session: Session, params: dict):
     sam2_margin = float(params.get("sam2_margin", 0))
     sam2_soften = float(params.get("sam2_soften", 0))
     halo_px = int(params.get("halo_px", 0))
+    trim_chroma = int(params.get("trim_chroma", 0))
     if session.alpha_raw is not None and session.sam2_gate_raw is not None:
         _gate = session.sam2_gate_raw.copy()
         if _gate.shape != session.alpha_raw.shape:
@@ -410,8 +415,11 @@ def render_composite(cu, session: Session, params: dict):
         # something; multiply-as-before everywhere else (including real holes
         # inside actor, which keep alpha=0). halo_px>0 dilates the gate so a
         # band of NN values around the SAM2 silhouette survives — recovers
-        # hair / motion-blur detail. See _trimap_fuse and apply_sam2_gate.
-        alpha = _trimap_fuse(session.alpha_raw, _gate, halo_px=halo_px)
+        # hair / motion-blur detail. trim_chroma>0 removes screen-colored
+        # pixels from the gate first. See _trimap_fuse and apply_sam2_gate.
+        _src_rgb = session.original_rgb if session.original_rgb is not None else session.fg_rgb
+        alpha = _trimap_fuse(session.alpha_raw, _gate, source_rgb=_src_rgb,
+                             screen_type="green", trim_chroma=trim_chroma, halo_px=halo_px)
         if sam2_margin > 0:
             alpha = _dilate_mask(alpha, sam2_margin)
         if sam2_soften > 0:
@@ -569,6 +577,11 @@ class PersistentWindow(QtWidgets.QWidget):
             # NN values around the silhouette survives — recovers hair /
             # motion-blur detail at the SAM2 edge. SAM2-only control.
             "halo_px": 0,
+            # TRIM SAM2: chroma-aware mask refinement. 0 = off (bit-identical).
+            # >0 removes screen-colored pixels from the SAM2 gate before
+            # combine — kills "holes" at silhouette edges where SAM2 claims
+            # green but NN keyed transparent. SAM2-only control.
+            "trim_chroma": 0,
             # FG SOURCE: "nn" = model FG (default, original behavior)
             #            "source" = original plate inside the matte (yellow-shirt rescue)
             #            "blend" = 50/50 NN + source (built but not exposed in UI yet)
@@ -1288,6 +1301,26 @@ class PersistentWindow(QtWidgets.QWidget):
         self.halo_value_label.setToolTip(_HALO_TOOLTIP)
         grid.addWidget(self.halo_value_label, 5, 2)
 
+        # --- TRIM SAM2: chroma-aware mask refinement (slider 0-100 integer). ---
+        # SAM2-only. Removes screen-colored pixels from the SAM2 gate before
+        # combine — kills "holes" at silhouette edges where SAM2 claims green
+        # but NN keyed transparent. NN edge detail preserved. 0 = bit-identical.
+        _TRIM_TOOLTIP = ("TRIM SAM2 — removes screen-colored pixels from SAM2 mask edges.\n"
+                         "0 = off (bit-identical). 30-60 typical. Higher = more aggressive trim.")
+        self.trim_chroma_label_widget = _label("TRIM SAM2")
+        self.trim_chroma_label_widget.setToolTip(_TRIM_TOOLTIP)
+        grid.addWidget(self.trim_chroma_label_widget, 6, 0)
+        self.trim_chroma_slider = JumpSlider(QtCore.Qt.Horizontal)
+        self.trim_chroma_slider.setRange(0, 100)
+        self.trim_chroma_slider.setValue(int(self._params["trim_chroma"]))
+        self.trim_chroma_slider.valueChanged.connect(self._on_trim_chroma_changed)
+        self.trim_chroma_slider.setToolTip(_TRIM_TOOLTIP)
+        grid.addWidget(self.trim_chroma_slider, 6, 1)
+        self.trim_chroma_value_label = _label(f"{int(self._params['trim_chroma'])}", "#0ff")
+        self.trim_chroma_value_label.setMinimumWidth(42)
+        self.trim_chroma_value_label.setToolTip(_TRIM_TOOLTIP)
+        grid.addWidget(self.trim_chroma_value_label, 6, 2)
+
         # --- FG SOURCE: NN vs SOURCE radio buttons ---
         # Path A "warm wardrobe rescue" (yellow shirts going pink). NN = current
         # behavior (model paints the FG); SOURCE = use the original plate inside
@@ -1299,7 +1332,7 @@ class PersistentWindow(QtWidgets.QWidget):
                           "SOURCE: original plate, despilled. Real color, more spill risk.")
         self.fg_source_label_widget = _label("FG SOURCE")
         self.fg_source_label_widget.setToolTip(_FGSRC_TOOLTIP)
-        grid.addWidget(self.fg_source_label_widget, 6, 0)
+        grid.addWidget(self.fg_source_label_widget, 7, 0)
         _fgsrc_row = QtWidgets.QWidget()
         _fgsrc_row.setStyleSheet("background: transparent; border: none;")
         _fgsrc_layout = QtWidgets.QHBoxLayout(_fgsrc_row)
@@ -1328,7 +1361,7 @@ class PersistentWindow(QtWidgets.QWidget):
         _fgsrc_layout.addWidget(self.fg_source_btn_nn)
         _fgsrc_layout.addWidget(self.fg_source_btn_src)
         _fgsrc_layout.addStretch(1)
-        grid.addWidget(_fgsrc_row, 6, 1, 1, 2)
+        grid.addWidget(_fgsrc_row, 7, 1, 1, 2)
 
         grid.setColumnStretch(1, 1)
         parent_layout.addWidget(panel)
@@ -1403,6 +1436,15 @@ class PersistentWindow(QtWidgets.QWidget):
         self._schedule_render()
         self._schedule_save()
 
+    def _on_trim_chroma_changed(self, value: int):
+        # Slider 0-100 integer. SAM2-only — visible effect requires an active
+        # SAM2 mask (greyed-out otherwise via _update_sam2_slider_state).
+        # 0 = bit-identical to no-trim path.
+        self._params["trim_chroma"] = int(value)
+        self.trim_chroma_value_label.setText(f"{int(value)}")
+        self._schedule_render()
+        self._schedule_save()
+
     # WHAT IT DOES: FG SOURCE radio handler. Switches between NN (model FG —
     #   default) and SOURCE (original plate inside the matte — Mocha-style
     #   warm-wardrobe rescue). Writes to live_params.json immediately so a
@@ -1440,7 +1482,9 @@ class PersistentWindow(QtWidgets.QWidget):
                   self.soften_slider, self.soften_value_label,
                   self.margin_label_widget, self.soften_label_widget,
                   self.halo_slider, self.halo_value_label,
-                  self.halo_label_widget):
+                  self.halo_label_widget,
+                  self.trim_chroma_slider, self.trim_chroma_value_label,
+                  self.trim_chroma_label_widget):
             try:
                 w.setEnabled(sam2_active)
             except Exception:
@@ -1456,6 +1500,8 @@ class PersistentWindow(QtWidgets.QWidget):
             except Exception: pass
             try: self.halo_label_widget.setText("HALO")
             except Exception: pass
+            try: self.trim_chroma_label_widget.setText("TRIM SAM2")
+            except Exception: pass
         else:
             # Short suffix — long phrasing crowded the slider row. Tooltip still
             # carries the full "needs Click to Mask" explanation on hover.
@@ -1464,6 +1510,8 @@ class PersistentWindow(QtWidgets.QWidget):
             try: self.soften_label_widget.setText("SOFTEN (mask)")
             except Exception: pass
             try: self.halo_label_widget.setText("HALO (mask)")
+            except Exception: pass
+            try: self.trim_chroma_label_widget.setText("TRIM SAM2 (mask)")
             except Exception: pass
 
     # WHAT IT DOES: Debounces live_params.json writes. Every slider move calls this;
@@ -1575,7 +1623,7 @@ class PersistentWindow(QtWidgets.QWidget):
         # with the correct state.
         merged = dict(self._params)
         for k, v in params.items():
-            if k in ("despill", "despeckle", "despeckleSize", "background", "fg_source"):
+            if k in ("despill", "despeckle", "despeckleSize", "background", "fg_source", "trim_chroma"):
                 merged[k] = v
         # Sync checkbox UI and self._params NOW — before any render fires — so that
         # every code path below uses the correct despeckle value. blockSignals prevents
@@ -1685,6 +1733,7 @@ class PersistentWindow(QtWidgets.QWidget):
                 matte_margin = float(params_for_matte.get("sam2_margin", 0))
                 matte_soften = float(params_for_matte.get("sam2_soften", 0))
                 matte_halo = int(params_for_matte.get("halo_px", 0))
+                matte_trim = int(params_for_matte.get("trim_chroma", 0))
                 if (self.session.alpha_raw is not None
                         and self.session.sam2_gate_raw is not None):
                     _gate = self.session.sam2_gate_raw.copy()
@@ -1702,7 +1751,12 @@ class PersistentWindow(QtWidgets.QWidget):
                         )
                     # Trimap fusion: solid 1.0 inside SAM2 confident core where
                     # NN saw something; multiply elsewhere. Real holes preserved.
-                    alpha = _trimap_fuse(self.session.alpha_raw, _gate, halo_px=matte_halo)
+                    _src_rgb_m = (self.session.original_rgb
+                                  if self.session.original_rgb is not None
+                                  else self.session.fg_rgb)
+                    alpha = _trimap_fuse(self.session.alpha_raw, _gate,
+                                         source_rgb=_src_rgb_m, screen_type="green",
+                                         trim_chroma=matte_trim, halo_px=matte_halo)
                     if matte_margin > 0:
                         alpha = _dilate_mask(alpha, matte_margin)
                     if matte_soften > 0:
