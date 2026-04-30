@@ -44,7 +44,7 @@ from PySide6 import QtWidgets, QtGui, QtCore
 # that doesn't have torch in its env. CK_ROOT is three levels up:
 # ae_plugin/cep_panel/preview_viewer_v2.py -> ae_plugin/cep_panel -> ae_plugin -> repo root.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-from sam2_combine import apply_sam2_gate, apply_sam2_gate_additive, trim_gate_by_chroma, fill_holes_color_aware
+from sam2_combine import apply_sam2_gate, apply_sam2_gate_additive, apply_sam2_gate_weighted, trim_gate_by_chroma, fill_holes_color_aware
 
 # WHAT IT DOES: Installs diagnostic crash / exception loggers as early as possible.
 #   faulthandler dumps Python tracebacks on native signals (SIGSEGV, stack overflow,
@@ -352,6 +352,7 @@ def render_composite(cu, session: Session, params: dict):
     trim_chroma = int(params.get("trim_chroma", 0))
     fill_holes = int(params.get("fill_holes", 0))
     sam2_additive = bool(params.get("sam2_additive", False))
+    sam2_weighted = bool(params.get("sam2_weighted", False))
     # DaVinci formula exactly: multiply NN × gate first, then dilate+soften the result.
     # Dilating the product spreads existing NN alpha values outward so MARGIN visibly
     # grows the body. Gate cuts background bleed. SOFTEN feathers the expanded edge.
@@ -367,7 +368,14 @@ def render_composite(cu, session: Session, params: dict):
             _gate = cv2.resize(_gate, (session.alpha_nn.shape[1], session.alpha_nn.shape[0]),
                                interpolation=cv2.INTER_LINEAR)
         _src_rgb = session.original_rgb if session.original_rgb is not None else session.fg_rgb
-        if sam2_additive:
+        if sam2_weighted:
+            # SMART BLEND: per-pixel weighted combine — NN trusted in green
+            # regions, SAM2 trusted off-green. Skips trim/fill/halo (the
+            # chroma-derived weight handles boundary blending).
+            alpha = np.clip(apply_sam2_gate_weighted(session.alpha_nn, _gate,
+                                                     _src_rgb, screen_type="green"),
+                            0.0, 1.0)
+        elif sam2_additive:
             # ADDITIVE mode: alpha = max(NN, gate * non_screen). SAM2 can ADD
             # confidence where NN missed but never SUBTRACT NN's correct alpha.
             # trim_chroma / fill_holes don't apply here (additive math has no
@@ -523,6 +531,10 @@ class PersistentWindow(QtWidgets.QWidget):
             # Preserves subject regions SAM2 misses across visual boundaries
             # (straps, props). Off = bit-identical to current behavior.
             "sam2_additive": False,
+            # SAM2 SMART BLEND: when True, per-pixel blends NN and SAM2 by
+            # green-presence (chroma-derived weight). Wins over sam2_additive
+            # when both are checked. Off = bit-identical.
+            "sam2_weighted": False,
         }
         # Drop-stale: if a new update comes in while we're painting, we only keep
         # the latest one. _pending is None when idle, or a dict when a render is
@@ -1117,6 +1129,35 @@ class PersistentWindow(QtWidgets.QWidget):
         self.sam2_additive_checkbox.toggled.connect(self._on_sam2_additive_changed)
         grid.addWidget(self.sam2_additive_checkbox, 9, 1, 1, 2)
 
+        # --- SAM2 SMART BLEND: weighted combine toggle (checkbox) ---
+        # Per-pixel blends NN alpha and SAM2 gate by chroma-derived weight:
+        # NN trusted in green regions (preserves hair / butt-across-strap),
+        # SAM2 trusted off-green (kills floor / props NN can't see). OFF =
+        # bit-identical. Wins over SAM2 ADDITIVE when both are checked.
+        # SAM2-only — has no visible effect when SAM2 is inactive.
+        _SAM2_WEIGHTED_TOOLTIP = (
+            "SMART BLEND — auto-blend NN and SAM2 per pixel. NN owns "
+            "green-screen regions (preserves fine detail like hair and "
+            "butt-across-strap). SAM2 owns non-green regions (kills "
+            "off-screen floor and props NN can't see). Off = bit-identical "
+            "to before."
+        )
+        self.sam2_weighted_label_widget = _label("SMART BLEND")
+        self.sam2_weighted_label_widget.setToolTip(_SAM2_WEIGHTED_TOOLTIP)
+        grid.addWidget(self.sam2_weighted_label_widget, 10, 0)
+        self.sam2_weighted_checkbox = QtWidgets.QCheckBox("")
+        self.sam2_weighted_checkbox.setStyleSheet(
+            "QCheckBox { color: #8ab; border: none; background: transparent; "
+            "font-size: 12px; font-weight: 600; letter-spacing: 0.5px; } "
+            "QCheckBox::indicator { width: 12px; height: 12px; border: 1px solid "
+            "#2a6a7a; border-radius: 2px; background: #001a28; } "
+            "QCheckBox::indicator:checked { background: #0ff; border-color: #0ff; }"
+        )
+        self.sam2_weighted_checkbox.setChecked(bool(self._params.get("sam2_weighted", False)))
+        self.sam2_weighted_checkbox.setToolTip(_SAM2_WEIGHTED_TOOLTIP)
+        self.sam2_weighted_checkbox.toggled.connect(self._on_sam2_weighted_changed)
+        grid.addWidget(self.sam2_weighted_checkbox, 10, 1, 1, 2)
+
         grid.setColumnStretch(1, 1)
         parent_layout.addWidget(panel)
 
@@ -1224,6 +1265,17 @@ class PersistentWindow(QtWidgets.QWidget):
         self._render_now()
         self._save_live_params_now()
 
+    # WHAT IT DOES: SMART BLEND checkbox handler. Toggles per-pixel weighted
+    #   NN/SAM2 combine. Wins over sam2_additive when both checked. Mirrors
+    #   Resolve viewer parity.
+    # DEPENDS-ON: self._params, _render_now, _save_live_params_now.
+    # AFFECTS: self._params["sam2_weighted"], repaint, persists to disk.
+    def _on_sam2_weighted_changed(self, checked: bool):
+        self._params["sam2_weighted"] = bool(checked)
+        self._local_change_time = time.perf_counter()
+        self._render_now()
+        self._save_live_params_now()
+
     # WHAT IT DOES: Debounces live_params.json writes. Every slider move calls this;
     #   the actual disk write happens 250ms after the LAST move. Prevents filesystem
     #   thrash on rapid drags.
@@ -1304,7 +1356,7 @@ class PersistentWindow(QtWidgets.QWidget):
                     pass  # PNGs unreadable — stale view is better than a crash
         merged = dict(self._params)
         for k, v in params.items():
-            if k in ("despill", "despeckle", "despeckleSize", "background", "sam2_margin", "sam2_soften", "halo_px", "trim_chroma", "fill_holes", "fg_source", "sam2_additive"):
+            if k in ("despill", "despeckle", "despeckleSize", "background", "sam2_margin", "sam2_soften", "halo_px", "trim_chroma", "fill_holes", "fg_source", "sam2_additive", "sam2_weighted"):
                 merged[k] = v
         if self._painting:
             self._pending = merged
@@ -1492,6 +1544,7 @@ class PersistentWindow(QtWidgets.QWidget):
                 _trim = int(params_for_matte.get("trim_chroma", 0))
                 _fill = int(params_for_matte.get("fill_holes", 0))
                 _additive = bool(params_for_matte.get("sam2_additive", False))
+                _weighted = bool(params_for_matte.get("sam2_weighted", False))
                 if self.session.alpha_nn is not None and self.session.sam2_gate_raw is not None:
                     _gate = self.session.sam2_gate_raw.copy()
                     # SAM2 returns the gate at 256x256 — must resize to alpha
@@ -1511,7 +1564,15 @@ class PersistentWindow(QtWidgets.QWidget):
                     _src_rgb_m = (self.session.original_rgb
                                   if self.session.original_rgb is not None
                                   else self.session.fg_rgb)
-                    if _additive:
+                    if _weighted:
+                        # SMART BLEND mirror of Composite branch — per-pixel
+                        # weighted NN/SAM2 by chroma. trim/fill_holes/halo
+                        # intentionally not applied here either.
+                        alpha = np.clip(apply_sam2_gate_weighted(self.session.alpha_nn,
+                                                                 _gate, _src_rgb_m,
+                                                                 screen_type="green"),
+                                        0.0, 1.0)
+                    elif _additive:
                         # ADDITIVE mode mirrors the Composite branch. HALO still
                         # functional but its semantics shift (extends additive
                         # contribution outward rather than preserving NN edge band).

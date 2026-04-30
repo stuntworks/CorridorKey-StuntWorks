@@ -88,6 +88,35 @@ def apply_sam2_gate_additive(alpha, gate, source_rgb, screen_type='green'):
     return np.maximum(alpha, contribution).astype(alpha.dtype, copy=False)
 
 
+def apply_sam2_gate_weighted(alpha, gate, source_rgb, screen_type='green', feather_px=10):
+    """Weighted blend: NN trusted where green exists, SAM2 trusted where it doesn't.
+
+    Universal fix for "NN keys body well but can't kill non-green floor/props,
+    SAM2 can kill them but cuts good NN body parts." Per-pixel weight derived
+    from source chroma, smooth feather at the boundary.
+
+    feather_px: Gaussian blur radius for the green/non-green boundary. 0 = hard
+    boundary; 10-20 typical for natural transitions.
+    """
+    if gate is None:
+        return alpha
+    if screen_type == "blue":
+        chroma = source_rgb[..., 2] - np.maximum(source_rgb[..., 0], source_rgb[..., 1])
+    else:
+        chroma = source_rgb[..., 1] - np.maximum(source_rgb[..., 0], source_rgb[..., 2])
+    chroma = np.clip(chroma, 0.0, 1.0)
+    # Map chroma 0..0.2 to weight 0..1 — soft ramp on green-presence detection
+    weight = np.clip(chroma * 5.0, 0.0, 1.0).astype(np.float32)
+    # Soft feather at the green/non-green boundary
+    if feather_px and feather_px > 0:
+        import cv2 as _cv2
+        ksize = int(feather_px) * 2 + 1
+        weight = _cv2.GaussianBlur(weight, (ksize, ksize), float(feather_px) / 2.0)
+    # NN trusted in green region, SAM2 trusted off-green
+    out = weight * alpha + (1.0 - weight) * gate
+    return np.clip(out, 0.0, 1.0).astype(alpha.dtype, copy=False)
+
+
 # DANGER ZONE FRAGILE: this is the SINGLE SOURCE OF TRUTH for SAM2 + NN combine. All 6 callsites must use this. Do NOT inline alpha*gate elsewhere.
 def apply_sam2_gate(alpha: np.ndarray, gate: np.ndarray | None, invert: bool = False, halo_px: int = 0) -> np.ndarray:
     """Combine NN alpha with SAM2 gate. invert=True = garbage matte mode (subtract clicked region).
