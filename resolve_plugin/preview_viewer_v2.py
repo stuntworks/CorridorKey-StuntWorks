@@ -92,7 +92,12 @@ class _ViewerColorUtils:
 
     @staticmethod
     def despill_opencv(image, green_limit_mode="average", strength=1.0):
-        """Removes green spill from an RGB float (0-1) image."""
+        """Removes green spill from an RGB float (0-1) image. Subtractive only
+        (no R/B boost) + warm-wardrobe guard (R >= G skipped). Mirrors the
+        engine's color_utils.despill_opencv. Both fixes are required to keep
+        yellow/orange/tan wardrobe from shifting pink. DANGER ZONE FRAGILE —
+        if the viewer ever shows yellow shirts as pink again, FIRST check
+        whether someone reverted these two changes."""
         if strength <= 0.0:
             return image
         r = image[..., 0]
@@ -103,9 +108,12 @@ class _ViewerColorUtils:
         else:
             limit = (r + b) / 2.0
         spill_amount = np.maximum(g - limit, 0.0)
+        # Warm-wardrobe guard — zero spill on R >= G pixels.
+        spill_amount = np.where(r >= g, 0.0, spill_amount)
+        # SUBTRACTIVE despill — do NOT reintroduce R/B boost.
         g_new = g - spill_amount
-        r_new = r + (spill_amount * 0.5)
-        b_new = b + (spill_amount * 0.5)
+        r_new = r
+        b_new = b
         despilled = np.stack([r_new, g_new, b_new], axis=-1)
         if strength < 1.0:
             return image * (1.0 - strength) + despilled * strength
