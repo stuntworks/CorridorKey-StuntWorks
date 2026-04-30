@@ -44,7 +44,7 @@ from PySide6 import QtWidgets, QtGui, QtCore
 # that doesn't have torch in its env. CK_ROOT is three levels up:
 # ae_plugin/cep_panel/preview_viewer_v2.py -> ae_plugin/cep_panel -> ae_plugin -> repo root.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-from sam2_combine import apply_sam2_gate, trim_gate_by_chroma, fill_holes_color_aware
+from sam2_combine import apply_sam2_gate, apply_sam2_gate_additive, trim_gate_by_chroma, fill_holes_color_aware
 
 # WHAT IT DOES: Installs diagnostic crash / exception loggers as early as possible.
 #   faulthandler dumps Python tracebacks on native signals (SIGSEGV, stack overflow,
@@ -351,6 +351,7 @@ def render_composite(cu, session: Session, params: dict):
     halo_px = int(params.get("halo_px", 0))
     trim_chroma = int(params.get("trim_chroma", 0))
     fill_holes = int(params.get("fill_holes", 0))
+    sam2_additive = bool(params.get("sam2_additive", False))
     # DaVinci formula exactly: multiply NN × gate first, then dilate+soften the result.
     # Dilating the product spreads existing NN alpha values outward so MARGIN visibly
     # grows the body. Gate cuts background bleed. SOFTEN feathers the expanded edge.
@@ -366,11 +367,28 @@ def render_composite(cu, session: Session, params: dict):
             _gate = cv2.resize(_gate, (session.alpha_nn.shape[1], session.alpha_nn.shape[0]),
                                interpolation=cv2.INTER_LINEAR)
         _src_rgb = session.original_rgb if session.original_rgb is not None else session.fg_rgb
-        if trim_chroma > 0:
-            _gate = trim_gate_by_chroma(_gate, _src_rgb, "green", trim_chroma)
-        alpha = np.clip(apply_sam2_gate(session.alpha_nn, _gate, invert=False, halo_px=halo_px), 0.0, 1.0)
-        if fill_holes > 0:
-            alpha = fill_holes_color_aware(alpha, _gate, _src_rgb, "green", fill_holes)
+        if sam2_additive:
+            # ADDITIVE mode: alpha = max(NN, gate * non_screen). SAM2 can ADD
+            # confidence where NN missed but never SUBTRACT NN's correct alpha.
+            # trim_chroma / fill_holes don't apply here (additive math has no
+            # multiplicative combine to gate). HALO still functional but its
+            # semantics shift — it dilates the SAM2 gate so the additive
+            # contribution extends outward, rather than preserving NN's edge band.
+            _gate_for_add = _gate
+            if halo_px and halo_px > 0:
+                _bin = (_gate_for_add > 0.5).astype(np.uint8)
+                _k = int(halo_px) * 2 + 1
+                _kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_k, _k))
+                _gate_for_add = cv2.dilate(_bin, _kernel).astype(np.float32)
+            alpha = np.clip(apply_sam2_gate_additive(session.alpha_nn, _gate_for_add,
+                                                     _src_rgb, screen_type="green"),
+                            0.0, 1.0)
+        else:
+            if trim_chroma > 0:
+                _gate = trim_gate_by_chroma(_gate, _src_rgb, "green", trim_chroma)
+            alpha = np.clip(apply_sam2_gate(session.alpha_nn, _gate, invert=False, halo_px=halo_px), 0.0, 1.0)
+            if fill_holes > 0:
+                alpha = fill_holes_color_aware(alpha, _gate, _src_rgb, "green", fill_holes)
     else:
         alpha = session.alpha.copy()
     if sam2_margin > 0:
@@ -500,6 +518,11 @@ class PersistentWindow(QtWidgets.QWidget):
             #            "source" = original plate inside the matte (yellow-shirt rescue)
             #            "blend" = 50/50 NN + source (built but not exposed in UI yet)
             "fg_source": "nn",
+            # SAM2 ADDITIVE: when True, switches combine math from NN x SAM2
+            # (multiplicative, default) to max(NN, SAM2 x non_screen) (additive).
+            # Preserves subject regions SAM2 misses across visual boundaries
+            # (straps, props). Off = bit-identical to current behavior.
+            "sam2_additive": False,
         }
         # Drop-stale: if a new update comes in while we're painting, we only keep
         # the latest one. _pending is None when idle, or a dict when a render is
@@ -1066,6 +1089,34 @@ class PersistentWindow(QtWidgets.QWidget):
         _fgsrc_layout.addStretch(1)
         grid.addWidget(_fgsrc_row, 8, 1, 1, 2)
 
+        # --- SAM2 ADDITIVE: combine math toggle (checkbox) ---
+        # Switches the NN+SAM2 combine from multiplicative (alpha = NN x gate,
+        # default) to additive (alpha = max(NN, gate * non_screen)). Preserves
+        # subject regions SAM2 misses across visual boundaries (e.g. a butt
+        # across a stunt-rig strap). OFF = bit-identical to previous behavior.
+        # SAM2-only — has no visible effect when SAM2 is inactive.
+        _SAM2_ADDITIVE_TOOLTIP = (
+            "SAM2 ADDITIVE — switches combine math from multiply (NN x SAM2, "
+            "default) to additive (max of NN, SAM2). Preserves subject regions "
+            "SAM2 misses across visual boundaries (straps, props). Off = "
+            "bit-identical to before."
+        )
+        self.sam2_additive_label_widget = _label("SAM2 ADD")
+        self.sam2_additive_label_widget.setToolTip(_SAM2_ADDITIVE_TOOLTIP)
+        grid.addWidget(self.sam2_additive_label_widget, 9, 0)
+        self.sam2_additive_checkbox = QtWidgets.QCheckBox("SAM2 ADDITIVE")
+        self.sam2_additive_checkbox.setStyleSheet(
+            "QCheckBox { color: #8ab; border: none; background: transparent; "
+            "font-size: 12px; font-weight: 600; letter-spacing: 0.5px; } "
+            "QCheckBox::indicator { width: 12px; height: 12px; border: 1px solid "
+            "#2a6a7a; border-radius: 2px; background: #001a28; } "
+            "QCheckBox::indicator:checked { background: #0ff; border-color: #0ff; }"
+        )
+        self.sam2_additive_checkbox.setChecked(bool(self._params.get("sam2_additive", False)))
+        self.sam2_additive_checkbox.setToolTip(_SAM2_ADDITIVE_TOOLTIP)
+        self.sam2_additive_checkbox.toggled.connect(self._on_sam2_additive_changed)
+        grid.addWidget(self.sam2_additive_checkbox, 9, 1, 1, 2)
+
         grid.setColumnStretch(1, 1)
         parent_layout.addWidget(panel)
 
@@ -1162,6 +1213,17 @@ class PersistentWindow(QtWidgets.QWidget):
         self._render_now()
         self._save_live_params_now()  # discrete control — save immediately so host sees it
 
+    # WHAT IT DOES: SAM2 ADDITIVE checkbox handler. Toggles combine math
+    #   between multiplicative (default, NN x SAM2) and additive
+    #   (max(NN, SAM2 x non_screen)). Mirrors Resolve viewer parity.
+    # DEPENDS-ON: self._params, _render_now, _save_live_params_now.
+    # AFFECTS: self._params["sam2_additive"], repaint, persists to disk.
+    def _on_sam2_additive_changed(self, checked: bool):
+        self._params["sam2_additive"] = bool(checked)
+        self._local_change_time = time.perf_counter()
+        self._render_now()
+        self._save_live_params_now()
+
     # WHAT IT DOES: Debounces live_params.json writes. Every slider move calls this;
     #   the actual disk write happens 250ms after the LAST move. Prevents filesystem
     #   thrash on rapid drags.
@@ -1242,7 +1304,7 @@ class PersistentWindow(QtWidgets.QWidget):
                     pass  # PNGs unreadable — stale view is better than a crash
         merged = dict(self._params)
         for k, v in params.items():
-            if k in ("despill", "despeckle", "despeckleSize", "background", "sam2_margin", "sam2_soften", "halo_px", "trim_chroma", "fill_holes", "fg_source"):
+            if k in ("despill", "despeckle", "despeckleSize", "background", "sam2_margin", "sam2_soften", "halo_px", "trim_chroma", "fill_holes", "fg_source", "sam2_additive"):
                 merged[k] = v
         if self._painting:
             self._pending = merged
@@ -1429,6 +1491,7 @@ class PersistentWindow(QtWidgets.QWidget):
                 _halo = int(params_for_matte.get("halo_px", 0))
                 _trim = int(params_for_matte.get("trim_chroma", 0))
                 _fill = int(params_for_matte.get("fill_holes", 0))
+                _additive = bool(params_for_matte.get("sam2_additive", False))
                 if self.session.alpha_nn is not None and self.session.sam2_gate_raw is not None:
                     _gate = self.session.sam2_gate_raw.copy()
                     # SAM2 returns the gate at 256x256 — must resize to alpha
@@ -1448,11 +1511,26 @@ class PersistentWindow(QtWidgets.QWidget):
                     _src_rgb_m = (self.session.original_rgb
                                   if self.session.original_rgb is not None
                                   else self.session.fg_rgb)
-                    if _trim > 0:
-                        _gate = trim_gate_by_chroma(_gate, _src_rgb_m, "green", _trim)
-                    alpha = np.clip(apply_sam2_gate(self.session.alpha_nn, _gate, invert=False, halo_px=_halo), 0.0, 1.0)
-                    if _fill > 0:
-                        alpha = fill_holes_color_aware(alpha, _gate, _src_rgb_m, "green", _fill)
+                    if _additive:
+                        # ADDITIVE mode mirrors the Composite branch. HALO still
+                        # functional but its semantics shift (extends additive
+                        # contribution outward rather than preserving NN edge band).
+                        _gate_for_add = _gate
+                        if _halo and _halo > 0:
+                            _bin = (_gate_for_add > 0.5).astype(np.uint8)
+                            _k = int(_halo) * 2 + 1
+                            _kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_k, _k))
+                            _gate_for_add = cv2.dilate(_bin, _kernel).astype(np.float32)
+                        alpha = np.clip(apply_sam2_gate_additive(self.session.alpha_nn,
+                                                                 _gate_for_add, _src_rgb_m,
+                                                                 screen_type="green"),
+                                        0.0, 1.0)
+                    else:
+                        if _trim > 0:
+                            _gate = trim_gate_by_chroma(_gate, _src_rgb_m, "green", _trim)
+                        alpha = np.clip(apply_sam2_gate(self.session.alpha_nn, _gate, invert=False, halo_px=_halo), 0.0, 1.0)
+                        if _fill > 0:
+                            alpha = fill_holes_color_aware(alpha, _gate, _src_rgb_m, "green", _fill)
                 else:
                     alpha = self.session.alpha.copy()
                 if _m > 0:

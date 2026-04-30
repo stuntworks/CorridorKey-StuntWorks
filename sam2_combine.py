@@ -64,6 +64,30 @@ def fill_holes_color_aware(alpha: np.ndarray, gate: np.ndarray, source_rgb: np.n
     return out.astype(alpha.dtype, copy=False)
 
 
+def apply_sam2_gate_additive(alpha, gate, source_rgb, screen_type='green'):
+    """Additive combine: alpha = max(NN, gate * non_screen).
+
+    SAM2 can ADD confidence where NN missed but never SUBTRACT NN's correct
+    alpha. The non_screen test prevents SAM2 from flooding green-pixel
+    regions (e.g. green-screen background that NN correctly killed).
+
+    Use as a drop-in alternative to apply_sam2_gate(alpha, gate) when the
+    user has SAM2 ADDITIVE mode toggled ON. source_rgb is float [0..1] RGB.
+    """
+    if gate is None:
+        return alpha
+    # Non-screen mask: 1.0 where pixel is NOT screen-color, 0.0 where it is.
+    if screen_type == "blue":
+        chroma = source_rgb[..., 2] - np.maximum(source_rgb[..., 0], source_rgb[..., 1])
+    else:
+        chroma = source_rgb[..., 1] - np.maximum(source_rgb[..., 0], source_rgb[..., 2])
+    chroma = np.clip(chroma, 0.0, 1.0)
+    is_screen = (chroma > 0.1).astype(np.float32)  # fixed threshold; tune later if needed
+    non_screen = 1.0 - is_screen
+    contribution = gate * non_screen
+    return np.maximum(alpha, contribution).astype(alpha.dtype, copy=False)
+
+
 # DANGER ZONE FRAGILE: this is the SINGLE SOURCE OF TRUTH for SAM2 + NN combine. All 6 callsites must use this. Do NOT inline alpha*gate elsewhere.
 def apply_sam2_gate(alpha: np.ndarray, gate: np.ndarray | None, invert: bool = False, halo_px: int = 0) -> np.ndarray:
     """Combine NN alpha with SAM2 gate. invert=True = garbage matte mode (subtract clicked region).
