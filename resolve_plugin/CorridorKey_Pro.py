@@ -470,6 +470,13 @@ def get_settings():
         # wardrobe like yellow shirts that the NN paints pink) | "blend" (50/50).
         # Viewer-owned; overridden by _merge_live_params.
         "fg_source": "nn",
+        # SAM2 ADDITIVE: when True, switches the NN+SAM2 combine math from
+        # multiplicative (alpha = NN x SAM2_gate, default) to additive
+        # (alpha = max(NN, SAM2_gate * non_screen)). Preserves NN's correct
+        # alpha across visual boundaries SAM2 misses (e.g. a stunt-rig strap
+        # crossing the actor). Default False = bit-identical to prior render.
+        # Viewer-owned; overridden by _merge_live_params.
+        "sam2_additive": False,
     }
 
 # WHAT IT DOES: Overrides panel's despill / despeckle settings with the v2 viewer's
@@ -516,6 +523,19 @@ def _merge_live_params(settings):
             _v = str(lp["fg_source"]).lower()
             if _v in ("nn", "source", "blend"):
                 out["fg_source"] = _v
+        if "sam2_additive" in lp:
+            # Accept native bool, "true"/"false" strings (case-insensitive),
+            # and 0/1 numerics. Anything else falls through to default False.
+            _av = lp["sam2_additive"]
+            if isinstance(_av, bool):
+                out["sam2_additive"] = _av
+            elif isinstance(_av, str):
+                out["sam2_additive"] = _av.strip().lower() in ("true", "1", "yes", "on")
+            else:
+                try:
+                    out["sam2_additive"] = bool(int(_av))
+                except (ValueError, TypeError):
+                    pass
         if "sam_positive" in lp or "sam_negative" in lp:
             sam_points["positive"] = [tuple(p) for p in lp.get("sam_positive", [])]
             sam_points["negative"] = [tuple(p) for p in lp.get("sam_negative", [])]
@@ -2213,16 +2233,21 @@ def _key_one_scrub_frame():
             if _gate.shape != mt.shape:
                 _gate = _cv2.resize(_gate, (mt.shape[1], mt.shape[0]),
                                     interpolation=_cv2.INTER_LINEAR)
-            from sam2_combine import apply_sam2_gate, trim_gate_by_chroma, fill_holes_color_aware
+            from sam2_combine import apply_sam2_gate, apply_sam2_gate_additive, trim_gate_by_chroma, fill_holes_color_aware
             _trim_chroma = int(ctx["settings"].get("trim_chroma", 0))
             _fill_holes = int(ctx["settings"].get("fill_holes", 0))
             _stype = ctx["settings"].get("screen_type", "green")
-            if _trim_chroma > 0:
-                _gate = trim_gate_by_chroma(_gate, fr, _stype, _trim_chroma)
-            mt = apply_sam2_gate(mt, _gate, invert=False, halo_px=int(ctx["settings"].get("halo_px", 0)))
-            if _fill_holes > 0:
-                _mt2d_fill = mt[:, :, 0] if len(mt.shape) == 3 else mt
-                mt = fill_holes_color_aware(_mt2d_fill, _gate, fr, _stype, _fill_holes)
+            _sam2_additive = bool(ctx["settings"].get("sam2_additive", False))
+            if _sam2_additive:
+                _mt2d_add = mt[:, :, 0] if len(mt.shape) == 3 else mt
+                mt = apply_sam2_gate_additive(_mt2d_add, _gate, fr, _stype)
+            else:
+                if _trim_chroma > 0:
+                    _gate = trim_gate_by_chroma(_gate, fr, _stype, _trim_chroma)
+                mt = apply_sam2_gate(mt, _gate, invert=False, halo_px=int(ctx["settings"].get("halo_px", 0)))
+                if _fill_holes > 0:
+                    _mt2d_fill = mt[:, :, 0] if len(mt.shape) == 3 else mt
+                    mt = fill_holes_color_aware(_mt2d_fill, _gate, fr, _stype, _fill_holes)
         if fg is not None and mt is not None:
             out_dir = ctx["scrub_dir"] / f"{frame_idx:03d}"
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -2799,29 +2824,36 @@ def on_process_range(ev):
                 # DEPENDS-ON: _braw_sam2_video_masks (propagation), _braw_sam2_gate (fallback)
                 # AFFECTS: mt for this frame only
                 if mt is not None:
-                    from sam2_combine import apply_sam2_gate, trim_gate_by_chroma, fill_holes_color_aware
+                    from sam2_combine import apply_sam2_gate, apply_sam2_gate_additive, trim_gate_by_chroma, fill_holes_color_aware
                     _halo_px = int(settings.get("halo_px", 0))
                     _trim_px = int(settings.get("trim_chroma", 0))
                     _fill_px = int(settings.get("fill_holes", 0))
                     _stype = settings.get("screen_type", "green")
+                    _sam2_additive = bool(settings.get("sam2_additive", False))
                     if _braw_sam2_video_masks and fidx in _braw_sam2_video_masks:
                         _gate = _dilate_sam2_mask(_braw_sam2_video_masks[fidx], margin=settings.get("sam2_margin", SAM2_MATTE_MARGIN))
                         _gate = _soften_sam2_mask(_gate, soften=settings.get("sam2_soften", 0))
                         _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
-                        if _trim_px > 0:
-                            _gate = trim_gate_by_chroma(_gate, fr, _stype, _trim_px)
-                        mt = apply_sam2_gate(_mt2d, _gate, invert=False, halo_px=_halo_px)
-                        if _fill_px > 0:
-                            mt = fill_holes_color_aware(mt, _gate, fr, _stype, _fill_px)
+                        if _sam2_additive:
+                            mt = apply_sam2_gate_additive(_mt2d, _gate, fr, _stype)
+                        else:
+                            if _trim_px > 0:
+                                _gate = trim_gate_by_chroma(_gate, fr, _stype, _trim_px)
+                            mt = apply_sam2_gate(_mt2d, _gate, invert=False, halo_px=_halo_px)
+                            if _fill_px > 0:
+                                mt = fill_holes_color_aware(mt, _gate, fr, _stype, _fill_px)
                     elif _braw_sam2_gate is not None:
                         _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
-                        if _trim_px > 0:
-                            _bgate = trim_gate_by_chroma(_braw_sam2_gate, fr, _stype, _trim_px)
+                        if _sam2_additive:
+                            mt = apply_sam2_gate_additive(_mt2d, _braw_sam2_gate, fr, _stype)
                         else:
-                            _bgate = _braw_sam2_gate
-                        mt = apply_sam2_gate(_mt2d, _bgate, invert=False, halo_px=_halo_px)
-                        if _fill_px > 0:
-                            mt = fill_holes_color_aware(mt, _bgate, fr, _stype, _fill_px)
+                            if _trim_px > 0:
+                                _bgate = trim_gate_by_chroma(_braw_sam2_gate, fr, _stype, _trim_px)
+                            else:
+                                _bgate = _braw_sam2_gate
+                            mt = apply_sam2_gate(_mt2d, _bgate, invert=False, halo_px=_halo_px)
+                            if _fill_px > 0:
+                                mt = fill_holes_color_aware(mt, _bgate, fr, _stype, _fill_px)
                 choke_px = int(settings.get("choke", 0))
                 if choke_px > 0 and mt is not None:
                     _k = choke_px * 2 + 1
@@ -3023,21 +3055,25 @@ def on_process_range(ev):
                 # DEPENDS-ON: sam2_video_masks, _static_sam2_gate, _load_sam2_output_gate
                 # AFFECTS: mt (alpha) — multiplied by gate, zeroing pixels outside the matte.
                 if mt is not None:
-                    from sam2_combine import apply_sam2_gate, trim_gate_by_chroma, fill_holes_color_aware
+                    from sam2_combine import apply_sam2_gate, apply_sam2_gate_additive, trim_gate_by_chroma, fill_holes_color_aware
                     _halo_px = int(settings.get("halo_px", 0))
                     _trim_px = int(settings.get("trim_chroma", 0))
                     _fill_px = int(settings.get("fill_holes", 0))
                     _stype = settings.get("screen_type", "green")
+                    _sam2_additive = bool(settings.get("sam2_additive", False))
                     if sam2_video_masks and range_idx in sam2_video_masks:
                         # Normal path — per-frame mask from video propagation.
                         _gate = _dilate_sam2_mask(sam2_video_masks[range_idx], margin=settings.get("sam2_margin", SAM2_MATTE_MARGIN))
                         _gate = _soften_sam2_mask(_gate, soften=settings.get("sam2_soften", 0))
                         _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
-                        if _trim_px > 0:
-                            _gate = trim_gate_by_chroma(_gate, fr, _stype, _trim_px)
-                        mt = apply_sam2_gate(_mt2d, _gate, invert=False, halo_px=_halo_px)
-                        if _fill_px > 0:
-                            mt = fill_holes_color_aware(mt, _gate, fr, _stype, _fill_px)
+                        if _sam2_additive:
+                            mt = apply_sam2_gate_additive(_mt2d, _gate, fr, _stype)
+                        else:
+                            if _trim_px > 0:
+                                _gate = trim_gate_by_chroma(_gate, fr, _stype, _trim_px)
+                            mt = apply_sam2_gate(_mt2d, _gate, invert=False, halo_px=_halo_px)
+                            if _fill_px > 0:
+                                mt = fill_holes_color_aware(mt, _gate, fr, _stype, _fill_px)
                     else:
                         # Fallback path — static gate loaded lazily on first frame so we have
                         # real frame.shape for the resize check inside _load_sam2_output_gate.
@@ -3048,13 +3084,16 @@ def on_process_range(ev):
                                 _tlog("SAM2 static gate loaded — applying same mask to all range frames (no propagation)")
                         if _static_sam2_gate is not None:
                             _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
-                            if _trim_px > 0:
-                                _sgate = trim_gate_by_chroma(_static_sam2_gate, fr, _stype, _trim_px)
+                            if _sam2_additive:
+                                mt = apply_sam2_gate_additive(_mt2d, _static_sam2_gate, fr, _stype)
                             else:
-                                _sgate = _static_sam2_gate
-                            mt = apply_sam2_gate(_mt2d, _sgate, invert=False, halo_px=_halo_px)
-                            if _fill_px > 0:
-                                mt = fill_holes_color_aware(mt, _sgate, fr, _stype, _fill_px)
+                                if _trim_px > 0:
+                                    _sgate = trim_gate_by_chroma(_static_sam2_gate, fr, _stype, _trim_px)
+                                else:
+                                    _sgate = _static_sam2_gate
+                                mt = apply_sam2_gate(_mt2d, _sgate, invert=False, halo_px=_halo_px)
+                                if _fill_px > 0:
+                                    mt = fill_holes_color_aware(mt, _sgate, fr, _stype, _fill_px)
                 choke_px = int(settings.get("choke", 0))
                 if choke_px > 0 and mt is not None:
                     k = choke_px * 2 + 1
