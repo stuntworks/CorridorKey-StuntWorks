@@ -196,11 +196,16 @@ class CorridorKeyEngine:
             compiled_model = torch.compile(self.model, mode=compile_mode)
             # Trigger compilation with a dummy input (the actual compile
             # happens here, not in the torch.compile() call above)
-            dummy_input = torch.zeros(
+            # torch.rand instead of zeros: forces CUDA graph capture with realistic
+            # non-trivial input so the captured graph is stable on the first real frame.
+            # zeros produced different memory characteristics than real frames, causing
+            # the graph to re-capture on the first real call (slow startup).
+            dummy_input = torch.rand(
                 1, 4, self.img_size, self.img_size, dtype=self.model_precision, device=self.device
             )
             with torch.inference_mode():
-                compiled_model(dummy_input)
+                compiled_model(dummy_input)  # capture
+                compiled_model(dummy_input)  # first replay — ensures graph is stable before real frames
             del dummy_input
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
