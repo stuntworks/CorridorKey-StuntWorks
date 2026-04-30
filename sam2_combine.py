@@ -4,6 +4,30 @@ from __future__ import annotations
 import numpy as np
 
 
+def trim_gate_by_chroma(gate: np.ndarray, source_rgb: np.ndarray, screen_type: str = "green", strength: int = 0) -> np.ndarray:
+    """Trim screen-colored pixels FROM the SAM2 gate before combine.
+
+    Returns gate unchanged when strength <= 0 (bit-identical to no-trim path).
+    For strength > 0, computes a per-pixel chroma score on source_rgb (RGB float
+    [0..1]) — green = G - max(R, B), blue = B - max(R, G) — and zeros out gate
+    pixels whose chroma exceeds threshold t = 0.05 + (1 - strength/100) * 0.4.
+    Higher strength = lower threshold = more aggressive trim. Used to prevent
+    SAM2 from claiming green pixels at silhouette edges that NN correctly keyed
+    as background.
+    """
+    if strength is None or int(strength) <= 0:
+        return gate
+    s = float(int(strength))
+    if screen_type == "blue":
+        chroma_score = source_rgb[..., 2] - np.maximum(source_rgb[..., 0], source_rgb[..., 1])
+    else:  # default to green for any other value
+        chroma_score = source_rgb[..., 1] - np.maximum(source_rgb[..., 0], source_rgb[..., 2])
+    chroma_score = np.clip(chroma_score, 0.0, 1.0)
+    t = 0.05 + (1.0 - s / 100.0) * 0.4
+    is_screen = (chroma_score > t).astype(np.float32)
+    return (gate * (1.0 - is_screen)).astype(gate.dtype, copy=False)
+
+
 # DANGER ZONE FRAGILE: this is the SINGLE SOURCE OF TRUTH for SAM2 + NN combine. All 6 callsites must use this. Do NOT inline alpha*gate elsewhere.
 def apply_sam2_gate(alpha: np.ndarray, gate: np.ndarray | None, invert: bool = False, halo_px: int = 0) -> np.ndarray:
     """Combine NN alpha with SAM2 gate. invert=True = garbage matte mode (subtract clicked region).
