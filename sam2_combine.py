@@ -28,6 +28,42 @@ def trim_gate_by_chroma(gate: np.ndarray, source_rgb: np.ndarray, screen_type: s
     return (gate * (1.0 - is_screen)).astype(gate.dtype, copy=False)
 
 
+def fill_holes_color_aware(alpha: np.ndarray, gate: np.ndarray, source_rgb: np.ndarray, screen_type: str = "green", strength: int = 0) -> np.ndarray:
+    """Fill alpha=0 holes inside SAM2 region for non-screen-color pixels.
+
+    strength: 0..100 integer. 0 = off (returns input unchanged — bit-identical).
+    Higher = more aggressive (more lenient on what counts as "non-screen").
+
+    For each pixel where gate > 0.5 AND alpha < 0.5 AND pixel is not screen-color,
+    set alpha = 1.0. Returns a NEW array; input alpha is unchanged.
+
+    Why this differs from trim_gate_by_chroma: trim removes screen-colored pixels
+    FROM the gate (kills 0×1 to 0×0 — invisible). Fill flips alpha at low-alpha
+    pixels INSIDE the gate that are not screen-colored — rescues NN dropouts on
+    yellow shirts / skin / red while leaving correctly-killed green pixels alone.
+    """
+    if strength is None or int(strength) <= 0:
+        return alpha
+    s = float(int(strength))
+    is_inside = gate > 0.5
+    is_low_alpha = alpha < 0.5
+    candidates = is_inside & is_low_alpha
+    if screen_type == "blue":
+        chroma = source_rgb[..., 2] - np.maximum(source_rgb[..., 0], source_rgb[..., 1])
+    else:
+        chroma = source_rgb[..., 1] - np.maximum(source_rgb[..., 0], source_rgb[..., 2])
+    chroma = np.clip(chroma, 0.0, 1.0)
+    # Higher strength = higher threshold = more pixels qualify as non-screen.
+    # At strength=1, t=0.054 (strict — almost anything green-leaning excluded).
+    # At strength=100, t=0.45 (lenient — only pure-green excluded).
+    t = 0.05 + (s / 100.0) * 0.4
+    is_screen = chroma > t
+    fill_mask = candidates & ~is_screen
+    out = alpha.copy()
+    out[fill_mask] = 1.0
+    return out.astype(alpha.dtype, copy=False)
+
+
 # DANGER ZONE FRAGILE: this is the SINGLE SOURCE OF TRUTH for SAM2 + NN combine. All 6 callsites must use this. Do NOT inline alpha*gate elsewhere.
 def apply_sam2_gate(alpha: np.ndarray, gate: np.ndarray | None, invert: bool = False, halo_px: int = 0) -> np.ndarray:
     """Combine NN alpha with SAM2 gate. invert=True = garbage matte mode (subtract clicked region).
