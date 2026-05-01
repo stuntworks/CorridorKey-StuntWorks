@@ -100,6 +100,13 @@ def apply_sam2_gate_weighted(alpha, gate, source_rgb, screen_type='green', feath
     """
     if gate is None:
         return alpha
+    import cv2 as _cv2
+    # Binarize + soften the SAM2 gate first (matches multiplicative path).
+    # Without this we'd use SAM2's raw sigmoid (0.3-0.7 in body interior) directly,
+    # producing 25-50% opacity in non-green body regions. Binarize at 0.5 then
+    # Gaussian blur for soft anti-aliased edge — same as _trimap_fuse does.
+    gate_bin = (gate > 0.5).astype(np.float32)
+    gate_bin = _cv2.GaussianBlur(gate_bin, (11, 11), 2.5)
     if screen_type == "blue":
         chroma = source_rgb[..., 2] - np.maximum(source_rgb[..., 0], source_rgb[..., 1])
     else:
@@ -109,10 +116,10 @@ def apply_sam2_gate_weighted(alpha, gate, source_rgb, screen_type='green', feath
     weight = np.clip(chroma * 5.0, 0.0, 1.0).astype(np.float32)
     # Soft feather at the green/non-green boundary
     if feather_px and feather_px > 0:
-        import cv2 as _cv2
         ksize = int(feather_px) * 2 + 1
         weight = _cv2.GaussianBlur(weight, (ksize, ksize), float(feather_px) / 2.0)
     # NN trusted in green region, SAM2 trusted off-green
+    gate = gate_bin  # use binarized+softened gate from here
     out = weight * alpha + (1.0 - weight) * gate
     return np.clip(out, 0.0, 1.0).astype(alpha.dtype, copy=False)
 
