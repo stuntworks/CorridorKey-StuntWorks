@@ -43,7 +43,7 @@ from PySide6 import QtWidgets, QtGui, QtCore
 # the package __init__ which loads torch (40-60s) and breaks the viewer's
 # subprocess that doesn't have torch in its env.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from sam2_combine import apply_sam2_gate, apply_sam2_gate_additive, apply_sam2_gate_weighted, trim_gate_by_chroma, fill_holes_color_aware
+from sam2_combine import apply_sam2_gate, apply_sam2_gate_additive, apply_sam2_gate_weighted, apply_sam2_gate_subtract, trim_gate_by_chroma, fill_holes_color_aware
 
 # WHAT IT DOES: Installs diagnostic crash / exception loggers as early as possible.
 #   faulthandler dumps Python tracebacks on native signals (SIGSEGV, stack overflow,
@@ -419,13 +419,26 @@ def render_composite(cu, session: Session, params: dict):
     fill_holes = int(params.get("fill_holes", 0))
     sam2_additive = bool(params.get("sam2_additive", False))
     sam2_weighted = bool(params.get("sam2_weighted", False))
+    sam2_subtract = bool(params.get("sam2_subtract", False))
+    edge_guard_px = int(params.get("edge_guard_px", 8))
     if session.alpha_raw is not None and session.sam2_gate_raw is not None:
         _gate = session.sam2_gate_raw.copy()
         if _gate.shape != session.alpha_raw.shape:
             _gate = cv2.resize(_gate, (session.alpha_raw.shape[1], session.alpha_raw.shape[0]),
                                interpolation=cv2.INTER_LINEAR)
         _src_rgb = session.original_rgb if session.original_rgb is not None else session.fg_rgb
-        if sam2_weighted:
+        if sam2_subtract:
+            # SUBTRACT mode: NN owns the matte everywhere green exists. SAM2 only
+            # permitted to kill in non-green zones (floor under feet, off-screen
+            # props). Hair / fine detail in green territory protected by the
+            # buffer + feather distance ramp. Wins over weighted/additive when
+            # toggled. trim/fill_holes/halo intentionally not applied.
+            _fp = max(int(edge_guard_px) // 2, 1)
+            alpha = apply_sam2_gate_subtract(session.alpha_raw, _gate, _src_rgb,
+                                             screen_type="green",
+                                             buffer_px=int(edge_guard_px),
+                                             feather_px=_fp)
+        elif sam2_weighted:
             # SMART BLEND: per-pixel weighted combine — NN trusted in green
             # regions (preserves hair / butt-across-strap detail), SAM2 trusted
             # off-green (kills floor / props NN can't see). Skips _trimap_fuse
@@ -644,6 +657,16 @@ class PersistentWindow(QtWidgets.QWidget):
             # exists, SAM2 trusted off-green. Wins over sam2_additive when
             # both are checked. Off = bit-identical to current behavior.
             "sam2_weighted": False,
+            # SAM2 SUBTRACT: when True, NN matte preserved everywhere green
+            # exists; SAM2 only permitted to kill in non-green zones (floor /
+            # off-screen junk). Buffer + feather distance ramp protects body
+            # parts at the green edge. Wins over sam2_weighted/sam2_additive
+            # when toggled. Off = bit-identical to current behavior.
+            "sam2_subtract": False,
+            # EDGE GUARD: distance in pixels past the green edge before SAM2
+            # may begin to kill (buffer). Feather is auto-set to half this
+            # value. Default 8 px works for typical 1080p stunt footage.
+            "edge_guard_px": 8,
         }
         # Drop-stale: if a new update comes in while we're painting, we only keep
         # the latest one. _pending is None when idle, or a dict when a render is
@@ -1502,6 +1525,59 @@ class PersistentWindow(QtWidgets.QWidget):
         self.sam2_weighted_checkbox.toggled.connect(self._on_sam2_weighted_changed)
         grid.addWidget(self.sam2_weighted_checkbox, 10, 1, 1, 2)
 
+        # --- SAM2 SUBTRACT: subtract-only combine toggle (checkbox) ---
+        # NN owns the matte everywhere green exists. SAM2 is permitted to
+        # subtract junk (floor under feet, off-screen props) only in regions
+        # far from the green edge. EDGE GUARD slider controls the protected
+        # buffer width. Wins over SMART BLEND + ADDITIVE when toggled.
+        # SAM2-only — greyed out when SAM2 is inactive.
+        _SAM2_SUBTRACT_TOOLTIP = (
+            "SAM2 SUBTRACT — NN owns the matte where green exists. SAM2 can "
+            "only kill non-green junk (floor under feet, props off-screen). "
+            "Hair / fine detail protected automatically. EDGE GUARD slider "
+            "controls how far past the green edge SAM2 may reach. Off = "
+            "bit-identical to before."
+        )
+        self.sam2_subtract_label_widget = _label("SUBTRACT")
+        self.sam2_subtract_label_widget.setToolTip(_SAM2_SUBTRACT_TOOLTIP)
+        grid.addWidget(self.sam2_subtract_label_widget, 11, 0)
+        self.sam2_subtract_checkbox = QtWidgets.QCheckBox("")
+        self.sam2_subtract_checkbox.setStyleSheet(
+            "QCheckBox { color: #8ab; border: none; background: transparent; "
+            "font-size: 12px; font-weight: 600; letter-spacing: 0.5px; } "
+            "QCheckBox::indicator { width: 12px; height: 12px; border: 1px solid "
+            "#2a6a7a; border-radius: 2px; background: #001a28; } "
+            "QCheckBox::indicator:checked { background: #0ff; border-color: #0ff; }"
+        )
+        self.sam2_subtract_checkbox.setChecked(bool(self._params.get("sam2_subtract", False)))
+        self.sam2_subtract_checkbox.setToolTip(_SAM2_SUBTRACT_TOOLTIP)
+        self.sam2_subtract_checkbox.toggled.connect(self._on_sam2_subtract_changed)
+        grid.addWidget(self.sam2_subtract_checkbox, 11, 1, 1, 2)
+
+        # --- EDGE GUARD: distance buffer past green edge before SAM2 may kill ---
+        # Slider 0-50 px integer. Higher = more body protection, less aggressive
+        # SAM2 reach. Feather (soft transition) auto-set to half this value.
+        # Only meaningful when SUBTRACT mode is on.
+        _EDGE_GUARD_TOOLTIP = (
+            "EDGE GUARD — distance (px) past the green edge before SUBTRACT "
+            "may begin to kill. Higher = more protection for body parts at "
+            "the green edge. Feather auto-set to half this value. Default 8. "
+            "Only used when SUBTRACT mode is on."
+        )
+        self.edge_guard_label_widget = _label("EDGE GUARD")
+        self.edge_guard_label_widget.setToolTip(_EDGE_GUARD_TOOLTIP)
+        grid.addWidget(self.edge_guard_label_widget, 12, 0)
+        self.edge_guard_slider = JumpSlider(QtCore.Qt.Horizontal)
+        self.edge_guard_slider.setRange(0, 50)
+        self.edge_guard_slider.setValue(int(self._params.get("edge_guard_px", 8)))
+        self.edge_guard_slider.valueChanged.connect(self._on_edge_guard_changed)
+        self.edge_guard_slider.setToolTip(_EDGE_GUARD_TOOLTIP)
+        grid.addWidget(self.edge_guard_slider, 12, 1)
+        self.edge_guard_value_label = _label(f"{int(self._params.get('edge_guard_px', 8))}", "#0ff")
+        self.edge_guard_value_label.setMinimumWidth(42)
+        self.edge_guard_value_label.setToolTip(_EDGE_GUARD_TOOLTIP)
+        grid.addWidget(self.edge_guard_value_label, 12, 2)
+
         grid.setColumnStretch(1, 1)
         parent_layout.addWidget(panel)
 
@@ -1636,6 +1712,25 @@ class PersistentWindow(QtWidgets.QWidget):
         self._render_now()
         self._save_live_params_now()
 
+    # WHAT IT DOES: SAM2 SUBTRACT checkbox handler. Toggles subtract-only
+    #   combine. Wins over sam2_weighted + sam2_additive when checked.
+    #   Discrete control — saves immediately.
+    # AFFECTS: self._params["sam2_subtract"], repaint, persists to disk.
+    def _on_sam2_subtract_changed(self, checked: bool):
+        self._params["sam2_subtract"] = bool(checked)
+        self._local_change_time = time.perf_counter()
+        self._last_activity_time = self._local_change_time
+        self._render_now()
+        self._save_live_params_now()
+
+    # WHAT IT DOES: EDGE GUARD slider handler. 0-50 px integer. Only meaningful
+    #   when SUBTRACT mode is on. Continuous control — debounced save.
+    def _on_edge_guard_changed(self, value: int):
+        self._params["edge_guard_px"] = int(value)
+        self.edge_guard_value_label.setText(f"{int(value)}")
+        self._schedule_render()
+        self._schedule_save()
+
     # WHAT IT DOES: Greys out the SAM2-only controls (Margin, Soften) when
     #   no SAM2 mask is active. This makes it visually obvious to the user
     #   that those sliders aren't doing anything until they engage SAM2.
@@ -1663,7 +1758,12 @@ class PersistentWindow(QtWidgets.QWidget):
                   self.sam2_additive_checkbox,
                   self.sam2_additive_label_widget,
                   self.sam2_weighted_checkbox,
-                  self.sam2_weighted_label_widget):
+                  self.sam2_weighted_label_widget,
+                  self.sam2_subtract_checkbox,
+                  self.sam2_subtract_label_widget,
+                  self.edge_guard_slider,
+                  self.edge_guard_value_label,
+                  self.edge_guard_label_widget):
             try:
                 w.setEnabled(sam2_active)
             except Exception:
@@ -1806,7 +1906,7 @@ class PersistentWindow(QtWidgets.QWidget):
         # with the correct state.
         merged = dict(self._params)
         for k, v in params.items():
-            if k in ("despill", "despeckle", "despeckleSize", "background", "fg_source", "trim_chroma", "fill_holes", "sam2_additive", "sam2_weighted"):
+            if k in ("despill", "despeckle", "despeckleSize", "background", "fg_source", "trim_chroma", "fill_holes", "sam2_additive", "sam2_weighted", "sam2_subtract", "edge_guard_px"):
                 merged[k] = v
         # Sync checkbox UI and self._params NOW — before any render fires — so that
         # every code path below uses the correct despeckle value. blockSignals prevents
@@ -1920,6 +2020,8 @@ class PersistentWindow(QtWidgets.QWidget):
                 matte_fill = int(params_for_matte.get("fill_holes", 0))
                 matte_additive = bool(params_for_matte.get("sam2_additive", False))
                 matte_weighted = bool(params_for_matte.get("sam2_weighted", False))
+                matte_subtract = bool(params_for_matte.get("sam2_subtract", False))
+                matte_edge_guard = int(params_for_matte.get("edge_guard_px", 8))
                 if (self.session.alpha_raw is not None
                         and self.session.sam2_gate_raw is not None):
                     _gate = self.session.sam2_gate_raw.copy()
@@ -1938,7 +2040,18 @@ class PersistentWindow(QtWidgets.QWidget):
                     _src_rgb_m = (self.session.original_rgb
                                   if self.session.original_rgb is not None
                                   else self.session.fg_rgb)
-                    if matte_weighted:
+                    if matte_subtract:
+                        # SUBTRACT mirror of Composite branch — NN matte preserved
+                        # in green zones, SAM2 only kills in non-green regions
+                        # past the edge-guard buffer. trim/fill_holes/halo
+                        # intentionally not applied (buffer ramp handles boundary).
+                        _fp_m = max(int(matte_edge_guard) // 2, 1)
+                        alpha = apply_sam2_gate_subtract(self.session.alpha_raw,
+                                                         _gate, _src_rgb_m,
+                                                         screen_type="green",
+                                                         buffer_px=int(matte_edge_guard),
+                                                         feather_px=_fp_m)
+                    elif matte_weighted:
                         # SMART BLEND mirror of Composite branch — per-pixel
                         # weighted NN/SAM2 by chroma. trim/fill_holes/halo
                         # intentionally not applied here either.

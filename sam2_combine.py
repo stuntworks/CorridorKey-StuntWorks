@@ -124,6 +124,58 @@ def apply_sam2_gate_weighted(alpha, gate, source_rgb, screen_type='green', feath
     return np.clip(out, 0.0, 1.0).astype(alpha.dtype, copy=False)
 
 
+def apply_sam2_gate_subtract(alpha, gate, source_rgb, screen_type='green',
+                             buffer_px=8, feather_px=4):
+    """Subtract-only combine: NN matte owned by CorridorKey, SAM2 only kills in non-green zones.
+
+    Product principle: CorridorKey owns the matte everywhere green exists. SAM2 is
+    permitted to subtract junk (floor under feet, props off-screen) only in regions
+    far from the green screen, where NN had no chroma to key against. Hair / fine
+    detail in green territory is protected because the kill ramp is 0 there.
+
+    buffer_px: distance past the green edge (in pixels) before SAM2 may begin to
+        kill. Acts as a safety band for body parts at the green edge.
+    feather_px: width of the soft transition where SAM2's kill power ramps from 0
+        to full. Avoids paper-cutout boundary look.
+
+    Math:
+        kill_ramp = clip((dist_from_green - buffer) / feather, 0, 1)
+        sam2_bg = 1 - gate_binarized_then_softened
+        result = alpha * (1 - kill_ramp * sam2_bg)
+
+    The gate is binarized at 0.5 BEFORE the spatial Gaussian blur (mirrors
+    apply_sam2_gate_weighted). Without binarization, SAM2's raw sigmoid (0.3-0.7
+    in body interior) would multiply NN by an intermediate value — exactly the
+    50/50 ghost that broke SMART BLEND. Spatial feather happens on the binary mask
+    so only the silhouette boundary is soft, not the whole interior.
+    """
+    if gate is None:
+        return alpha
+    import cv2 as _cv2
+    # Binarize then spatial feather. See docstring on why this order matters.
+    gate_bin = (gate > 0.5).astype(np.float32)
+    gate_bin = _cv2.GaussianBlur(gate_bin, (11, 11), 2.5)
+    if screen_type == "blue":
+        chroma = source_rgb[..., 2] - np.maximum(source_rgb[..., 0], source_rgb[..., 1])
+    else:
+        chroma = source_rgb[..., 1] - np.maximum(source_rgb[..., 0], source_rgb[..., 2])
+    chroma = np.clip(chroma, 0.0, 1.0)
+    green_binary = (chroma > 0.10).astype(np.uint8)
+    # Empty-green fallback: shot has no green pixels at all (indoor / no screen).
+    # distanceTransform on an all-ones map saturates to max-distance — kill_ramp
+    # would be 1 everywhere → equivalent to multiplicative gate. Short-circuit
+    # to that directly and skip the distance compute.
+    if int(green_binary.sum()) == 0:
+        return (alpha * gate_bin).astype(alpha.dtype, copy=False)
+    dist = _cv2.distanceTransform(1 - green_binary, _cv2.DIST_L2, 5)
+    fp = max(int(feather_px), 1)
+    bp = max(int(buffer_px), 0)
+    kill_ramp = np.clip((dist - float(bp)) / float(fp), 0.0, 1.0).astype(np.float32)
+    sam2_bg = 1.0 - gate_bin
+    result = alpha * (1.0 - kill_ramp * sam2_bg)
+    return np.clip(result, 0.0, 1.0).astype(alpha.dtype, copy=False)
+
+
 # DANGER ZONE FRAGILE: this is the SINGLE SOURCE OF TRUTH for SAM2 + NN combine. All 6 callsites must use this. Do NOT inline alpha*gate elsewhere.
 def apply_sam2_gate(alpha: np.ndarray, gate: np.ndarray | None, invert: bool = False, halo_px: int = 0) -> np.ndarray:
     """Combine NN alpha with SAM2 gate. invert=True = garbage matte mode (subtract clicked region).
