@@ -372,11 +372,12 @@ def render_composite(cu, session: Session, params: dict):
                                interpolation=cv2.INTER_LINEAR)
         _src_rgb = session.original_rgb if session.original_rgb is not None else session.fg_rgb
         if sam2_subtract:
-            # EDGE GUARD = smooth fade width past the green edge (no hard buffer).
+            # REVERTED to f6fa072: EDGE GUARD = hard buffer, feather = half.
+            _fp = max(int(edge_guard_px) // 2, 1)
             alpha = np.clip(apply_sam2_gate_subtract(session.alpha_nn, _gate, _src_rgb,
                                                      screen_type="green",
-                                                     buffer_px=0,
-                                                     feather_px=max(int(edge_guard_px), 1)),
+                                                     buffer_px=int(edge_guard_px),
+                                                     feather_px=_fp),
                             0.0, 1.0)
         elif sam2_weighted:
             # SMART BLEND: per-pixel weighted combine — NN trusted in green
@@ -1164,9 +1165,9 @@ class PersistentWindow(QtWidgets.QWidget):
 
         # --- EDGE GUARD: distance buffer past green edge before SAM2 may kill ---
         _EDGE_GUARD_TOOLTIP = (
-            "EDGE GUARD — width (px) of the smooth kill fade past the green "
-            "edge. Higher = smoother halo, less hair attenuation. Default 20. "
-            "Only used when SUBTRACT mode is on."
+            "EDGE GUARD — distance (px) past the green edge before SUBTRACT "
+            "may kill. Higher = more protection for body interior surrounded "
+            "by green. Default 20. Only used when SUBTRACT mode is on."
         )
         self.edge_guard_label_widget = _label("EDGE GUARD")
         self.edge_guard_label_widget.setToolTip(_EDGE_GUARD_TOOLTIP)
@@ -1664,11 +1665,12 @@ class PersistentWindow(QtWidgets.QWidget):
                                   else self.session.fg_rgb)
                     if _subtract:
                         # SUBTRACT mirror — see Composite branch.
+                        _fp_m = max(int(_edge_guard) // 2, 1)
                         alpha = np.clip(apply_sam2_gate_subtract(self.session.alpha_nn,
                                                                  _gate, _src_rgb_m,
                                                                  screen_type="green",
-                                                                 buffer_px=0,
-                                                                 feather_px=max(int(_edge_guard), 1)),
+                                                                 buffer_px=int(_edge_guard),
+                                                                 feather_px=_fp_m),
                                         0.0, 1.0)
                     elif _weighted:
                         # SMART BLEND mirror of Composite branch — per-pixel
