@@ -484,6 +484,13 @@ def get_settings():
         # both are checked. Default False = bit-identical to prior render.
         # Viewer-owned; overridden by _merge_live_params.
         "sam2_weighted": False,
+        # SAM2 SUBTRACT: NN matte preserved in green zones; SAM2 only kills in
+        # non-green regions past the EDGE GUARD buffer. Wins over
+        # sam2_weighted/sam2_additive when toggled. Default False = bit-identical.
+        "sam2_subtract": False,
+        # EDGE GUARD: distance (px) past green edge before SAM2 may kill.
+        # Feather auto-set to half this value. Default 8 px.
+        "edge_guard_px": 8,
     }
 
 # WHAT IT DOES: Overrides panel's despill / despeckle settings with the v2 viewer's
@@ -556,6 +563,20 @@ def _merge_live_params(settings):
                     out["sam2_weighted"] = bool(int(_wv))
                 except (ValueError, TypeError):
                     pass
+        if "sam2_subtract" in lp:
+            _sv = lp["sam2_subtract"]
+            if isinstance(_sv, bool):
+                out["sam2_subtract"] = _sv
+            elif isinstance(_sv, str):
+                out["sam2_subtract"] = _sv.strip().lower() in ("true", "1", "yes", "on")
+            else:
+                try:
+                    out["sam2_subtract"] = bool(int(_sv))
+                except (ValueError, TypeError):
+                    pass
+        if "edge_guard_px" in lp:
+            try: out["edge_guard_px"] = max(0, min(50, int(lp["edge_guard_px"])))
+            except (ValueError, TypeError): pass
         if "sam_positive" in lp or "sam_negative" in lp:
             sam_points["positive"] = [tuple(p) for p in lp.get("sam_positive", [])]
             sam_points["negative"] = [tuple(p) for p in lp.get("sam_negative", [])]
@@ -2253,13 +2274,20 @@ def _key_one_scrub_frame():
             if _gate.shape != mt.shape:
                 _gate = _cv2.resize(_gate, (mt.shape[1], mt.shape[0]),
                                     interpolation=_cv2.INTER_LINEAR)
-            from sam2_combine import apply_sam2_gate, apply_sam2_gate_additive, apply_sam2_gate_weighted, trim_gate_by_chroma, fill_holes_color_aware
+            from sam2_combine import apply_sam2_gate, apply_sam2_gate_additive, apply_sam2_gate_weighted, apply_sam2_gate_subtract, trim_gate_by_chroma, fill_holes_color_aware
             _trim_chroma = int(ctx["settings"].get("trim_chroma", 0))
             _fill_holes = int(ctx["settings"].get("fill_holes", 0))
             _stype = ctx["settings"].get("screen_type", "green")
             _sam2_additive = bool(ctx["settings"].get("sam2_additive", False))
             _sam2_weighted = bool(ctx["settings"].get("sam2_weighted", False))
-            if _sam2_weighted:
+            _sam2_subtract = bool(ctx["settings"].get("sam2_subtract", False))
+            _edge_guard = int(ctx["settings"].get("edge_guard_px", 8))
+            if _sam2_subtract:
+                _mt2d_s = mt[:, :, 0] if len(mt.shape) == 3 else mt
+                _fp_s = max(int(_edge_guard) // 2, 1)
+                mt = apply_sam2_gate_subtract(_mt2d_s, _gate, fr, _stype,
+                                              buffer_px=int(_edge_guard), feather_px=_fp_s)
+            elif _sam2_weighted:
                 _mt2d_w = mt[:, :, 0] if len(mt.shape) == 3 else mt
                 mt = apply_sam2_gate_weighted(_mt2d_w, _gate, fr, _stype)
             elif _sam2_additive:
@@ -2848,18 +2876,24 @@ def on_process_range(ev):
                 # DEPENDS-ON: _braw_sam2_video_masks (propagation), _braw_sam2_gate (fallback)
                 # AFFECTS: mt for this frame only
                 if mt is not None:
-                    from sam2_combine import apply_sam2_gate, apply_sam2_gate_additive, apply_sam2_gate_weighted, trim_gate_by_chroma, fill_holes_color_aware
+                    from sam2_combine import apply_sam2_gate, apply_sam2_gate_additive, apply_sam2_gate_weighted, apply_sam2_gate_subtract, trim_gate_by_chroma, fill_holes_color_aware
                     _halo_px = int(settings.get("halo_px", 0))
                     _trim_px = int(settings.get("trim_chroma", 0))
                     _fill_px = int(settings.get("fill_holes", 0))
                     _stype = settings.get("screen_type", "green")
                     _sam2_additive = bool(settings.get("sam2_additive", False))
                     _sam2_weighted = bool(settings.get("sam2_weighted", False))
+                    _sam2_subtract = bool(settings.get("sam2_subtract", False))
+                    _edge_guard = int(settings.get("edge_guard_px", 8))
+                    _fp_eg = max(int(_edge_guard) // 2, 1)
                     if _braw_sam2_video_masks and fidx in _braw_sam2_video_masks:
                         _gate = _dilate_sam2_mask(_braw_sam2_video_masks[fidx], margin=settings.get("sam2_margin", SAM2_MATTE_MARGIN))
                         _gate = _soften_sam2_mask(_gate, soften=settings.get("sam2_soften", 0))
                         _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
-                        if _sam2_weighted:
+                        if _sam2_subtract:
+                            mt = apply_sam2_gate_subtract(_mt2d, _gate, fr, _stype,
+                                                           buffer_px=int(_edge_guard), feather_px=_fp_eg)
+                        elif _sam2_weighted:
                             mt = apply_sam2_gate_weighted(_mt2d, _gate, fr, _stype)
                         elif _sam2_additive:
                             mt = apply_sam2_gate_additive(_mt2d, _gate, fr, _stype)
@@ -2871,7 +2905,10 @@ def on_process_range(ev):
                                 mt = fill_holes_color_aware(mt, _gate, fr, _stype, _fill_px)
                     elif _braw_sam2_gate is not None:
                         _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
-                        if _sam2_weighted:
+                        if _sam2_subtract:
+                            mt = apply_sam2_gate_subtract(_mt2d, _braw_sam2_gate, fr, _stype,
+                                                           buffer_px=int(_edge_guard), feather_px=_fp_eg)
+                        elif _sam2_weighted:
                             mt = apply_sam2_gate_weighted(_mt2d, _braw_sam2_gate, fr, _stype)
                         elif _sam2_additive:
                             mt = apply_sam2_gate_additive(_mt2d, _braw_sam2_gate, fr, _stype)
@@ -3084,19 +3121,25 @@ def on_process_range(ev):
                 # DEPENDS-ON: sam2_video_masks, _static_sam2_gate, _load_sam2_output_gate
                 # AFFECTS: mt (alpha) — multiplied by gate, zeroing pixels outside the matte.
                 if mt is not None:
-                    from sam2_combine import apply_sam2_gate, apply_sam2_gate_additive, apply_sam2_gate_weighted, trim_gate_by_chroma, fill_holes_color_aware
+                    from sam2_combine import apply_sam2_gate, apply_sam2_gate_additive, apply_sam2_gate_weighted, apply_sam2_gate_subtract, trim_gate_by_chroma, fill_holes_color_aware
                     _halo_px = int(settings.get("halo_px", 0))
                     _trim_px = int(settings.get("trim_chroma", 0))
                     _fill_px = int(settings.get("fill_holes", 0))
                     _stype = settings.get("screen_type", "green")
                     _sam2_additive = bool(settings.get("sam2_additive", False))
                     _sam2_weighted = bool(settings.get("sam2_weighted", False))
+                    _sam2_subtract = bool(settings.get("sam2_subtract", False))
+                    _edge_guard = int(settings.get("edge_guard_px", 8))
+                    _fp_eg = max(int(_edge_guard) // 2, 1)
                     if sam2_video_masks and range_idx in sam2_video_masks:
                         # Normal path — per-frame mask from video propagation.
                         _gate = _dilate_sam2_mask(sam2_video_masks[range_idx], margin=settings.get("sam2_margin", SAM2_MATTE_MARGIN))
                         _gate = _soften_sam2_mask(_gate, soften=settings.get("sam2_soften", 0))
                         _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
-                        if _sam2_weighted:
+                        if _sam2_subtract:
+                            mt = apply_sam2_gate_subtract(_mt2d, _gate, fr, _stype,
+                                                           buffer_px=int(_edge_guard), feather_px=_fp_eg)
+                        elif _sam2_weighted:
                             mt = apply_sam2_gate_weighted(_mt2d, _gate, fr, _stype)
                         elif _sam2_additive:
                             mt = apply_sam2_gate_additive(_mt2d, _gate, fr, _stype)
@@ -3116,7 +3159,10 @@ def on_process_range(ev):
                                 _tlog("SAM2 static gate loaded — applying same mask to all range frames (no propagation)")
                         if _static_sam2_gate is not None:
                             _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
-                            if _sam2_weighted:
+                            if _sam2_subtract:
+                                mt = apply_sam2_gate_subtract(_mt2d, _static_sam2_gate, fr, _stype,
+                                                               buffer_px=int(_edge_guard), feather_px=_fp_eg)
+                            elif _sam2_weighted:
                                 mt = apply_sam2_gate_weighted(_mt2d, _static_sam2_gate, fr, _stype)
                             elif _sam2_additive:
                                 mt = apply_sam2_gate_additive(_mt2d, _static_sam2_gate, fr, _stype)
