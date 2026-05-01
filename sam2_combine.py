@@ -124,50 +124,48 @@ def apply_sam2_gate_weighted(alpha, gate, source_rgb, screen_type='green', feath
     return np.clip(out, 0.0, 1.0).astype(alpha.dtype, copy=False)
 
 
-def apply_sam2_gate_subtract(alpha, gate, source_rgb, screen_type='green',
+def apply_sam2_gate_subtract(alpha, gate, source_rgb=None, screen_type='green',
                              buffer_px=8, feather_px=4):
-    """Subtract-only combine: NN matte owned by CorridorKey, SAM2 only kills in non-green zones.
+    """Subtract-only combine: NN matte owns the protection; SAM2 only kills past the matte edge.
 
-    Product principle: CorridorKey owns the matte everywhere green exists. SAM2 is
-    permitted to subtract junk (floor under feet, props off-screen) only in regions
-    far from the green screen, where NN had no chroma to key against. Hair / fine
-    detail in green territory is protected because the kill ramp is 0 there.
+    ARCHITECTURE REVISION 2026-05-01: protection signal is CorridorKey's OWN
+    MATTE (alpha), not chroma from the original RGB. The previous chroma-based
+    version got tricked by green-screen pixels near studio junk: a couch sitting
+    close to the screen would fall inside the dilated-green protection zone and
+    survive even though SAM2 said it was background. Using NN's matte directly
+    fixes this: studio junk has low NN alpha (NN already partially keyed it out),
+    so the kill ramp engages there. The actor body has high NN alpha and is
+    protected. The original RGB is never inspected.
 
-    buffer_px: distance past the green edge (in pixels) before SAM2 may begin to
-        kill. Acts as a safety band for body parts at the green edge.
-    feather_px: width of the soft transition where SAM2's kill power ramps from 0
-        to full. Avoids paper-cutout boundary look.
+    Logic:
+        nn_solid     = (alpha > 0.5)                  # binary: where NN says "actor"
+        dist         = distance to nearest nn_solid pixel
+        kill_ramp    = clip((dist - buffer) / feather, 0, 1)
+        sam2_bg      = 1 - gate_binarized_then_softened  # where SAM2 says "background"
+        result       = alpha * (1 - kill_ramp * sam2_bg)
 
-    Math:
-        kill_ramp = clip((dist_from_green - buffer) / feather, 0, 1)
-        sam2_bg = 1 - gate_binarized_then_softened
-        result = alpha * (1 - kill_ramp * sam2_bg)
+    buffer_px: distance past CorridorKey's matte edge before SAM2 may begin to
+        kill. Higher = more protection for hair / motion-blur halo.
+    feather_px: width of the soft transition.
+    source_rgb / screen_type: kept for signature compatibility with callsites
+        wired in older revisions; ignored by this implementation.
 
-    The gate is binarized at 0.5 BEFORE the spatial Gaussian blur (mirrors
-    apply_sam2_gate_weighted). Without binarization, SAM2's raw sigmoid (0.3-0.7
-    in body interior) would multiply NN by an intermediate value — exactly the
-    50/50 ghost that broke SMART BLEND. Spatial feather happens on the binary mask
-    so only the silhouette boundary is soft, not the whole interior.
+    SAM2 gate is binarized at 0.5 BEFORE the spatial Gaussian blur — without
+    that, raw sigmoid 0.3-0.7 in body interior would produce the SMART BLEND
+    ghost. Spatial feather lives on the binary mask so only the silhouette
+    boundary is soft, not the whole interior.
     """
     if gate is None:
         return alpha
     import cv2 as _cv2
-    # Binarize then spatial feather. See docstring on why this order matters.
     gate_bin = (gate > 0.5).astype(np.float32)
     gate_bin = _cv2.GaussianBlur(gate_bin, (11, 11), 2.5)
-    if screen_type == "blue":
-        chroma = source_rgb[..., 2] - np.maximum(source_rgb[..., 0], source_rgb[..., 1])
-    else:
-        chroma = source_rgb[..., 1] - np.maximum(source_rgb[..., 0], source_rgb[..., 2])
-    chroma = np.clip(chroma, 0.0, 1.0)
-    green_binary = (chroma > 0.10).astype(np.uint8)
-    # Empty-green fallback: shot has no green pixels at all (indoor / no screen).
-    # distanceTransform on an all-ones map saturates to max-distance — kill_ramp
-    # would be 1 everywhere → equivalent to multiplicative gate. Short-circuit
-    # to that directly and skip the distance compute.
-    if int(green_binary.sum()) == 0:
+    nn_solid = (alpha > 0.5).astype(np.uint8)
+    # Empty-NN fallback: nothing for NN to protect (e.g. SAM2 active before NN
+    # has a real matte). Degrade to multiplicative gate behavior.
+    if int(nn_solid.sum()) == 0:
         return (alpha * gate_bin).astype(alpha.dtype, copy=False)
-    dist = _cv2.distanceTransform(1 - green_binary, _cv2.DIST_L2, 5)
+    dist = _cv2.distanceTransform(1 - nn_solid, _cv2.DIST_L2, 5)
     fp = max(int(feather_px), 1)
     bp = max(int(buffer_px), 0)
     kill_ramp = np.clip((dist - float(bp)) / float(fp), 0.0, 1.0).astype(np.float32)
