@@ -434,13 +434,16 @@ def render_composite(cu, session: Session, params: dict):
             # props). Hair / fine detail in green territory protected by the
             # buffer + feather distance ramp. Wins over weighted/additive when
             # toggled. trim/fill_holes/halo intentionally not applied.
-            # EDGE GUARD now means "smooth fade width": kill ramps from 0 at the
-            # green edge to full at edge_guard_px past it. No hard preserved
-            # buffer — that was creating the visible white halo Berto reported.
+            # REVERTED 2026-05-01 to f6fa072 semantics: EDGE GUARD = hard
+            # buffer past the green edge before SAM2 may kill, with feather =
+            # half buffer for a soft transition tail. No closings on
+            # nn_killed or SAM2 silhouette. This is the version that produced
+            # Berto's clean-matte-from-feet-dots result.
+            _fp = max(int(edge_guard_px) // 2, 1)
             alpha = apply_sam2_gate_subtract(session.alpha_raw, _gate, _src_rgb,
                                              screen_type="green",
-                                             buffer_px=0,
-                                             feather_px=max(int(edge_guard_px), 1))
+                                             buffer_px=int(edge_guard_px),
+                                             feather_px=_fp)
         elif sam2_weighted:
             # SMART BLEND: per-pixel weighted combine — NN trusted in green
             # regions (preserves hair / butt-across-strap detail), SAM2 trusted
@@ -1525,11 +1528,11 @@ class PersistentWindow(QtWidgets.QWidget):
         # SAM2 reach. Feather (soft transition) auto-set to half this value.
         # Only meaningful when SUBTRACT mode is on.
         _EDGE_GUARD_TOOLTIP = (
-            "EDGE GUARD — width (px) of the smooth kill fade past the green "
-            "edge. Kill ramps from 0 at the green edge to full at this "
-            "distance. Higher = smoother fade-out, less visible halo, less "
-            "hair attenuation. Lower = sharper cut. Default 20. Only used "
-            "when SUBTRACT mode is on."
+            "EDGE GUARD — distance (px) past the green edge before SUBTRACT "
+            "may kill anything. Higher = more protection for body parts "
+            "surrounded by green (no SAM2 dots needed there). A small soft "
+            "transition tail extends past this distance. Default 20. Only "
+            "used when SUBTRACT mode is on."
         )
         self.edge_guard_label_widget = _label("EDGE GUARD")
         self.edge_guard_label_widget.setToolTip(_EDGE_GUARD_TOOLTIP)
@@ -2073,11 +2076,12 @@ class PersistentWindow(QtWidgets.QWidget):
                                   else self.session.fg_rgb)
                     if matte_subtract:
                         # SUBTRACT mirror — see Composite branch comment.
+                        _fp_m = max(int(matte_edge_guard) // 2, 1)
                         alpha = apply_sam2_gate_subtract(self.session.alpha_raw,
                                                          _gate, _src_rgb_m,
                                                          screen_type="green",
-                                                         buffer_px=0,
-                                                         feather_px=max(int(matte_edge_guard), 1))
+                                                         buffer_px=int(matte_edge_guard),
+                                                         feather_px=_fp_m)
                     elif matte_weighted:
                         # SMART BLEND mirror of Composite branch — per-pixel
                         # weighted NN/SAM2 by chroma. trim/fill_holes/halo
