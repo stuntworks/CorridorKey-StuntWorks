@@ -191,25 +191,58 @@ def apply_sam2_gate_subtract(alpha, gate, source_rgb=None, screen_type='green',
 
 
 # DANGER ZONE FRAGILE: this is the SINGLE SOURCE OF TRUTH for SAM2 + NN combine. All 6 callsites must use this. Do NOT inline alpha*gate elsewhere.
-def apply_sam2_gate(alpha: np.ndarray, gate: np.ndarray | None, invert: bool = False, halo_px: int = 0) -> np.ndarray:
+def apply_sam2_gate(alpha: np.ndarray, gate: np.ndarray | None, invert: bool = False,
+                    halo_px: int = 0, halo_body_px: int = 0) -> np.ndarray:
     """Combine NN alpha with SAM2 gate. invert=True = garbage matte mode (subtract clicked region).
 
-    halo_px: trimap-guided halo band width in pixels. When 0 (default), behavior is
-    bit-identical to the previous version: alpha * gate (or alpha * (1-gate) when
-    invert). When >0, the SAM2 gate is binarized at 0.5 and dilated by halo_px so a
-    band of NN-driven alpha values around the SAM2 silhouette survives the gate
-    multiply. Recovers hair / motion-blur detail at the SAM2 edge.
+    halo_px (HALO FEET): SAM2 gate dilation in NON-GREEN zones (under feet, on
+        floor, in studio non-green areas). When 0, no dilation in those zones.
+    halo_body_px (HALO BODY): SAM2 gate dilation in GREEN-BORDERED zones (around
+        the body silhouette where it meets the green screen). When 0, no dilation
+        in those zones. Designed to recover NN edge detail (hair fringe, butt
+        across strap, fingertip wisps) where SAM2's silhouette is tighter than
+        the actor's actual edge. Berto-locked design 2026-05-01: two zones,
+        independent control, predictable across shots.
+
+    When both halos are 0, returns alpha * gate (or alpha * (1-gate) for invert).
+    Bit-identical to the original single-halo behavior when halo_body_px=0 and
+    halo_px>=0.
+
+    Zone detection: a pixel is in the "green-bordered" zone if it lies within
+    max(halo_px, halo_body_px) pixels of any NN-killed pixel (alpha < 0.05).
+    Otherwise it's in the "non-green" zone.
     """
     if gate is None:
         return alpha
     gate_use = (1.0 - gate) if invert else gate
-    if halo_px and halo_px > 0:
-        # Lazy import — keep the no-halo fast path numpy-only and avoid forcing
-        # cv2 onto callers that never use halo. Viewers already import cv2.
-        import cv2 as _cv2
-        binary = (gate_use > 0.5).astype(np.uint8)
-        k = int(halo_px) * 2 + 1
-        kernel = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (k, k))
-        extended = _cv2.dilate(binary, kernel).astype(np.float32)
-        return alpha * extended
-    return alpha * gate_use
+    has_halo = (halo_px and halo_px > 0) or (halo_body_px and halo_body_px > 0)
+    if not has_halo:
+        return alpha * gate_use
+    import cv2 as _cv2
+    binary = (gate_use > 0.5).astype(np.uint8)
+    if halo_body_px and halo_body_px > 0:
+        # Two-zone path: dilate gate at different rates depending on whether
+        # the pixel is near a green region or not.
+        green_mask = (alpha < 0.05).astype(np.uint8)
+        # Proximity radius: large enough to cover the body fringe near green.
+        # Use the larger of the two halos so neither zone shrinks the other.
+        prox_r = max(int(halo_body_px), int(halo_px))
+        prox_kernel = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE,
+                                                 (prox_r * 2 + 1, prox_r * 2 + 1))
+        near_green = _cv2.dilate(green_mask, prox_kernel)
+        # Body dilation
+        kb = int(halo_body_px) * 2 + 1
+        gate_body = _cv2.dilate(binary, _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (kb, kb)))
+        # Feet dilation (or no dilation if halo_px = 0)
+        if halo_px and halo_px > 0:
+            kf = int(halo_px) * 2 + 1
+            gate_feet = _cv2.dilate(binary, _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (kf, kf)))
+        else:
+            gate_feet = binary
+        gate_combined = np.where(near_green > 0, gate_body, gate_feet).astype(np.float32)
+        return (alpha * gate_combined).astype(alpha.dtype, copy=False)
+    # Single-halo path (original behavior, halo_body_px = 0)
+    k = int(halo_px) * 2 + 1
+    kernel = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (k, k))
+    extended = _cv2.dilate(binary, kernel).astype(np.float32)
+    return alpha * extended
