@@ -354,7 +354,7 @@ def render_composite(cu, session: Session, params: dict):
     sam2_additive = bool(params.get("sam2_additive", False))
     sam2_weighted = bool(params.get("sam2_weighted", False))
     sam2_subtract = bool(params.get("sam2_subtract", False))
-    edge_guard_px = int(params.get("edge_guard_px", 8))
+    edge_guard_px = int(params.get("edge_guard_px", 20))
     # DaVinci formula exactly: multiply NN × gate first, then dilate+soften the result.
     # Dilating the product spreads existing NN alpha values outward so MARGIN visibly
     # grows the body. Gate cuts background bleed. SOFTEN feathers the expanded edge.
@@ -371,13 +371,11 @@ def render_composite(cu, session: Session, params: dict):
                                interpolation=cv2.INTER_LINEAR)
         _src_rgb = session.original_rgb if session.original_rgb is not None else session.fg_rgb
         if sam2_subtract:
-            # SUBTRACT mode: NN owns the matte everywhere green exists. SAM2 only
-            # permitted to kill in non-green zones. Wins over weighted/additive.
-            _fp = max(int(edge_guard_px) // 2, 1)
+            # EDGE GUARD = smooth fade width past the green edge (no hard buffer).
             alpha = np.clip(apply_sam2_gate_subtract(session.alpha_nn, _gate, _src_rgb,
                                                      screen_type="green",
-                                                     buffer_px=int(edge_guard_px),
-                                                     feather_px=_fp),
+                                                     buffer_px=0,
+                                                     feather_px=max(int(edge_guard_px), 1)),
                             0.0, 1.0)
         elif sam2_weighted:
             # SMART BLEND: per-pixel weighted combine — NN trusted in green
@@ -552,7 +550,7 @@ class PersistentWindow(QtWidgets.QWidget):
             "sam2_subtract": False,
             # EDGE GUARD: distance (px) past green edge before SAM2 may kill.
             # Feather auto-set to half this value. Default 8.
-            "edge_guard_px": 8,
+            "edge_guard_px": 20,
         }
         # Drop-stale: if a new update comes in while we're painting, we only keep
         # the latest one. _pending is None when idle, or a dict when a render is
@@ -1204,21 +1202,20 @@ class PersistentWindow(QtWidgets.QWidget):
 
         # --- EDGE GUARD: distance buffer past green edge before SAM2 may kill ---
         _EDGE_GUARD_TOOLTIP = (
-            "EDGE GUARD — distance (px) past the green edge before SUBTRACT "
-            "may begin to kill. Higher = more protection for body parts at "
-            "the green edge. Feather auto-set to half this value. Default 8. "
+            "EDGE GUARD — width (px) of the smooth kill fade past the green "
+            "edge. Higher = smoother halo, less hair attenuation. Default 20. "
             "Only used when SUBTRACT mode is on."
         )
         self.edge_guard_label_widget = _label("EDGE GUARD")
         self.edge_guard_label_widget.setToolTip(_EDGE_GUARD_TOOLTIP)
         grid.addWidget(self.edge_guard_label_widget, 12, 0)
         self.edge_guard_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.edge_guard_slider.setRange(0, 50)
-        self.edge_guard_slider.setValue(int(self._params.get("edge_guard_px", 8)))
+        self.edge_guard_slider.setRange(0, 200)
+        self.edge_guard_slider.setValue(int(self._params.get("edge_guard_px", 20)))
         self.edge_guard_slider.valueChanged.connect(self._on_edge_guard_changed)
         self.edge_guard_slider.setToolTip(_EDGE_GUARD_TOOLTIP)
         grid.addWidget(self.edge_guard_slider, 12, 1)
-        self.edge_guard_value_label = _label(f"{int(self._params.get('edge_guard_px', 8))}", "#0ff")
+        self.edge_guard_value_label = _label(f"{int(self._params.get('edge_guard_px', 20))}", "#0ff")
         self.edge_guard_value_label.setMinimumWidth(42)
         self.edge_guard_value_label.setToolTip(_EDGE_GUARD_TOOLTIP)
         grid.addWidget(self.edge_guard_value_label, 12, 2)
@@ -1626,7 +1623,7 @@ class PersistentWindow(QtWidgets.QWidget):
                 _additive = bool(params_for_matte.get("sam2_additive", False))
                 _weighted = bool(params_for_matte.get("sam2_weighted", False))
                 _subtract = bool(params_for_matte.get("sam2_subtract", False))
-                _edge_guard = int(params_for_matte.get("edge_guard_px", 8))
+                _edge_guard = int(params_for_matte.get("edge_guard_px", 20))
                 if self.session.alpha_nn is not None and self.session.sam2_gate_raw is not None:
                     _gate = self.session.sam2_gate_raw.copy()
                     # SAM2 returns the gate at 256x256 — must resize to alpha
@@ -1647,15 +1644,12 @@ class PersistentWindow(QtWidgets.QWidget):
                                   if self.session.original_rgb is not None
                                   else self.session.fg_rgb)
                     if _subtract:
-                        # SUBTRACT mirror of Composite branch — NN matte preserved
-                        # in green zones, SAM2 only kills in non-green regions
-                        # past the edge-guard buffer.
-                        _fp_m = max(int(_edge_guard) // 2, 1)
+                        # SUBTRACT mirror — see Composite branch.
                         alpha = np.clip(apply_sam2_gate_subtract(self.session.alpha_nn,
                                                                  _gate, _src_rgb_m,
                                                                  screen_type="green",
-                                                                 buffer_px=int(_edge_guard),
-                                                                 feather_px=_fp_m),
+                                                                 buffer_px=0,
+                                                                 feather_px=max(int(_edge_guard), 1)),
                                         0.0, 1.0)
                     elif _weighted:
                         # SMART BLEND mirror of Composite branch — per-pixel

@@ -490,7 +490,7 @@ def get_settings():
         "sam2_subtract": False,
         # EDGE GUARD: distance (px) past green edge before SAM2 may kill.
         # Feather auto-set to half this value. Default 8 px.
-        "edge_guard_px": 8,
+        "edge_guard_px": 20,
     }
 
 # WHAT IT DOES: Overrides panel's despill / despeckle settings with the v2 viewer's
@@ -575,7 +575,7 @@ def _merge_live_params(settings):
                 except (ValueError, TypeError):
                     pass
         if "edge_guard_px" in lp:
-            try: out["edge_guard_px"] = max(0, min(50, int(lp["edge_guard_px"])))
+            try: out["edge_guard_px"] = max(0, min(200, int(lp["edge_guard_px"])))
             except (ValueError, TypeError): pass
         if "sam_positive" in lp or "sam_negative" in lp:
             sam_points["positive"] = [tuple(p) for p in lp.get("sam_positive", [])]
@@ -2281,12 +2281,11 @@ def _key_one_scrub_frame():
             _sam2_additive = bool(ctx["settings"].get("sam2_additive", False))
             _sam2_weighted = bool(ctx["settings"].get("sam2_weighted", False))
             _sam2_subtract = bool(ctx["settings"].get("sam2_subtract", False))
-            _edge_guard = int(ctx["settings"].get("edge_guard_px", 8))
+            _edge_guard = int(ctx["settings"].get("edge_guard_px", 20))
             if _sam2_subtract:
                 _mt2d_s = mt[:, :, 0] if len(mt.shape) == 3 else mt
-                _fp_s = max(int(_edge_guard) // 2, 1)
                 mt = apply_sam2_gate_subtract(_mt2d_s, _gate, fr, _stype,
-                                              buffer_px=int(_edge_guard), feather_px=_fp_s)
+                                              buffer_px=0, feather_px=max(int(_edge_guard), 1))
             elif _sam2_weighted:
                 _mt2d_w = mt[:, :, 0] if len(mt.shape) == 3 else mt
                 mt = apply_sam2_gate_weighted(_mt2d_w, _gate, fr, _stype)
@@ -2884,15 +2883,15 @@ def on_process_range(ev):
                     _sam2_additive = bool(settings.get("sam2_additive", False))
                     _sam2_weighted = bool(settings.get("sam2_weighted", False))
                     _sam2_subtract = bool(settings.get("sam2_subtract", False))
-                    _edge_guard = int(settings.get("edge_guard_px", 8))
-                    _fp_eg = max(int(_edge_guard) // 2, 1)
+                    _edge_guard = int(settings.get("edge_guard_px", 20))
+                    _fp_eg = max(int(_edge_guard), 1)
                     if _braw_sam2_video_masks and fidx in _braw_sam2_video_masks:
                         _gate = _dilate_sam2_mask(_braw_sam2_video_masks[fidx], margin=settings.get("sam2_margin", SAM2_MATTE_MARGIN))
                         _gate = _soften_sam2_mask(_gate, soften=settings.get("sam2_soften", 0))
                         _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
                         if _sam2_subtract:
                             mt = apply_sam2_gate_subtract(_mt2d, _gate, fr, _stype,
-                                                           buffer_px=int(_edge_guard), feather_px=_fp_eg)
+                                                           buffer_px=0, feather_px=_fp_eg)
                         elif _sam2_weighted:
                             mt = apply_sam2_gate_weighted(_mt2d, _gate, fr, _stype)
                         elif _sam2_additive:
@@ -2907,7 +2906,7 @@ def on_process_range(ev):
                         _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
                         if _sam2_subtract:
                             mt = apply_sam2_gate_subtract(_mt2d, _braw_sam2_gate, fr, _stype,
-                                                           buffer_px=int(_edge_guard), feather_px=_fp_eg)
+                                                           buffer_px=0, feather_px=_fp_eg)
                         elif _sam2_weighted:
                             mt = apply_sam2_gate_weighted(_mt2d, _braw_sam2_gate, fr, _stype)
                         elif _sam2_additive:
@@ -3129,8 +3128,8 @@ def on_process_range(ev):
                     _sam2_additive = bool(settings.get("sam2_additive", False))
                     _sam2_weighted = bool(settings.get("sam2_weighted", False))
                     _sam2_subtract = bool(settings.get("sam2_subtract", False))
-                    _edge_guard = int(settings.get("edge_guard_px", 8))
-                    _fp_eg = max(int(_edge_guard) // 2, 1)
+                    _edge_guard = int(settings.get("edge_guard_px", 20))
+                    _fp_eg = max(int(_edge_guard), 1)
                     if sam2_video_masks and range_idx in sam2_video_masks:
                         # Normal path — per-frame mask from video propagation.
                         _gate = _dilate_sam2_mask(sam2_video_masks[range_idx], margin=settings.get("sam2_margin", SAM2_MATTE_MARGIN))
@@ -3138,7 +3137,7 @@ def on_process_range(ev):
                         _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
                         if _sam2_subtract:
                             mt = apply_sam2_gate_subtract(_mt2d, _gate, fr, _stype,
-                                                           buffer_px=int(_edge_guard), feather_px=_fp_eg)
+                                                           buffer_px=0, feather_px=_fp_eg)
                         elif _sam2_weighted:
                             mt = apply_sam2_gate_weighted(_mt2d, _gate, fr, _stype)
                         elif _sam2_additive:
@@ -3161,7 +3160,7 @@ def on_process_range(ev):
                             _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
                             if _sam2_subtract:
                                 mt = apply_sam2_gate_subtract(_mt2d, _static_sam2_gate, fr, _stype,
-                                                               buffer_px=int(_edge_guard), feather_px=_fp_eg)
+                                                               buffer_px=0, feather_px=_fp_eg)
                             elif _sam2_weighted:
                                 mt = apply_sam2_gate_weighted(_mt2d, _static_sam2_gate, fr, _stype)
                             elif _sam2_additive:
