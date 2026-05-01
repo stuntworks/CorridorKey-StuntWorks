@@ -491,6 +491,8 @@ def get_settings():
         # EDGE GUARD: distance (px) past green edge before SAM2 may kill.
         # Feather auto-set to half this value. Default 8 px.
         "edge_guard_px": 20,
+        # SAM2 BYPASS: master switch — when True, all SAM2 paths skipped.
+        "sam2_bypass": False,
     }
 
 # WHAT IT DOES: Overrides panel's despill / despeckle settings with the v2 viewer's
@@ -577,6 +579,17 @@ def _merge_live_params(settings):
         if "edge_guard_px" in lp:
             try: out["edge_guard_px"] = max(0, min(200, int(lp["edge_guard_px"])))
             except (ValueError, TypeError): pass
+        if "sam2_bypass" in lp:
+            _bv = lp["sam2_bypass"]
+            if isinstance(_bv, bool):
+                out["sam2_bypass"] = _bv
+            elif isinstance(_bv, str):
+                out["sam2_bypass"] = _bv.strip().lower() in ("true", "1", "yes", "on")
+            else:
+                try:
+                    out["sam2_bypass"] = bool(int(_bv))
+                except (ValueError, TypeError):
+                    pass
         if "sam_positive" in lp or "sam_negative" in lp:
             sam_points["positive"] = [tuple(p) for p in lp.get("sam_positive", [])]
             sam_points["negative"] = [tuple(p) for p in lp.get("sam_negative", [])]
@@ -2281,8 +2294,11 @@ def _key_one_scrub_frame():
             _sam2_additive = bool(ctx["settings"].get("sam2_additive", False))
             _sam2_weighted = bool(ctx["settings"].get("sam2_weighted", False))
             _sam2_subtract = bool(ctx["settings"].get("sam2_subtract", False))
+            _sam2_bypass = bool(ctx["settings"].get("sam2_bypass", False))
             _edge_guard = int(ctx["settings"].get("edge_guard_px", 20))
-            if _sam2_subtract:
+            if _sam2_bypass:
+                pass  # skip all SAM2 combine — keep mt as NN-only
+            elif _sam2_subtract:
                 _mt2d_s = mt[:, :, 0] if len(mt.shape) == 3 else mt
                 mt = apply_sam2_gate_subtract(_mt2d_s, _gate, fr, _stype,
                                               buffer_px=0, feather_px=max(int(_edge_guard), 1))
@@ -2883,9 +2899,12 @@ def on_process_range(ev):
                     _sam2_additive = bool(settings.get("sam2_additive", False))
                     _sam2_weighted = bool(settings.get("sam2_weighted", False))
                     _sam2_subtract = bool(settings.get("sam2_subtract", False))
+                    _sam2_bypass = bool(settings.get("sam2_bypass", False))
                     _edge_guard = int(settings.get("edge_guard_px", 20))
                     _fp_eg = max(int(_edge_guard), 1)
-                    if _braw_sam2_video_masks and fidx in _braw_sam2_video_masks:
+                    if _sam2_bypass:
+                        pass  # skip all SAM2 combine — keep mt as NN-only
+                    elif _braw_sam2_video_masks and fidx in _braw_sam2_video_masks:
                         _gate = _dilate_sam2_mask(_braw_sam2_video_masks[fidx], margin=settings.get("sam2_margin", SAM2_MATTE_MARGIN))
                         _gate = _soften_sam2_mask(_gate, soften=settings.get("sam2_soften", 0))
                         _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
@@ -3128,9 +3147,12 @@ def on_process_range(ev):
                     _sam2_additive = bool(settings.get("sam2_additive", False))
                     _sam2_weighted = bool(settings.get("sam2_weighted", False))
                     _sam2_subtract = bool(settings.get("sam2_subtract", False))
+                    _sam2_bypass = bool(settings.get("sam2_bypass", False))
                     _edge_guard = int(settings.get("edge_guard_px", 20))
                     _fp_eg = max(int(_edge_guard), 1)
-                    if sam2_video_masks and range_idx in sam2_video_masks:
+                    if _sam2_bypass:
+                        pass  # skip all SAM2 combine — keep mt as NN-only
+                    elif sam2_video_masks and range_idx in sam2_video_masks:
                         # Normal path — per-frame mask from video propagation.
                         _gate = _dilate_sam2_mask(sam2_video_masks[range_idx], margin=settings.get("sam2_margin", SAM2_MATTE_MARGIN))
                         _gate = _soften_sam2_mask(_gate, soften=settings.get("sam2_soften", 0))
