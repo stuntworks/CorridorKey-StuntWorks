@@ -174,52 +174,14 @@ def apply_sam2_gate_subtract(alpha, gate, source_rgb=None, screen_type='green',
     import cv2 as _cv2
     gate_bin = (gate > 0.5).astype(np.float32)
     gate_bin = _cv2.GaussianBlur(gate_bin, (11, 11), 2.5)
-    # Green zones: where NN confidently drove alpha to 0. Threshold low so
-    # hair fringe (alpha 0.2-0.6) isn't included.
+    # "Green zones" = where NN confidently drove alpha to 0. Threshold low so
+    # we don't include hair fringe (typically alpha 0.2-0.6) in the green zone.
     nn_killed = (alpha < 0.05).astype(np.uint8)
-    # Empty-killed fallback: no NN-killed pixels (no green / SAM2 invoked
-    # before refiner). Degrade to multiplicative.
+    # Empty-killed fallback: shot has no NN-killed pixels (NN saw no green at
+    # all — e.g. SAM2 invoked before refiner ran). Degrade to multiplicative.
     if int(nn_killed.sum()) == 0:
         return (alpha * gate_bin).astype(alpha.dtype, copy=False)
-    # PROTECTION ZONE = closing(green) ∪ closing(SAM2 actor).
-    #
-    # Two closings, two distinct purposes:
-    #
-    # 1. closing(nn_killed, radius=80) — fills holes in the green mask up to
-    #    ~160px diameter. This auto-protects body parts that are completely
-    #    surrounded by green WITHOUT requiring SAM2 dots on them. Berto's
-    #    canonical "click only the feet" workflow depends on this. Tradeoff:
-    #    studio junk small enough to fit inside 160px-of-green ALSO gets
-    #    protected — acceptable because real stunt sets keep junk well off
-    #    the green stage.
-    #
-    # 2. closing(sam2_actor, radius=30) — fills internal gaps in SAM2's
-    #    silhouette (e.g. a stunt-rig strap crossing the butt). Lets body
-    #    parts extending past the green (feet on floor with positive dots)
-    #    be protected via SAM2.
-    #
-    # Pixel walk:
-    #   green pixel:                    nn_killed=1 → protected ✓
-    #   body interior on green:         in closing(nn_killed) → protected ✓
-    #   body across strap on green:     same as above ✓
-    #   foot off green WITH dot:        in closing(sam2_actor) → protected ✓
-    #   foot off green WITHOUT dot:     not in either → killed ✗ (workflow needs dot)
-    #   couch off green far from screen: not in either → killed ✓
-    #   couch in green-bounded hole:    in closing(nn_killed) → protected (rare false +)
-    _GREEN_CLOSE_R = 80
-    _gck = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE,
-                                      (_GREEN_CLOSE_R * 2 + 1, _GREEN_CLOSE_R * 2 + 1))
-    nn_killed_closed = _cv2.morphologyEx(nn_killed, _cv2.MORPH_CLOSE, _gck)
-    sam2_actor = (gate > 0.5).astype(np.uint8)
-    if int(sam2_actor.sum()) > 0:
-        _SAM2_CLOSE_R = 30
-        _sck = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE,
-                                          (_SAM2_CLOSE_R * 2 + 1, _SAM2_CLOSE_R * 2 + 1))
-        sam2_filled = _cv2.morphologyEx(sam2_actor, _cv2.MORPH_CLOSE, _sck)
-    else:
-        sam2_filled = sam2_actor
-    nn_protected = (nn_killed_closed | sam2_filled).astype(np.uint8)
-    dist = _cv2.distanceTransform(1 - nn_protected, _cv2.DIST_L2, 5)
+    dist = _cv2.distanceTransform(1 - nn_killed, _cv2.DIST_L2, 5)
     fp = max(int(feather_px), 1)
     bp = max(int(buffer_px), 0)
     kill_ramp = np.clip((dist - float(bp)) / float(fp), 0.0, 1.0).astype(np.float32)
