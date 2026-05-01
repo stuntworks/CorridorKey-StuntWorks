@@ -181,7 +181,19 @@ def apply_sam2_gate_subtract(alpha, gate, source_rgb=None, screen_type='green',
     # all — e.g. SAM2 invoked before refiner ran). Degrade to multiplicative.
     if int(nn_killed.sum()) == 0:
         return (alpha * gate_bin).astype(alpha.dtype, copy=False)
-    dist = _cv2.distanceTransform(1 - nn_killed, _cv2.DIST_L2, 5)
+    # CRITICAL: morphological closing to capture body interior. Without this,
+    # body pixels deep inside a green-surrounded silhouette have a large dist
+    # from any green pixel, so kill_ramp goes high there and SAM2's wrong
+    # "bg" vote (e.g. on a strap crossing the butt) cuts the body. Closing
+    # fills holes in the green mask smaller than the kernel — i.e. body
+    # interiors surrounded by green become part of the protected zone, but
+    # open non-green areas (couch, rack, floor) do not.
+    # Kernel size = max body half-width to cover at 1080p; tunable later.
+    _CLOSE_R = 120
+    _ck = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE,
+                                     (_CLOSE_R * 2 + 1, _CLOSE_R * 2 + 1))
+    nn_protected = _cv2.morphologyEx(nn_killed, _cv2.MORPH_CLOSE, _ck)
+    dist = _cv2.distanceTransform(1 - nn_protected, _cv2.DIST_L2, 5)
     fp = max(int(feather_px), 1)
     bp = max(int(buffer_px), 0)
     kill_ramp = np.clip((dist - float(bp)) / float(fp), 0.0, 1.0).astype(np.float32)
