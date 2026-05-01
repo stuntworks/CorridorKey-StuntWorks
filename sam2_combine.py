@@ -174,25 +174,43 @@ def apply_sam2_gate_subtract(alpha, gate, source_rgb=None, screen_type='green',
     import cv2 as _cv2
     gate_bin = (gate > 0.5).astype(np.float32)
     gate_bin = _cv2.GaussianBlur(gate_bin, (11, 11), 2.5)
-    # "Green zones" = where NN confidently drove alpha to 0. Threshold low so
-    # we don't include hair fringe (typically alpha 0.2-0.6) in the green zone.
+    # Green zones: where NN confidently drove alpha to 0. Threshold low so
+    # hair fringe (alpha 0.2-0.6) isn't included.
     nn_killed = (alpha < 0.05).astype(np.uint8)
-    # Empty-killed fallback: shot has no NN-killed pixels (NN saw no green at
-    # all — e.g. SAM2 invoked before refiner ran). Degrade to multiplicative.
+    # Empty-killed fallback: no NN-killed pixels (no green / SAM2 invoked
+    # before refiner). Degrade to multiplicative.
     if int(nn_killed.sum()) == 0:
         return (alpha * gate_bin).astype(alpha.dtype, copy=False)
-    # CRITICAL: morphological closing to capture body interior. Without this,
-    # body pixels deep inside a green-surrounded silhouette have a large dist
-    # from any green pixel, so kill_ramp goes high there and SAM2's wrong
-    # "bg" vote (e.g. on a strap crossing the butt) cuts the body. Closing
-    # fills holes in the green mask smaller than the kernel — i.e. body
-    # interiors surrounded by green become part of the protected zone, but
-    # open non-green areas (couch, rack, floor) do not.
-    # Kernel size = max body half-width to cover at 1080p; tunable later.
-    _CLOSE_R = 120
-    _ck = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE,
-                                     (_CLOSE_R * 2 + 1, _CLOSE_R * 2 + 1))
-    nn_protected = _cv2.morphologyEx(nn_killed, _cv2.MORPH_CLOSE, _ck)
+    # PROTECTION ZONE = NN's green pixels  +  SAM2's filled actor silhouette.
+    # Reasoning:
+    #   Closing the green mask alone (prior approach) filled small non-green
+    #   holes inside the green region — including the couch and rack, which
+    #   are NOT body. It also failed when the body extended past the green
+    #   (open-bottom silhouette) because closing can't fill open holes.
+    #
+    #   SAM2's actor silhouette is the only signal that genuinely identifies
+    #   actor vs studio junk. Closing SAM2's mask fills internal gaps (e.g.
+    #   a strap crossing the butt) without expanding into junk. Unioning
+    #   SAM2's filled zone with green pixels gives a clean protection mask:
+    #     - Pure green pixels: protected (NN already keyed)
+    #     - Body interior where SAM2 says actor: protected (sam2_filled)
+    #     - Body across strap (small SAM2 gap): protected by closing
+    #     - Junk in non-green areas: not in either set → SAM2 can kill
+    #     - Studio prop in green-bounded hole: not green, no SAM2 actor →
+    #       not protected → SAM2 can kill
+    #
+    # Tradeoff: body parts that extend past the green screen MUST have
+    # positive SAM2 dots placed on them. Without dots, SAM2 won't cover them
+    # and SUBTRACT will treat them as junk.
+    sam2_actor = (gate > 0.5).astype(np.uint8)
+    if int(sam2_actor.sum()) > 0:
+        _SAM2_CLOSE_R = 30
+        _ck = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE,
+                                         (_SAM2_CLOSE_R * 2 + 1, _SAM2_CLOSE_R * 2 + 1))
+        sam2_filled = _cv2.morphologyEx(sam2_actor, _cv2.MORPH_CLOSE, _ck)
+    else:
+        sam2_filled = sam2_actor
+    nn_protected = (nn_killed | sam2_filled).astype(np.uint8)
     dist = _cv2.distanceTransform(1 - nn_protected, _cv2.DIST_L2, 5)
     fp = max(int(feather_px), 1)
     bp = max(int(buffer_px), 0)
