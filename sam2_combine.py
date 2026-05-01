@@ -126,46 +126,62 @@ def apply_sam2_gate_weighted(alpha, gate, source_rgb, screen_type='green', feath
 
 def apply_sam2_gate_subtract(alpha, gate, source_rgb=None, screen_type='green',
                              buffer_px=8, feather_px=4):
-    """Subtract-only combine: NN matte owns the protection; SAM2 only kills past the matte edge.
+    """Subtract-only combine: SAM2 may only kill OUTSIDE CorridorKey's green zones.
 
-    ARCHITECTURE REVISION 2026-05-01: protection signal is CorridorKey's OWN
-    MATTE (alpha), not chroma from the original RGB. The previous chroma-based
-    version got tricked by green-screen pixels near studio junk: a couch sitting
-    close to the screen would fall inside the dilated-green protection zone and
-    survive even though SAM2 said it was background. Using NN's matte directly
-    fixes this: studio junk has low NN alpha (NN already partially keyed it out),
-    so the kill ramp engages there. The actor body has high NN alpha and is
-    protected. The original RGB is never inspected.
+    ARCHITECTURE 2026-05-01 (revised twice in one session):
+
+    Goal: SAM2 should only act in non-green areas (where CorridorKey couldn't key
+    against anything). In green areas, CorridorKey already owns the matte and
+    SAM2 must stay out — otherwise SAM2's tighter silhouette cuts hair / fringe.
+
+    The "where is green?" signal is CorridorKey's OWN MATTE — specifically the
+    pixels where NN drove alpha to ~0. Reading green from the original RGB chroma
+    (the first version) misfired because green spill bouncing off the screen
+    onto nearby studio junk (couch, equipment) registered as "green-ish" and
+    protected the junk from SAM2's kill. NN's matte does not get fooled by
+    spill: NN keys spill-tinted-but-not-actually-green pixels as foreground
+    (alpha > 0), so they're correctly outside the protection zone.
 
     Logic:
-        nn_solid     = (alpha > 0.5)                  # binary: where NN says "actor"
-        dist         = distance to nearest nn_solid pixel
+        nn_killed    = (alpha < 0.05)                 # where NN confidently killed the green
+        dist         = distance to nearest nn_killed pixel  (= distance from green zone)
         kill_ramp    = clip((dist - buffer) / feather, 0, 1)
-        sam2_bg      = 1 - gate_binarized_then_softened  # where SAM2 says "background"
+        sam2_bg      = 1 - gate_binarized_then_softened
         result       = alpha * (1 - kill_ramp * sam2_bg)
 
-    buffer_px: distance past CorridorKey's matte edge before SAM2 may begin to
-        kill. Higher = more protection for hair / motion-blur halo.
-    feather_px: width of the soft transition.
-    source_rgb / screen_type: kept for signature compatibility with callsites
-        wired in older revisions; ignored by this implementation.
+    Pixel walk:
+      - Green pixel:        alpha=0, in nn_killed zone, dist=0 → no kill (alpha is 0 anyway)
+      - Hair fringe:        alpha=0.4, distance to green ~ 1-2px → within buffer → no kill
+      - Body interior:      alpha=1, distance to green ~ small → within buffer → no kill
+      - Couch off-screen:   alpha=1, distance to green = 100+px → past buffer → SAM2 kills
+      - Foot on non-green:  alpha=1, distance to green ~ small (foot at green edge)
+                            → if SAM2 says actor, no kill regardless. If SAM2 says bg, only
+                            killed past EDGE GUARD distance from the green edge.
+
+    buffer_px (EDGE GUARD): distance past the green edge before SAM2 may begin
+        to kill. Larger = more protection for hair / fringe and for body parts
+        right at the green border, but also more protection for any junk that
+        happens to be within that distance of the green.
+    feather_px: width of the soft kill transition.
+    source_rgb / screen_type: signature kept for callsite compatibility; ignored.
 
     SAM2 gate is binarized at 0.5 BEFORE the spatial Gaussian blur — without
     that, raw sigmoid 0.3-0.7 in body interior would produce the SMART BLEND
-    ghost. Spatial feather lives on the binary mask so only the silhouette
-    boundary is soft, not the whole interior.
+    ghost. Spatial feather lives on the binary mask.
     """
     if gate is None:
         return alpha
     import cv2 as _cv2
     gate_bin = (gate > 0.5).astype(np.float32)
     gate_bin = _cv2.GaussianBlur(gate_bin, (11, 11), 2.5)
-    nn_solid = (alpha > 0.5).astype(np.uint8)
-    # Empty-NN fallback: nothing for NN to protect (e.g. SAM2 active before NN
-    # has a real matte). Degrade to multiplicative gate behavior.
-    if int(nn_solid.sum()) == 0:
+    # "Green zones" = where NN confidently drove alpha to 0. Threshold low so
+    # we don't include hair fringe (typically alpha 0.2-0.6) in the green zone.
+    nn_killed = (alpha < 0.05).astype(np.uint8)
+    # Empty-killed fallback: shot has no NN-killed pixels (NN saw no green at
+    # all — e.g. SAM2 invoked before refiner ran). Degrade to multiplicative.
+    if int(nn_killed.sum()) == 0:
         return (alpha * gate_bin).astype(alpha.dtype, copy=False)
-    dist = _cv2.distanceTransform(1 - nn_solid, _cv2.DIST_L2, 5)
+    dist = _cv2.distanceTransform(1 - nn_killed, _cv2.DIST_L2, 5)
     fp = max(int(feather_px), 1)
     bp = max(int(buffer_px), 0)
     kill_ramp = np.clip((dist - float(bp)) / float(fp), 0.0, 1.0).astype(np.float32)
