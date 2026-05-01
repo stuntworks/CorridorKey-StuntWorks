@@ -420,7 +420,7 @@ def render_composite(cu, session: Session, params: dict):
     sam2_additive = bool(params.get("sam2_additive", False))
     sam2_weighted = bool(params.get("sam2_weighted", False))
     sam2_subtract = bool(params.get("sam2_subtract", False))
-    edge_guard_px = int(params.get("edge_guard_px", 8))
+    edge_guard_px = int(params.get("edge_guard_px", 20))
     if session.alpha_raw is not None and session.sam2_gate_raw is not None:
         _gate = session.sam2_gate_raw.copy()
         if _gate.shape != session.alpha_raw.shape:
@@ -433,11 +433,13 @@ def render_composite(cu, session: Session, params: dict):
             # props). Hair / fine detail in green territory protected by the
             # buffer + feather distance ramp. Wins over weighted/additive when
             # toggled. trim/fill_holes/halo intentionally not applied.
-            _fp = max(int(edge_guard_px) // 2, 1)
+            # EDGE GUARD now means "smooth fade width": kill ramps from 0 at the
+            # green edge to full at edge_guard_px past it. No hard preserved
+            # buffer — that was creating the visible white halo Berto reported.
             alpha = apply_sam2_gate_subtract(session.alpha_raw, _gate, _src_rgb,
                                              screen_type="green",
-                                             buffer_px=int(edge_guard_px),
-                                             feather_px=_fp)
+                                             buffer_px=0,
+                                             feather_px=max(int(edge_guard_px), 1))
         elif sam2_weighted:
             # SMART BLEND: per-pixel weighted combine — NN trusted in green
             # regions (preserves hair / butt-across-strap detail), SAM2 trusted
@@ -666,7 +668,7 @@ class PersistentWindow(QtWidgets.QWidget):
             # EDGE GUARD: distance in pixels past the green edge before SAM2
             # may begin to kill (buffer). Feather is auto-set to half this
             # value. Default 8 px works for typical 1080p stunt footage.
-            "edge_guard_px": 8,
+            "edge_guard_px": 20,
         }
         # Drop-stale: if a new update comes in while we're painting, we only keep
         # the latest one. _pending is None when idle, or a dict when a render is
@@ -1559,21 +1561,22 @@ class PersistentWindow(QtWidgets.QWidget):
         # SAM2 reach. Feather (soft transition) auto-set to half this value.
         # Only meaningful when SUBTRACT mode is on.
         _EDGE_GUARD_TOOLTIP = (
-            "EDGE GUARD — distance (px) past the green edge before SUBTRACT "
-            "may begin to kill. Higher = more protection for body parts at "
-            "the green edge. Feather auto-set to half this value. Default 8. "
-            "Only used when SUBTRACT mode is on."
+            "EDGE GUARD — width (px) of the smooth kill fade past the green "
+            "edge. Kill ramps from 0 at the green edge to full at this "
+            "distance. Higher = smoother fade-out, less visible halo, less "
+            "hair attenuation. Lower = sharper cut. Default 20. Only used "
+            "when SUBTRACT mode is on."
         )
         self.edge_guard_label_widget = _label("EDGE GUARD")
         self.edge_guard_label_widget.setToolTip(_EDGE_GUARD_TOOLTIP)
         grid.addWidget(self.edge_guard_label_widget, 12, 0)
         self.edge_guard_slider = JumpSlider(QtCore.Qt.Horizontal)
-        self.edge_guard_slider.setRange(0, 50)
-        self.edge_guard_slider.setValue(int(self._params.get("edge_guard_px", 8)))
+        self.edge_guard_slider.setRange(0, 200)
+        self.edge_guard_slider.setValue(int(self._params.get("edge_guard_px", 20)))
         self.edge_guard_slider.valueChanged.connect(self._on_edge_guard_changed)
         self.edge_guard_slider.setToolTip(_EDGE_GUARD_TOOLTIP)
         grid.addWidget(self.edge_guard_slider, 12, 1)
-        self.edge_guard_value_label = _label(f"{int(self._params.get('edge_guard_px', 8))}", "#0ff")
+        self.edge_guard_value_label = _label(f"{int(self._params.get('edge_guard_px', 20))}", "#0ff")
         self.edge_guard_value_label.setMinimumWidth(42)
         self.edge_guard_value_label.setToolTip(_EDGE_GUARD_TOOLTIP)
         grid.addWidget(self.edge_guard_value_label, 12, 2)
@@ -2021,7 +2024,7 @@ class PersistentWindow(QtWidgets.QWidget):
                 matte_additive = bool(params_for_matte.get("sam2_additive", False))
                 matte_weighted = bool(params_for_matte.get("sam2_weighted", False))
                 matte_subtract = bool(params_for_matte.get("sam2_subtract", False))
-                matte_edge_guard = int(params_for_matte.get("edge_guard_px", 8))
+                matte_edge_guard = int(params_for_matte.get("edge_guard_px", 20))
                 if (self.session.alpha_raw is not None
                         and self.session.sam2_gate_raw is not None):
                     _gate = self.session.sam2_gate_raw.copy()
@@ -2041,16 +2044,12 @@ class PersistentWindow(QtWidgets.QWidget):
                                   if self.session.original_rgb is not None
                                   else self.session.fg_rgb)
                     if matte_subtract:
-                        # SUBTRACT mirror of Composite branch — NN matte preserved
-                        # in green zones, SAM2 only kills in non-green regions
-                        # past the edge-guard buffer. trim/fill_holes/halo
-                        # intentionally not applied (buffer ramp handles boundary).
-                        _fp_m = max(int(matte_edge_guard) // 2, 1)
+                        # SUBTRACT mirror — see Composite branch comment.
                         alpha = apply_sam2_gate_subtract(self.session.alpha_raw,
                                                          _gate, _src_rgb_m,
                                                          screen_type="green",
-                                                         buffer_px=int(matte_edge_guard),
-                                                         feather_px=_fp_m)
+                                                         buffer_px=0,
+                                                         feather_px=max(int(matte_edge_guard), 1))
                     elif matte_weighted:
                         # SMART BLEND mirror of Composite branch — per-pixel
                         # weighted NN/SAM2 by chroma. trim/fill_holes/halo
