@@ -354,6 +354,7 @@ def render_composite(cu, session: Session, params: dict):
     sam2_additive = bool(params.get("sam2_additive", False))
     sam2_weighted = bool(params.get("sam2_weighted", False))
     sam2_subtract = bool(params.get("sam2_subtract", False))
+    sam2_bypass = bool(params.get("sam2_bypass", False))
     edge_guard_px = int(params.get("edge_guard_px", 20))
     # DaVinci formula exactly: multiply NN × gate first, then dilate+soften the result.
     # Dilating the product spreads existing NN alpha values outward so MARGIN visibly
@@ -364,7 +365,7 @@ def render_composite(cu, session: Session, params: dict):
     # fill_holes>0 fills alpha=0 holes inside the gate at non-screen-color pixels —
     # rescues NN dropouts on yellow/skin/red. Applied AFTER the combine using the
     # SAME (post-trim) gate so fill respects whatever TRIM SAM2 did.
-    if session.alpha_nn is not None and session.sam2_gate_raw is not None:
+    if session.alpha_nn is not None and session.sam2_gate_raw is not None and not sam2_bypass:
         _gate = session.sam2_gate_raw.copy()
         if _gate.shape != session.alpha_nn.shape:
             _gate = cv2.resize(_gate, (session.alpha_nn.shape[1], session.alpha_nn.shape[0]),
@@ -551,6 +552,10 @@ class PersistentWindow(QtWidgets.QWidget):
             # EDGE GUARD: distance (px) past green edge before SAM2 may kill.
             # Feather auto-set to half this value. Default 8.
             "edge_guard_px": 20,
+            # SAM2 BYPASS: master switch — when True, skip ALL SAM2 paths.
+            "sam2_bypass": False,
+            # SHOW SAM2: viewer-only cyan outline overlay.
+            "show_sam2": False,
         }
         # Drop-stale: if a new update comes in while we're painting, we only keep
         # the latest one. _pending is None when idle, or a dict when a render is
@@ -1031,25 +1036,8 @@ class PersistentWindow(QtWidgets.QWidget):
         self.halo_value_label.setMinimumWidth(42)
         grid.addWidget(self.halo_value_label, 5, 2)
 
-        # --- TRIM SAM2: chroma-aware mask refinement (slider 0-100 integer). ---
-        # SAM2-only. Removes screen-colored pixels from the SAM2 gate before
-        # combine — kills "holes" at silhouette edges where SAM2 claims green
-        # but NN keyed transparent. NN edge detail preserved. 0 = bit-identical.
-        _TRIM_TOOLTIP = ("TRIM SAM2 — removes screen-colored pixels from SAM2 mask edges.\n"
-                         "0 = off (bit-identical). 30-60 typical. Higher = more aggressive trim.")
-        self.trim_chroma_label_widget = _label("TRIM SAM2")
-        self.trim_chroma_label_widget.setToolTip(_TRIM_TOOLTIP)
-        grid.addWidget(self.trim_chroma_label_widget, 6, 0)
-        self.trim_chroma_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.trim_chroma_slider.setRange(0, 100)
-        self.trim_chroma_slider.setValue(int(self._params["trim_chroma"]))
-        self.trim_chroma_slider.valueChanged.connect(self._on_trim_chroma_changed)
-        self.trim_chroma_slider.setToolTip(_TRIM_TOOLTIP)
-        grid.addWidget(self.trim_chroma_slider, 6, 1)
-        self.trim_chroma_value_label = _label(f"{int(self._params['trim_chroma'])}", "#0ff")
-        self.trim_chroma_value_label.setMinimumWidth(42)
-        self.trim_chroma_value_label.setToolTip(_TRIM_TOOLTIP)
-        grid.addWidget(self.trim_chroma_value_label, 6, 2)
+        # TRIM SAM2 widget removed from UI 2026-05-01 (Berto declared useless).
+        # Underlying flow + helper kept; param defaults to 0.
 
         # --- FILL HOLES: color-aware interior alpha-zero fill (slider 0-100 integer). ---
         # SAM2-only. Fills alpha=0 holes INSIDE the SAM2 gate at pixels whose
@@ -1129,7 +1117,7 @@ class PersistentWindow(QtWidgets.QWidget):
             "SAM2 misses across visual boundaries (straps, props). Off = "
             "bit-identical to before."
         )
-        self.sam2_additive_label_widget = _label("SAM2 ON/OFF")
+        self.sam2_additive_label_widget = _label("SAM2 ADDITIVE")
         self.sam2_additive_label_widget.setToolTip(_SAM2_ADDITIVE_TOOLTIP)
         grid.addWidget(self.sam2_additive_label_widget, 9, 0)
         self.sam2_additive_checkbox = QtWidgets.QCheckBox("")
@@ -1145,34 +1133,8 @@ class PersistentWindow(QtWidgets.QWidget):
         self.sam2_additive_checkbox.toggled.connect(self._on_sam2_additive_changed)
         grid.addWidget(self.sam2_additive_checkbox, 9, 1, 1, 2)
 
-        # --- SAM2 SMART BLEND: weighted combine toggle (checkbox) ---
-        # Per-pixel blends NN alpha and SAM2 gate by chroma-derived weight:
-        # NN trusted in green regions (preserves hair / butt-across-strap),
-        # SAM2 trusted off-green (kills floor / props NN can't see). OFF =
-        # bit-identical. Wins over SAM2 ADDITIVE when both are checked.
-        # SAM2-only — has no visible effect when SAM2 is inactive.
-        _SAM2_WEIGHTED_TOOLTIP = (
-            "SMART BLEND — auto-blend NN and SAM2 per pixel. NN owns "
-            "green-screen regions (preserves fine detail like hair and "
-            "butt-across-strap). SAM2 owns non-green regions (kills "
-            "off-screen floor and props NN can't see). Off = bit-identical "
-            "to before."
-        )
-        self.sam2_weighted_label_widget = _label("SMART BLEND")
-        self.sam2_weighted_label_widget.setToolTip(_SAM2_WEIGHTED_TOOLTIP)
-        grid.addWidget(self.sam2_weighted_label_widget, 10, 0)
-        self.sam2_weighted_checkbox = QtWidgets.QCheckBox("")
-        self.sam2_weighted_checkbox.setStyleSheet(
-            "QCheckBox { color: #8ab; border: none; background: transparent; "
-            "font-size: 12px; font-weight: 600; letter-spacing: 0.5px; } "
-            "QCheckBox::indicator { width: 12px; height: 12px; border: 1px solid "
-            "#2a6a7a; border-radius: 2px; background: #001a28; } "
-            "QCheckBox::indicator:checked { background: #0ff; border-color: #0ff; }"
-        )
-        self.sam2_weighted_checkbox.setChecked(bool(self._params.get("sam2_weighted", False)))
-        self.sam2_weighted_checkbox.setToolTip(_SAM2_WEIGHTED_TOOLTIP)
-        self.sam2_weighted_checkbox.toggled.connect(self._on_sam2_weighted_changed)
-        grid.addWidget(self.sam2_weighted_checkbox, 10, 1, 1, 2)
+        # SMART BLEND widget removed from UI 2026-05-01 (50/50 ghost confirmed
+        # broken). Underlying flow + helper kept; param defaults to False.
 
         # --- SAM2 SUBTRACT: subtract-only combine toggle (checkbox) ---
         # NN owns matte where green exists. SAM2 only kills in non-green
@@ -1219,6 +1181,48 @@ class PersistentWindow(QtWidgets.QWidget):
         self.edge_guard_value_label.setMinimumWidth(42)
         self.edge_guard_value_label.setToolTip(_EDGE_GUARD_TOOLTIP)
         grid.addWidget(self.edge_guard_value_label, 12, 2)
+
+        # --- BYPASS SAM2 master toggle ---
+        _SAM2_BYPASS_TOOLTIP = (
+            "BYPASS SAM2 — master switch. When ON, ignore SAM2 entirely. "
+            "Lets you A/B compare NN vs NN+SAM2 without clearing dots."
+        )
+        self.sam2_bypass_label_widget = _label("BYPASS SAM2")
+        self.sam2_bypass_label_widget.setToolTip(_SAM2_BYPASS_TOOLTIP)
+        grid.addWidget(self.sam2_bypass_label_widget, 13, 0)
+        self.sam2_bypass_checkbox = QtWidgets.QCheckBox("")
+        self.sam2_bypass_checkbox.setStyleSheet(
+            "QCheckBox { color: #8ab; border: none; background: transparent; "
+            "font-size: 12px; font-weight: 600; letter-spacing: 0.5px; } "
+            "QCheckBox::indicator { width: 12px; height: 12px; border: 1px solid "
+            "#2a6a7a; border-radius: 2px; background: #001a28; } "
+            "QCheckBox::indicator:checked { background: #0ff; border-color: #0ff; }"
+        )
+        self.sam2_bypass_checkbox.setChecked(bool(self._params.get("sam2_bypass", False)))
+        self.sam2_bypass_checkbox.setToolTip(_SAM2_BYPASS_TOOLTIP)
+        self.sam2_bypass_checkbox.toggled.connect(self._on_sam2_bypass_changed)
+        grid.addWidget(self.sam2_bypass_checkbox, 13, 1, 1, 2)
+
+        # --- SHOW SAM2 overlay ---
+        _SHOW_SAM2_TOOLTIP = (
+            "SHOW SAM2 — overlays a cyan outline of SAM2's silhouette on "
+            "the view. Display only; does not change render output."
+        )
+        self.show_sam2_label_widget = _label("SHOW SAM2")
+        self.show_sam2_label_widget.setToolTip(_SHOW_SAM2_TOOLTIP)
+        grid.addWidget(self.show_sam2_label_widget, 14, 0)
+        self.show_sam2_checkbox = QtWidgets.QCheckBox("")
+        self.show_sam2_checkbox.setStyleSheet(
+            "QCheckBox { color: #8ab; border: none; background: transparent; "
+            "font-size: 12px; font-weight: 600; letter-spacing: 0.5px; } "
+            "QCheckBox::indicator { width: 12px; height: 12px; border: 1px solid "
+            "#2a6a7a; border-radius: 2px; background: #001a28; } "
+            "QCheckBox::indicator:checked { background: #0ff; border-color: #0ff; }"
+        )
+        self.show_sam2_checkbox.setChecked(bool(self._params.get("show_sam2", False)))
+        self.show_sam2_checkbox.setToolTip(_SHOW_SAM2_TOOLTIP)
+        self.show_sam2_checkbox.toggled.connect(self._on_show_sam2_changed)
+        grid.addWidget(self.show_sam2_checkbox, 14, 1, 1, 2)
 
         grid.setColumnStretch(1, 1)
         parent_layout.addWidget(panel)
@@ -1353,6 +1357,20 @@ class PersistentWindow(QtWidgets.QWidget):
         self._schedule_render()
         self._schedule_save()
 
+    # WHAT IT DOES: BYPASS SAM2 master toggle.
+    def _on_sam2_bypass_changed(self, checked: bool):
+        self._params["sam2_bypass"] = bool(checked)
+        self._local_change_time = time.perf_counter()
+        self._render_now()
+        self._save_live_params_now()
+
+    # WHAT IT DOES: SHOW SAM2 overlay toggle.
+    def _on_show_sam2_changed(self, checked: bool):
+        self._params["show_sam2"] = bool(checked)
+        self._local_change_time = time.perf_counter()
+        self._render_now()
+        self._save_live_params_now()
+
     # WHAT IT DOES: Debounces live_params.json writes. Every slider move calls this;
     #   the actual disk write happens 250ms after the LAST move. Prevents filesystem
     #   thrash on rapid drags.
@@ -1433,7 +1451,7 @@ class PersistentWindow(QtWidgets.QWidget):
                     pass  # PNGs unreadable — stale view is better than a crash
         merged = dict(self._params)
         for k, v in params.items():
-            if k in ("despill", "despeckle", "despeckleSize", "background", "sam2_margin", "sam2_soften", "halo_px", "trim_chroma", "fill_holes", "fg_source", "sam2_additive", "sam2_weighted", "sam2_subtract", "edge_guard_px"):
+            if k in ("despill", "despeckle", "despeckleSize", "background", "sam2_margin", "sam2_soften", "halo_px", "trim_chroma", "fill_holes", "fg_source", "sam2_additive", "sam2_weighted", "sam2_subtract", "edge_guard_px", "sam2_bypass", "show_sam2"):
                 merged[k] = v
         if self._painting:
             self._pending = merged
@@ -1623,8 +1641,9 @@ class PersistentWindow(QtWidgets.QWidget):
                 _additive = bool(params_for_matte.get("sam2_additive", False))
                 _weighted = bool(params_for_matte.get("sam2_weighted", False))
                 _subtract = bool(params_for_matte.get("sam2_subtract", False))
+                _bypass = bool(params_for_matte.get("sam2_bypass", False))
                 _edge_guard = int(params_for_matte.get("edge_guard_px", 20))
-                if self.session.alpha_nn is not None and self.session.sam2_gate_raw is not None:
+                if self.session.alpha_nn is not None and self.session.sam2_gate_raw is not None and not _bypass:
                     _gate = self.session.sam2_gate_raw.copy()
                     # SAM2 returns the gate at 256x256 — must resize to alpha
                     # shape or the multiply throws "operands could not be
@@ -1690,6 +1709,21 @@ class PersistentWindow(QtWidgets.QWidget):
                         alpha, area_threshold=int(params_for_matte.get("despeckleSize", 400))
                     )
                 img = alpha_to_rgb_u8(alpha)
+
+            # SHOW SAM2 viewer-only overlay (cyan outline of SAM2 silhouette).
+            if bool(self._params.get("show_sam2", False)) and self.session is not None \
+                    and self.session.sam2_gate_raw is not None and img is not None:
+                try:
+                    _g = self.session.sam2_gate_raw
+                    if img.ndim == 3 and (_g.shape[0] != img.shape[0] or _g.shape[1] != img.shape[1]):
+                        _g = cv2.resize(_g, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_LINEAR)
+                    _gb = (_g > 0.5).astype(np.uint8) * 255
+                    _edges = cv2.Canny(_gb, 50, 150)
+                    _edges = cv2.dilate(_edges, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
+                    img = img.copy()
+                    img[_edges > 0] = [0, 255, 255]  # cyan (RGB)
+                except Exception:
+                    pass
 
             # Cache the full-res result so window resizes can rescale without
             # re-running stage-2. Then paint it at the current label size.
