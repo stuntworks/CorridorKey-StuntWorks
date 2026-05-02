@@ -222,6 +222,27 @@ def apply_sam2_gate(alpha: np.ndarray, gate: np.ndarray | None, invert: bool = F
     import cv2 as _cv2
     binary = (gate_use > 0.5).astype(np.uint8)
 
+    # Drop spurious SAM2 blobs (small floor patches near feet, crew behind
+    # actor, etc.) before any halo dilation. Without this filter, anisotropic
+    # UP would amplify a 100-px floor patch into a hundreds-of-pixels-tall
+    # vertical strip — Berto's "big window on right foot" bug 2026-05-02.
+    # Geometric, not heuristic: always keep the largest component, then keep
+    # additional components whose area is >= 5% of the largest (or 500 px,
+    # whichever is greater). Any halo > 0 activates this; no-halo path stays
+    # bit-identical.
+    n_lab, labels, stats, _ = _cv2.connectedComponentsWithStats(binary, connectivity=8)
+    if n_lab > 1:
+        sizes = stats[1:, _cv2.CC_STAT_AREA]
+        largest_idx = int(sizes.argmax()) + 1  # +1 because label 0 is background
+        largest = int(sizes.max())
+        threshold = max(500, largest // 20)  # 5% of main, with 500-px floor
+        keep = np.zeros(n_lab, dtype=np.uint8)
+        keep[largest_idx] = 1  # always keep the largest component
+        for i in range(1, n_lab):
+            if i != largest_idx and int(stats[i, _cv2.CC_STAT_AREA]) >= threshold:
+                keep[i] = 1
+        binary = keep[labels].astype(np.uint8)
+
     # HALO BODY: anisotropic UP. Bottom half of kernel active → dilation
     # extends silhouette UPWARD and sideways at the silhouette row.
     if halo_body_px and halo_body_px > 0:
