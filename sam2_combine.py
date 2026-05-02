@@ -195,22 +195,23 @@ def apply_sam2_gate(alpha: np.ndarray, gate: np.ndarray | None, invert: bool = F
                     halo_px: int = 0, halo_body_px: int = 0) -> np.ndarray:
     """Combine NN alpha with SAM2 gate. invert=True = garbage matte mode (subtract clicked region).
 
-    halo_px (HALO FEET): SAM2 gate dilation in NON-GREEN zones (under feet, on
-        floor, in studio non-green areas). When 0, no dilation in those zones.
-    halo_body_px (HALO BODY): SAM2 gate dilation in GREEN-BORDERED zones (around
-        the body silhouette where it meets the green screen). When 0, no dilation
-        in those zones. Designed to recover NN edge detail (hair fringe, butt
-        across strap, fingertip wisps) where SAM2's silhouette is tighter than
-        the actor's actual edge. Berto-locked design 2026-05-01: two zones,
-        independent control, predictable across shots.
+    halo_px (HALO FEET): downward dilation of the SAM2 silhouette. Extends the
+        gate DOWN from the silhouette into floor area (shadow / contact
+        recovery). Default 0 = no extension = tight cutoff at feet.
+    halo_body_px (HALO BODY): upward + sideways dilation. Extends the gate UP
+        from the silhouette (recovers hair above the head, butt-above-gap,
+        fingertip wisps at sides). Cannot extend below the silhouette by
+        construction — no bleed below feet, no matter how high the slider.
 
-    When both halos are 0, returns alpha * gate (or alpha * (1-gate) for invert).
-    Bit-identical to the original single-halo behavior when halo_body_px=0 and
-    halo_px>=0.
+    Implementation: anisotropic kernels.
+        HALO BODY: kernel rows 0 to halo_body-1 are zeroed (top half of the
+            kernel inactive). Dilation with a bottom-half-active kernel
+            spreads the silhouette UPWARD (and sideways at center row).
+        HALO FEET: kernel rows halo_feet+1 to 2*halo_feet zeroed (bottom half
+            inactive). Top-half-active kernel spreads the silhouette DOWNWARD.
 
-    Zone detection: a pixel is in the "green-bordered" zone if it lies within
-    max(halo_px, halo_body_px) pixels of any NN-killed pixel (alpha < 0.05).
-    Otherwise it's in the "non-green" zone.
+    Combined as max(gate_body, gate_feet) so the two halos are independent.
+    When both halos are 0: returns alpha * gate (bit-identical no-halo path).
     """
     if gate is None:
         return alpha
@@ -220,29 +221,28 @@ def apply_sam2_gate(alpha: np.ndarray, gate: np.ndarray | None, invert: bool = F
         return alpha * gate_use
     import cv2 as _cv2
     binary = (gate_use > 0.5).astype(np.uint8)
+
+    # HALO BODY: anisotropic UP. Bottom half of kernel active → dilation
+    # extends silhouette UPWARD and sideways at the silhouette row.
     if halo_body_px and halo_body_px > 0:
-        # Two-zone path: dilate gate at different rates depending on whether
-        # the pixel is near a green region or not.
-        green_mask = (alpha < 0.05).astype(np.uint8)
-        # Proximity radius: large enough to cover the body fringe near green.
-        # Use the larger of the two halos so neither zone shrinks the other.
-        prox_r = max(int(halo_body_px), int(halo_px))
-        prox_kernel = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE,
-                                                 (prox_r * 2 + 1, prox_r * 2 + 1))
-        near_green = _cv2.dilate(green_mask, prox_kernel)
-        # Body dilation
-        kb = int(halo_body_px) * 2 + 1
-        gate_body = _cv2.dilate(binary, _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (kb, kb)))
-        # Feet dilation (or no dilation if halo_px = 0)
-        if halo_px and halo_px > 0:
-            kf = int(halo_px) * 2 + 1
-            gate_feet = _cv2.dilate(binary, _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (kf, kf)))
-        else:
-            gate_feet = binary
-        gate_combined = np.where(near_green > 0, gate_body, gate_feet).astype(np.float32)
-        return (alpha * gate_combined).astype(alpha.dtype, copy=False)
-    # Single-halo path (original behavior, halo_body_px = 0)
-    k = int(halo_px) * 2 + 1
-    kernel = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (k, k))
-    extended = _cv2.dilate(binary, kernel).astype(np.float32)
-    return alpha * extended
+        h_b = int(halo_body_px)
+        kb = h_b * 2 + 1
+        body_kernel = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (kb, kb))
+        body_kernel[:h_b, :] = 0  # zero TOP half → spreads UP
+        gate_body = _cv2.dilate(binary, body_kernel)
+    else:
+        gate_body = binary
+
+    # HALO FEET: anisotropic DOWN. Top half of kernel active → dilation
+    # extends silhouette DOWNWARD and sideways at the silhouette row.
+    if halo_px and halo_px > 0:
+        h_f = int(halo_px)
+        kf = h_f * 2 + 1
+        feet_kernel = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (kf, kf))
+        feet_kernel[h_f + 1:, :] = 0  # zero BOTTOM half → spreads DOWN
+        gate_feet = _cv2.dilate(binary, feet_kernel)
+    else:
+        gate_feet = binary
+
+    gate_combined = np.maximum(gate_body, gate_feet).astype(np.float32)
+    return (alpha * gate_combined).astype(alpha.dtype, copy=False)
