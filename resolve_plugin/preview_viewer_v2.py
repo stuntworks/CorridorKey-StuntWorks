@@ -259,7 +259,7 @@ EDGE_FEATHER_KSIZE = 11
 EDGE_FEATHER_SIGMA = 2.5
 
 
-def _trimap_fuse(alpha_raw, gate, source_rgb=None, screen_type="green", trim_chroma=0, halo_px=0, fill_holes=0):
+def _trimap_fuse(alpha_raw, gate, source_rgb=None, screen_type="green", trim_chroma=0, halo_px=0, halo_body_px=0, fill_holes=0):
     # WHAT IT DOES: Uses SAM2 as a pure GARBAGE MATTE — crops the background
     #   without touching alpha_raw values inside the actor. The NN alpha is now
     #   reliably solid inside the body (post tan-vest alpha-hint fix), so this
@@ -288,7 +288,7 @@ def _trimap_fuse(alpha_raw, gate, source_rgb=None, screen_type="green", trim_chr
         (EDGE_FEATHER_KSIZE, EDGE_FEATHER_KSIZE),
         EDGE_FEATHER_SIGMA,
     )
-    combined = apply_sam2_gate(alpha_raw, soft, invert=False, halo_px=halo_px).astype(np.float32)
+    combined = apply_sam2_gate(alpha_raw, soft, invert=False, halo_px=halo_px, halo_body_px=halo_body_px).astype(np.float32)
     # FILL HOLES: bit-identical when fill_holes <= 0 (helper short-circuits).
     # Use the SAME soft gate that fed the combine so fill respects whatever
     # TRIM SAM2 / edge-softening did. fill is applied on the COMBINED alpha,
@@ -415,6 +415,7 @@ def render_composite(cu, session: Session, params: dict):
     sam2_margin = float(params.get("sam2_margin", 0))
     sam2_soften = float(params.get("sam2_soften", 0))
     halo_px = int(params.get("halo_px", 0))
+    halo_body_px = int(params.get("halo_body_px", 0))
     trim_chroma = int(params.get("trim_chroma", 0))
     fill_holes = int(params.get("fill_holes", 0))
     sam2_additive = bool(params.get("sam2_additive", False))
@@ -480,6 +481,7 @@ def render_composite(cu, session: Session, params: dict):
             # dropouts). See _trimap_fuse and apply_sam2_gate.
             alpha = _trimap_fuse(session.alpha_raw, _gate, source_rgb=_src_rgb,
                                  screen_type="green", trim_chroma=trim_chroma, halo_px=halo_px,
+                                 halo_body_px=halo_body_px,
                                  fill_holes=fill_holes)
         if sam2_margin > 0:
             alpha = _dilate_mask(alpha, sam2_margin)
@@ -638,6 +640,13 @@ class PersistentWindow(QtWidgets.QWidget):
             # NN values around the silhouette survives — recovers hair /
             # motion-blur detail at the SAM2 edge. SAM2-only control.
             "halo_px": 0,
+            # HALO BODY: SAM2 gate dilation in GREEN-BORDERED zones (body
+            # silhouette where it meets the green screen). Pairs with halo_px
+            # (= HALO FEET) for the May 1 TWO HALO design — independent control
+            # so a 30+ px buffer can recover hair / butt-across-strap detail
+            # without bloating feet into the floor. 0 = off (bit-identical to
+            # single-halo behavior). SAM2-only control.
+            "halo_body_px": 0,
             # TRIM SAM2: chroma-aware mask refinement. 0 = off (bit-identical).
             # >0 removes screen-colored pixels from the SAM2 gate before
             # combine — kills "holes" at silhouette edges where SAM2 claims
@@ -1373,27 +1382,51 @@ class PersistentWindow(QtWidgets.QWidget):
         self.soften_value_label.setToolTip(_SAM2_TOOLTIP)
         grid.addWidget(self.soften_value_label, 4, 2)
 
-        # --- HALO: trimap-guided halo band width in px (slider 0-150, integer). ---
-        # SAM2-only. Dilates the SAM2 gate so a band of NN-driven alpha values
-        # around the silhouette survives the gate multiply — recovers hair and
-        # motion-blur detail at the SAM2 edge. 0 = current behavior.
-        _HALO_TOOLTIP = ("HALO — recovers hair / motion blur at the SAM2 edge.\n"
-                         "Dilates the SAM2 mask by N pixels so NN's soft edge survives.\n"
-                         "0 = off (bit-identical to no-halo). 20-80 typical. Max 150.\n"
-                         "SAM2 must be active for this control to work.")
-        self.halo_label_widget = _label("HALO")
-        self.halo_label_widget.setToolTip(_HALO_TOOLTIP)
-        grid.addWidget(self.halo_label_widget, 5, 0)
+        # --- HALO BODY: SAM2 gate dilation in GREEN-BORDERED zones (slider 0-150). ---
+        # The May 1 TWO HALO design: independent dilation values for body
+        # silhouette (this slider) vs feet/floor cutoff (HALO FEET below).
+        # Body buffer recovers hair / butt-across-strap detail where SAM2's
+        # silhouette is tighter than the actor's actual edge, without bloating
+        # feet into the floor. 0 = off (bit-identical to single-halo behavior).
+        _HALO_BODY_TOOLTIP = ("HALO BODY — buffer SAM2 silhouette where it meets the green screen.\n"
+                              "Recovers hair, butt-across-strap, fingertip detail. Invisible in\n"
+                              "non-green zones (feet, floor). 0 = off. 30-50 typical. Max 150.\n"
+                              "SAM2 must be active for this control to work.")
+        self.halo_body_label_widget = _label("HALO BODY")
+        self.halo_body_label_widget.setToolTip(_HALO_BODY_TOOLTIP)
+        grid.addWidget(self.halo_body_label_widget, 5, 0)
+        self.halo_body_slider = JumpSlider(QtCore.Qt.Horizontal)
+        self.halo_body_slider.setRange(0, 150)
+        self.halo_body_slider.setValue(int(self._params["halo_body_px"]))
+        self.halo_body_slider.valueChanged.connect(self._on_halo_body_changed)
+        self.halo_body_slider.setToolTip(_HALO_BODY_TOOLTIP)
+        grid.addWidget(self.halo_body_slider, 5, 1)
+        self.halo_body_value_label = _label(f"{int(self._params['halo_body_px'])}", "#0ff")
+        self.halo_body_value_label.setMinimumWidth(42)
+        self.halo_body_value_label.setToolTip(_HALO_BODY_TOOLTIP)
+        grid.addWidget(self.halo_body_value_label, 5, 2)
+
+        # --- HALO FEET: SAM2 gate dilation in NON-GREEN zones (slider 0-150). ---
+        # The original HALO behavior, now scoped to feet/floor/non-green-bordered
+        # regions. Dilates SAM2 outward in those zones — visible kicks the matte
+        # past the floor edge. Default 0 keeps a tight cutoff at feet.
+        _HALO_FEET_TOOLTIP = ("HALO FEET — buffer SAM2 silhouette in non-green zones (feet, floor).\n"
+                              "Visible effect grows the matte past the floor edge. Default 0 keeps\n"
+                              "a tight cutoff. 0 = off. 0-30 typical. Max 150.\n"
+                              "SAM2 must be active for this control to work.")
+        self.halo_label_widget = _label("HALO FEET")
+        self.halo_label_widget.setToolTip(_HALO_FEET_TOOLTIP)
+        grid.addWidget(self.halo_label_widget, 6, 0)
         self.halo_slider = JumpSlider(QtCore.Qt.Horizontal)
         self.halo_slider.setRange(0, 150)
         self.halo_slider.setValue(int(self._params["halo_px"]))
         self.halo_slider.valueChanged.connect(self._on_halo_changed)
-        self.halo_slider.setToolTip(_HALO_TOOLTIP)
-        grid.addWidget(self.halo_slider, 5, 1)
+        self.halo_slider.setToolTip(_HALO_FEET_TOOLTIP)
+        grid.addWidget(self.halo_slider, 6, 1)
         self.halo_value_label = _label(f"{int(self._params['halo_px'])}", "#0ff")
         self.halo_value_label.setMinimumWidth(42)
-        self.halo_value_label.setToolTip(_HALO_TOOLTIP)
-        grid.addWidget(self.halo_value_label, 5, 2)
+        self.halo_value_label.setToolTip(_HALO_FEET_TOOLTIP)
+        grid.addWidget(self.halo_value_label, 6, 2)
 
         # TRIM SAM2 widget removed from UI 2026-05-01 (Berto declared useless).
         # Underlying flow + helper kept; param defaults to 0 (bit-identical to off).
@@ -1662,10 +1695,21 @@ class PersistentWindow(QtWidgets.QWidget):
         self._schedule_save()
 
     def _on_halo_changed(self, value: int):
+        # HALO FEET — SAM2 gate dilation in non-green zones (feet, floor).
         # Slider 0-150 px integer. SAM2-only — visible effect requires an
         # active SAM2 mask (greyed-out otherwise via _update_sam2_slider_state).
         self._params["halo_px"] = int(value)
         self.halo_value_label.setText(f"{int(value)}")
+        self._schedule_render()
+        self._schedule_save()
+
+    def _on_halo_body_changed(self, value: int):
+        # HALO BODY — SAM2 gate dilation in green-bordered zones (body
+        # silhouette). Slider 0-150 px integer. SAM2-only — visible effect
+        # requires an active SAM2 mask (greyed-out otherwise via
+        # _update_sam2_slider_state).
+        self._params["halo_body_px"] = int(value)
+        self.halo_body_value_label.setText(f"{int(value)}")
         self._schedule_render()
         self._schedule_save()
 
@@ -1787,6 +1831,8 @@ class PersistentWindow(QtWidgets.QWidget):
                   self.margin_label_widget, self.soften_label_widget,
                   self.halo_slider, self.halo_value_label,
                   self.halo_label_widget,
+                  self.halo_body_slider, self.halo_body_value_label,
+                  self.halo_body_label_widget,
                   self.fill_holes_slider, self.fill_holes_value_label,
                   self.fill_holes_label_widget,
                   self.sam2_additive_checkbox,
@@ -1813,7 +1859,9 @@ class PersistentWindow(QtWidgets.QWidget):
             except Exception: pass
             try: self.soften_label_widget.setText("SOFTEN")
             except Exception: pass
-            try: self.halo_label_widget.setText("HALO")
+            try: self.halo_label_widget.setText("HALO FEET")
+            except Exception: pass
+            try: self.halo_body_label_widget.setText("HALO BODY")
             except Exception: pass
             try: self.fill_holes_label_widget.setText("FILL HOLES")
             except Exception: pass
@@ -1824,7 +1872,9 @@ class PersistentWindow(QtWidgets.QWidget):
             except Exception: pass
             try: self.soften_label_widget.setText("SOFTEN (mask)")
             except Exception: pass
-            try: self.halo_label_widget.setText("HALO (mask)")
+            try: self.halo_label_widget.setText("HALO FEET (mask)")
+            except Exception: pass
+            try: self.halo_body_label_widget.setText("HALO BODY (mask)")
             except Exception: pass
             try: self.fill_holes_label_widget.setText("FILL HOLES (mask)")
             except Exception: pass
@@ -2048,6 +2098,7 @@ class PersistentWindow(QtWidgets.QWidget):
                 matte_margin = float(params_for_matte.get("sam2_margin", 0))
                 matte_soften = float(params_for_matte.get("sam2_soften", 0))
                 matte_halo = int(params_for_matte.get("halo_px", 0))
+                matte_halo_body = int(params_for_matte.get("halo_body_px", 0))
                 matte_trim = int(params_for_matte.get("trim_chroma", 0))
                 matte_fill = int(params_for_matte.get("fill_holes", 0))
                 matte_additive = bool(params_for_matte.get("sam2_additive", False))
@@ -2108,6 +2159,7 @@ class PersistentWindow(QtWidgets.QWidget):
                         alpha = _trimap_fuse(self.session.alpha_raw, _gate,
                                              source_rgb=_src_rgb_m, screen_type="green",
                                              trim_chroma=matte_trim, halo_px=matte_halo,
+                                             halo_body_px=matte_halo_body,
                                              fill_holes=matte_fill)
                     if matte_margin > 0:
                         alpha = _dilate_mask(alpha, matte_margin)

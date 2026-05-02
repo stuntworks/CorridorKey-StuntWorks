@@ -349,6 +349,7 @@ def render_composite(cu, session: Session, params: dict):
     sam2_margin = int(params.get("sam2_margin", 0))
     sam2_soften = int(params.get("sam2_soften", 0))
     halo_px = int(params.get("halo_px", 0))
+    halo_body_px = int(params.get("halo_body_px", 0))
     trim_chroma = int(params.get("trim_chroma", 0))
     fill_holes = int(params.get("fill_holes", 0))
     sam2_additive = bool(params.get("sam2_additive", False))
@@ -405,7 +406,7 @@ def render_composite(cu, session: Session, params: dict):
         else:
             if trim_chroma > 0:
                 _gate = trim_gate_by_chroma(_gate, _src_rgb, "green", trim_chroma)
-            alpha = np.clip(apply_sam2_gate(session.alpha_nn, _gate, invert=False, halo_px=halo_px), 0.0, 1.0)
+            alpha = np.clip(apply_sam2_gate(session.alpha_nn, _gate, invert=False, halo_px=halo_px, halo_body_px=halo_body_px), 0.0, 1.0)
             if fill_holes > 0:
                 alpha = fill_holes_color_aware(alpha, _gate, _src_rgb, "green", fill_holes)
     else:
@@ -522,6 +523,12 @@ class PersistentWindow(QtWidgets.QWidget):
             # NN values around the silhouette survives — recovers hair /
             # motion-blur detail at the SAM2 edge. SAM2-only control.
             "halo_px": 0,
+            # HALO BODY: SAM2 gate dilation in GREEN-BORDERED zones (body
+            # silhouette where it meets the green screen). Pairs with halo_px
+            # (= HALO FEET) for the May 1 TWO HALO design — independent control
+            # so a 30+ px buffer can recover hair / butt-across-strap detail
+            # without bloating feet into the floor. 0 = off (bit-identical).
+            "halo_body_px": 0,
             # TRIM SAM2: chroma-aware mask refinement. 0 = off (bit-identical).
             # >0 removes screen-colored pixels from the SAM2 gate before
             # combine — kills "holes" at silhouette edges where SAM2 claims
@@ -1022,20 +1029,36 @@ class PersistentWindow(QtWidgets.QWidget):
         self.sam2_soften_value_label.setMinimumWidth(42)
         grid.addWidget(self.sam2_soften_value_label, 4, 2)
 
-        # --- HALO: trimap-guided halo band width in px (slider 0-150, integer). ---
-        # SAM2-only. Dilates the SAM2 gate so a band of NN-driven alpha values
-        # around the silhouette survives the gate multiply — recovers hair and
-        # motion-blur detail at the SAM2 edge. 0 = current behavior.
-        self.halo_label_widget = _label("HALO")
-        grid.addWidget(self.halo_label_widget, 5, 0)
+        # --- HALO BODY: SAM2 gate dilation in GREEN-BORDERED zones (slider 0-150). ---
+        # The May 1 TWO HALO design: independent dilation values for body
+        # silhouette (this slider) vs feet/floor cutoff (HALO FEET below).
+        # Body buffer recovers hair / butt-across-strap detail where SAM2's
+        # silhouette is tighter than the actor's actual edge. 0 = off.
+        self.halo_body_label_widget = _label("HALO BODY")
+        grid.addWidget(self.halo_body_label_widget, 5, 0)
+        self.halo_body_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.halo_body_slider.setRange(0, 150)
+        self.halo_body_slider.setValue(int(self._params["halo_body_px"]))
+        self.halo_body_slider.valueChanged.connect(self._on_halo_body_changed)
+        grid.addWidget(self.halo_body_slider, 5, 1)
+        self.halo_body_value_label = _label(f"{int(self._params['halo_body_px'])}", "#0ff")
+        self.halo_body_value_label.setMinimumWidth(42)
+        grid.addWidget(self.halo_body_value_label, 5, 2)
+
+        # --- HALO FEET: SAM2 gate dilation in NON-GREEN zones (slider 0-150). ---
+        # Original HALO behavior, scoped to feet/floor/non-green-bordered
+        # regions. Visible kicks the matte past the floor edge. Default 0
+        # keeps a tight cutoff at feet.
+        self.halo_label_widget = _label("HALO FEET")
+        grid.addWidget(self.halo_label_widget, 6, 0)
         self.halo_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.halo_slider.setRange(0, 150)
         self.halo_slider.setValue(int(self._params["halo_px"]))
         self.halo_slider.valueChanged.connect(self._on_halo_changed)
-        grid.addWidget(self.halo_slider, 5, 1)
+        grid.addWidget(self.halo_slider, 6, 1)
         self.halo_value_label = _label(f"{int(self._params['halo_px'])}", "#0ff")
         self.halo_value_label.setMinimumWidth(42)
-        grid.addWidget(self.halo_value_label, 5, 2)
+        grid.addWidget(self.halo_value_label, 6, 2)
 
         # TRIM SAM2 widget removed from UI 2026-05-01 (Berto declared useless).
         # Underlying flow + helper kept; param defaults to 0.
@@ -1279,10 +1302,19 @@ class PersistentWindow(QtWidgets.QWidget):
         self._schedule_save()
 
     def _on_halo_changed(self, value: int):
+        # HALO FEET — SAM2 gate dilation in non-green zones (feet, floor).
         # Slider 0-150 px integer. SAM2-only — visible effect requires an
         # active SAM2 mask. Mirrors Resolve viewer's _on_halo_changed.
         self._params["halo_px"] = int(value)
         self.halo_value_label.setText(str(int(value)))
+        self._render_now()
+        self._schedule_save()
+
+    def _on_halo_body_changed(self, value: int):
+        # HALO BODY — SAM2 gate dilation in green-bordered zones (body
+        # silhouette). Slider 0-150 px integer. SAM2-only.
+        self._params["halo_body_px"] = int(value)
+        self.halo_body_value_label.setText(str(int(value)))
         self._render_now()
         self._schedule_save()
 
@@ -1452,7 +1484,7 @@ class PersistentWindow(QtWidgets.QWidget):
                     pass  # PNGs unreadable — stale view is better than a crash
         merged = dict(self._params)
         for k, v in params.items():
-            if k in ("despill", "despeckle", "despeckleSize", "background", "sam2_margin", "sam2_soften", "halo_px", "trim_chroma", "fill_holes", "fg_source", "sam2_additive", "sam2_weighted", "sam2_subtract", "edge_guard_px", "sam2_bypass", "show_sam2"):
+            if k in ("despill", "despeckle", "despeckleSize", "background", "sam2_margin", "sam2_soften", "halo_px", "halo_body_px", "trim_chroma", "fill_holes", "fg_source", "sam2_additive", "sam2_weighted", "sam2_subtract", "edge_guard_px", "sam2_bypass", "show_sam2"):
                 merged[k] = v
         if self._painting:
             self._pending = merged
@@ -1637,6 +1669,7 @@ class PersistentWindow(QtWidgets.QWidget):
                 _m = int(params_for_matte.get("sam2_margin", 0))
                 _s = int(params_for_matte.get("sam2_soften", 0))
                 _halo = int(params_for_matte.get("halo_px", 0))
+                _halo_body = int(params_for_matte.get("halo_body_px", 0))
                 _trim = int(params_for_matte.get("trim_chroma", 0))
                 _fill = int(params_for_matte.get("fill_holes", 0))
                 _additive = bool(params_for_matte.get("sam2_additive", False))
@@ -1697,7 +1730,7 @@ class PersistentWindow(QtWidgets.QWidget):
                     else:
                         if _trim > 0:
                             _gate = trim_gate_by_chroma(_gate, _src_rgb_m, "green", _trim)
-                        alpha = np.clip(apply_sam2_gate(self.session.alpha_nn, _gate, invert=False, halo_px=_halo), 0.0, 1.0)
+                        alpha = np.clip(apply_sam2_gate(self.session.alpha_nn, _gate, invert=False, halo_px=_halo, halo_body_px=_halo_body), 0.0, 1.0)
                         if _fill > 0:
                             alpha = fill_holes_color_aware(alpha, _gate, _src_rgb_m, "green", _fill)
                 else:
