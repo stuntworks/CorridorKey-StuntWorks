@@ -26,9 +26,11 @@
 
 ## Why This Project Exists
 
-StuntWorks Cinema is **Roberto Lopez and Elvis Lopez** — stunt performers and indie action filmmakers. We work primarily in **DaVinci Resolve** and **After Effects**, shooting real stunt and action shorts on tight budgets — imperfect green screen, bad lighting, motion blur, fast action — and existing keyers struggle with that footage. So we built this around Niko Pueringer's CorridorKey AI engine for our own films. Free for other action filmmakers. **Still building it.**
+StuntWorks Cinema is **Roberto Lopez and Elvis Lopez** — stunt performers and indie action filmmakers. We work primarily in **DaVinci Resolve** and **After Effects**, shooting real stunt and action shorts on tight budgets — imperfect green screen, bad lighting, motion blur, fast action — and existing keyers struggle with that footage. So we built this around the open-source CorridorKey AI engine for our own films.
 
-Watch what we make with it: **[youtube.com/@stuntworkscinema](https://www.youtube.com/@stuntworkscinema)**
+**Free for all** — thanks to [Niko Pueringer](https://github.com/nikopueringer/CorridorKey) for releasing CorridorKey as open source.
+
+**Still building it — bigger upgrades coming. Follow the channel for updates: [@stuntworkscinema](https://www.youtube.com/@stuntworkscinema).**
 
 ---
 
