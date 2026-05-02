@@ -41,7 +41,7 @@ StuntWorks Cinema is **Roberto Lopez and Elvis Lopez** — stunt performers and 
 
 ## Test Footage
 
-Real stunt/action greenscreen clips for testing are attached to the [v0.7.0 release](https://github.com/stuntworks/CorridorKey-StuntWorks/releases/tag/v0.7.0).
+Real stunt/action greenscreen clips for testing are attached to the [v0.7.0 release](https://github.com/stuntworks/CorridorKey-StuntWorks/releases/tag/v0.7.0). **More clips coming with future releases.**
 
 > **Important:** These are intentionally difficult shots — fast action, motion blur, and suboptimal lighting — chosen to stress-test the plugin on worst-case material. Results on well-lit production greenscreen will be significantly cleaner.
 
