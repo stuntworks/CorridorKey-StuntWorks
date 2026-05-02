@@ -454,9 +454,14 @@ def get_settings():
         # _merge_live_params() which pulls the actual values from live_params.json
         "sam2_margin": 0.0,
         "sam2_soften": 0.0,
-        # HALO: trimap-guided halo band width (px). Viewer-owned default 0 =
-        # bit-identical to no-halo behavior; overridden by _merge_live_params.
+        # HALO FEET: SAM2 gate dilation in non-green zones (px). Viewer-owned
+        # default 0 = bit-identical to no-halo behavior; overridden by
+        # _merge_live_params.
         "halo_px": 0,
+        # HALO BODY: SAM2 gate dilation in green-bordered zones (px). May 1
+        # TWO HALO design — independent of halo_px so a body buffer can be set
+        # without growing feet into the floor. Default 0 = bit-identical.
+        "halo_body_px": 0,
         # TRIM SAM2: chroma-aware mask refinement (0-100). Viewer-owned default
         # 0 = bit-identical to no-trim behavior; overridden by _merge_live_params.
         "trim_chroma": 0,
@@ -528,6 +533,9 @@ def _merge_live_params(settings):
             except (ValueError, TypeError): pass
         if "halo_px" in lp:
             try: out["halo_px"] = max(0, int(lp["halo_px"]))
+            except (ValueError, TypeError): pass
+        if "halo_body_px" in lp:
+            try: out["halo_body_px"] = max(0, int(lp["halo_body_px"]))
             except (ValueError, TypeError): pass
         if "trim_chroma" in lp:
             try: out["trim_chroma"] = max(0, min(100, int(lp["trim_chroma"])))
@@ -2312,7 +2320,7 @@ def _key_one_scrub_frame():
             else:
                 if _trim_chroma > 0:
                     _gate = trim_gate_by_chroma(_gate, fr, _stype, _trim_chroma)
-                mt = apply_sam2_gate(mt, _gate, invert=False, halo_px=int(ctx["settings"].get("halo_px", 0)))
+                mt = apply_sam2_gate(mt, _gate, invert=False, halo_px=int(ctx["settings"].get("halo_px", 0)), halo_body_px=int(ctx["settings"].get("halo_body_px", 0)))
                 if _fill_holes > 0:
                     _mt2d_fill = mt[:, :, 0] if len(mt.shape) == 3 else mt
                     mt = fill_holes_color_aware(_mt2d_fill, _gate, fr, _stype, _fill_holes)
@@ -2894,6 +2902,7 @@ def on_process_range(ev):
                 if mt is not None:
                     from sam2_combine import apply_sam2_gate, apply_sam2_gate_additive, apply_sam2_gate_weighted, apply_sam2_gate_subtract, trim_gate_by_chroma, fill_holes_color_aware
                     _halo_px = int(settings.get("halo_px", 0))
+                    _halo_body_px = int(settings.get("halo_body_px", 0))
                     _trim_px = int(settings.get("trim_chroma", 0))
                     _fill_px = int(settings.get("fill_holes", 0))
                     _stype = settings.get("screen_type", "green")
@@ -2919,7 +2928,7 @@ def on_process_range(ev):
                         else:
                             if _trim_px > 0:
                                 _gate = trim_gate_by_chroma(_gate, fr, _stype, _trim_px)
-                            mt = apply_sam2_gate(_mt2d, _gate, invert=False, halo_px=_halo_px)
+                            mt = apply_sam2_gate(_mt2d, _gate, invert=False, halo_px=_halo_px, halo_body_px=_halo_body_px)
                             if _fill_px > 0:
                                 mt = fill_holes_color_aware(mt, _gate, fr, _stype, _fill_px)
                     elif _braw_sam2_gate is not None:
@@ -2936,7 +2945,7 @@ def on_process_range(ev):
                                 _bgate = trim_gate_by_chroma(_braw_sam2_gate, fr, _stype, _trim_px)
                             else:
                                 _bgate = _braw_sam2_gate
-                            mt = apply_sam2_gate(_mt2d, _bgate, invert=False, halo_px=_halo_px)
+                            mt = apply_sam2_gate(_mt2d, _bgate, invert=False, halo_px=_halo_px, halo_body_px=_halo_body_px)
                             if _fill_px > 0:
                                 mt = fill_holes_color_aware(mt, _bgate, fr, _stype, _fill_px)
                 choke_px = int(settings.get("choke", 0))
@@ -3142,6 +3151,7 @@ def on_process_range(ev):
                 if mt is not None:
                     from sam2_combine import apply_sam2_gate, apply_sam2_gate_additive, apply_sam2_gate_weighted, apply_sam2_gate_subtract, trim_gate_by_chroma, fill_holes_color_aware
                     _halo_px = int(settings.get("halo_px", 0))
+                    _halo_body_px = int(settings.get("halo_body_px", 0))
                     _trim_px = int(settings.get("trim_chroma", 0))
                     _fill_px = int(settings.get("fill_holes", 0))
                     _stype = settings.get("screen_type", "green")
@@ -3168,7 +3178,7 @@ def on_process_range(ev):
                         else:
                             if _trim_px > 0:
                                 _gate = trim_gate_by_chroma(_gate, fr, _stype, _trim_px)
-                            mt = apply_sam2_gate(_mt2d, _gate, invert=False, halo_px=_halo_px)
+                            mt = apply_sam2_gate(_mt2d, _gate, invert=False, halo_px=_halo_px, halo_body_px=_halo_body_px)
                             if _fill_px > 0:
                                 mt = fill_holes_color_aware(mt, _gate, fr, _stype, _fill_px)
                     else:
@@ -3193,7 +3203,7 @@ def on_process_range(ev):
                                     _sgate = trim_gate_by_chroma(_static_sam2_gate, fr, _stype, _trim_px)
                                 else:
                                     _sgate = _static_sam2_gate
-                                mt = apply_sam2_gate(_mt2d, _sgate, invert=False, halo_px=_halo_px)
+                                mt = apply_sam2_gate(_mt2d, _sgate, invert=False, halo_px=_halo_px, halo_body_px=_halo_body_px)
                                 if _fill_px > 0:
                                     mt = fill_holes_color_aware(mt, _sgate, fr, _stype, _fill_px)
                 choke_px = int(settings.get("choke", 0))
