@@ -24,6 +24,14 @@
 
 ---
 
+## Why This Project Exists
+
+StuntWorks Cinema is **Roberto Lopez and Elvis Lopez** — stunt performers and indie action filmmakers. We work primarily in **DaVinci Resolve** and **After Effects**, shooting real stunt and action shorts on tight budgets — imperfect green screen, bad lighting, motion blur, fast action — and existing keyers struggle with that footage. So we built this around Niko Pueringer's CorridorKey AI engine for our own films. Free for other action filmmakers. **Still building it.**
+
+Watch what we make with it: **[youtube.com/@stuntworkscinema](https://www.youtube.com/@stuntworkscinema)**
+
+---
+
 > **Which version should I download?**
 > For a verified, tested build use the latest **[release tag](https://github.com/stuntworks/CorridorKey-StuntWorks/releases)** (currently `v0.7.0`). The `main` branch is active development and may include unfinished work.
 
@@ -57,9 +65,9 @@ Real stunt/action greenscreen clips for testing are attached to the [v0.7.0 rele
 
 > Drop green screen footage in your editor. Click one button. Get a clean key.
 
-- AI-powered green/blue screen removal — no manual color picking
+- **SAM2 Garbage Matte** — click foreground / background points like Adobe's Roto Brush or DaVinci's Magic Mask. AI draws a precision matte applied to the render. Free, open source, works in all three editors.
+- AI-powered green / blue screen removal — no manual color picking
 - Works inside **Resolve**, **After Effects**, and **Premiere Pro**
-- **SAM2 Garbage Matte** — click points on the live preview to draw a precision foreground boundary; the AI mask is applied to the render so background garbage never bleeds through
 - Live preview viewer — see your key in a floating window, drag sliders to update in real time
 - Batch process entire clips or frame ranges
 - Adjustable despill, edge refinement, and despeckle
@@ -93,6 +101,8 @@ python install.py
 | `--uninstall` | Remove from all apps |
 
 > Set `CORRIDORKEY_ROOT` environment variable if your CorridorKey install isn't in a sibling directory.
+
+> ⭐ **If this saves you time, please star the repo** — it helps other action filmmakers find it.
 
 ---
 
