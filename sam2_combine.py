@@ -263,17 +263,27 @@ def apply_sam2_gate(alpha: np.ndarray, gate: np.ndarray | None, invert: bool = F
         feet_extension = _cv2.dilate(binary, feet_kernel)
         gate_combined = np.maximum(gate_combined, feet_extension)
 
-    # HALO FEET negative: shrink combined silhouette from the bottom edge.
-    # Uses a PURE VERTICAL (1-col-wide) erosion kernel: each column is
-    # independently shrunk by |halo_px| rows from below. Vertical-only avoids
-    # eroding the silhouette top row when the silhouette is narrower than the
-    # halo (which would happen with an elliptical kernel because lateral
-    # kernel positions reach outside the silhouette).
+    # HALO FEET negative: shrink the silhouette only at the bottom of its
+    # bounding box. Two-step:
+    #   (a) find the silhouette's bbox bottom row.
+    #   (b) erode only within rows [bbox_bottom - |halo_px| + 1, bbox_bottom].
+    # Above that range, the silhouette is preserved as-is — protects the
+    # arms / upper body from global erosion. Erosion uses a pure vertical
+    # 1-col kernel so lateral pixels never reach outside the silhouette.
     elif halo_px and halo_px < 0:
         h_neg = abs(int(halo_px))
-        kn = h_neg * 2 + 1
-        erode_kernel = np.zeros((kn, 1), dtype=np.uint8)
-        erode_kernel[h_neg:, 0] = 1  # active rows h_neg..2*h_neg → dr [0, h_neg]
-        gate_combined = _cv2.erode(gate_combined, erode_kernel)
+        ys = np.where(gate_combined > 0)[0]
+        if len(ys) > 0:
+            bbox_bottom = int(ys.max())
+            feet_zone_top = max(0, bbox_bottom - h_neg + 1)
+            kn = h_neg * 2 + 1
+            erode_kernel = np.zeros((kn, 1), dtype=np.uint8)
+            erode_kernel[h_neg:, 0] = 1  # active rows h_neg..2*h_neg → dr [0, h_neg]
+            eroded = _cv2.erode(gate_combined, erode_kernel)
+            # Apply erosion only in the bottom h_neg rows of the bbox.
+            gate_combined = gate_combined.copy()
+            gate_combined[feet_zone_top:bbox_bottom + 1, :] = (
+                eroded[feet_zone_top:bbox_bottom + 1, :]
+            )
 
     return (alpha * gate_combined.astype(np.float32)).astype(alpha.dtype, copy=False)
