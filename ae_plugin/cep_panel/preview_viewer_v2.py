@@ -1046,14 +1046,14 @@ class PersistentWindow(QtWidgets.QWidget):
         self.halo_body_value_label.setMinimumWidth(42)
         grid.addWidget(self.halo_body_value_label, 5, 2)
 
-        # --- HALO FEET: SAM2 gate dilation in NON-GREEN zones (slider 0-150). ---
-        # Original HALO behavior, scoped to feet/floor/non-green-bordered
-        # regions. Visible kicks the matte past the floor edge. Default 0
-        # keeps a tight cutoff at feet.
+        # --- HALO FEET: bidirectional silhouette adjustment at feet (-100 to +150). ---
+        # Negative values SHRINK the silhouette upward from the bottom edge —
+        # useful for removing connected floor patches. Positive values extend
+        # the silhouette down (foot shadow / contact recovery). Zero = no change.
         self.halo_label_widget = _label("HALO FEET")
         grid.addWidget(self.halo_label_widget, 6, 0)
         self.halo_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.halo_slider.setRange(0, 150)
+        self.halo_slider.setRange(-100, 150)
         self.halo_slider.setValue(int(self._params["halo_px"]))
         self.halo_slider.valueChanged.connect(self._on_halo_changed)
         grid.addWidget(self.halo_slider, 6, 1)

@@ -1407,19 +1407,21 @@ class PersistentWindow(QtWidgets.QWidget):
         self.halo_body_value_label.setToolTip(_HALO_BODY_TOOLTIP)
         grid.addWidget(self.halo_body_value_label, 5, 2)
 
-        # --- HALO FEET: SAM2 gate dilation in NON-GREEN zones (slider 0-150). ---
-        # The original HALO behavior, now scoped to feet/floor/non-green-bordered
-        # regions. Dilates SAM2 outward in those zones — visible kicks the matte
-        # past the floor edge. Default 0 keeps a tight cutoff at feet.
-        _HALO_FEET_TOOLTIP = ("HALO FEET — buffer SAM2 silhouette in non-green zones (feet, floor).\n"
-                              "Visible effect grows the matte past the floor edge. Default 0 keeps\n"
-                              "a tight cutoff. 0 = off. 0-30 typical. Max 150.\n"
+        # --- HALO FEET: bidirectional silhouette adjustment at feet (-100 to +150). ---
+        # Negative values SHRINK the silhouette upward from the bottom edge —
+        # useful for removing connected floor patches that the largest-component
+        # filter couldn't drop. Positive values extend the silhouette down (foot
+        # shadow / contact recovery). Zero = no change.
+        _HALO_FEET_TOOLTIP = ("HALO FEET — adjust SAM2 silhouette at the feet.\n"
+                              "Negative: lift foot edge UP (removes connected floor patches).\n"
+                              "Positive: extend foot DOWN (foot shadow / contact recovery).\n"
+                              "Zero: no change. Range -100 to +150.\n"
                               "SAM2 must be active for this control to work.")
         self.halo_label_widget = _label("HALO FEET")
         self.halo_label_widget.setToolTip(_HALO_FEET_TOOLTIP)
         grid.addWidget(self.halo_label_widget, 6, 0)
         self.halo_slider = JumpSlider(QtCore.Qt.Horizontal)
-        self.halo_slider.setRange(0, 150)
+        self.halo_slider.setRange(-100, 150)
         self.halo_slider.setValue(int(self._params["halo_px"]))
         self.halo_slider.valueChanged.connect(self._on_halo_changed)
         self.halo_slider.setToolTip(_HALO_FEET_TOOLTIP)

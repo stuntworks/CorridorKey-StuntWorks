@@ -195,75 +195,85 @@ def apply_sam2_gate(alpha: np.ndarray, gate: np.ndarray | None, invert: bool = F
                     halo_px: int = 0, halo_body_px: int = 0) -> np.ndarray:
     """Combine NN alpha with SAM2 gate. invert=True = garbage matte mode (subtract clicked region).
 
-    halo_px (HALO FEET): downward dilation of the SAM2 silhouette. Extends the
-        gate DOWN from the silhouette into floor area (shadow / contact
-        recovery). Default 0 = no extension = tight cutoff at feet.
-    halo_body_px (HALO BODY): upward + sideways dilation. Extends the gate UP
-        from the silhouette (recovers hair above the head, butt-above-gap,
-        fingertip wisps at sides). Cannot extend below the silhouette by
-        construction — no bleed below feet, no matter how high the slider.
+    halo_px (HALO FEET):
+        > 0: extend silhouette DOWNWARD by halo_px rows (anisotropic-down kernel).
+        < 0: SHRINK silhouette upward from the bottom edge by |halo_px|.
+             Removes connected floor patches that the largest-component filter
+             couldn't drop.
+        = 0: silhouette unchanged.
+    halo_body_px (HALO BODY):
+        > 0: extend silhouette UPWARD by halo_body_px rows (anisotropic-up
+             kernel). Recovers hair above the head, butt-above-gap, fingertip
+             wisps. Cannot extend below the silhouette by construction.
+        = 0: silhouette unchanged.
 
-    Implementation: anisotropic kernels.
-        HALO BODY: kernel rows 0 to halo_body-1 are zeroed (top half of the
-            kernel inactive). Dilation with a bottom-half-active kernel
-            spreads the silhouette UPWARD (and sideways at center row).
-        HALO FEET: kernel rows halo_feet+1 to 2*halo_feet zeroed (bottom half
-            inactive). Top-half-active kernel spreads the silhouette DOWNWARD.
+    Kernels include the silhouette CENTER row so lateral extension at the
+    silhouette row works (preserves hair flowing sideways at silhouette top
+    edge).
 
-    Combined as max(gate_body, gate_feet) so the two halos are independent.
     When both halos are 0: returns alpha * gate (bit-identical no-halo path).
     """
     if gate is None:
         return alpha
     gate_use = (1.0 - gate) if invert else gate
-    has_halo = (halo_px and halo_px > 0) or (halo_body_px and halo_body_px > 0)
+    has_halo = bool(halo_px) or bool(halo_body_px)
     if not has_halo:
         return alpha * gate_use
     import cv2 as _cv2
     binary = (gate_use > 0.5).astype(np.uint8)
 
     # Drop spurious SAM2 blobs (small floor patches near feet, crew behind
-    # actor, etc.) before any halo dilation. Without this filter, anisotropic
-    # UP would amplify a 100-px floor patch into a hundreds-of-pixels-tall
-    # vertical strip — Berto's "big window on right foot" bug 2026-05-02.
-    # Geometric, not heuristic: always keep the largest component, then keep
-    # additional components whose area is >= 5% of the largest (or 500 px,
-    # whichever is greater). Any halo > 0 activates this; no-halo path stays
-    # bit-identical.
+    # actor, etc.) before any halo. Geometric, not heuristic: always keep the
+    # largest component, then keep additional components >= 5% of the largest
+    # (or 500 px, whichever is greater). Bit-identical to no-filter when only
+    # one component exists.
     n_lab, labels, stats, _ = _cv2.connectedComponentsWithStats(binary, connectivity=8)
     if n_lab > 1:
         sizes = stats[1:, _cv2.CC_STAT_AREA]
-        largest_idx = int(sizes.argmax()) + 1  # +1 because label 0 is background
+        largest_idx = int(sizes.argmax()) + 1
         largest = int(sizes.max())
-        threshold = max(500, largest // 20)  # 5% of main, with 500-px floor
+        threshold = max(500, largest // 20)
         keep = np.zeros(n_lab, dtype=np.uint8)
-        keep[largest_idx] = 1  # always keep the largest component
+        keep[largest_idx] = 1
         for i in range(1, n_lab):
             if i != largest_idx and int(stats[i, _cv2.CC_STAT_AREA]) >= threshold:
                 keep[i] = 1
         binary = keep[labels].astype(np.uint8)
 
-    # HALO BODY: anisotropic UP. Bottom half of kernel active → dilation
-    # extends silhouette UPWARD and sideways at the silhouette row.
+    gate_combined = binary.copy()
+
+    # HALO BODY: anisotropic UP. Kernel TOP half zeroed → bottom-half +
+    # center active → dilation extends silhouette UPWARD with full lateral
+    # at silhouette row.
     if halo_body_px and halo_body_px > 0:
         h_b = int(halo_body_px)
         kb = h_b * 2 + 1
         body_kernel = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (kb, kb))
         body_kernel[:h_b, :] = 0  # zero TOP half → spreads UP
-        gate_body = _cv2.dilate(binary, body_kernel)
-    else:
-        gate_body = binary
+        body_extension = _cv2.dilate(binary, body_kernel)
+        gate_combined = np.maximum(gate_combined, body_extension)
 
-    # HALO FEET: anisotropic DOWN. Top half of kernel active → dilation
-    # extends silhouette DOWNWARD and sideways at the silhouette row.
+    # HALO FEET positive: anisotropic DOWN. Kernel BOTTOM half zeroed →
+    # top-half + center active → dilation extends silhouette DOWNWARD.
     if halo_px and halo_px > 0:
         h_f = int(halo_px)
         kf = h_f * 2 + 1
         feet_kernel = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (kf, kf))
         feet_kernel[h_f + 1:, :] = 0  # zero BOTTOM half → spreads DOWN
-        gate_feet = _cv2.dilate(binary, feet_kernel)
-    else:
-        gate_feet = binary
+        feet_extension = _cv2.dilate(binary, feet_kernel)
+        gate_combined = np.maximum(gate_combined, feet_extension)
 
-    gate_combined = np.maximum(gate_body, gate_feet).astype(np.float32)
-    return (alpha * gate_combined).astype(alpha.dtype, copy=False)
+    # HALO FEET negative: shrink combined silhouette from the bottom edge.
+    # Uses a PURE VERTICAL (1-col-wide) erosion kernel: each column is
+    # independently shrunk by |halo_px| rows from below. Vertical-only avoids
+    # eroding the silhouette top row when the silhouette is narrower than the
+    # halo (which would happen with an elliptical kernel because lateral
+    # kernel positions reach outside the silhouette).
+    elif halo_px and halo_px < 0:
+        h_neg = abs(int(halo_px))
+        kn = h_neg * 2 + 1
+        erode_kernel = np.zeros((kn, 1), dtype=np.uint8)
+        erode_kernel[h_neg:, 0] = 1  # active rows h_neg..2*h_neg → dr [0, h_neg]
+        gate_combined = _cv2.erode(gate_combined, erode_kernel)
+
+    return (alpha * gate_combined.astype(np.float32)).astype(alpha.dtype, copy=False)
