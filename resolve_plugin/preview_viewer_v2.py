@@ -1388,15 +1388,16 @@ class PersistentWindow(QtWidgets.QWidget):
         # Body buffer recovers hair / butt-across-strap detail where SAM2's
         # silhouette is tighter than the actor's actual edge, without bloating
         # feet into the floor. 0 = off (bit-identical to single-halo behavior).
-        _HALO_BODY_TOOLTIP = ("HALO BODY — buffer SAM2 silhouette where it meets the green screen.\n"
-                              "Recovers hair, butt-across-strap, fingertip detail. Invisible in\n"
-                              "non-green zones (feet, floor). 0 = off. 30-50 typical. Max 150.\n"
+        _HALO_BODY_TOOLTIP = ("HALO BODY — dilate SAM2 silhouette INTO green pixels only.\n"
+                              "Recovers hair, butt-across-strap, fingertip detail. Cannot bleed\n"
+                              "into floor / non-green areas (intersection with NN green mask).\n"
+                              "0 = off. 30-100 typical. Max 300. Self-clamping at green edges.\n"
                               "SAM2 must be active for this control to work.")
         self.halo_body_label_widget = _label("HALO BODY")
         self.halo_body_label_widget.setToolTip(_HALO_BODY_TOOLTIP)
         grid.addWidget(self.halo_body_label_widget, 5, 0)
         self.halo_body_slider = JumpSlider(QtCore.Qt.Horizontal)
-        self.halo_body_slider.setRange(0, 150)
+        self.halo_body_slider.setRange(0, 300)
         self.halo_body_slider.setValue(int(self._params["halo_body_px"]))
         self.halo_body_slider.valueChanged.connect(self._on_halo_body_changed)
         self.halo_body_slider.setToolTip(_HALO_BODY_TOOLTIP)
