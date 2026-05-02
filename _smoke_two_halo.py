@@ -151,7 +151,64 @@ def main() -> int:
         return 1
     print(f"PASS: lone small component preserved (300-px silhouette kept, grew above by {above_lone:.0f})")
 
-    # 11. gate=None passthrough.
+    # 11a. NEGATIVE HALO FEET shrinks silhouette from bottom.
+    #     Single 100-row silhouette, HALO FEET=-30 → bottom 30 rows removed,
+    #     top intact.
+    alpha_n = np.ones((400, 200), dtype=np.float32)
+    gate_n = np.zeros((400, 200), dtype=np.float32)
+    gate_n[100:200, 80:120] = 1.0  # 100 rows tall, rows 100-199
+    out_neg = apply_sam2_gate(alpha_n, gate_n, halo_px=-30, halo_body_px=0)
+    out_neg_bin = out_neg > 0.5
+    # Top of silhouette (row 100) should be preserved
+    top_kept = int(out_neg_bin[100].sum())
+    # Bottom 30 rows (170-199) should be eroded out
+    bottom_eroded = int(out_neg_bin[170:200].sum())
+    # Just-above-silhouette (rows 90-99) should still be 0 (erosion doesn't add)
+    above_silh = int(out_neg_bin[90:100].sum())
+    if top_kept == 0:
+        print(f"FAIL: HALO FEET=-30 erased silhouette top row (top_kept={top_kept})")
+        return 1
+    if bottom_eroded > 0:
+        print(f"FAIL: HALO FEET=-30 didn't erode bottom rows (sum={bottom_eroded})")
+        return 1
+    if above_silh > 0:
+        print(f"FAIL: HALO FEET=-30 added pixels above silhouette (sum={above_silh})")
+        return 1
+    print(f"PASS: HALO FEET=-30 shrunk silhouette from bottom (top kept, 30 rows eroded)")
+
+    # 11b. NEGATIVE HALO FEET removes a connected floor patch at the bottom.
+    #     Body 100 rows + connected floor patch 20 rows below. With HALO FEET=-25,
+    #     the patch + 5 rows of body bottom should be removed.
+    alpha_p = np.ones((400, 200), dtype=np.float32)
+    gate_p = np.zeros((400, 200), dtype=np.float32)
+    gate_p[100:200, 80:120] = 1.0  # body
+    gate_p[200:220, 90:110] = 1.0  # connected floor patch (20 rows below body)
+    out_neg_p = apply_sam2_gate(alpha_p, gate_p, halo_px=-25, halo_body_px=0)
+    out_neg_p_bin = out_neg_p > 0.5
+    # All of patch (rows 200-219) and bottom 5 rows of body (195-199) should be eroded
+    patch_eroded = int(out_neg_p_bin[195:220].sum())
+    if patch_eroded > 0:
+        print(f"FAIL: HALO FEET=-25 didn't remove patch + bottom 5 of body (sum={patch_eroded})")
+        return 1
+    print("PASS: HALO FEET=-25 removed connected floor patch")
+
+    # 11c. Combined HALO BODY > 0 + HALO FEET < 0 — body grows above, silhouette
+    #      shrinks at bottom. Both effects independent and visible.
+    out_combo = apply_sam2_gate(alpha_n, gate_n, halo_px=-20, halo_body_px=30)
+    out_combo_bin = out_combo > 0.5
+    # Body extends above silhouette (rows 70-99)
+    body_above = int(out_combo_bin[70:100].sum())
+    # Silhouette bottom shrunk (rows 180-199 should be 0)
+    feet_eroded = int(out_combo_bin[180:200].sum())
+    if body_above == 0:
+        print(f"FAIL: combined BODY=30 + FEET=-20 — body didn't grow above (sum={body_above})")
+        return 1
+    if feet_eroded > 0:
+        print(f"FAIL: combined BODY=30 + FEET=-20 — bottom not eroded (sum={feet_eroded})")
+        return 1
+    print(f"PASS: combined BODY=30 + FEET=-20 (above={body_above}, bottom_eroded=0)")
+
+    # 12. gate=None passthrough.
     out_none = apply_sam2_gate(alpha, None, halo_px=20, halo_body_px=20)
     if not np.array_equal(out_none, alpha):
         print("FAIL: gate=None should pass alpha through unchanged")
