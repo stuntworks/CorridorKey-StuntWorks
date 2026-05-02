@@ -1029,15 +1029,16 @@ class PersistentWindow(QtWidgets.QWidget):
         self.sam2_soften_value_label.setMinimumWidth(42)
         grid.addWidget(self.sam2_soften_value_label, 4, 2)
 
-        # --- HALO BODY: SAM2 gate dilation in GREEN-BORDERED zones (slider 0-150). ---
-        # The May 1 TWO HALO design: independent dilation values for body
-        # silhouette (this slider) vs feet/floor cutoff (HALO FEET below).
-        # Body buffer recovers hair / butt-across-strap detail where SAM2's
-        # silhouette is tighter than the actor's actual edge. 0 = off.
+        # --- HALO BODY: dilate SAM2 silhouette INTO green pixels only (slider 0-300). ---
+        # Option 5 design (2026-05-02): the dilated SAM2 silhouette is
+        # intersected with NN's green mask so the expansion can ONLY land on
+        # pixels NN keyed as background. Recovers hair / butt-across-strap /
+        # fingertip detail. By construction cannot bleed into floor or other
+        # non-green regions. Self-clamping at green edges. 0 = off.
         self.halo_body_label_widget = _label("HALO BODY")
         grid.addWidget(self.halo_body_label_widget, 5, 0)
         self.halo_body_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.halo_body_slider.setRange(0, 150)
+        self.halo_body_slider.setRange(0, 300)
         self.halo_body_slider.setValue(int(self._params["halo_body_px"]))
         self.halo_body_slider.valueChanged.connect(self._on_halo_body_changed)
         grid.addWidget(self.halo_body_slider, 5, 1)
