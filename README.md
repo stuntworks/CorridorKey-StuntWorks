@@ -30,7 +30,7 @@ StuntWorks Cinema is **Roberto Lopez and Elvis Lopez** — stunt performers and 
 
 **Free for all** — thanks to [Niko Pueringer](https://github.com/nikopueringer/CorridorKey) for releasing CorridorKey as open source.
 
-**Still building it — bigger upgrades coming. Follow the channel for updates: [@stuntworkscinema](https://www.youtube.com/@stuntworkscinema).**
+**Active development — bigger upgrades coming. Tutorials on the way. Follow the channel for updates: [@stuntworkscinema](https://www.youtube.com/@stuntworkscinema).**
 
 ---
 
