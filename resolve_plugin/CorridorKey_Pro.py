@@ -532,10 +532,13 @@ def _merge_live_params(settings):
             try: out["sam2_soften"] = max(0.0, float(lp["sam2_soften"]))
             except (ValueError, TypeError): pass
         if "halo_px" in lp:
-            try: out["halo_px"] = max(0, int(lp["halo_px"]))
+            # HALO FEET supports negative values (shrink silhouette from bottom).
+            # Clamp to slider range -100..+150.
+            try: out["halo_px"] = max(-100, min(150, int(lp["halo_px"])))
             except (ValueError, TypeError): pass
         if "halo_body_px" in lp:
-            try: out["halo_body_px"] = max(0, int(lp["halo_body_px"]))
+            # HALO BODY positive only (extends silhouette upward). 0..300.
+            try: out["halo_body_px"] = max(0, min(300, int(lp["halo_body_px"])))
             except (ValueError, TypeError): pass
         if "trim_chroma" in lp:
             try: out["trim_chroma"] = max(0, min(100, int(lp["trim_chroma"])))
