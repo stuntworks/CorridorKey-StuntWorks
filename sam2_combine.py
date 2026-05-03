@@ -342,16 +342,29 @@ def apply_sam2_gate(alpha: np.ndarray, gate: np.ndarray | None, invert: bool = F
 
     gate_combined = binary.copy()
 
-    # HALO BODY: anisotropic UP. Kernel TOP half zeroed → bottom-half +
-    # center active → dilation extends silhouette UPWARD with full lateral
-    # at silhouette row.
+    # HALO BODY: anisotropic UP, restricted to the silhouette TOP STRIP.
+    # Why "top strip" (top h_b rows of bbox) instead of the whole silhouette:
+    # the previous version dilated EVERY silhouette pixel upward, which
+    # creates a lateral pillow at every silhouette row — including at feet
+    # level on a whole-actor mask, where the pillow extends into the floor.
+    # By dilating only the top h_b rows, the halo lives where the head /
+    # hair are. Body middle and feet contribute zero halo, so no pillows
+    # form below the head no matter how big the silhouette is. Hair-fringe
+    # recovery (the whole point of HALO BODY) still works because the head
+    # top is always in the top strip.
     if halo_body_px and halo_body_px > 0:
         h_b = int(halo_body_px)
-        kb = h_b * 2 + 1
-        body_kernel = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (kb, kb))
-        body_kernel[:h_b, :] = 0  # zero TOP half → spreads UP
-        body_extension = _cv2.dilate(binary, body_kernel)
-        gate_combined = np.maximum(gate_combined, body_extension)
+        ys = np.where(binary > 0)[0]
+        if len(ys) > 0:
+            bbox_top = int(ys.min())
+            top_strip = np.zeros_like(binary)
+            strip_bot = min(binary.shape[0], bbox_top + h_b)
+            top_strip[bbox_top:strip_bot, :] = binary[bbox_top:strip_bot, :]
+            kb = h_b * 2 + 1
+            body_kernel = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (kb, kb))
+            body_kernel[:h_b, :] = 0  # zero TOP half → spreads UP
+            body_extension = _cv2.dilate(top_strip, body_kernel)
+            gate_combined = np.maximum(gate_combined, body_extension)
 
     # HALO FEET positive: anisotropic DOWN. Kernel BOTTOM half zeroed →
     # top-half + center active → dilation extends silhouette DOWNWARD.
