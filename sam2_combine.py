@@ -226,94 +226,100 @@ def apply_sam2_gate_weighted(alpha, gate, source_rgb, screen_type='green', feath
 
 def apply_sam2_gate_subtract(alpha, gate, source_rgb=None, screen_type='green',
                              buffer_px=8, feather_px=4):
-    """Subtract-only combine: SAM2 may only kill OUTSIDE CorridorKey's green zones.
+    """Connected-component SUBTRACT — keep NN-FG blobs that overlap SAM2.
 
-    ARCHITECTURE 2026-05-03 (chroma-aware revision):
+    ARCHITECTURE 2026-05-03 (geometry-based, replaces distance-based):
 
-    Goal: SAM2 should only act in non-green areas (where CorridorKey couldn't
-    key against anything). In green areas, CorridorKey already owns the matte
-    and SAM2 must stay out — otherwise SAM2's tighter silhouette cuts hair,
-    butt curve, and other body parts NN keyed correctly.
+    The previous chroma/distance-based SUBTRACT couldn't kill junk that sits
+    AGAINST the greenscreen — cables in front of green, tracking marks ON
+    green, wall corners flush with green drape. Every distance-based scheme
+    sees those at distance ~0 from green and protects them like hair fringe.
 
-    The "where is green?" signal requires BOTH:
-        1. NN drove alpha to ~0 (NN said this is background)
-        2. Source RGB has actual green chroma (this pixel really is green)
+    Geometry signal that DOES distinguish hair from cable: hair is part of
+    the actor's connected NN-FG blob; cable is its own separate blob. We
+    label NN-FG blobs, keep the ones that overlap SAM2's silhouette, kill
+    the rest.
 
-    Why both: NN-killed alone fails when NN keys non-green floor as background
-    (cables on floor get protected as if they were green). Source-chroma alone
-    fails when green spill bounces onto studio junk (junk gets protected
-    because spill makes it slightly green). Requiring BOTH:
-      - Real greenscreen (NN-killed AND green chroma)        → green zone ✓
-      - Floor NN happened to kill (NN-killed, NOT green)     → not green zone, killable ✓
-      - Spill-tinted junk (NN sees FG, slight green chroma)  → not green zone (fails NN-killed)
-                                                                → killable ✓
-      - Hair fringe / butt at green edge (NN sees FG, no green chroma)
-                                                              → not green zone, but ADJACENT
-                                                                to one → protected by EDGE GUARD ✓
+    Pixel walk on Berto's stunt-vest clip:
+      - Actor body / hair / butt / fingers (one big NN-FG blob, overlaps
+        SAM2 silhouette) → keep, full NN matte preserved
+      - Tracking marks +/× on greenscreen (small isolated blobs, no overlap
+        with SAM2) → killed
+      - Black cable across greenscreen (separate blob, no SAM2 overlap)
+        → killed
+      - Wall corner top-left (separate blob, no SAM2 overlap) → killed
+      - Lift base bottom-left (separate blob, no SAM2 overlap) → killed
 
-    Logic:
-        nn_killed     = (alpha < 0.05)                       # NN said background
-        chroma_green  = source[:,:,1] - max(R, B) > 0.05     # actually green-coloured
-        green_zone    = nn_killed AND chroma_green           # both signals
-        dist          = distance to nearest green_zone pixel
-        kill_ramp     = clip((dist - buffer) / feather, 0, 1)
-        sam2_bg       = 1 - gate_binarized_then_softened
-        result        = alpha * (1 - kill_ramp * sam2_bg)
+    buffer_px (EDGE GUARD): pixels of dilation around kept blobs to recover
+        soft-edge values (hair fringe at alpha<0.10 that wouldn't be in the
+        binary blob). Larger = more soft-edge survives; smaller = tighter cut.
+    feather_px: Gaussian width of the kill / keep boundary.
+    source_rgb / screen_type: signature kept for callsite compatibility.
+        Geometry-based logic doesn't need them; ignored.
 
-    buffer_px (EDGE GUARD): distance past the green edge before SAM2 may begin
-        to kill. Larger = more protection for hair / fringe / butt curve and
-        body parts right at the green border. Smaller = more aggressive junk
-        kill closer to actor.
-    feather_px: width of the soft kill transition.
-    source_rgb: REQUIRED. RGB float [0..1]. Used for chroma green detection.
-        When None or not provided, falls back to NN-killed-only definition
-        (legacy behaviour from pre-2026-05-03).
-    screen_type: "green" or "blue". Determines which channel is dominant
-        in the chroma score.
+    SAM2 gate is binarized at 0.5 to define the silhouette used for blob
+    overlap testing. The soft-edge gate is no longer used for the kill
+    multiplier — keep_mask drives the result instead.
 
-    SAM2 gate is binarized at 0.5 BEFORE the spatial Gaussian blur — without
-    that, raw sigmoid 0.3-0.7 in body interior would produce the SMART BLEND
-    ghost. Spatial feather lives on the binary mask.
+    Edge cases:
+      - SAM2 silhouette empty / no NN-FG blob overlaps it: degrade to
+        multiplicative (alpha * SAM2 gate) so the user still gets a sane
+        cut.
+      - Junk that physically touches the actor in NN's alpha: would join
+        the actor's blob and survive. Rare in greenscreen footage where
+        green pixels separate the actor from junk; if it happens the user
+        should mark it with a SAM2 negative dot or rely on a future
+        morphological-erosion safety pass.
     """
     if gate is None:
         return alpha
     import cv2 as _cv2
-    gate_bin = (gate > 0.5).astype(np.float32)
-    gate_bin = _cv2.GaussianBlur(gate_bin, (11, 11), 2.5)
-    # "Green zone" = NN-killed AND ACTUALLY green chroma. Three checks make
-    # the green-test strict enough to exclude spill-tinted floor that LED
-    # lighting commonly creates:
-    #   1. NN killed it (alpha ~ 0)
-    #   2. Green channel dominates by ≥ 0.10 (was 0.05 — too lenient, dim
-    #      spill-green floor was passing and protecting cables on it)
-    #   3. Green channel brightness ≥ 0.25 (real greenscreen is BRIGHT
-    #      green; spill-tinted dim floor never hits this)
-    # Together, the three checks let real greenscreen protect the actor's
-    # NN matte while letting SAM2 kill cables / junk on dim spill-tinted
-    # surfaces that NN happened to also kill.
-    nn_killed = (alpha < 0.05)
-    if source_rgb is not None and source_rgb.ndim == 3 and source_rgb.shape[2] >= 3:
-        if screen_type == "blue":
-            dom_ch = source_rgb[..., 2]
-            chroma_score = dom_ch - np.maximum(source_rgb[..., 0], source_rgb[..., 1])
-        else:
-            dom_ch = source_rgb[..., 1]
-            chroma_score = dom_ch - np.maximum(source_rgb[..., 0], source_rgb[..., 2])
-        chroma_green = (chroma_score > 0.10) & (dom_ch > 0.25)
-        green_zone = (nn_killed & chroma_green).astype(np.uint8)
-    else:
-        # Legacy fallback when source_rgb is unavailable.
-        green_zone = nn_killed.astype(np.uint8)
-    # Empty fallback: no green zone detected at all (e.g. shot has no green
-    # AND no NN-killed). Degrade to multiplicative.
-    if int(green_zone.sum()) == 0:
-        return (alpha * gate_bin).astype(alpha.dtype, copy=False)
-    dist = _cv2.distanceTransform(1 - green_zone, _cv2.DIST_L2, 5)
-    fp = max(int(feather_px), 1)
+    gate_bin_uint = (gate > 0.5).astype(np.uint8)
+    gate_bin_soft = _cv2.GaussianBlur(gate_bin_uint.astype(np.float32),
+                                      (11, 11), 2.5)
+    # NN-FG binary at a low threshold so soft hair / motion-blur edges land
+    # in the same blob as the body. 0.10 catches typical hair fringe values
+    # (0.2-0.6) without flooding into pure-green pixels (alpha < 0.05).
+    nn_fg = (alpha > 0.10).astype(np.uint8)
+    if int(nn_fg.sum()) == 0:
+        # Nothing to keep — fall back to legacy multiplicative.
+        return (alpha * gate_bin_soft).astype(alpha.dtype, copy=False)
+    # Connected components on NN-FG. Label 0 is background.
+    n_lab, labels, stats, _ = _cv2.connectedComponentsWithStats(nn_fg, connectivity=8)
+    sam2_bool = gate_bin_uint.astype(bool)
+    keep_mask = np.zeros_like(nn_fg)
+    for i in range(1, n_lab):
+        component_pixels = (labels == i)
+        component_size = int(component_pixels.sum())
+        if component_size == 0:
+            continue
+        overlap = int(np.count_nonzero(component_pixels & sam2_bool))
+        # Keep if the blob has any meaningful SAM2 overlap. The threshold of
+        # max(50, 5% of blob size) tolerates SAM2 silhouettes that don't
+        # cover the full actor (e.g. SAM2 only catches torso, not hair).
+        if overlap >= max(50, int(component_size * 0.05)):
+            keep_mask[component_pixels] = 1
+    # If no blob overlapped SAM2 (user error: SAM2 silhouette empty or
+    # off-mark), degrade to multiplicative so the user still sees something
+    # sensible instead of an entirely black matte.
+    if int(keep_mask.sum()) == 0:
+        return (alpha * gate_bin_soft).astype(alpha.dtype, copy=False)
+    # EDGE GUARD: dilate keep_mask outward so hair fringe (alpha 0.05-0.10
+    # that fell below the nn_fg threshold) and motion-blur tails get
+    # included. Without this, hair just past the binary blob edge dies.
     bp = max(int(buffer_px), 0)
-    kill_ramp = np.clip((dist - float(bp)) / float(fp), 0.0, 1.0).astype(np.float32)
-    sam2_bg = 1.0 - gate_bin
-    result = alpha * (1.0 - kill_ramp * sam2_bg)
+    if bp > 0:
+        kb = bp * 2 + 1
+        kernel = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (kb, kb))
+        keep_mask = _cv2.dilate(keep_mask, kernel)
+    # Soft feather at the keep_mask boundary so the cut isn't a hard pixel
+    # cliff. Mirrors the Gaussian feather the legacy SUBTRACT used.
+    keep_soft = keep_mask.astype(np.float32)
+    fp = max(int(feather_px), 1)
+    if fp > 0:
+        ksize = fp * 2 + 1
+        keep_soft = _cv2.GaussianBlur(keep_soft, (ksize, ksize), float(fp) / 2.0)
+    result = alpha * keep_soft
     return np.clip(result, 0.0, 1.0).astype(alpha.dtype, copy=False)
 
 
