@@ -201,3 +201,89 @@ https://github.com/gaomingqi/Awesome-Video-Object-Segmentation — comprehensive
 - https://medium.com/tier-iv-tech-blog/high-performance-sam2-inference-framework-with-tensorrt-9b01dbab4bf7
 - https://huggingface.co/docs/transformers/model_doc/sam2
 - https://www.runcomfy.com/comfyui-nodes/ComfyUI_LayerStyle_Advance/layer-mask-sam2-video-ultra
+
+---
+
+## Kimi swarm findings (2026-05-02 evening)
+
+External research swarm fed RESEARCH_BRIEF_MULTI_OBJECT_SAM2.md. Most findings reinforce what we already had. New / actionable items below.
+
+### NEW — DEVA / XMem hybrid for hair flicker
+
+Source: https://github.com/hkchengrex/Tracking-Anything-with-DEVA
+
+SAM2 + XMem hybrid for temporal consistency. SAM2 for initialization / major changes, XMem for frame-to-frame propagation. Reduces hair flicker and floor artifacts via temporal smoothing.
+
+```python
+sam2_mask = get_sam2_mask(frame)
+xmem_mask = xmem.track(frame, obj_id)
+final_mask = sam2_mask * 0.7 + xmem_mask * 0.3
+```
+
+Risk: MEDIUM. MIT license. More complex integration but proven in production.
+
+**Action:** Track for v0.9. Don't add to v0.8 multi-object scope.
+
+### NEW — Path to 4K support
+
+CPU offloading reduces VRAM 60% (8.2GB → 3.2GB at 1080p). 720p processing + mask upscaling = 3-4× speedup with minimal quality loss.
+
+Strategy: 720p for preview/scrub, 1080p+ for final render. 4K direct OOMs on 24GB GPU; needs tile-based processing not yet in SAM2.
+
+**Action:** v0.9+ resolution-switching layer.
+
+### NEW — Concrete latency benchmarks (RTX 4090, 1080p)
+
+| Configuration | Latency | FPS | VRAM |
+|---|---|---|---|
+| Current (uncached) | 2000-5000ms | 0.2-0.5 | ~6GB |
+| + Predictor caching | 30-80ms | 12-30 | ~6GB |
+| + vos_optimized=True | 20-50ms | 20-50 | ~6GB |
+| + CPU offloading | 25-60ms | 16-40 | ~3GB |
+| + 720p processing | 8-20ms | 50-125 | ~2GB |
+| + TensorRT export | 5-10ms | 100-200 | ~2GB |
+
+**Action:** Confirms punchlist #4 (caching) is the highest-leverage win. APPLY MASK from 2-5s to 30-80ms.
+
+### Reinforced (already in our plan / punchlist)
+
+- `vos_optimized=True` — 30 second change, 2-3× speedup. Already in research doc above.
+- Predictor caching via `init_state()` once + reuse — punchlist #4.
+- Native `obj_id` API for multi-object — already in PLAN_MULTI_OBJECT_SAM2_2026-05-02.md v2.
+- No existing SAM2 plugins for NLEs — confirms market gap. CorridorKey first to market.
+- Per-object undo via per-object snapshot stack — pattern from Segment-and-Track-Anything (z-x-yang). Maps to punchlist #5 (Ctrl+Z for SAM2 dots).
+
+### Rejected / wrong fit
+
+- HSV-based chroma masking on top of SAM2 — same trap CorridorKey already hit (alpha-hint HSV trap memory).
+- Grounded-SAM-2 auto-detect — Berto explicitly rejected auto-detect UX.
+- SAM2-Matte (CVPR 2026) — paper only, no code, monitor for v2.0.
+- MatAnyone 2 — wrong problem domain (arbitrary backgrounds, not green-screen).
+- Domain-specific retrained segmentation — training overhead unjustified vs SAM2 zero-shot.
+
+### Kimi P0/P1/P2 priority ordering
+
+**P0 (next code session, ~2-3 hr):**
+1. `vos_optimized=True` flag — 30 sec change, 2-3× speedup
+2. Predictor caching — `init_state()` once on video load
+3. Native `obj_id` API — replaces dual-predictor architecture in plan v2
+
+**P1 (this week, ~4-6 hr):**
+1. 720p preview + mask upscaling
+2. 30-frame batching to prevent OOM
+3. Deterministic overlap resolution (higher obj_id wins)
+
+**P2 (v0.9):**
+1. SAM2 + XMem / DEVA hybrid for hair flicker
+2. TensorRT export pipeline
+3. Per-object undo/redo
+
+### Sources added by Kimi swarm
+
+- https://github.com/dinglufe/sam2-video — caching pattern reference
+- https://github.com/z-x-yang/Segment-and-Track-Anything — per-object undo/redo state mgmt
+- https://github.com/hkchengrex/Tracking-Anything-with-DEVA — XMem hybrid for temporal smoothing
+- https://github.com/kadirnar/segment-anything-video — HSV chroma trap example (avoid)
+- https://huggingface.co/facebook/sam2-hiera-large — obj_id docs
+- https://github.com/facebookresearch/sam2/blob/main/notebooks/video_predictor_example.ipynb — CPU offload notebook
+- https://arxiv.org/abs/2401.10214 — domain-specific retraining paper (rejected)
