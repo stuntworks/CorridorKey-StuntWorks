@@ -228,42 +228,48 @@ def apply_sam2_gate_subtract(alpha, gate, source_rgb=None, screen_type='green',
                              buffer_px=8, feather_px=4):
     """Subtract-only combine: SAM2 may only kill OUTSIDE CorridorKey's green zones.
 
-    ARCHITECTURE 2026-05-01 (revised twice in one session):
+    ARCHITECTURE 2026-05-03 (chroma-aware revision):
 
-    Goal: SAM2 should only act in non-green areas (where CorridorKey couldn't key
-    against anything). In green areas, CorridorKey already owns the matte and
-    SAM2 must stay out — otherwise SAM2's tighter silhouette cuts hair / fringe.
+    Goal: SAM2 should only act in non-green areas (where CorridorKey couldn't
+    key against anything). In green areas, CorridorKey already owns the matte
+    and SAM2 must stay out — otherwise SAM2's tighter silhouette cuts hair,
+    butt curve, and other body parts NN keyed correctly.
 
-    The "where is green?" signal is CorridorKey's OWN MATTE — specifically the
-    pixels where NN drove alpha to ~0. Reading green from the original RGB chroma
-    (the first version) misfired because green spill bouncing off the screen
-    onto nearby studio junk (couch, equipment) registered as "green-ish" and
-    protected the junk from SAM2's kill. NN's matte does not get fooled by
-    spill: NN keys spill-tinted-but-not-actually-green pixels as foreground
-    (alpha > 0), so they're correctly outside the protection zone.
+    The "where is green?" signal requires BOTH:
+        1. NN drove alpha to ~0 (NN said this is background)
+        2. Source RGB has actual green chroma (this pixel really is green)
+
+    Why both: NN-killed alone fails when NN keys non-green floor as background
+    (cables on floor get protected as if they were green). Source-chroma alone
+    fails when green spill bounces onto studio junk (junk gets protected
+    because spill makes it slightly green). Requiring BOTH:
+      - Real greenscreen (NN-killed AND green chroma)        → green zone ✓
+      - Floor NN happened to kill (NN-killed, NOT green)     → not green zone, killable ✓
+      - Spill-tinted junk (NN sees FG, slight green chroma)  → not green zone (fails NN-killed)
+                                                                → killable ✓
+      - Hair fringe / butt at green edge (NN sees FG, no green chroma)
+                                                              → not green zone, but ADJACENT
+                                                                to one → protected by EDGE GUARD ✓
 
     Logic:
-        nn_killed    = (alpha < 0.05)                 # where NN confidently killed the green
-        dist         = distance to nearest nn_killed pixel  (= distance from green zone)
-        kill_ramp    = clip((dist - buffer) / feather, 0, 1)
-        sam2_bg      = 1 - gate_binarized_then_softened
-        result       = alpha * (1 - kill_ramp * sam2_bg)
-
-    Pixel walk:
-      - Green pixel:        alpha=0, in nn_killed zone, dist=0 → no kill (alpha is 0 anyway)
-      - Hair fringe:        alpha=0.4, distance to green ~ 1-2px → within buffer → no kill
-      - Body interior:      alpha=1, distance to green ~ small → within buffer → no kill
-      - Couch off-screen:   alpha=1, distance to green = 100+px → past buffer → SAM2 kills
-      - Foot on non-green:  alpha=1, distance to green ~ small (foot at green edge)
-                            → if SAM2 says actor, no kill regardless. If SAM2 says bg, only
-                            killed past EDGE GUARD distance from the green edge.
+        nn_killed     = (alpha < 0.05)                       # NN said background
+        chroma_green  = source[:,:,1] - max(R, B) > 0.05     # actually green-coloured
+        green_zone    = nn_killed AND chroma_green           # both signals
+        dist          = distance to nearest green_zone pixel
+        kill_ramp     = clip((dist - buffer) / feather, 0, 1)
+        sam2_bg       = 1 - gate_binarized_then_softened
+        result        = alpha * (1 - kill_ramp * sam2_bg)
 
     buffer_px (EDGE GUARD): distance past the green edge before SAM2 may begin
-        to kill. Larger = more protection for hair / fringe and for body parts
-        right at the green border, but also more protection for any junk that
-        happens to be within that distance of the green.
+        to kill. Larger = more protection for hair / fringe / butt curve and
+        body parts right at the green border. Smaller = more aggressive junk
+        kill closer to actor.
     feather_px: width of the soft kill transition.
-    source_rgb / screen_type: signature kept for callsite compatibility; ignored.
+    source_rgb: REQUIRED. RGB float [0..1]. Used for chroma green detection.
+        When None or not provided, falls back to NN-killed-only definition
+        (legacy behaviour from pre-2026-05-03).
+    screen_type: "green" or "blue". Determines which channel is dominant
+        in the chroma score.
 
     SAM2 gate is binarized at 0.5 BEFORE the spatial Gaussian blur — without
     that, raw sigmoid 0.3-0.7 in body interior would produce the SMART BLEND
@@ -274,14 +280,26 @@ def apply_sam2_gate_subtract(alpha, gate, source_rgb=None, screen_type='green',
     import cv2 as _cv2
     gate_bin = (gate > 0.5).astype(np.float32)
     gate_bin = _cv2.GaussianBlur(gate_bin, (11, 11), 2.5)
-    # "Green zones" = where NN confidently drove alpha to 0. Threshold low so
-    # we don't include hair fringe (typically alpha 0.2-0.6) in the green zone.
-    nn_killed = (alpha < 0.05).astype(np.uint8)
-    # Empty-killed fallback: shot has no NN-killed pixels (NN saw no green at
-    # all — e.g. SAM2 invoked before refiner ran). Degrade to multiplicative.
-    if int(nn_killed.sum()) == 0:
+    # "Green zone" = NN-killed AND actually green chroma. This double-gate
+    # rules out floor that NN happened to kill (cables on floor become
+    # killable) AND spill-tinted junk that's chroma-green but NN saw as FG
+    # (junk become killable).
+    nn_killed = (alpha < 0.05)
+    if source_rgb is not None and source_rgb.ndim == 3 and source_rgb.shape[2] >= 3:
+        if screen_type == "blue":
+            chroma_score = source_rgb[..., 2] - np.maximum(source_rgb[..., 0], source_rgb[..., 1])
+        else:
+            chroma_score = source_rgb[..., 1] - np.maximum(source_rgb[..., 0], source_rgb[..., 2])
+        chroma_green = chroma_score > 0.05
+        green_zone = (nn_killed & chroma_green).astype(np.uint8)
+    else:
+        # Legacy fallback when source_rgb is unavailable.
+        green_zone = nn_killed.astype(np.uint8)
+    # Empty fallback: no green zone detected at all (e.g. shot has no green
+    # AND no NN-killed). Degrade to multiplicative.
+    if int(green_zone.sum()) == 0:
         return (alpha * gate_bin).astype(alpha.dtype, copy=False)
-    dist = _cv2.distanceTransform(1 - nn_killed, _cv2.DIST_L2, 5)
+    dist = _cv2.distanceTransform(1 - green_zone, _cv2.DIST_L2, 5)
     fp = max(int(feather_px), 1)
     bp = max(int(buffer_px), 0)
     kill_ramp = np.clip((dist - float(bp)) / float(fp), 0.0, 1.0).astype(np.float32)
