@@ -799,44 +799,61 @@ def _panel_combine_one_mask(alpha, gate, src_rgb, settings):
 
 
 # WHAT IT DOES: Runs _panel_combine_one_mask across each per-mask gate and
-#   unions the alphas. Single-mask sessions take the same path with one gate.
+#   unions the alphas. Implements Option C halo binding: when 2+ masks are
+#   active, HALO BODY only applies to MASK 1 and HALO FEET only applies to
+#   MASK 2. When exactly one mask is active (single-mask sessions, including
+#   legacy migrated sessions), both halos apply to that mask — preserves the
+#   pre-multi-object behaviour so old workflows don't regress.
 # DEPENDS-ON: _panel_combine_one_mask, union_alpha from sam2_combine.
 # AFFECTS: returns a fresh alpha array; inputs unchanged. Returns alpha
 #   unchanged when gates list is empty (NN-only fallback).
-def _panel_dispatch_sam2_combine(alpha, gates, src_rgb, settings):
+def _panel_dispatch_sam2_combine(alpha, gates, src_rgb, settings, obj_ids=None):
     if not gates:
         return alpha
     from sam2_combine import union_alpha
-    per_mask = [
-        _panel_combine_one_mask(alpha, g, src_rgb, settings) for g in gates
-    ]
+    per_mask = []
+    n_active = len(gates)
+    halo_px_user = int(settings.get("halo_px", 0))
+    halo_body_user = int(settings.get("halo_body_px", 0))
+    for i, g in enumerate(gates):
+        oid = obj_ids[i] if (obj_ids is not None and i < len(obj_ids)) else None
+        if oid is not None and n_active > 1:
+            local = dict(settings)
+            # MASK 1 owns HALO BODY; MASK 2 owns HALO FEET. Other halos zero
+            # out so each mask only acts in its own domain.
+            local["halo_body_px"] = halo_body_user if oid == 1 else 0
+            local["halo_px"] = halo_px_user if oid == 2 else 0
+        else:
+            local = settings
+        per_mask.append(_panel_combine_one_mask(alpha, g, src_rgb, local))
     out = union_alpha(*per_mask)
     return out if out is not None else alpha
 
 
 # WHAT IT DOES: Reads per-object SAM2 silhouette PNGs (sam2_mask_obj1.png and
-#   sam2_mask_obj2.png) from SESSION_DIR and returns them as a list of float32
-#   masks at the requested shape, dilated and softened per the user's MARGIN /
-#   SOFTEN sliders. Falls back to the legacy single sam2_mask.png when no
-#   per-object files exist.
+#   sam2_mask_obj2.png) from SESSION_DIR and returns them as a dict[obj_id,
+#   float32 mask] at the requested shape, dilated and softened per the user's
+#   MARGIN / SOFTEN sliders. Falls back to legacy single sam2_mask.png mapped
+#   to obj_id=1 when no per-object files exist.
 # DEPENDS-ON: SESSION_DIR/sam2_mask_obj{N}.png written by viewer's _apply_sam_mask.
-# AFFECTS: pure read; returns a NEW list of arrays.
+# AFFECTS: pure read; returns a NEW dict of arrays. obj_id is the dict key
+#   so callers (Option C halo binder) know which mask is which.
 def _load_per_object_sam2_gates(frame_shape, settings):
     import numpy as np, cv2
     if settings.get("alpha_method") != 1:
-        return []
+        return {}
     h, w = frame_shape[:2]
-    candidates = [
-        SESSION_DIR / "sam2_mask_obj1.png",
-        SESSION_DIR / "sam2_mask_obj2.png",
+    pairs = [
+        (1, SESSION_DIR / "sam2_mask_obj1.png"),
+        (2, SESSION_DIR / "sam2_mask_obj2.png"),
     ]
     legacy = SESSION_DIR / "sam2_mask.png"
-    if not any(p.exists() for p in candidates) and legacy.exists():
-        candidates = [legacy]
-    out = []
+    if not any(p.exists() for _, p in pairs) and legacy.exists():
+        pairs = [(1, legacy)]
+    out = {}
     margin = settings.get("sam2_margin", SAM2_MATTE_MARGIN)
     soften = settings.get("sam2_soften", 0)
-    for p in candidates:
+    for oid, p in pairs:
         if not p.exists():
             continue
         raw = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
@@ -849,9 +866,9 @@ def _load_per_object_sam2_gates(frame_shape, settings):
         m = raw.astype(np.float32) / 255.0
         m = _dilate_sam2_mask(m, margin=margin)
         m = _soften_sam2_mask(m, soften=soften)
-        out.append(m)
+        out[oid] = m
     if out:
-        log(f"SAM2 gates loaded — {len(out)} per-object PNG(s)")
+        log(f"SAM2 gates loaded — obj_ids={sorted(out.keys())}")
     return out
 
 
@@ -1261,18 +1278,20 @@ def run_sam2_video_propagation(fp, ss, cs, in_f, out_f, pos_pts, neg_pts, anchor
         if torch.cuda.is_available():
             torch.cuda.synchronize()  # wait for GPU to finish before clearing cache
             torch.cuda.empty_cache()
-        # Combine per-object dicts into per-frame list of masks. Consumers
-        # iterate the list (single-element when only one obj was tracked).
+        # Combine per-object dicts into per-frame dict[obj_id, mask]. The
+        # obj_id key is preserved so downstream halo binding (Option C) can
+        # tell MASK 1 from MASK 2 even when only one of them is present in
+        # a given frame.
         masks_out = {}
         all_frame_keys = set()
         for m_dict in masks_per_obj.values():
             all_frame_keys.update(m_dict.keys())
         for f in sorted(all_frame_keys):
-            per_frame = []
+            per_frame = {}
             for oid in active_obj_ids:
                 m = masks_per_obj[oid].get(f)
                 if m is not None:
-                    per_frame.append(m)
+                    per_frame[oid] = m
             if per_frame:
                 masks_out[f] = per_frame
         log(f"SAM2 video propagation done — {len(masks_out)} frames, "
@@ -2505,15 +2524,22 @@ def _key_one_scrub_frame():
             _s2_raw = _s2_masks[frame_idx]
             _s2_raw8 = (_s2_raw * 255).clip(0, 255).astype(_np.uint8)
             _cv2.imwrite(str(out_dir / "sam2_gate_raw.png"), _s2_raw8)
-            # Multi-object v0.8 — _s2_masks[frame_idx] is a list of per-obj
-            # masks (single-element list when video prop tracked one object).
-            # Each mask gets its own MARGIN / SOFTEN treatment, then runs
-            # through the unified combine + union helper.
+            # Multi-object v0.8 — _s2_masks[frame_idx] is dict[obj_id, mask]
+            # (or list-of-masks from older code, or a bare mask in legacy).
+            # Track obj_ids so Option C halo binding can route HALO BODY to
+            # MASK 1 and HALO FEET to MASK 2.
             _per_frame = _s2_masks[frame_idx]
-            if not isinstance(_per_frame, (list, tuple)):
-                _per_frame = [_per_frame]  # legacy single-mask compat
+            if isinstance(_per_frame, dict):
+                _frame_obj_ids = list(_per_frame.keys())
+                _frame_gates = list(_per_frame.values())
+            elif isinstance(_per_frame, (list, tuple)):
+                _frame_obj_ids = list(range(1, len(_per_frame) + 1))
+                _frame_gates = list(_per_frame)
+            else:
+                _frame_obj_ids = [1]
+                _frame_gates = [_per_frame]
             _gates_list = []
-            for _gm in _per_frame:
+            for _gm in _frame_gates:
                 _gx = _dilate_sam2_mask(_gm, margin=ctx["settings"].get("sam2_margin", SAM2_MATTE_MARGIN))
                 _gx = _soften_sam2_mask(_gx, soften=ctx["settings"].get("sam2_soften", 0))
                 if _gx.shape != mt.shape[:2]:
@@ -2521,7 +2547,7 @@ def _key_one_scrub_frame():
                                       interpolation=_cv2.INTER_LINEAR)
                 _gates_list.append(_gx)
             if not bool(ctx["settings"].get("sam2_bypass", False)):
-                mt = _panel_dispatch_sam2_combine(mt, _gates_list, fr, ctx["settings"])
+                mt = _panel_dispatch_sam2_combine(mt, _gates_list, fr, ctx["settings"], obj_ids=_frame_obj_ids)
         if fg is not None and mt is not None:
             out_dir = ctx["scrub_dir"] / f"{frame_idx:03d}"
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -3113,26 +3139,38 @@ def on_process_range(ev):
                 # AFFECTS: mt for this frame only
                 if mt is not None:
                     # Multi-object v0.8 — gather per-object gates (video-prop
-                    # output is a list when multi-tracked; static fallback is
-                    # a list of per-object PNGs from the viewer). Run combine
-                    # per-mask and union the alphas.
+                    # output is dict[obj_id, mask]; static fallback is
+                    # dict[obj_id, gate] from _load_per_object_sam2_gates).
+                    # Track obj_ids so Option C halo binding routes HALO BODY
+                    # to MASK 1 and HALO FEET to MASK 2.
                     if not bool(settings.get("sam2_bypass", False)):
                         _gates_list = []
+                        _obj_ids = []
                         if _braw_sam2_video_masks and fidx in _braw_sam2_video_masks:
                             _per = _braw_sam2_video_masks[fidx]
-                            if not isinstance(_per, (list, tuple)):
-                                _per = [_per]
-                            for _gm in _per:
+                            if isinstance(_per, dict):
+                                _items = list(_per.items())
+                            elif isinstance(_per, (list, tuple)):
+                                _items = list(enumerate(_per, start=1))
+                            else:
+                                _items = [(1, _per)]
+                            for _oid, _gm in _items:
                                 _gx = _dilate_sam2_mask(_gm, margin=settings.get("sam2_margin", SAM2_MATTE_MARGIN))
                                 _gx = _soften_sam2_mask(_gx, soften=settings.get("sam2_soften", 0))
                                 _gates_list.append(_gx)
-                        elif _braw_sam2_gate is not None:
-                            _per = _braw_sam2_gate
-                            if not isinstance(_per, (list, tuple)):
-                                _per = [_per]
-                            _gates_list.extend(_per)
+                                _obj_ids.append(_oid)
+                        elif _braw_sam2_gate:
+                            if isinstance(_braw_sam2_gate, dict):
+                                _items = list(_braw_sam2_gate.items())
+                            elif isinstance(_braw_sam2_gate, (list, tuple)):
+                                _items = list(enumerate(_braw_sam2_gate, start=1))
+                            else:
+                                _items = [(1, _braw_sam2_gate)]
+                            for _oid, _g in _items:
+                                _gates_list.append(_g)
+                                _obj_ids.append(_oid)
                         if _gates_list:
-                            mt = _panel_dispatch_sam2_combine(mt, _gates_list, fr, settings)
+                            mt = _panel_dispatch_sam2_combine(mt, _gates_list, fr, settings, obj_ids=_obj_ids)
                 choke_px = int(settings.get("choke", 0))
                 if choke_px > 0 and mt is not None:
                     _k = choke_px * 2 + 1
@@ -3340,16 +3378,24 @@ def on_process_range(ev):
                 # AFFECTS: mt (alpha) — multiplied by gate, zeroing pixels outside the matte.
                 if mt is not None and not bool(settings.get("sam2_bypass", False)):
                     # Multi-object v0.8 — gather per-mask gates (video-prop or
-                    # static fallback), run combine per-mask, union alphas.
+                    # static fallback) plus their obj_ids so Option C halo
+                    # binding can route HALO BODY to MASK 1 and HALO FEET to
+                    # MASK 2.
                     _gates_list = []
+                    _obj_ids = []
                     if sam2_video_masks and range_idx in sam2_video_masks:
                         _per = sam2_video_masks[range_idx]
-                        if not isinstance(_per, (list, tuple)):
-                            _per = [_per]
-                        for _gm in _per:
+                        if isinstance(_per, dict):
+                            _items = list(_per.items())
+                        elif isinstance(_per, (list, tuple)):
+                            _items = list(enumerate(_per, start=1))
+                        else:
+                            _items = [(1, _per)]
+                        for _oid, _gm in _items:
                             _gx = _dilate_sam2_mask(_gm, margin=settings.get("sam2_margin", SAM2_MATTE_MARGIN))
                             _gx = _soften_sam2_mask(_gx, soften=settings.get("sam2_soften", 0))
                             _gates_list.append(_gx)
+                            _obj_ids.append(_oid)
                     else:
                         # Fallback path — static per-object gates loaded lazily on
                         # first frame so we have real frame.shape for the resize.
@@ -3359,9 +3405,17 @@ def on_process_range(ev):
                             if _static_sam2_gate:
                                 _tlog(f"SAM2 static {len(_static_sam2_gate)} per-object gate(s) — applying same mask to all range frames (no propagation)")
                         if _static_sam2_gate:
-                            _gates_list.extend(_static_sam2_gate)
+                            if isinstance(_static_sam2_gate, dict):
+                                _items = list(_static_sam2_gate.items())
+                            elif isinstance(_static_sam2_gate, (list, tuple)):
+                                _items = list(enumerate(_static_sam2_gate, start=1))
+                            else:
+                                _items = [(1, _static_sam2_gate)]
+                            for _oid, _g in _items:
+                                _gates_list.append(_g)
+                                _obj_ids.append(_oid)
                     if _gates_list:
-                        mt = _panel_dispatch_sam2_combine(mt, _gates_list, fr, settings)
+                        mt = _panel_dispatch_sam2_combine(mt, _gates_list, fr, settings, obj_ids=_obj_ids)
                 choke_px = int(settings.get("choke", 0))
                 if choke_px > 0 and mt is not None:
                     k = choke_px * 2 + 1
