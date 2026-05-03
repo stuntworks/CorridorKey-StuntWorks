@@ -511,11 +511,25 @@ def get_settings():
 def _merge_live_params(settings):
     try:
         import json
+        # Multi-object v0.8 — rename any legacy single-mask PNGs to MASK 1
+        # namespace before any code reads them. Idempotent + silent on error.
+        try:
+            from sam2_combine import migrate_legacy_sam_pngs as _migrate_pngs
+            _migrate_pngs(SESSION_DIR)
+        except Exception:
+            pass
         lp_path = SESSION_DIR / "live_params.json"
         if not lp_path.exists():
             return settings
         with open(lp_path, "r", encoding="utf-8") as f:
             lp = json.load(f)
+        # Translate legacy sam_positive/sam_negative/sam_anchor_frame into MASK 1
+        # keys so multi-object readers find values for old sessions.
+        try:
+            from sam2_combine import migrate_legacy_sam_keys as _migrate_keys
+            lp = _migrate_keys(lp)
+        except Exception:
+            pass
         out = dict(settings)
         if "despill" in lp:
             try: out["despill_strength"] = max(0.0, min(1.0, float(lp["despill"])))

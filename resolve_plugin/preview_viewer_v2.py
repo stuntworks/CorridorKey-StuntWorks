@@ -309,6 +309,14 @@ class Session:
     #   self.meta.
     def __init__(self, session_dir: Path):
         self.session_dir = Path(session_dir)
+        # Multi-object v0.8 — rename legacy single-mask PNGs to MASK 1 namespace
+        # before any code reads them. Imported lazily to avoid hard-failing the
+        # viewer if the engine package is reorganised in future.
+        try:
+            from sam2_combine import migrate_legacy_sam_pngs as _migrate_pngs
+            _migrate_pngs(self.session_dir)
+        except Exception:
+            pass
         fg_path = self.session_dir / "fg.png"
         alpha_path = self.session_dir / "alpha.png"
         if not fg_path.exists() or not alpha_path.exists():
