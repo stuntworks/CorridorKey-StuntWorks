@@ -67,6 +67,43 @@ def migrate_legacy_sam_pngs(session_dir) -> None:
                 pass
 
 
+def union_sam2_gates(*gates):
+    """OR-combine multiple SAM2 silhouettes via per-pixel max. None-tolerant.
+
+    Drops any None entries; returns None if no usable gate. Used by callers that
+    have multiple per-object SAM2 masks (MASK 1, MASK 2, ...) and need a single
+    combined gate. Per the multi-object plan, combine usually happens at the
+    ALPHA layer (each gate run through apply_sam2_gate with its own bbox first,
+    then alphas unioned), but this helper is here for callers that want a raw
+    silhouette union — for example the SHOW SAM2 viewer overlay.
+
+    Shapes must match. Caller resizes if needed.
+    """
+    valid = [g for g in gates if g is not None]
+    if not valid:
+        return None
+    out = valid[0]
+    for g in valid[1:]:
+        out = np.maximum(out, g)
+    return out
+
+
+def union_alpha(*alphas):
+    """OR-combine multiple per-mask alpha results. None-tolerant.
+
+    Drops None entries (a mask with no SAM2 gate). Returns None if every input
+    is None. Used by render dispatch: for each MASK, run apply_sam2_gate with
+    that mask's bbox-confined halos to get alpha_n, then union all alpha_n.
+    """
+    valid = [a for a in alphas if a is not None]
+    if not valid:
+        return None
+    out = valid[0]
+    for a in valid[1:]:
+        out = np.maximum(out, a)
+    return out
+
+
 def trim_gate_by_chroma(gate: np.ndarray, source_rgb: np.ndarray, screen_type: str = "green", strength: int = 0) -> np.ndarray:
     """Trim screen-colored pixels FROM the SAM2 gate before combine.
 
