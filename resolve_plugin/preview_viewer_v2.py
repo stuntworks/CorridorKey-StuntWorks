@@ -43,7 +43,7 @@ from PySide6 import QtWidgets, QtGui, QtCore
 # the package __init__ which loads torch (40-60s) and breaks the viewer's
 # subprocess that doesn't have torch in its env.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from sam2_combine import apply_sam2_gate, apply_sam2_gate_additive, apply_sam2_gate_weighted, apply_sam2_gate_subtract, trim_gate_by_chroma, fill_holes_color_aware
+from sam2_combine import apply_sam2_gate, apply_sam2_gate_additive, apply_sam2_gate_weighted, apply_sam2_gate_subtract, trim_gate_by_chroma, fill_holes_color_aware, union_alpha, union_sam2_gates
 
 # WHAT IT DOES: Installs diagnostic crash / exception loggers as early as possible.
 #   faulthandler dumps Python tracebacks on native signals (SIGSEGV, stack overflow,
@@ -333,7 +333,11 @@ class Session:
         # The Resolve engine only writes alpha.png (not alpha_raw.png),
         # so we use alpha.png as the raw source — same as the AE version does.
         self.alpha_raw = self.alpha.copy()
-        self.sam2_gate_raw = None
+        # Multi-object v0.8: per-mask SAM2 silhouettes. sam2_gate_raw stays as a
+        # backward-compat property (returns the per-pixel union of both masks).
+        # Existing render code reads sam2_gate_raw and Just Works on legacy
+        # single-mask sessions; multi-mask code paths read sam2_gates directly.
+        self.sam2_gates: dict[int, "np.ndarray | None"] = {1: None, 2: None}
         # original.png is the RAW source frame (with green spill, before NN). The
         # Original view mode displays this. Falls back to fg_rgb if not present
         # (older sessions / AE which doesn't write it).
@@ -359,6 +363,31 @@ class Session:
     @property
     def shape_hw(self):
         return self.fg_rgb.shape[:2]
+
+    @property
+    def sam2_gate_raw(self):
+        """Per-pixel union of all per-mask SAM2 gates. None if no mask is set.
+
+        Backward-compat shim for code that hasn't been ported to per-mask
+        dispatch yet. SHOW SAM2 overlay and any single-gate render path
+        Just Work on multi-mask sessions via this property.
+        """
+        from sam2_combine import union_sam2_gates as _u
+        return _u(*[self.sam2_gates.get(i) for i in (1, 2)])
+
+    @sam2_gate_raw.setter
+    def sam2_gate_raw(self, value):
+        """Legacy setter — routes single-gate writes into MASK 1 slot.
+
+        Old call sites do `session.sam2_gate_raw = X`. We honour that by
+        storing X into MASK 1 and clearing MASK 2 (since the caller is
+        treating SAM2 as single-mask). New call sites assign into
+        session.sam2_gates[obj_id] directly to preserve other masks.
+        """
+        if value is None:
+            self.sam2_gates = {1: None, 2: None}
+        else:
+            self.sam2_gates = {1: value, 2: None}
 
     # WHAT IT DOES: Re-reads fg.png + alpha.png from disk and updates self.fg_rgb
     #   and self.alpha in place. Called when the panel re-runs stage-1 (refiner
@@ -396,15 +425,65 @@ class Session:
         # so we derive alpha_raw directly from the freshly loaded alpha —
         # same as the AE version does.
         self.alpha_raw = alpha.copy()
-        # Always clear the SAM2 gate when a new frame loads. The leftover
-        # sam2_gate_raw.png in the session dir is from the previous frame's
-        # pose — auto-applying it to a new frame produces a wrong-shape choke
-        # (the "fish" still cutting into the body). User must click Apply Mask
-        # fresh on each new frame to regenerate the gate for that frame.
-        self.sam2_gate_raw = None
+        # Always clear the SAM2 gates when a new frame loads. The leftover
+        # sam2_gate_raw_obj{N}.png files in the session dir are from the
+        # previous frame's pose — auto-applying them to a new frame produces
+        # a wrong-shape choke (the "fish" still cutting into the body). User
+        # must click APPLY MASK fresh on each new frame per active mask to
+        # regenerate the gate for that frame.
+        self.sam2_gates = {1: None, 2: None}
 
 
 # ===== Post-processing pipeline =====
+
+# Multi-object v0.8 — runs the SAM2 + NN combine for ONE mask. Caller invokes
+# this per-mask and unions the resulting alphas (union_alpha). Per-mask is
+# the correct contract for HALO operations: apply_sam2_gate uses the gate's
+# OWN bbox to confine erosion/dilation, so calling it per-mask keeps each
+# mask's halo zones in its own region.
+def _combine_one_mask(alpha_raw, gate, src_rgb, *,
+                      sam2_subtract: bool, sam2_weighted: bool, sam2_additive: bool,
+                      halo_px: int, halo_body_px: int, edge_guard_px: int,
+                      trim_chroma: int, fill_holes: int,
+                      screen_type: str = "green"):
+    if sam2_subtract:
+        # SUBTRACT mode: NN owns the matte everywhere green exists. SAM2 only
+        # permitted to kill in non-green zones. Hair / fine detail in green
+        # territory protected by the buffer + feather distance ramp. Wins over
+        # weighted/additive when toggled. trim/fill_holes/halo intentionally
+        # not applied — SUBTRACT semantics are independent of gate-shape ops.
+        _fp = max(int(edge_guard_px) // 2, 1)
+        return apply_sam2_gate_subtract(alpha_raw, gate, src_rgb,
+                                        screen_type=screen_type,
+                                        buffer_px=int(edge_guard_px),
+                                        feather_px=_fp)
+    if sam2_weighted:
+        # SMART BLEND: per-pixel weighted combine — NN trusted in green
+        # regions, gate trusted off-green. Boundary smoothed by chroma weight.
+        return apply_sam2_gate_weighted(alpha_raw, gate, src_rgb,
+                                        screen_type=screen_type)
+    if sam2_additive:
+        # ADDITIVE: alpha = max(NN, gate * non_screen). HALO FEET dilates the
+        # gate so additive contribution extends outward. HALO BODY ignored
+        # (additive can't shrink), trim/fill_holes inapplicable.
+        gate_for_add = gate
+        if halo_px and halo_px > 0:
+            _bin = (gate_for_add > 0.5).astype(np.uint8)
+            _k = int(halo_px) * 2 + 1
+            _kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_k, _k))
+            gate_for_add = cv2.dilate(_bin, _kernel).astype(np.float32)
+        return apply_sam2_gate_additive(alpha_raw, gate_for_add, src_rgb,
+                                        screen_type=screen_type)
+    # Default: trimap fusion. Solid 1.0 inside SAM2 confident core where NN
+    # saw something; multiply elsewhere. halo_px>0 dilates the gate to keep
+    # NN edge values; halo_px<0 erodes the bottom of the gate's bbox to
+    # remove floor patches. Real holes inside the actor preserved.
+    return _trimap_fuse(alpha_raw, gate, source_rgb=src_rgb,
+                        screen_type=screen_type, trim_chroma=trim_chroma,
+                        halo_px=halo_px, halo_body_px=halo_body_px,
+                        fill_holes=fill_holes)
+
+
 # WHAT IT DOES: Applies stage-2 post-proc (despill + despeckle) against the cached
 #   NN output, then composites over the requested background. This is what runs on
 #   every slider tick — no NN involvement.
@@ -431,66 +510,31 @@ def render_composite(cu, session: Session, params: dict):
     sam2_subtract = bool(params.get("sam2_subtract", False))
     sam2_bypass = bool(params.get("sam2_bypass", False))
     edge_guard_px = int(params.get("edge_guard_px", 20))
-    if session.alpha_raw is not None and session.sam2_gate_raw is not None and not sam2_bypass:
-        _gate = session.sam2_gate_raw.copy()
-        if _gate.shape != session.alpha_raw.shape:
-            _gate = cv2.resize(_gate, (session.alpha_raw.shape[1], session.alpha_raw.shape[0]),
-                               interpolation=cv2.INTER_LINEAR)
+    # Multi-object v0.8 — collect every per-mask gate and run the combine
+    # pipeline ONCE PER MASK, then union the per-mask alphas. Per-mask is the
+    # correct contract for HALO operations (apply_sam2_gate uses the mask's
+    # OWN bbox internally) so MASK 2's negative HALO FEET only erodes MASK 2's
+    # bottom rows, not MASK 1's. Single-mask sessions take the same path with
+    # one gate — bit-identical to the legacy single-gate flow.
+    _per_mask_gates = [g for g in (session.sam2_gates.get(1), session.sam2_gates.get(2)) if g is not None]
+    if session.alpha_raw is not None and _per_mask_gates and not sam2_bypass:
         _src_rgb = session.original_rgb if session.original_rgb is not None else session.fg_rgb
-        if sam2_subtract:
-            # SUBTRACT mode: NN owns the matte everywhere green exists. SAM2 only
-            # permitted to kill in non-green zones (floor under feet, off-screen
-            # props). Hair / fine detail in green territory protected by the
-            # buffer + feather distance ramp. Wins over weighted/additive when
-            # toggled. trim/fill_holes/halo intentionally not applied.
-            # REVERTED 2026-05-01 to f6fa072 semantics: EDGE GUARD = hard
-            # buffer past the green edge before SAM2 may kill, with feather =
-            # half buffer for a soft transition tail. No closings on
-            # nn_killed or SAM2 silhouette. This is the version that produced
-            # Berto's clean-matte-from-feet-dots result.
-            _fp = max(int(edge_guard_px) // 2, 1)
-            alpha = apply_sam2_gate_subtract(session.alpha_raw, _gate, _src_rgb,
-                                             screen_type="green",
-                                             buffer_px=int(edge_guard_px),
-                                             feather_px=_fp)
-        elif sam2_weighted:
-            # SMART BLEND: per-pixel weighted combine — NN trusted in green
-            # regions (preserves hair / butt-across-strap detail), SAM2 trusted
-            # off-green (kills floor / props NN can't see). Skips _trimap_fuse
-            # and additive paths; trim/fill_holes/halo intentionally not applied
-            # (the chroma-derived weight handles boundary blending).
-            alpha = apply_sam2_gate_weighted(session.alpha_raw, _gate, _src_rgb,
-                                             screen_type="green")
-        elif sam2_additive:
-            # ADDITIVE mode: alpha = max(NN, gate * non_screen). SAM2 can ADD
-            # confidence where NN missed but never SUBTRACT NN's correct alpha.
-            # Trim/fill_holes don't apply here (no multiplicative combine to
-            # gate); HALO still dilates the gate but the effect is "extend SAM2
-            # contribution outward" rather than "preserve NN edge band".
-            _gate_for_add = _gate
-            if halo_px and halo_px > 0:
-                # Dilate the gate so additive contribution extends outward.
-                # Keeps HALO functional in additive mode; semantics differ from
-                # multiplicative mode (where it preserves NN edge values).
-                _bin = (_gate_for_add > 0.5).astype(np.uint8)
-                _k = int(halo_px) * 2 + 1
-                _kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_k, _k))
-                _gate_for_add = cv2.dilate(_bin, _kernel).astype(np.float32)
-            alpha = apply_sam2_gate_additive(session.alpha_raw, _gate_for_add,
-                                             _src_rgb, screen_type="green")
-        else:
-            # Trimap fusion: solid 1.0 inside SAM2 confident core where NN saw
-            # something; multiply-as-before everywhere else (including real holes
-            # inside actor, which keep alpha=0). halo_px>0 dilates the gate so a
-            # band of NN values around the SAM2 silhouette survives — recovers
-            # hair / motion-blur detail. trim_chroma>0 removes screen-colored
-            # pixels from the gate first. fill_holes>0 fills alpha=0 holes inside
-            # the gate at non-screen-color pixels (rescues yellow/skin/red NN
-            # dropouts). See _trimap_fuse and apply_sam2_gate.
-            alpha = _trimap_fuse(session.alpha_raw, _gate, source_rgb=_src_rgb,
-                                 screen_type="green", trim_chroma=trim_chroma, halo_px=halo_px,
-                                 halo_body_px=halo_body_px,
-                                 fill_holes=fill_holes)
+        _per_mask_alphas = []
+        for _gate_n in _per_mask_gates:
+            _gate = _gate_n
+            if _gate.shape != session.alpha_raw.shape:
+                _gate = cv2.resize(_gate, (session.alpha_raw.shape[1], session.alpha_raw.shape[0]),
+                                   interpolation=cv2.INTER_LINEAR)
+            _per_mask_alphas.append(_combine_one_mask(
+                session.alpha_raw, _gate, _src_rgb,
+                sam2_subtract=sam2_subtract,
+                sam2_weighted=sam2_weighted,
+                sam2_additive=sam2_additive,
+                halo_px=halo_px, halo_body_px=halo_body_px,
+                edge_guard_px=edge_guard_px,
+                trim_chroma=trim_chroma, fill_holes=fill_holes,
+            ))
+        alpha = union_alpha(*_per_mask_alphas)
         if sam2_margin > 0:
             alpha = _dilate_mask(alpha, sam2_margin)
         if sam2_soften > 0:
@@ -743,9 +787,16 @@ class PersistentWindow(QtWidgets.QWidget):
         self._drag_start = None
         self._drag_start_pan = (0.5, 0.5)
 
-        # SAM click-to-mask state
+        # SAM click-to-mask state — multi-object v0.8
+        # _sam_pts_by_obj: {obj_id: list of (nx, ny, is_positive, frame_num)}.
+        # frame_num is the absolute timeline frame the click was placed on
+        # (read from meta.json at click time). None if meta unavailable.
+        # _active_mask: which mask receives new clicks + APPLY MASK + CLEAR.
+        # _sam_display_pts is a property below that returns the active mask's
+        # list, so existing reads keep working unchanged.
         self._sam_mode = False
-        self._sam_display_pts = []  # (nx, ny, is_positive, frame_num) — frame_num is the absolute timeline frame the click was placed on (read from meta.json at click time). None if meta not available.
+        self._sam_pts_by_obj: dict[int, list] = {1: [], 2: []}
+        self._active_mask: int = 1
         self._last_right_geom = None  # cached paint geometry for coord mapping
 
         h, w = session.shape_hw
@@ -783,6 +834,66 @@ class PersistentWindow(QtWidgets.QWidget):
         self._live_watcher.setInterval(50)
         self._live_watcher.timeout.connect(self._poll_live_params)
         self._live_watcher.start()
+
+        # Tab key toggles between MASK 1 and MASK 2 for multi-object SAM2.
+        # MVP UI per PLAN_MULTI_OBJECT_SAM2_2026-05-02 — invisible toggle, status
+        # bar shows the active mask. Visible radio buttons land in polish session.
+        try:
+            self._mask_toggle_shortcut = QtWidgets.QShortcut(
+                QtGui.QKeySequence(QtCore.Qt.Key_Tab), self
+            )
+            self._mask_toggle_shortcut.setContext(QtCore.Qt.WindowShortcut)
+            self._mask_toggle_shortcut.activated.connect(self._toggle_active_mask)
+        except Exception:
+            pass
+        # Initial sync of SAM button labels to active mask (1).
+        try:
+            self._refresh_sam_button_labels()
+        except Exception:
+            pass
+
+    # Backward-compat property: the active mask's dot list. Existing reads of
+    # self._sam_display_pts return the list for whichever mask is active. The
+    # setter routes assignments (e.g. `self._sam_display_pts = []` to clear)
+    # into the active mask only — other masks are preserved.
+    @property
+    def _sam_display_pts(self):
+        return self._sam_pts_by_obj[self._active_mask]
+
+    @_sam_display_pts.setter
+    def _sam_display_pts(self, value):
+        self._sam_pts_by_obj[self._active_mask] = list(value)
+
+    # Toggle the active mask between MASK 1 and MASK 2. Triggered by the Tab
+    # key shortcut. Updates status bar, refreshes button labels, repaints
+    # overlay so the user can tell which mask is now active.
+    def _toggle_active_mask(self):
+        self._active_mask = 2 if self._active_mask == 1 else 1
+        try:
+            self._refresh_sam_button_labels()
+        except Exception:
+            pass
+        try:
+            self.status.setText(f"MASK {self._active_mask} active — clicks add to MASK {self._active_mask}")
+        except Exception:
+            pass
+        try:
+            self._draw_sam_overlay()
+        except Exception:
+            pass
+
+    # Sync APPLY MASK / CLEAR / SAM mode button labels with the active mask
+    # so the user can tell which mask is the target. Idempotent — safe to
+    # call after every toggle / state change.
+    def _refresh_sam_button_labels(self):
+        try:
+            self._sam_apply_btn.setText(f"APPLY MASK {self._active_mask}")
+        except Exception:
+            pass
+        try:
+            self._sam_clear_btn.setText(f"CLEAR {self._active_mask}")
+        except Exception:
+            pass
 
     # WHAT IT DOES: Polls live_params.json in the session dir and dispatches to
     #   on_update() when the panel writes a new slider state. Silent on missing
@@ -1922,40 +2033,54 @@ class PersistentWindow(QtWidgets.QWidget):
         try:
             tmp = str(self._live_params_path) + ".tmp"
             payload = dict(self._params)
-            # Write SAM2 click points so the panel can use them during render
-            if self._sam_display_pts:
-                ih, iw = self.session.shape_hw
-                # Each click stores its OWN frame_num (the frame the user was viewing
-                # when they placed it). This lets the panel place each click on its
-                # correct frame during SAM2 video propagation, instead of forcing
-                # all clicks onto a single global anchor frame. Fixes the bug where
-                # adding a refining click after the playhead moved invalidated the
-                # original clicks (because they got re-anchored to the new frame).
-                payload["sam_clicks"] = [
-                    {"x": int(nx * iw), "y": int(ny * ih), "label": 1 if v else 0,
-                     "frame": fr}
-                    for nx, ny, v, fr in self._sam_display_pts
+            # Multi-object v0.8 — emit per-mask click data (sam_clicks_obj1,
+            # sam_positive_obj1, etc.) AND a single union under the legacy keys
+            # so panel code that hasn't been ported yet keeps working. Anchor
+            # frame is the FIRST click's frame for each mask (mirroring the
+            # legacy single-mask behaviour).
+            ih, iw = self.session.shape_hw
+            any_pts = False
+            # Fallback frame from meta.json if no click had a frame captured.
+            _meta_frame = None
+            try:
+                meta_path = self.session.session_dir / "meta.json"
+                if meta_path.exists():
+                    import json as _json
+                    _meta_frame = _json.loads(meta_path.read_text()).get("frame_num")
+            except Exception:
+                pass
+            for obj_id in (1, 2):
+                pts = self._sam_pts_by_obj.get(obj_id, [])
+                clicks = [
+                    {"x": int(nx * iw), "y": int(ny * ih),
+                     "label": 1 if v else 0, "frame": fr}
+                    for nx, ny, v, fr in pts
                 ]
-                # Legacy fields for back-compat with code paths that haven't been
-                # updated yet. sam_anchor_frame falls back to the FIRST click's
-                # frame (the original anchor). Most paths will read sam_clicks.
-                payload["sam_positive"] = [[int(nx * iw), int(ny * ih)] for nx, ny, v, _ in self._sam_display_pts if v]
-                payload["sam_negative"] = [[int(nx * iw), int(ny * ih)] for nx, ny, v, _ in self._sam_display_pts if not v]
-                payload["alpha_method"] = 1
-                _frames = [fr for _, _, _, fr in self._sam_display_pts if fr is not None]
+                pos = [[int(nx * iw), int(ny * ih)] for nx, ny, v, _ in pts if v]
+                neg = [[int(nx * iw), int(ny * ih)] for nx, ny, v, _ in pts if not v]
+                payload[f"sam_clicks_obj{obj_id}"] = clicks
+                payload[f"sam_positive_obj{obj_id}"] = pos
+                payload[f"sam_negative_obj{obj_id}"] = neg
+                _frames = [fr for _, _, _, fr in pts if fr is not None]
                 if _frames:
-                    payload["sam_anchor_frame"] = _frames[0]
-                else:
-                    # Fall back to current meta.frame_num if no click had a frame
-                    # captured (shouldn't happen post-fix, but be safe).
-                    try:
-                        meta_path = self.session.session_dir / "meta.json"
-                        if meta_path.exists():
-                            import json as _json
-                            meta = _json.loads(meta_path.read_text())
-                            payload["sam_anchor_frame"] = meta.get("frame_num")
-                    except Exception:
-                        pass
+                    payload[f"sam_anchor_frame_obj{obj_id}"] = _frames[0]
+                elif pts and _meta_frame is not None:
+                    payload[f"sam_anchor_frame_obj{obj_id}"] = _meta_frame
+                if pts:
+                    any_pts = True
+            payload["sam_active_object"] = self._active_mask
+            if any_pts:
+                payload["alpha_method"] = 1
+            # Legacy mirror: union of both masks' clicks under the old keys so
+            # panel code that hasn't been ported keeps producing a usable mask.
+            # Drops to MASK 1's anchor frame for sam_anchor_frame.
+            if any_pts:
+                payload["sam_clicks"] = list(payload["sam_clicks_obj1"]) + list(payload["sam_clicks_obj2"])
+                payload["sam_positive"] = list(payload["sam_positive_obj1"]) + list(payload["sam_positive_obj2"])
+                payload["sam_negative"] = list(payload["sam_negative_obj1"]) + list(payload["sam_negative_obj2"])
+                _af1 = payload.get("sam_anchor_frame_obj1")
+                _af2 = payload.get("sam_anchor_frame_obj2")
+                payload["sam_anchor_frame"] = _af1 if _af1 is not None else _af2
             else:
                 payload["sam_clicks"] = []
                 payload["sam_positive"] = []
@@ -2117,61 +2242,37 @@ class PersistentWindow(QtWidgets.QWidget):
                 matte_subtract = bool(params_for_matte.get("sam2_subtract", False))
                 matte_bypass = bool(params_for_matte.get("sam2_bypass", False))
                 matte_edge_guard = int(params_for_matte.get("edge_guard_px", 20))
+                # Multi-object v0.8 — same per-mask + union strategy as the
+                # Composite branch. Each gate runs through the combine, the
+                # alphas are unioned. Per-mask bbox protocol preserved by
+                # _combine_one_mask -> apply_sam2_gate using each gate's bbox.
+                _matte_gates = [g for g in (self.session.sam2_gates.get(1), self.session.sam2_gates.get(2)) if g is not None]
                 if (self.session.alpha_raw is not None
-                        and self.session.sam2_gate_raw is not None
+                        and _matte_gates
                         and not matte_bypass):
-                    _gate = self.session.sam2_gate_raw.copy()
-                    # SAM2 logits return at 256x256 — must resize to alpha shape or
-                    # the multiply throws ValueError (silently caught by the outer
-                    # try/except, leaving the matte view blank). The Composite
-                    # branch in render_composite handles this; the Matte branch was
-                    # missing the resize. Fixed 2026-04-26.
-                    if _gate.shape != self.session.alpha_raw.shape:
-                        _gate = cv2.resize(
-                            _gate,
-                            (self.session.alpha_raw.shape[1],
-                             self.session.alpha_raw.shape[0]),
-                            interpolation=cv2.INTER_LINEAR,
-                        )
                     _src_rgb_m = (self.session.original_rgb
                                   if self.session.original_rgb is not None
                                   else self.session.fg_rgb)
-                    if matte_subtract:
-                        # SUBTRACT mirror — see Composite branch comment.
-                        _fp_m = max(int(matte_edge_guard) // 2, 1)
-                        alpha = apply_sam2_gate_subtract(self.session.alpha_raw,
-                                                         _gate, _src_rgb_m,
-                                                         screen_type="green",
-                                                         buffer_px=int(matte_edge_guard),
-                                                         feather_px=_fp_m)
-                    elif matte_weighted:
-                        # SMART BLEND mirror of Composite branch — per-pixel
-                        # weighted NN/SAM2 by chroma. trim/fill_holes/halo
-                        # intentionally not applied here either.
-                        alpha = apply_sam2_gate_weighted(self.session.alpha_raw,
-                                                         _gate, _src_rgb_m,
-                                                         screen_type="green")
-                    elif matte_additive:
-                        # ADDITIVE mode mirrors the Composite branch. HALO still
-                        # functional but its semantics shift (extends additive
-                        # contribution outward rather than preserving NN edge band).
-                        _gate_for_add = _gate
-                        if matte_halo and matte_halo > 0:
-                            _bin = (_gate_for_add > 0.5).astype(np.uint8)
-                            _k = int(matte_halo) * 2 + 1
-                            _kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_k, _k))
-                            _gate_for_add = cv2.dilate(_bin, _kernel).astype(np.float32)
-                        alpha = apply_sam2_gate_additive(self.session.alpha_raw,
-                                                         _gate_for_add, _src_rgb_m,
-                                                         screen_type="green")
-                    else:
-                        # Trimap fusion: solid 1.0 inside SAM2 confident core where
-                        # NN saw something; multiply elsewhere. Real holes preserved.
-                        alpha = _trimap_fuse(self.session.alpha_raw, _gate,
-                                             source_rgb=_src_rgb_m, screen_type="green",
-                                             trim_chroma=matte_trim, halo_px=matte_halo,
-                                             halo_body_px=matte_halo_body,
-                                             fill_holes=matte_fill)
+                    _matte_alphas = []
+                    for _gate_m in _matte_gates:
+                        _gate = _gate_m
+                        if _gate.shape != self.session.alpha_raw.shape:
+                            _gate = cv2.resize(
+                                _gate,
+                                (self.session.alpha_raw.shape[1],
+                                 self.session.alpha_raw.shape[0]),
+                                interpolation=cv2.INTER_LINEAR,
+                            )
+                        _matte_alphas.append(_combine_one_mask(
+                            self.session.alpha_raw, _gate, _src_rgb_m,
+                            sam2_subtract=matte_subtract,
+                            sam2_weighted=matte_weighted,
+                            sam2_additive=matte_additive,
+                            halo_px=matte_halo, halo_body_px=matte_halo_body,
+                            edge_guard_px=matte_edge_guard,
+                            trim_chroma=matte_trim, fill_holes=matte_fill,
+                        ))
+                    alpha = union_alpha(*_matte_alphas)
                     if matte_margin > 0:
                         alpha = _dilate_mask(alpha, matte_margin)
                     if matte_soften > 0:
@@ -2326,7 +2427,10 @@ class PersistentWindow(QtWidgets.QWidget):
                 "border: 1px solid #da5; border-radius: 12px; font-size: 12px; font-weight: 600;"
             )
             self.right_label.setCursor(QtCore.Qt.CrossCursor)
-            self.status.setText("SAM mode ON — left-click: include (+)  right-click: exclude (−)")
+            self.status.setText(
+                f"SAM mode ON — MASK {self._active_mask} active "
+                "(Tab: switch mask)  L-click: include (+)  R-click: exclude (−)"
+            )
         else:
             self._sam_btn.setStyleSheet(
                 "background-color: #111; color: #da5; padding: 5px 14px; "
@@ -2371,7 +2475,10 @@ class PersistentWindow(QtWidgets.QWidget):
                             self._sam_display_pts.append((nx, ny, bool(is_pos), _click_frame))
                     pos_count = sum(1 for t in self._sam_display_pts if t[2])
                     neg_count = len(self._sam_display_pts) - pos_count
-                    self.status.setText(f"SAM points: {pos_count}+ {neg_count}−  (right-click=exclude)")
+                    self.status.setText(
+                        f"MASK {self._active_mask}: {pos_count}+ {neg_count}−  "
+                        f"(Tab: switch mask, R-click: exclude)"
+                    )
                     self._draw_sam_overlay()
                     return True
         return super().eventFilter(obj, event)
@@ -2383,42 +2490,51 @@ class PersistentWindow(QtWidgets.QWidget):
     # DEPENDS-ON: self._sam_display_pts, _repaint_both to redraw without dots.
     # AFFECTS: self._sam_display_pts emptied, sam2_mask.png deleted, status updated.
     def _clear_sam_points(self):
-        sam2_mask_path = self.session.session_dir / "sam2_mask.png"
-        sam2_gate_path = self.session.session_dir / "sam2_gate_raw.png"
-        self._sam_display_pts = []
-        # Delete BOTH the binary mask AND the raw gate. Previously only
-        # sam2_mask.png was deleted; sam2_gate_raw.png lingered on disk and
-        # render paths kept reading it, producing a "weird black mass" over
-        # the body and corrupted Composite/Matte views — the user had to
-        # close + reopen the viewer to fully reset. Deleting both files is
-        # the only way to land in a true "no SAM2" state.
-        for _p in (sam2_mask_path, sam2_gate_path):
+        # Multi-object v0.8 — CLEAR clears the ACTIVE mask only. The other
+        # mask keeps its dots + silhouette. To reset everything, the user
+        # toggles to the other mask and clears too.
+        active = self._active_mask
+        session_dir = self.session.session_dir
+        # Per-object PNGs ONLY for the active mask. Legacy single-mask PNGs
+        # were already migrated to obj1 namespace by sam2_combine on load.
+        per_obj_paths = (
+            session_dir / f"sam2_mask_obj{active}.png",
+            session_dir / f"sam2_gate_raw_obj{active}.png",
+        )
+        self._sam_pts_by_obj[active] = []
+        for _p in per_obj_paths:
             try:
                 if _p.exists():
                     _p.unlink()
             except Exception:
                 pass
-        # Restore the NN alpha that _apply_sam_mask backed up before overwriting alpha.png.
-        # Without this, CLEAR leaves alpha.png as the SAM2 binary → actress disappears.
-        nn_backup = self.session.session_dir / "alpha_nn_backup.png"
-        alpha_path = self.session.session_dir / "alpha.png"
-        try:
-            if nn_backup.exists():
-                import shutil as _shutil
-                _shutil.copy2(str(nn_backup), str(alpha_path))
-                nn_backup.unlink()
-        except Exception:
-            pass
+        # If both masks are now empty, restore the NN alpha that _apply_sam_mask
+        # backed up before overwriting alpha.png. With one mask remaining, leave
+        # alpha.png alone — that mask is still in effect.
+        other = 2 if active == 1 else 1
+        any_other_pts = bool(self._sam_pts_by_obj.get(other))
+        any_other_gate = self.session.sam2_gates.get(other) is not None
+        if not any_other_pts and not any_other_gate:
+            nn_backup = session_dir / "alpha_nn_backup.png"
+            alpha_path = session_dir / "alpha.png"
+            try:
+                if nn_backup.exists():
+                    import shutil as _shutil
+                    _shutil.copy2(str(nn_backup), str(alpha_path))
+                    nn_backup.unlink()
+            except Exception:
+                pass
         try:
             self.session.reload_pngs()
         except Exception:
             pass
-        # Belt-and-suspenders: reload_pngs() already clears in-memory
-        # sam2_gate_raw to None, but if reload_pngs threw above the gate
-        # might still point at the previous SAM2 result. Force-clear here
-        # so the next render unconditionally takes the no-SAM2 branch.
+        # Belt-and-suspenders: reload_pngs() clears sam2_gates wholesale,
+        # so explicitly re-set just the active mask's slot to None and
+        # leave the other mask's slot untouched (already cleared by the
+        # reload). The next render then unconditionally drops the active
+        # mask's contribution.
         try:
-            self.session.sam2_gate_raw = None
+            self.session.sam2_gates[active] = None
         except Exception:
             pass
         self._save_live_params_now()
@@ -2429,7 +2545,10 @@ class PersistentWindow(QtWidgets.QWidget):
             self._update_sam2_slider_state()
         except Exception:
             pass
-        self.status.setText("SAM2 mask cleared — NN alpha restored")
+        if not any_other_pts and not any_other_gate:
+            self.status.setText(f"MASK {active} cleared — NN alpha restored")
+        else:
+            self.status.setText(f"MASK {active} cleared — MASK {other} still active")
         self._render_now()
 
     # WHAT IT DOES: Runs SAM2 on the cached source frame using the user's click points.
@@ -2441,20 +2560,27 @@ class PersistentWindow(QtWidgets.QWidget):
     # AFFECTS: session_dir/alpha.png overwritten, session.alpha reloaded, repaint triggered.
     # DANGER ZONE HIGH: Synchronous — Qt event loop freezes during SAM2 inference (~2-5s).
     def _apply_sam_mask(self):
-        if not self._sam_display_pts:
-            self.status.setText("No points — click on image first")
+        # Multi-object v0.8 — APPLY MASK runs on the ACTIVE mask only. Other
+        # masks keep their last computed silhouette so the user can refine
+        # MASK 2 without re-applying MASK 1.
+        active = self._active_mask
+        active_pts = self._sam_pts_by_obj.get(active, [])
+        if not active_pts:
+            self.status.setText(
+                f"MASK {active} has no dots — click on the actor first (Tab to switch mask)"
+            )
             return
-        self.status.setText("Running SAM2…")
+        self.status.setText(f"Running SAM2 for MASK {active}…")
         QtWidgets.QApplication.processEvents()
         try:
             import cv2, numpy as np, torch, os
             ih, iw = self.session.shape_hw
-            pos_pts = [(int(nx * iw), int(ny * ih)) for nx, ny, v, _ in self._sam_display_pts if v]
-            neg_pts = [(int(nx * iw), int(ny * ih)) for nx, ny, v, _ in self._sam_display_pts if not v]
+            pos_pts = [(int(nx * iw), int(ny * ih)) for nx, ny, v, _ in active_pts if v]
+            neg_pts = [(int(nx * iw), int(ny * ih)) for nx, ny, v, _ in active_pts if not v]
             all_pts = [[p[0], p[1]] for p in pos_pts] + [[p[0], p[1]] for p in neg_pts]
             labels  = [1] * len(pos_pts) + [0] * len(neg_pts)
             if not all_pts:
-                self.status.setText("No valid points in image bounds")
+                self.status.setText(f"MASK {active}: no valid points in image bounds")
                 return
             # Source image for SAM2: uint8 RGB (session stores float32 RGB 0..1)
             # Tried feeding original.png (raw greenscreen) — didn't help, reverted.
@@ -2496,34 +2622,47 @@ class PersistentWindow(QtWidgets.QWidget):
             if alpha_path.exists() and not nn_backup.exists():
                 import shutil as _shutil
                 _shutil.copy2(str(alpha_path), str(nn_backup))
-            # Save soft gate as uint16 PNG so the 0..1 precision survives the
-            # save/load roundtrip (uint8 would quantize to 256 levels and undo
-            # the soft-edge benefit). _to_float01 handles uint16 on read.
+            # Save the ACTIVE mask's soft gate as uint16 PNG (preserves 0..1
+            # precision across the save/load roundtrip; uint8 quantizes to 256
+            # levels and undoes the soft-edge benefit). _to_float01 handles
+            # uint16 on read. Per-object PNG namespacing — sam2_gate_raw_obj{N}.png
+            # for the soft gate, sam2_mask_obj{N}.png for the panel's binary
+            # hardmask contract.
+            session_dir = self.session.session_dir
             gate_u16  = (best * 65535.0).astype(np.uint16)
-            gate_path = self.session.session_dir / "sam2_gate_raw.png"
-            gate_tmp  = self.session.session_dir / "sam2_gate_raw.tmp.png"
+            gate_path = session_dir / f"sam2_gate_raw_obj{active}.png"
+            gate_tmp  = session_dir / f"sam2_gate_raw_obj{active}.tmp.png"
             cv2.imwrite(str(gate_tmp), gate_u16)
             os.replace(str(gate_tmp), str(gate_path))
-            # sam2_mask.png stays binary uint8 — it's consumed by the panel's
-            # batch path which expects the legacy hard-mask contract.
             sam2_mask_u8   = (best > 0.5).astype(np.uint8) * 255
-            sam2_mask_path = self.session.session_dir / "sam2_mask.png"
-            sam2_tmp_path  = self.session.session_dir / "sam2_mask.tmp.png"
+            sam2_mask_path = session_dir / f"sam2_mask_obj{active}.png"
+            sam2_tmp_path  = session_dir / f"sam2_mask_obj{active}.tmp.png"
             cv2.imwrite(str(sam2_tmp_path), sam2_mask_u8)
             os.replace(str(sam2_tmp_path), str(sam2_mask_path))
+            # Snapshot the OTHER mask's gate so reload_pngs (which clears
+            # sam2_gates wholesale) doesn't wipe it. We restore it below.
+            other = 2 if active == 1 else 1
+            other_gate_snapshot = self.session.sam2_gates.get(other)
             # reload_pngs() must run BEFORE assigning the new gate — it
-            # unconditionally clears sam2_gate_raw to None (so a new frame
-            # never inherits the previous frame's gate). Calling it after
-            # the assignment would wipe the gate we just computed and
-            # Apply Mask would silently do nothing.
+            # unconditionally clears sam2_gates (so a new frame never inherits
+            # the previous frame's gate). Calling it after the assignment
+            # would wipe the gate we just computed and APPLY MASK would
+            # silently do nothing.
             self.session.reload_pngs()
-            self.session.sam2_gate_raw = best.copy()
+            self.session.sam2_gates[active] = best.copy()
+            # Restore the other mask's gate so APPLY on MASK 2 doesn't
+            # erase MASK 1 (and vice-versa). reload_pngs cleared it to None.
+            if other_gate_snapshot is not None:
+                self.session.sam2_gates[other] = other_gate_snapshot
             # Keep points visible so the user can add/refine and re-apply —
             # each predict() takes ALL current points, so wiping them here
             # forced users to re-click everything. CLEAR button wipes manually.
             self._render_now()
             self._save_live_params_now()  # write points + anchor to disk NOW, not on timer
-            self.status.setText(f"SAM2 mask applied — {len(pos_pts)}+ {len(neg_pts)}-")
+            self.status.setText(
+                f"MASK {active} applied — {len(pos_pts)}+ {len(neg_pts)}- "
+                f"(Tab to switch mask)"
+            )
         except Exception as e:
             self.status.setText(f"SAM2 error: {e}")
 
@@ -2536,7 +2675,11 @@ class PersistentWindow(QtWidgets.QWidget):
     # DEPENDS-ON: self._sam_display_pts (label coords), right_label having a pixmap.
     # AFFECTS: right_label pixmap (in-place QPainter draw).
     def _draw_sam_overlay(self):
-        if not self._sam_display_pts:
+        # Multi-object v0.8 — draw dots for BOTH masks. The active mask's dots
+        # render at full opacity; the inactive mask's dots dim to ~43% so the
+        # user can tell at a glance which mask owns which cluster.
+        any_pts = any(self._sam_pts_by_obj.get(i) for i in (1, 2))
+        if not any_pts:
             return
         g = self._last_right_geom
         if not g:
@@ -2546,28 +2689,39 @@ class PersistentWindow(QtWidgets.QWidget):
             return
         painter = QtGui.QPainter(pixmap)
         painter.setRenderHint(QtGui.QPainter.Antialiasing)
-        for nx, ny, is_pos, _ in self._sam_display_pts:
-            # Normalized image → source image coords
+        # Active mask drawn LAST so its dots paint on top of the inactive's.
+        order = [i for i in (1, 2) if i != self._active_mask] + [self._active_mask]
+        for _obj_id_ovl in order:
+            _pts_ovl = self._sam_pts_by_obj.get(_obj_id_ovl, [])
+            if not _pts_ovl:
+                continue
+            _alpha_ovl = 255 if _obj_id_ovl == self._active_mask else 110
+            self._draw_sam_overlay_pts(painter, g, _pts_ovl, _alpha_ovl)
+        painter.end()
+        self.right_label.setPixmap(pixmap)
+
+    def _draw_sam_overlay_pts(self, painter, g, pts, alpha):
+        """Inner draw helper — paints one mask's dots at the given alpha (0..255)."""
+        for nx, ny, is_pos, _ in pts:
             src_x = nx * g["iw"] - g["x0"]
             src_y = ny * g["ih"] - g["y0"]
-            # Skip if outside the current zoom/pan crop window
             if src_x < 0 or src_y < 0 or src_x >= g["cw"] or src_y >= g["ch"]:
                 continue
-            # Crop coords → pixmap coords
             px = int(src_x * g["tw"] / g["cw"])
             py = int(src_y * g["th"] / g["ch"])
-            fill = QtGui.QColor("#00ee00") if is_pos else QtGui.QColor("#ff3333")
-            painter.setPen(QtGui.QPen(QtGui.QColor("#000000"), 2))
+            if is_pos:
+                fill = QtGui.QColor(0x00, 0xee, 0x00, alpha)
+            else:
+                fill = QtGui.QColor(0xff, 0x33, 0x33, alpha)
+            painter.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0, alpha), 2))
             painter.setBrush(QtGui.QBrush(fill))
             painter.drawEllipse(QtCore.QPoint(px, py), 9, 9)
-            painter.setPen(QtGui.QPen(QtGui.QColor("#ffffff"), 1))
+            painter.setPen(QtGui.QPen(QtGui.QColor(0xff, 0xff, 0xff, alpha), 1))
             font = painter.font()
             font.setBold(True)
             font.setPixelSize(13)
             painter.setFont(font)
-            painter.drawText(px - 4, py + 5, "+" if is_pos else "\u2212")
-        painter.end()
-        self.right_label.setPixmap(pixmap)
+            painter.drawText(px - 4, py + 5, "+" if is_pos else "−")
 
     # WHAT IT DOES: Mouse wheel zooms in/out on the preview. Wheel up = zoom in.
     #   Clamps 1.0..10.0. Re-paints both panes on change.

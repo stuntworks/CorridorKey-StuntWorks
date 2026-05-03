@@ -806,26 +806,49 @@ def generate_alpha_hint(frame, settings):
 # NOTE: sam2_mask.png is separate from alpha.png so Preview Frame cannot overwrite it.
 #   alpha.png is the neural keyer output (display); sam2_mask.png is the binary SAM2 gate (render).
 def _load_sam2_output_gate(frame_shape, settings):
+    """Multi-object v0.8 — read per-object SAM2 PNGs and return their union.
+
+    Falls back to legacy sam2_mask.png when no per-object files exist (the
+    migration shim normally renames legacy files to obj1, so this path only
+    fires for code that bypasses the shim). Per-mask render dispatch is the
+    correctness path; this single-gate union is a transitional shim until
+    the panel render sites are refactored per-mask too (commit 4).
+    """
     import numpy as np, cv2
     if settings.get("alpha_method") != 1:
         log(f"SAM2 output gate: alpha_method={settings.get('alpha_method')} — gate skipped")
         return None
-    sam2_png = SESSION_DIR / "sam2_mask.png"
-    if not sam2_png.exists():
-        log(f"SAM2 output gate: sam2_mask.png not found at {sam2_png} — no garbage matte applied")
-        return None
-    raw = cv2.imread(str(sam2_png), cv2.IMREAD_GRAYSCALE)
-    if raw is None:
-        log("SAM2 output gate: could not read sam2_mask.png")
-        return None
     h, w = frame_shape[:2]
-    _, raw = cv2.threshold(raw, 127, 255, cv2.THRESH_BINARY)
-    if raw.shape != (h, w):
-        raw = cv2.resize(raw, (w, h), interpolation=cv2.INTER_NEAREST)
-    mask = raw.astype(np.float32) / 255.0
+    candidates = [
+        SESSION_DIR / "sam2_mask_obj1.png",
+        SESSION_DIR / "sam2_mask_obj2.png",
+    ]
+    legacy = SESSION_DIR / "sam2_mask.png"
+    if not any(p.exists() for p in candidates) and legacy.exists():
+        candidates = [legacy]
+    found = []
+    for p in candidates:
+        if not p.exists():
+            continue
+        raw = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+        if raw is None:
+            log(f"SAM2 output gate: could not read {p.name}")
+            continue
+        _, raw = cv2.threshold(raw, 127, 255, cv2.THRESH_BINARY)
+        if raw.shape != (h, w):
+            raw = cv2.resize(raw, (w, h), interpolation=cv2.INTER_NEAREST)
+        found.append(raw.astype(np.float32) / 255.0)
+    if not found:
+        log("SAM2 output gate: no per-object PNG present — no garbage matte applied")
+        return None
+    # Per-pixel union — single-mask sessions take this path with one entry.
+    mask = found[0]
+    for m in found[1:]:
+        mask = np.maximum(mask, m)
     mask = _dilate_sam2_mask(mask, margin=settings.get("sam2_margin", SAM2_MATTE_MARGIN))
     mask = _soften_sam2_mask(mask, soften=settings.get("sam2_soften", 0))
-    log(f"SAM2 output gate loaded — coverage {mask.mean():.3f} ({int(mask.sum())} px foreground)")
+    log(f"SAM2 output gate loaded — {len(found)} per-object PNG(s), "
+        f"coverage {mask.mean():.3f} ({int(mask.sum())} px foreground)")
     return mask
 
 # WHAT IT DOES: Runs SAM2 (Segment Anything Model 2) to generate a mask from user click points.
