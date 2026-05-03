@@ -280,17 +280,26 @@ def apply_sam2_gate_subtract(alpha, gate, source_rgb=None, screen_type='green',
     import cv2 as _cv2
     gate_bin = (gate > 0.5).astype(np.float32)
     gate_bin = _cv2.GaussianBlur(gate_bin, (11, 11), 2.5)
-    # "Green zone" = NN-killed AND actually green chroma. This double-gate
-    # rules out floor that NN happened to kill (cables on floor become
-    # killable) AND spill-tinted junk that's chroma-green but NN saw as FG
-    # (junk become killable).
+    # "Green zone" = NN-killed AND ACTUALLY green chroma. Three checks make
+    # the green-test strict enough to exclude spill-tinted floor that LED
+    # lighting commonly creates:
+    #   1. NN killed it (alpha ~ 0)
+    #   2. Green channel dominates by ≥ 0.10 (was 0.05 — too lenient, dim
+    #      spill-green floor was passing and protecting cables on it)
+    #   3. Green channel brightness ≥ 0.25 (real greenscreen is BRIGHT
+    #      green; spill-tinted dim floor never hits this)
+    # Together, the three checks let real greenscreen protect the actor's
+    # NN matte while letting SAM2 kill cables / junk on dim spill-tinted
+    # surfaces that NN happened to also kill.
     nn_killed = (alpha < 0.05)
     if source_rgb is not None and source_rgb.ndim == 3 and source_rgb.shape[2] >= 3:
         if screen_type == "blue":
-            chroma_score = source_rgb[..., 2] - np.maximum(source_rgb[..., 0], source_rgb[..., 1])
+            dom_ch = source_rgb[..., 2]
+            chroma_score = dom_ch - np.maximum(source_rgb[..., 0], source_rgb[..., 1])
         else:
-            chroma_score = source_rgb[..., 1] - np.maximum(source_rgb[..., 0], source_rgb[..., 2])
-        chroma_green = chroma_score > 0.05
+            dom_ch = source_rgb[..., 1]
+            chroma_score = dom_ch - np.maximum(source_rgb[..., 0], source_rgb[..., 2])
+        chroma_green = (chroma_score > 0.10) & (dom_ch > 0.25)
         green_zone = (nn_killed & chroma_green).astype(np.uint8)
     else:
         # Legacy fallback when source_rgb is unavailable.
