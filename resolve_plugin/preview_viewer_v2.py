@@ -510,27 +510,38 @@ def render_composite(cu, session: Session, params: dict):
     sam2_subtract = bool(params.get("sam2_subtract", False))
     sam2_bypass = bool(params.get("sam2_bypass", False))
     edge_guard_px = int(params.get("edge_guard_px", 20))
-    # Multi-object v0.8 — collect every per-mask gate and run the combine
-    # pipeline ONCE PER MASK, then union the per-mask alphas. Per-mask is the
-    # correct contract for HALO operations (apply_sam2_gate uses the mask's
-    # OWN bbox internally) so MASK 2's negative HALO FEET only erodes MASK 2's
-    # bottom rows, not MASK 1's. Single-mask sessions take the same path with
-    # one gate — bit-identical to the legacy single-gate flow.
-    _per_mask_gates = [g for g in (session.sam2_gates.get(1), session.sam2_gates.get(2)) if g is not None]
-    if session.alpha_raw is not None and _per_mask_gates and not sam2_bypass:
+    # Multi-object v0.8 — collect every per-mask gate (paired with obj_id)
+    # and run the combine pipeline ONCE PER MASK, then union the per-mask
+    # alphas. Per-mask is the correct contract for HALO operations
+    # (apply_sam2_gate uses the mask's OWN bbox internally).
+    # Option C halo binding: when 2+ masks are active, HALO BODY only acts
+    # on MASK 1 and HALO FEET only acts on MASK 2 — eliminates the "pillow
+    # around feet" caused by HALO BODY's lateral extension at MASK 2's
+    # silhouette row. Single-mask sessions get both halos applied (legacy
+    # behaviour preserved for migrated old sessions).
+    _per_mask_pairs = [(oid, session.sam2_gates.get(oid)) for oid in (1, 2)
+                       if session.sam2_gates.get(oid) is not None]
+    if session.alpha_raw is not None and _per_mask_pairs and not sam2_bypass:
         _src_rgb = session.original_rgb if session.original_rgb is not None else session.fg_rgb
         _per_mask_alphas = []
-        for _gate_n in _per_mask_gates:
+        _n_active = len(_per_mask_pairs)
+        for _oid, _gate_n in _per_mask_pairs:
             _gate = _gate_n
             if _gate.shape != session.alpha_raw.shape:
                 _gate = cv2.resize(_gate, (session.alpha_raw.shape[1], session.alpha_raw.shape[0]),
                                    interpolation=cv2.INTER_LINEAR)
+            if _n_active > 1:
+                _h_body = halo_body_px if _oid == 1 else 0
+                _h_feet = halo_px if _oid == 2 else 0
+            else:
+                _h_body = halo_body_px
+                _h_feet = halo_px
             _per_mask_alphas.append(_combine_one_mask(
                 session.alpha_raw, _gate, _src_rgb,
                 sam2_subtract=sam2_subtract,
                 sam2_weighted=sam2_weighted,
                 sam2_additive=sam2_additive,
-                halo_px=halo_px, halo_body_px=halo_body_px,
+                halo_px=_h_feet, halo_body_px=_h_body,
                 edge_guard_px=edge_guard_px,
                 trim_chroma=trim_chroma, fill_holes=fill_holes,
             ))
@@ -2243,18 +2254,20 @@ class PersistentWindow(QtWidgets.QWidget):
                 matte_bypass = bool(params_for_matte.get("sam2_bypass", False))
                 matte_edge_guard = int(params_for_matte.get("edge_guard_px", 20))
                 # Multi-object v0.8 — same per-mask + union strategy as the
-                # Composite branch. Each gate runs through the combine, the
-                # alphas are unioned. Per-mask bbox protocol preserved by
-                # _combine_one_mask -> apply_sam2_gate using each gate's bbox.
-                _matte_gates = [g for g in (self.session.sam2_gates.get(1), self.session.sam2_gates.get(2)) if g is not None]
+                # Composite branch, with the same Option C halo binding so
+                # the Matte view matches what render_composite produces.
+                _matte_pairs = [(oid, self.session.sam2_gates.get(oid))
+                                for oid in (1, 2)
+                                if self.session.sam2_gates.get(oid) is not None]
                 if (self.session.alpha_raw is not None
-                        and _matte_gates
+                        and _matte_pairs
                         and not matte_bypass):
                     _src_rgb_m = (self.session.original_rgb
                                   if self.session.original_rgb is not None
                                   else self.session.fg_rgb)
                     _matte_alphas = []
-                    for _gate_m in _matte_gates:
+                    _n_active_m = len(_matte_pairs)
+                    for _oid_m, _gate_m in _matte_pairs:
                         _gate = _gate_m
                         if _gate.shape != self.session.alpha_raw.shape:
                             _gate = cv2.resize(
@@ -2263,12 +2276,18 @@ class PersistentWindow(QtWidgets.QWidget):
                                  self.session.alpha_raw.shape[0]),
                                 interpolation=cv2.INTER_LINEAR,
                             )
+                        if _n_active_m > 1:
+                            _h_body_m = matte_halo_body if _oid_m == 1 else 0
+                            _h_feet_m = matte_halo if _oid_m == 2 else 0
+                        else:
+                            _h_body_m = matte_halo_body
+                            _h_feet_m = matte_halo
                         _matte_alphas.append(_combine_one_mask(
                             self.session.alpha_raw, _gate, _src_rgb_m,
                             sam2_subtract=matte_subtract,
                             sam2_weighted=matte_weighted,
                             sam2_additive=matte_additive,
-                            halo_px=matte_halo, halo_body_px=matte_halo_body,
+                            halo_px=_h_feet_m, halo_body_px=_h_body_m,
                             edge_guard_px=matte_edge_guard,
                             trim_chroma=matte_trim, fill_holes=matte_fill,
                         ))
