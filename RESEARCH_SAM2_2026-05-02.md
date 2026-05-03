@@ -123,6 +123,69 @@ Output format: markdown with headings per topic, citations at the end of each
 finding. Don't summarize my prompt back to me — just give the findings.
 ```
 
+## Round 2 findings (2026-05-02 deeper sweep)
+
+### SAM 3 / SAM 3.1 exists
+
+Meta released SAM 3 — successor to SAM 2. Doubles cgF1 scores in concept segmentation performance in videos compared to SAM 2. Faster, more accessible real-time tracking. Major upgrade path for v2.0+.
+
+Source: https://ai.meta.com/blog/segment-anything-model-3/
+
+### Sammie-Roto 2 — the existing competitor product
+
+Open-source GUI for AI rotoscoping / masking on GitHub: https://github.com/Zarxrax/Sammie-Roto-2
+
+Tech stack:
+- SAM2 for video segmentation
+- MatAnyone + MatAnyone 2 for matting
+- VideoMaMa for matting
+- MiniMax-Remover for object removal
+
+Active 2026 development: v2.2.0 (MatAnyone 2), v2.3.0 (VideoMaMa), v2.3.1 (live preview during segmentation), v2.3.2 (improved temporal stability), v2.3.3 (perf optimizations).
+
+**This is what CorridorKey-StuntWorks is competing against.** Worth studying for UX patterns and feature gap analysis.
+
+Also: **RotoTrackID** (https://github.com/nameshigawa/RotoTrackID) — YOLO + SAM hybrid for per-object alpha mattes from video. Smaller scope than Sammie-Roto.
+
+### Performance: `vos_optimized=True`
+
+SAM2's `build_sam2_video_predictor(vos_optimized=True)` enables torch.compile of the entire model. Reported as a "major speedup" for video object segmentation. Easy win for our APPLY MASK + SCRUB latency.
+
+Source: https://github.com/facebookresearch/sam2 (README perf section)
+
+### HuggingFace sam2-studio
+
+Official HuggingFace SAM2 wrapper: https://github.com/huggingface/sam2-studio. Cleaner Python APIs over Meta's reference implementation. Worth evaluating as a replacement for our direct facebookresearch/sam2 dependency.
+
+### Blog: SAM2 limits for VFX rotoscoping
+
+https://blog.electricsheep.tv/we-tested-sam2-for-rotoscoping-this-is-what-we-found/
+
+Key quote: "SAM2 falls short for VFX rotoscoping — fine details, multiple mattes, higher resolution edges, temporal consistency."
+
+This is exactly what TWO HALO + multi-object SAM2 + the planned upgrades aim to fix.
+
+### Caching: GitHub issue facebookresearch/sam2 #565
+
+https://github.com/facebookresearch/sam2/issues/565 — "Loading embeddings to speed up video predictions." Direct guidance for the caching task (punchlist #4). Should read before implementing.
+
+### HuggingFace SAM2 demos to study
+
+- EVF-SAM-2 (text prompts → segmentation): https://huggingface.co/spaces/wondervictor/evf-sam2
+- Florence2 + SAM2 (vision-language → segmentation): https://huggingface.co/spaces/SkalskiP/florence-sam
+- SAM2 Video Predictor + SAM2Long: https://huggingface.co/spaces/Mar2Ding/SAM2Long-Demo
+
+### Awesome list
+
+https://github.com/gaomingqi/Awesome-Video-Object-Segmentation — comprehensive curated list of papers, datasets, projects in video object segmentation. Use for ongoing research scans.
+
+## Action items added (round 2)
+
+5. **Study Sammie-Roto 2 UX** — closest competitor with multi-object + matting + object removal. Inform our v0.8 / v1.0 UX decisions. Don't copy, but understand the bar.
+6. **Try `vos_optimized=True`** in panel SAM2 invocation — could be a 10-30 min change for substantial speedup.
+7. **Track SAM 3 / 3.1 release** — successor model with major perf gains. Likely v2.0 upgrade path.
+8. **Read HuggingFace sam2-studio** repo for cleaner API patterns. Possibly replace direct facebookresearch/sam2 dependency.
+
 ## All source links (for reference)
 
 - https://github.com/facebookresearch/sam2
