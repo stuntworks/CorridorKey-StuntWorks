@@ -151,6 +151,14 @@ cached_processor = {"proc": None}  # Holds loaded AI model to avoid reloading ev
 # AFFECTS: _start_scrub_keying worker (reads this instead of creating its own)
 cached_scrub_cpu_proc = {"proc": None}  # CPU proc for SCRUB RANGE — pre-inited, never CUDA
 sam_points = {"positive": [], "negative": [], "frame": None}
+# Multi-object v0.8 — per-mask click data populated by _merge_live_params
+# from sam_positive_obj{N}, sam_negative_obj{N}, sam_anchor_frame_obj{N}.
+# sam_points (above) is kept as the legacy union for code that hasn't been
+# refactored yet. Multi-object SAM2 video propagation reads sam_points_per_obj.
+sam_points_per_obj: dict = {
+    1: {"positive": [], "negative": [], "frame": None},
+    2: {"positive": [], "negative": [], "frame": None},
+}
 frame_range = {"in_frame": None, "out_frame": None}
 _viewer_proc = None      # Tracks Live Preview subprocess — stays alive while scrubber is open
 _scrubber_proc = None   # Tracks SCRUB RANGE subprocess — separate from live preview
@@ -623,6 +631,16 @@ def _merge_live_params(settings):
             # does not need to be set to SAM2; the viewer places points = intent to use SAM2.
             if lp.get("alpha_method") == 1 or sam_points["positive"]:
                 out["alpha_method"] = 1
+        # Multi-object v0.8 — also load per-mask click data so video propagation
+        # can register obj_id=1 and obj_id=2 separately. Falls back to empty
+        # lists when keys aren't present (single-mask sessions still go through
+        # the legacy sam_points union above).
+        for _oid in (1, 2):
+            sam_points_per_obj[_oid]["positive"] = [tuple(p) for p in lp.get(f"sam_positive_obj{_oid}", []) or []]
+            sam_points_per_obj[_oid]["negative"] = [tuple(p) for p in lp.get(f"sam_negative_obj{_oid}", []) or []]
+            sam_points_per_obj[_oid]["frame"]    = lp.get(f"sam_anchor_frame_obj{_oid}", None)
+        if any(sam_points_per_obj[oid]["positive"] for oid in (1, 2)):
+            out["alpha_method"] = 1
         # If a SAM2 gate file exists on disk, always activate SAM2 mode regardless of
         # the panel dropdown or whether live_params.json still has the points. The gate
         # file persists across viewer restarts; the points in live_params.json do not.
@@ -726,6 +744,115 @@ def _soften_sam2_mask(mask_float32, soften=0):
     sz = int(soften) * 2 + 1
     blurred = cv2.GaussianBlur(mask_float32, (sz, sz), sigmaX=soften * 0.5)
     return blurred
+
+
+# ===== Multi-object SAM2 helpers (v0.8) =====
+
+# WHAT IT DOES: Runs the SAM2 + NN combine for ONE per-mask gate using whatever
+#   mode the user has toggled (subtract / weighted / additive / trimap default).
+#   Caller invokes this per-mask and unions the resulting alphas. Per-mask is
+#   the correct contract for HALO operations: apply_sam2_gate uses the gate's
+#   own bbox internally so each mask's halo zones stay confined to its region.
+# DEPENDS-ON: sam2_combine.{apply_sam2_gate,_additive,_weighted,_subtract,
+#   trim_gate_by_chroma,fill_holes_color_aware}; cv2; numpy.
+# AFFECTS: returns a fresh alpha array; inputs unchanged.
+def _panel_combine_one_mask(alpha, gate, src_rgb, settings):
+    import cv2, numpy as np
+    from sam2_combine import (
+        apply_sam2_gate, apply_sam2_gate_additive, apply_sam2_gate_weighted,
+        apply_sam2_gate_subtract, trim_gate_by_chroma, fill_holes_color_aware,
+    )
+    sam2_subtract = bool(settings.get("sam2_subtract", False))
+    sam2_weighted = bool(settings.get("sam2_weighted", False))
+    sam2_additive = bool(settings.get("sam2_additive", False))
+    halo_px = int(settings.get("halo_px", 0))
+    halo_body_px = int(settings.get("halo_body_px", 0))
+    edge_guard_px = int(settings.get("edge_guard_px", 20))
+    trim_chroma = int(settings.get("trim_chroma", 0))
+    fill_holes = int(settings.get("fill_holes", 0))
+    stype = str(settings.get("screen_type", "green"))
+    a2d = alpha[:, :, 0] if alpha.ndim == 3 else alpha
+    if sam2_subtract:
+        fp = max(int(edge_guard_px) // 2, 1)
+        return apply_sam2_gate_subtract(a2d, gate, src_rgb,
+                                        screen_type=stype,
+                                        buffer_px=int(edge_guard_px),
+                                        feather_px=fp)
+    if sam2_weighted:
+        return apply_sam2_gate_weighted(a2d, gate, src_rgb, screen_type=stype)
+    if sam2_additive:
+        gate_a = gate
+        if halo_px and halo_px > 0:
+            _bin = (gate_a > 0.5).astype(np.uint8)
+            _k = int(halo_px) * 2 + 1
+            _kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_k, _k))
+            gate_a = cv2.dilate(_bin, _kernel).astype(np.float32)
+        return apply_sam2_gate_additive(a2d, gate_a, src_rgb, screen_type=stype)
+    # Default trimap mode
+    g = gate
+    if trim_chroma > 0 and src_rgb is not None:
+        g = trim_gate_by_chroma(g, src_rgb, stype, trim_chroma)
+    out = apply_sam2_gate(a2d, g, invert=False, halo_px=halo_px, halo_body_px=halo_body_px)
+    if fill_holes > 0 and src_rgb is not None:
+        out = fill_holes_color_aware(out, g, src_rgb, stype, fill_holes)
+    return out
+
+
+# WHAT IT DOES: Runs _panel_combine_one_mask across each per-mask gate and
+#   unions the alphas. Single-mask sessions take the same path with one gate.
+# DEPENDS-ON: _panel_combine_one_mask, union_alpha from sam2_combine.
+# AFFECTS: returns a fresh alpha array; inputs unchanged. Returns alpha
+#   unchanged when gates list is empty (NN-only fallback).
+def _panel_dispatch_sam2_combine(alpha, gates, src_rgb, settings):
+    if not gates:
+        return alpha
+    from sam2_combine import union_alpha
+    per_mask = [
+        _panel_combine_one_mask(alpha, g, src_rgb, settings) for g in gates
+    ]
+    out = union_alpha(*per_mask)
+    return out if out is not None else alpha
+
+
+# WHAT IT DOES: Reads per-object SAM2 silhouette PNGs (sam2_mask_obj1.png and
+#   sam2_mask_obj2.png) from SESSION_DIR and returns them as a list of float32
+#   masks at the requested shape, dilated and softened per the user's MARGIN /
+#   SOFTEN sliders. Falls back to the legacy single sam2_mask.png when no
+#   per-object files exist.
+# DEPENDS-ON: SESSION_DIR/sam2_mask_obj{N}.png written by viewer's _apply_sam_mask.
+# AFFECTS: pure read; returns a NEW list of arrays.
+def _load_per_object_sam2_gates(frame_shape, settings):
+    import numpy as np, cv2
+    if settings.get("alpha_method") != 1:
+        return []
+    h, w = frame_shape[:2]
+    candidates = [
+        SESSION_DIR / "sam2_mask_obj1.png",
+        SESSION_DIR / "sam2_mask_obj2.png",
+    ]
+    legacy = SESSION_DIR / "sam2_mask.png"
+    if not any(p.exists() for p in candidates) and legacy.exists():
+        candidates = [legacy]
+    out = []
+    margin = settings.get("sam2_margin", SAM2_MATTE_MARGIN)
+    soften = settings.get("sam2_soften", 0)
+    for p in candidates:
+        if not p.exists():
+            continue
+        raw = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+        if raw is None:
+            log(f"per-object gate: could not read {p.name}")
+            continue
+        _, raw = cv2.threshold(raw, 127, 255, cv2.THRESH_BINARY)
+        if raw.shape != (h, w):
+            raw = cv2.resize(raw, (w, h), interpolation=cv2.INTER_NEAREST)
+        m = raw.astype(np.float32) / 255.0
+        m = _dilate_sam2_mask(m, margin=margin)
+        m = _soften_sam2_mask(m, soften=soften)
+        out.append(m)
+    if out:
+        log(f"SAM2 gates loaded — {len(out)} per-object PNG(s)")
+    return out
 
 
 # WHAT IT DOES: Applies the same matte despeckle the viewer uses, so what the
@@ -893,19 +1020,36 @@ def generate_sam2_mask(frame, pos_pts, neg_pts):
 # AFFECTS: writes then deletes a temp JPEG dir. Returns mask dict (no disk writes kept).
 # DANGER ZONE HIGH: Can fill disk on very long ranges. Each frame is a JPEG on disk.
 #   breaks: if disk space < ~0.5 MB * frame_count, or SAM2 weights missing.
-def run_sam2_video_propagation(fp, ss, cs, in_f, out_f, pos_pts, neg_pts, anchor_frame_abs):
+def run_sam2_video_propagation(fp, ss, cs, in_f, out_f, pos_pts, neg_pts, anchor_frame_abs,
+                               pos_pts_obj2=None, neg_pts_obj2=None, anchor_frame_obj2_abs=None):
+    """Multi-object v0.8 — track up to two SAM2 objects through the range.
+
+    obj1 = MASK 1 (always required). obj2 = MASK 2 (optional). When obj2 has
+    points, both objects are registered on a single SAM2VideoPredictor via the
+    native obj_id API and propagated together — one forward pass + one backward
+    pass cover both. Cheaper than running the predictor twice.
+
+    Returns dict[frame_idx, list[mask]]: per-frame list of float32 masks, one
+    per active object. Consumers iterate over the list and union (or apply
+    per-mask combine + union via _panel_dispatch_sam2_combine).
+    """
     import cv2, numpy as np, torch, shutil, tempfile
     ckpt = str(CK_ROOT / "sam2_weights" / "sam2.1_hiera_small.pt")
     cfg  = "configs/sam2.1/sam2.1_hiera_s.yaml"
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dur = out_f - in_f
 
-    # Map the absolute clicked frame to a range-relative index for the predictor.
-    # If the click was outside the range (or never recorded), anchor to frame 0.
-    if anchor_frame_abs is not None and in_f <= anchor_frame_abs < out_f:
-        anchor_rel = anchor_frame_abs - in_f
-    else:
-        anchor_rel = 0
+    # Map each object's absolute clicked frame to a range-relative index. If
+    # the click was outside the range (or never recorded), anchor to frame 0.
+    def _anchor_rel(frame_abs):
+        if frame_abs is not None and in_f <= frame_abs < out_f:
+            return frame_abs - in_f
+        return 0
+    anchor_rel = _anchor_rel(anchor_frame_abs)
+    anchor_rel_obj2 = _anchor_rel(anchor_frame_obj2_abs)
+
+    has_obj2 = bool(pos_pts_obj2) or bool(neg_pts_obj2)
+    active_obj_ids = [1] + ([2] if has_obj2 else [])
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="ck_sam2_frames_"))
     try:
@@ -945,16 +1089,36 @@ def run_sam2_video_propagation(fp, ss, cs, in_f, out_f, pos_pts, neg_pts, anchor
             _cap.release()
 
         # --- Load video predictor and propagate ---
-        log(f"SAM2 video: loading predictor, anchor=range-frame {anchor_rel} ...")
+        log(f"SAM2 video: loading predictor, anchor=range-frame {anchor_rel} (obj_ids={active_obj_ids})...")
         status("SAM2: loading video model...")
         from sam2.build_sam import build_sam2_video_predictor
-        predictor = build_sam2_video_predictor(cfg, ckpt, device=device)
+        # vos_optimized=True compiles the video model with torch.compile —
+        # Kimi research benchmarks: 2-3x speedup at 1080p with no quality
+        # change. Falls back gracefully on older SAM2 builds that don't
+        # accept the kwarg.
+        try:
+            predictor = build_sam2_video_predictor(cfg, ckpt, device=device, vos_optimized=True)
+            log("SAM2 video: vos_optimized=True (torch.compile)")
+        except TypeError:
+            predictor = build_sam2_video_predictor(cfg, ckpt, device=device)
+            log("SAM2 video: vos_optimized unsupported in this SAM2 build")
 
-        all_pts = ([[p[0], p[1]] for p in pos_pts] +
-                   [[p[0], p[1]] for p in neg_pts])
-        labs    = ([1] * len(pos_pts) + [0] * len(neg_pts))
+        # Per-object click sets — labels (1=positive, 0=negative).
+        obj_pts = {
+            1: ([[p[0], p[1]] for p in pos_pts] + [[p[0], p[1]] for p in neg_pts],
+                [1] * len(pos_pts) + [0] * len(neg_pts),
+                anchor_rel),
+        }
+        if has_obj2:
+            obj_pts[2] = (
+                [[p[0], p[1]] for p in (pos_pts_obj2 or [])] + [[p[0], p[1]] for p in (neg_pts_obj2 or [])],
+                [1] * len(pos_pts_obj2 or []) + [0] * len(neg_pts_obj2 or []),
+                anchor_rel_obj2,
+            )
 
-        masks = {}
+        # masks_per_obj[obj_id][frame_idx] = float32 mask. Combined per-frame
+        # at the end of propagation.
+        masks_per_obj = {oid: {} for oid in active_obj_ids}
         with torch.inference_mode():
             # offload_video_to_cpu keeps JPEG frames in RAM not VRAM — critical
             # because Resolve already uses 2-4 GB of VRAM on a working timeline.
@@ -972,14 +1136,20 @@ def run_sam2_video_propagation(fp, ss, cs, in_f, out_f, pos_pts, neg_pts, anchor
                 )
             finally:
                 sys.stdout = _ck_save_out
-            predictor.add_new_points_or_box(
-                inference_state=state,
-                frame_idx=anchor_rel,
-                obj_id=1,
-                points=np.array(all_pts, dtype=np.float32),
-                labels=np.array(labs,    dtype=np.int32),
-                clear_old_points=True,
-            )
+            # Register each object's prompts. Native multi-object via obj_id
+            # — one predictor, multiple trackers, single propagation pass.
+            for oid in active_obj_ids:
+                _pts, _labs, _anchor = obj_pts[oid]
+                if not _pts:
+                    continue
+                predictor.add_new_points_or_box(
+                    inference_state=state,
+                    frame_idx=_anchor,
+                    obj_id=oid,
+                    points=np.array(_pts, dtype=np.float32),
+                    labels=np.array(_labs, dtype=np.int32),
+                    clear_old_points=True,
+                )
 
             # --- Forward pass: anchor → last frame ---
             # DANGER ZONE FRAGILE: SAM2 propagate_in_video() is stateful — the backward
@@ -1004,87 +1174,78 @@ def run_sam2_video_propagation(fp, ss, cs, in_f, out_f, pos_pts, neg_pts, anchor
                 closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, _close_kernel)
                 return (closed.astype(np.float32) / 255.0)
 
+            def _store_propagated(frame_idx, _obj_ids_returned, mask_logits, direction):
+                """Convert per-object logits to float masks and stash in masks_per_obj."""
+                # mask_logits is shape [n_obj, 1, H, W]. _obj_ids_returned tells us
+                # which obj_id each row corresponds to (in active_obj_ids order).
+                for slot, oid in enumerate(_obj_ids_returned):
+                    if oid not in masks_per_obj:
+                        continue
+                    if direction == "backward" and frame_idx in masks_per_obj[oid]:
+                        # Forward pass already filled this frame for this obj — keep it.
+                        continue
+                    m = (mask_logits[slot] > 0.0).squeeze().cpu().numpy().astype(np.float32)
+                    if m.sum() < 100:
+                        masks_per_obj[oid][frame_idx] = m  # empty; resolved post-pass
+                    else:
+                        masks_per_obj[oid][frame_idx] = _bridge_holes(m)
+
             status("SAM2: forward pass...")
-            log(f"SAM2 video: forward pass (anchor={anchor_rel} → frame {dur-1})")
+            log(f"SAM2 video: forward pass (anchor={anchor_rel}, obj_ids={active_obj_ids} -> frame {dur-1})")
             forward_count = 0
-            forward_empty_frames = []  # frame indices where SAM2 returned empty
             for frame_idx, _obj_ids, mask_logits in predictor.propagate_in_video(state):
-                mask = (mask_logits[0] > 0.0).squeeze().cpu().numpy().astype(np.float32)
-                if mask.sum() < 100:
-                    # Empty frame — defer "collapse vs actor-exit" decision to
-                    # the post-pass step which has visibility across all frames.
-                    masks[frame_idx] = mask  # store empty; resolved below
-                    forward_empty_frames.append(frame_idx)
-                else:
-                    masks[frame_idx] = _bridge_holes(mask)
+                _store_propagated(frame_idx, list(_obj_ids), mask_logits, "forward")
                 forward_count += 1
                 if frame_idx % 20 == 0:
                     log(f"SAM2 forward: frame {frame_idx}/{dur}")
                     status(f"SAM2 forward: {frame_idx}/{dur} frames")
-            log(f"SAM2 forward pass done — {forward_count} masks "
-                f"({len(forward_empty_frames)} empty, resolved post-pass)")
+            log(f"SAM2 forward pass done — {forward_count} frames covered")
 
-            # --- Backward pass: anchor → first frame ---
-            # Only needed when the anchor is not the first frame. Frames already
-            # written by the forward pass are not overwritten (forward wins on overlap).
-            backward_empty_frames = []
-            if anchor_rel > 0:
+            # --- Backward pass ---
+            # Run if ANY object's anchor isn't frame 0 — single backward pass covers
+            # frames before any object's anchor. Forward results are preserved per-obj.
+            min_anchor = min(obj_pts[oid][2] for oid in active_obj_ids if obj_pts[oid][0])
+            if min_anchor > 0:
                 status("SAM2: backward pass...")
-                log(f"SAM2 video: backward pass (anchor={anchor_rel} → frame 0)")
+                log(f"SAM2 video: backward pass (min_anchor={min_anchor} -> frame 0)")
                 backward_count = 0
                 for frame_idx, _obj_ids, mask_logits in predictor.propagate_in_video(
                         state, reverse=True):
-                    if frame_idx not in masks:
-                        mask = (mask_logits[0] > 0.0).squeeze().cpu().numpy().astype(np.float32)
-                        if mask.sum() < 100:
-                            masks[frame_idx] = mask  # store empty; resolved post-pass
-                            backward_empty_frames.append(frame_idx)
-                        else:
-                            masks[frame_idx] = _bridge_holes(mask)
+                    _store_propagated(frame_idx, list(_obj_ids), mask_logits, "backward")
                     backward_count += 1
                     if frame_idx % 20 == 0:
                         log(f"SAM2 backward: frame {frame_idx}")
                         status(f"SAM2 backward: {frame_idx} frames")
-                log(f"SAM2 backward pass done — {backward_count} frames visited, "
-                    f"{sum(1 for k in masks if k < anchor_rel)} new masks added "
-                    f"({len(backward_empty_frames)} empty, resolved post-pass)")
+                log(f"SAM2 backward pass done — {backward_count} frames visited")
             else:
-                log("SAM2 video: anchor is frame 0 — backward pass skipped")
+                log("SAM2 video: every active object anchored at frame 0 — backward pass skipped")
 
-            # WHAT IT DOES: Resolves which empty frames are mid-range collapses
-            #   (fall back to NN-only via ones-mask) vs tail empties at the start
-            #   or end of the range (actor entering / leaving the frame — leave
-            #   empty so the call site's `mt = mt * gate` correctly zeros out
-            #   non-green set elements that would otherwise show through).
-            # DEPENDS-ON: masks dict populated by both forward and backward passes
-            # AFFECTS: masks dict — substitutes ones-mask for interior empty
-            #   frames; leaves tail empties unchanged.
-            # DANGER ZONE FRAGILE: do NOT substitute ones for ALL empty frames.
-            #   That re-introduces the "non-green set comes back at end of range"
-            #   regression seen on 2026-04-27 stunt clip after first quality-gate
-            #   fix.
-            sorted_frame_keys = sorted(masks.keys())
-            collapsed_count = 0
-            tail_empty_count = 0
-            if sorted_frame_keys:
-                first_substantial = next(
-                    (f for f in sorted_frame_keys if masks[f].sum() >= 100), None)
-                last_substantial = next(
-                    (f for f in reversed(sorted_frame_keys) if masks[f].sum() >= 100), None)
-                if first_substantial is not None and last_substantial is not None:
-                    for f in sorted_frame_keys:
-                        if masks[f].sum() >= 100:
-                            continue  # mask is real, leave alone
-                        if first_substantial <= f <= last_substantial:
-                            # Interior empty = mid-range tracking collapse → ones-mask
-                            masks[f] = np.ones_like(masks[f])
-                            collapsed_count += 1
-                        else:
-                            # Tail empty = actor not in frame → leave empty
-                            tail_empty_count += 1
-            log(f"SAM2 propagation post-pass: {collapsed_count} interior "
-                f"empties → NN-only fallback, {tail_empty_count} tail empties "
-                f"left empty (actor entering/leaving frame).")
+            # Per-object post-pass: resolve interior empties (mid-range
+            # tracking collapse → ones-mask, NN-only fallback) vs tail
+            # empties (actor not in frame → leave empty so call site's
+            # alpha*gate correctly zeroes the non-green set). Run the
+            # same logic per-object so MASK 1's collapse doesn't get filled
+            # by MASK 2's healthy frames and vice-versa.
+            for oid, m_dict in masks_per_obj.items():
+                sorted_keys = sorted(m_dict.keys())
+                collapsed_count = 0
+                tail_empty_count = 0
+                if sorted_keys:
+                    first_substantial = next(
+                        (f for f in sorted_keys if m_dict[f].sum() >= 100), None)
+                    last_substantial = next(
+                        (f for f in reversed(sorted_keys) if m_dict[f].sum() >= 100), None)
+                    if first_substantial is not None and last_substantial is not None:
+                        for f in sorted_keys:
+                            if m_dict[f].sum() >= 100:
+                                continue
+                            if first_substantial <= f <= last_substantial:
+                                m_dict[f] = np.ones_like(m_dict[f])
+                                collapsed_count += 1
+                            else:
+                                tail_empty_count += 1
+                log(f"SAM2 obj{oid} post-pass: {collapsed_count} interior empties -> NN fallback, "
+                    f"{tail_empty_count} tail empties left empty.")
 
             # reset_state releases SAM2's internal CUDA buffers before we drop
             # the predictor — prevents the GPU memory leak on Windows (issue #258).
@@ -1100,8 +1261,23 @@ def run_sam2_video_propagation(fp, ss, cs, in_f, out_f, pos_pts, neg_pts, anchor
         if torch.cuda.is_available():
             torch.cuda.synchronize()  # wait for GPU to finish before clearing cache
             torch.cuda.empty_cache()
-        log(f"SAM2 video propagation done — {len(masks)} masks")
-        return masks
+        # Combine per-object dicts into per-frame list of masks. Consumers
+        # iterate the list (single-element when only one obj was tracked).
+        masks_out = {}
+        all_frame_keys = set()
+        for m_dict in masks_per_obj.values():
+            all_frame_keys.update(m_dict.keys())
+        for f in sorted(all_frame_keys):
+            per_frame = []
+            for oid in active_obj_ids:
+                m = masks_per_obj[oid].get(f)
+                if m is not None:
+                    per_frame.append(m)
+            if per_frame:
+                masks_out[f] = per_frame
+        log(f"SAM2 video propagation done — {len(masks_out)} frames, "
+            f"{sum(len(v) for v in masks_out.values())} per-object masks")
+        return masks_out
 
     except Exception as e:
         log(f"SAM2 video propagation error: {e}")
@@ -2329,41 +2505,23 @@ def _key_one_scrub_frame():
             _s2_raw = _s2_masks[frame_idx]
             _s2_raw8 = (_s2_raw * 255).clip(0, 255).astype(_np.uint8)
             _cv2.imwrite(str(out_dir / "sam2_gate_raw.png"), _s2_raw8)
-            _gate = _dilate_sam2_mask(_s2_masks[frame_idx],
-                                      margin=ctx["settings"].get("sam2_margin", SAM2_MATTE_MARGIN))
-            _gate = _soften_sam2_mask(_gate, soften=ctx["settings"].get("sam2_soften", 0))
-            if _gate.shape != mt.shape:
-                _gate = _cv2.resize(_gate, (mt.shape[1], mt.shape[0]),
-                                    interpolation=_cv2.INTER_LINEAR)
-            from sam2_combine import apply_sam2_gate, apply_sam2_gate_additive, apply_sam2_gate_weighted, apply_sam2_gate_subtract, trim_gate_by_chroma, fill_holes_color_aware
-            _trim_chroma = int(ctx["settings"].get("trim_chroma", 0))
-            _fill_holes = int(ctx["settings"].get("fill_holes", 0))
-            _stype = ctx["settings"].get("screen_type", "green")
-            _sam2_additive = bool(ctx["settings"].get("sam2_additive", False))
-            _sam2_weighted = bool(ctx["settings"].get("sam2_weighted", False))
-            _sam2_subtract = bool(ctx["settings"].get("sam2_subtract", False))
-            _sam2_bypass = bool(ctx["settings"].get("sam2_bypass", False))
-            _edge_guard = int(ctx["settings"].get("edge_guard_px", 20))
-            if _sam2_bypass:
-                pass  # skip all SAM2 combine — keep mt as NN-only
-            elif _sam2_subtract:
-                _mt2d_s = mt[:, :, 0] if len(mt.shape) == 3 else mt
-                _fp_s = max(int(_edge_guard) // 2, 1)
-                mt = apply_sam2_gate_subtract(_mt2d_s, _gate, fr, _stype,
-                                              buffer_px=int(_edge_guard), feather_px=_fp_s)
-            elif _sam2_weighted:
-                _mt2d_w = mt[:, :, 0] if len(mt.shape) == 3 else mt
-                mt = apply_sam2_gate_weighted(_mt2d_w, _gate, fr, _stype)
-            elif _sam2_additive:
-                _mt2d_add = mt[:, :, 0] if len(mt.shape) == 3 else mt
-                mt = apply_sam2_gate_additive(_mt2d_add, _gate, fr, _stype)
-            else:
-                if _trim_chroma > 0:
-                    _gate = trim_gate_by_chroma(_gate, fr, _stype, _trim_chroma)
-                mt = apply_sam2_gate(mt, _gate, invert=False, halo_px=int(ctx["settings"].get("halo_px", 0)), halo_body_px=int(ctx["settings"].get("halo_body_px", 0)))
-                if _fill_holes > 0:
-                    _mt2d_fill = mt[:, :, 0] if len(mt.shape) == 3 else mt
-                    mt = fill_holes_color_aware(_mt2d_fill, _gate, fr, _stype, _fill_holes)
+            # Multi-object v0.8 — _s2_masks[frame_idx] is a list of per-obj
+            # masks (single-element list when video prop tracked one object).
+            # Each mask gets its own MARGIN / SOFTEN treatment, then runs
+            # through the unified combine + union helper.
+            _per_frame = _s2_masks[frame_idx]
+            if not isinstance(_per_frame, (list, tuple)):
+                _per_frame = [_per_frame]  # legacy single-mask compat
+            _gates_list = []
+            for _gm in _per_frame:
+                _gx = _dilate_sam2_mask(_gm, margin=ctx["settings"].get("sam2_margin", SAM2_MATTE_MARGIN))
+                _gx = _soften_sam2_mask(_gx, soften=ctx["settings"].get("sam2_soften", 0))
+                if _gx.shape != mt.shape[:2]:
+                    _gx = _cv2.resize(_gx, (mt.shape[1], mt.shape[0]),
+                                      interpolation=_cv2.INTER_LINEAR)
+                _gates_list.append(_gx)
+            if not bool(ctx["settings"].get("sam2_bypass", False)):
+                mt = _panel_dispatch_sam2_combine(mt, _gates_list, fr, ctx["settings"])
         if fg is not None and mt is not None:
             out_dir = ctx["scrub_dir"] / f"{frame_idx:03d}"
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -2585,9 +2743,12 @@ def on_scrub_range(ev):
     # DANGER ZONE HIGH: runs synchronously on main thread — adds ~20-60s for N frames on GPU.
     scrub_sam2_masks = {}
     if settings.get("alpha_method") == 1:
-        _pos = sam_points.get("positive", [])
-        _neg = sam_points.get("negative", [])
-        if _pos or _neg:
+        # Multi-object v0.8 — pass per-mask points so SAM2 tracks MASK 1 + MASK 2
+        # as native obj_id=1 / obj_id=2 in a single propagation pass.
+        _p1 = sam_points_per_obj[1]; _p2 = sam_points_per_obj[2]
+        _pos = _p1["positive"]; _neg = _p1["negative"]
+        _pos2 = _p2["positive"]; _neg2 = _p2["negative"]
+        if _pos or _neg or _pos2 or _neg2:
             import tempfile as _stmp2, shutil as _ssh2
             _sam_tmp = Path(_stmp2.mkdtemp(prefix="ck_sam2_scrub_"))
             try:
@@ -2601,17 +2762,20 @@ def on_scrub_range(ev):
                     _good_orig_idxs.append(_si2)
                 _n_good = len(_good_orig_idxs)
                 if _n_good > 0:
-                    _anch_abs = sam_points.get("frame")
-                    if _anch_abs is not None and sampled_tl_frames:
-                        _good_tl = [sampled_tl_frames[i] for i in _good_orig_idxs]
-                        _dists   = [abs(f - _anch_abs) for f in _good_tl]
-                        _anchor_rel = _dists.index(min(_dists))
-                    else:
-                        _anchor_rel = 0
+                    def _anchor_rel_for(anch_abs):
+                        if anch_abs is not None and sampled_tl_frames:
+                            _good_tl = [sampled_tl_frames[i] for i in _good_orig_idxs]
+                            _dists = [abs(f - anch_abs) for f in _good_tl]
+                            return _dists.index(min(_dists))
+                        return 0
+                    _anchor_rel = _anchor_rel_for(_p1["frame"])
+                    _anchor_rel_obj2 = _anchor_rel_for(_p2["frame"])
                     status("SAM2: propagating mask across scrub frames...")
-                    log(f"SAM2 scrub: {_n_good} frames, anchor_rel={_anchor_rel}")
+                    log(f"SAM2 scrub: {_n_good} frames, anchor_rel={_anchor_rel}, obj2={'yes' if (_pos2 or _neg2) else 'no'}")
                     _raw_masks = run_sam2_video_propagation(
                         str(_sam_tmp), 0, 0, 0, _n_good, _pos, _neg, _anchor_rel,
+                        pos_pts_obj2=_pos2, neg_pts_obj2=_neg2,
+                        anchor_frame_obj2_abs=_anchor_rel_obj2,
                     )
                     scrub_sam2_masks = {_good_orig_idxs[k]: v
                                         for k, v in _raw_masks.items()
@@ -2873,16 +3037,23 @@ def on_process_range(ev):
             _braw_sam2_video_masks = {}
             _braw_sam2_gate = None
             if settings.get("alpha_method") == 1:
-                pos = sam_points.get("positive", [])
-                neg = sam_points.get("negative", [])
-                if (pos or neg) and braw_frames_dir:
+                # Multi-object v0.8 — pass MASK 1 + MASK 2 click sets so SAM2
+                # video propagation tracks both natively in one pass.
+                _p1b = sam_points_per_obj[1]; _p2b = sam_points_per_obj[2]
+                pos = _p1b["positive"]; neg = _p1b["negative"]
+                pos2 = _p2b["positive"]; neg2 = _p2b["negative"]
+                if (pos or neg or pos2 or neg2) and braw_frames_dir:
                     try:
-                        _anchor_abs = sam_points.get("frame")
+                        _anchor_abs = _p1b["frame"]
                         _anchor_in_tif = (_anchor_abs - in_f) if _anchor_abs is not None else None
+                        _anchor_abs2 = _p2b["frame"]
+                        _anchor_in_tif2 = (_anchor_abs2 - in_f) if _anchor_abs2 is not None else None
                         status("SAM2: running video propagation for BRAW range...")
                         _braw_sam2_video_masks = run_sam2_video_propagation(
                             braw_frames_dir, 0, 0, 0, dur,
                             pos, neg, _anchor_in_tif,
+                            pos_pts_obj2=pos2, neg_pts_obj2=neg2,
+                            anchor_frame_obj2_abs=_anchor_in_tif2,
                         )
                         if _braw_sam2_video_masks:
                             log(f"SAM2 video propagation: {len(_braw_sam2_video_masks)} per-frame masks ready")
@@ -2897,10 +3068,11 @@ def on_process_range(ev):
                         _shape_pil = _PILImage.open(_braw_tif_buffers[0]).convert("RGB")
                         _shape_arr = np.array(_shape_pil)
                         _braw_tif_buffers[0].seek(0)
-                        _braw_sam2_gate = _load_sam2_output_gate(_shape_arr.shape, settings)
+                        # Multi-object v0.8 — list of per-mask static gates.
+                        _braw_sam2_gate = _load_per_object_sam2_gates(_shape_arr.shape, settings)
                         del _shape_arr, _shape_pil
-                        if _braw_sam2_gate is not None:
-                            log(f"SAM2 static gate loaded for BRAW — applying to all {dur} frames")
+                        if _braw_sam2_gate:
+                            log(f"SAM2 static {len(_braw_sam2_gate)} per-object gate(s) loaded for BRAW — applying to all {dur} frames")
                         else:
                             log("SAM2 gate: not loaded (file missing or alpha_method mismatch)")
                     except Exception as _ge:
@@ -2940,54 +3112,27 @@ def on_process_range(ev):
                 # DEPENDS-ON: _braw_sam2_video_masks (propagation), _braw_sam2_gate (fallback)
                 # AFFECTS: mt for this frame only
                 if mt is not None:
-                    from sam2_combine import apply_sam2_gate, apply_sam2_gate_additive, apply_sam2_gate_weighted, apply_sam2_gate_subtract, trim_gate_by_chroma, fill_holes_color_aware
-                    _halo_px = int(settings.get("halo_px", 0))
-                    _halo_body_px = int(settings.get("halo_body_px", 0))
-                    _trim_px = int(settings.get("trim_chroma", 0))
-                    _fill_px = int(settings.get("fill_holes", 0))
-                    _stype = settings.get("screen_type", "green")
-                    _sam2_additive = bool(settings.get("sam2_additive", False))
-                    _sam2_weighted = bool(settings.get("sam2_weighted", False))
-                    _sam2_subtract = bool(settings.get("sam2_subtract", False))
-                    _sam2_bypass = bool(settings.get("sam2_bypass", False))
-                    _edge_guard = int(settings.get("edge_guard_px", 20))
-                    _fp_eg = max(int(_edge_guard) // 2, 1)
-                    if _sam2_bypass:
-                        pass  # skip all SAM2 combine — keep mt as NN-only
-                    elif _braw_sam2_video_masks and fidx in _braw_sam2_video_masks:
-                        _gate = _dilate_sam2_mask(_braw_sam2_video_masks[fidx], margin=settings.get("sam2_margin", SAM2_MATTE_MARGIN))
-                        _gate = _soften_sam2_mask(_gate, soften=settings.get("sam2_soften", 0))
-                        _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
-                        if _sam2_subtract:
-                            mt = apply_sam2_gate_subtract(_mt2d, _gate, fr, _stype,
-                                                           buffer_px=int(_edge_guard), feather_px=_fp_eg)
-                        elif _sam2_weighted:
-                            mt = apply_sam2_gate_weighted(_mt2d, _gate, fr, _stype)
-                        elif _sam2_additive:
-                            mt = apply_sam2_gate_additive(_mt2d, _gate, fr, _stype)
-                        else:
-                            if _trim_px > 0:
-                                _gate = trim_gate_by_chroma(_gate, fr, _stype, _trim_px)
-                            mt = apply_sam2_gate(_mt2d, _gate, invert=False, halo_px=_halo_px, halo_body_px=_halo_body_px)
-                            if _fill_px > 0:
-                                mt = fill_holes_color_aware(mt, _gate, fr, _stype, _fill_px)
-                    elif _braw_sam2_gate is not None:
-                        _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
-                        if _sam2_subtract:
-                            mt = apply_sam2_gate_subtract(_mt2d, _braw_sam2_gate, fr, _stype,
-                                                           buffer_px=int(_edge_guard), feather_px=_fp_eg)
-                        elif _sam2_weighted:
-                            mt = apply_sam2_gate_weighted(_mt2d, _braw_sam2_gate, fr, _stype)
-                        elif _sam2_additive:
-                            mt = apply_sam2_gate_additive(_mt2d, _braw_sam2_gate, fr, _stype)
-                        else:
-                            if _trim_px > 0:
-                                _bgate = trim_gate_by_chroma(_braw_sam2_gate, fr, _stype, _trim_px)
-                            else:
-                                _bgate = _braw_sam2_gate
-                            mt = apply_sam2_gate(_mt2d, _bgate, invert=False, halo_px=_halo_px, halo_body_px=_halo_body_px)
-                            if _fill_px > 0:
-                                mt = fill_holes_color_aware(mt, _bgate, fr, _stype, _fill_px)
+                    # Multi-object v0.8 — gather per-object gates (video-prop
+                    # output is a list when multi-tracked; static fallback is
+                    # a list of per-object PNGs from the viewer). Run combine
+                    # per-mask and union the alphas.
+                    if not bool(settings.get("sam2_bypass", False)):
+                        _gates_list = []
+                        if _braw_sam2_video_masks and fidx in _braw_sam2_video_masks:
+                            _per = _braw_sam2_video_masks[fidx]
+                            if not isinstance(_per, (list, tuple)):
+                                _per = [_per]
+                            for _gm in _per:
+                                _gx = _dilate_sam2_mask(_gm, margin=settings.get("sam2_margin", SAM2_MATTE_MARGIN))
+                                _gx = _soften_sam2_mask(_gx, soften=settings.get("sam2_soften", 0))
+                                _gates_list.append(_gx)
+                        elif _braw_sam2_gate is not None:
+                            _per = _braw_sam2_gate
+                            if not isinstance(_per, (list, tuple)):
+                                _per = [_per]
+                            _gates_list.extend(_per)
+                        if _gates_list:
+                            mt = _panel_dispatch_sam2_combine(mt, _gates_list, fr, settings)
                 choke_px = int(settings.get("choke", 0))
                 if choke_px > 0 and mt is not None:
                     _k = choke_px * 2 + 1
@@ -3089,24 +3234,29 @@ def on_process_range(ev):
             # For BRAW, braw_frames_dir is the TIFF sequence directory — pass it so SAM2
             # gets full-chroma frames. Anchor frame shifts to TIFF index space (0-based).
             sam2_video_masks = {}
-            if (settings.get("alpha_method") == 1 and
-                    (sam_points.get("positive") or sam_points.get("negative"))):
+            # Multi-object v0.8 — pass per-mask click sets so SAM2 video tracks
+            # MASK 1 + MASK 2 independently as obj_id=1 / obj_id=2.
+            _p1r = sam_points_per_obj[1]; _p2r = sam_points_per_obj[2]
+            _has_pts = bool(_p1r["positive"] or _p1r["negative"] or _p2r["positive"] or _p2r["negative"])
+            if settings.get("alpha_method") == 1 and _has_pts:
                 _tlog(f"SAM2 mode — running video propagation for full range... braw_frames_dir={braw_frames_dir!r}")
                 if braw_frames_dir:
-                    _anchor_abs = sam_points.get("frame")
+                    _anchor_abs = _p1r["frame"]
                     _anchor_in_tif = (_anchor_abs - in_f) if _anchor_abs is not None else None
+                    _anchor_abs2 = _p2r["frame"]
+                    _anchor_in_tif2 = (_anchor_abs2 - in_f) if _anchor_abs2 is not None else None
                     sam2_video_masks = run_sam2_video_propagation(
                         braw_frames_dir, 0, 0, 0, dur,
-                        sam_points.get("positive", []),
-                        sam_points.get("negative", []),
-                        _anchor_in_tif,
+                        _p1r["positive"], _p1r["negative"], _anchor_in_tif,
+                        pos_pts_obj2=_p2r["positive"], neg_pts_obj2=_p2r["negative"],
+                        anchor_frame_obj2_abs=_anchor_in_tif2,
                     )
                 else:
                     sam2_video_masks = run_sam2_video_propagation(
                         fp, ss, cs, in_f, out_f,
-                        sam_points.get("positive", []),
-                        sam_points.get("negative", []),
-                        sam_points.get("frame"),
+                        _p1r["positive"], _p1r["negative"], _p1r["frame"],
+                        pos_pts_obj2=_p2r["positive"], neg_pts_obj2=_p2r["negative"],
+                        anchor_frame_obj2_abs=_p2r["frame"],
                     )
                 if sam2_video_masks:
                     _tlog(f"SAM2 video: {len(sam2_video_masks)} masks ready")
@@ -3188,64 +3338,30 @@ def on_process_range(ev):
                 #     handles Resolve-restart case where sam_points were lost but PNG still exists.
                 # DEPENDS-ON: sam2_video_masks, _static_sam2_gate, _load_sam2_output_gate
                 # AFFECTS: mt (alpha) — multiplied by gate, zeroing pixels outside the matte.
-                if mt is not None:
-                    from sam2_combine import apply_sam2_gate, apply_sam2_gate_additive, apply_sam2_gate_weighted, apply_sam2_gate_subtract, trim_gate_by_chroma, fill_holes_color_aware
-                    _halo_px = int(settings.get("halo_px", 0))
-                    _halo_body_px = int(settings.get("halo_body_px", 0))
-                    _trim_px = int(settings.get("trim_chroma", 0))
-                    _fill_px = int(settings.get("fill_holes", 0))
-                    _stype = settings.get("screen_type", "green")
-                    _sam2_additive = bool(settings.get("sam2_additive", False))
-                    _sam2_weighted = bool(settings.get("sam2_weighted", False))
-                    _sam2_subtract = bool(settings.get("sam2_subtract", False))
-                    _sam2_bypass = bool(settings.get("sam2_bypass", False))
-                    _edge_guard = int(settings.get("edge_guard_px", 20))
-                    _fp_eg = max(int(_edge_guard) // 2, 1)
-                    if _sam2_bypass:
-                        pass  # skip all SAM2 combine — keep mt as NN-only
-                    elif sam2_video_masks and range_idx in sam2_video_masks:
-                        # Normal path — per-frame mask from video propagation.
-                        _gate = _dilate_sam2_mask(sam2_video_masks[range_idx], margin=settings.get("sam2_margin", SAM2_MATTE_MARGIN))
-                        _gate = _soften_sam2_mask(_gate, soften=settings.get("sam2_soften", 0))
-                        _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
-                        if _sam2_subtract:
-                            mt = apply_sam2_gate_subtract(_mt2d, _gate, fr, _stype,
-                                                           buffer_px=int(_edge_guard), feather_px=_fp_eg)
-                        elif _sam2_weighted:
-                            mt = apply_sam2_gate_weighted(_mt2d, _gate, fr, _stype)
-                        elif _sam2_additive:
-                            mt = apply_sam2_gate_additive(_mt2d, _gate, fr, _stype)
-                        else:
-                            if _trim_px > 0:
-                                _gate = trim_gate_by_chroma(_gate, fr, _stype, _trim_px)
-                            mt = apply_sam2_gate(_mt2d, _gate, invert=False, halo_px=_halo_px, halo_body_px=_halo_body_px)
-                            if _fill_px > 0:
-                                mt = fill_holes_color_aware(mt, _gate, fr, _stype, _fill_px)
+                if mt is not None and not bool(settings.get("sam2_bypass", False)):
+                    # Multi-object v0.8 — gather per-mask gates (video-prop or
+                    # static fallback), run combine per-mask, union alphas.
+                    _gates_list = []
+                    if sam2_video_masks and range_idx in sam2_video_masks:
+                        _per = sam2_video_masks[range_idx]
+                        if not isinstance(_per, (list, tuple)):
+                            _per = [_per]
+                        for _gm in _per:
+                            _gx = _dilate_sam2_mask(_gm, margin=settings.get("sam2_margin", SAM2_MATTE_MARGIN))
+                            _gx = _soften_sam2_mask(_gx, soften=settings.get("sam2_soften", 0))
+                            _gates_list.append(_gx)
                     else:
-                        # Fallback path — static gate loaded lazily on first frame so we have
-                        # real frame.shape for the resize check inside _load_sam2_output_gate.
+                        # Fallback path — static per-object gates loaded lazily on
+                        # first frame so we have real frame.shape for the resize.
                         if not _static_sam2_gate_loaded:
-                            _static_sam2_gate = _load_sam2_output_gate(frame.shape, settings)
+                            _static_sam2_gate = _load_per_object_sam2_gates(frame.shape, settings)
                             _static_sam2_gate_loaded = True
-                            if _static_sam2_gate is not None:
-                                _tlog("SAM2 static gate loaded — applying same mask to all range frames (no propagation)")
-                        if _static_sam2_gate is not None:
-                            _mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
-                            if _sam2_subtract:
-                                mt = apply_sam2_gate_subtract(_mt2d, _static_sam2_gate, fr, _stype,
-                                                               buffer_px=int(_edge_guard), feather_px=_fp_eg)
-                            elif _sam2_weighted:
-                                mt = apply_sam2_gate_weighted(_mt2d, _static_sam2_gate, fr, _stype)
-                            elif _sam2_additive:
-                                mt = apply_sam2_gate_additive(_mt2d, _static_sam2_gate, fr, _stype)
-                            else:
-                                if _trim_px > 0:
-                                    _sgate = trim_gate_by_chroma(_static_sam2_gate, fr, _stype, _trim_px)
-                                else:
-                                    _sgate = _static_sam2_gate
-                                mt = apply_sam2_gate(_mt2d, _sgate, invert=False, halo_px=_halo_px, halo_body_px=_halo_body_px)
-                                if _fill_px > 0:
-                                    mt = fill_holes_color_aware(mt, _sgate, fr, _stype, _fill_px)
+                            if _static_sam2_gate:
+                                _tlog(f"SAM2 static {len(_static_sam2_gate)} per-object gate(s) — applying same mask to all range frames (no propagation)")
+                        if _static_sam2_gate:
+                            _gates_list.extend(_static_sam2_gate)
+                    if _gates_list:
+                        mt = _panel_dispatch_sam2_combine(mt, _gates_list, fr, settings)
                 choke_px = int(settings.get("choke", 0))
                 if choke_px > 0 and mt is not None:
                     k = choke_px * 2 + 1
