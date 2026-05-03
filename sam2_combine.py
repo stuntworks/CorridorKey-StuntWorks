@@ -1,7 +1,70 @@
 """SAM2 + NN alpha combine helper — single source of truth for the v1 INVERT plumbing."""
 from __future__ import annotations
 
+import os
+import shutil
+from pathlib import Path
+
 import numpy as np
+
+
+# ===== Multi-object migration shims (v0.8 multi-object SAM2) =====
+# Old single-mask sessions wrote sam_positive / sam_negative / sam_anchor_frame
+# in live_params.json and sam2_mask.png / sam2_gate_raw.png on disk. Multi-object
+# v0.8 namespaces everything per-object (obj1, obj2, ...). These shims translate
+# legacy artefacts into MASK 1 so existing sessions keep working.
+
+def migrate_legacy_sam_keys(lp: dict) -> dict:
+    """Translate legacy single-mask live_params keys into MASK 1 (obj1) keys.
+
+    Idempotent: if the obj1 keys already exist, leaves them alone. Returns a
+    SHALLOW COPY of lp with the obj1 keys filled in when legacy keys are
+    present. Original lp untouched.
+    """
+    if not isinstance(lp, dict):
+        return lp
+    out = dict(lp)
+    if "sam_positive" in lp and "sam_positive_obj1" not in lp:
+        out["sam_positive_obj1"] = lp.get("sam_positive", []) or []
+    if "sam_negative" in lp and "sam_negative_obj1" not in lp:
+        out["sam_negative_obj1"] = lp.get("sam_negative", []) or []
+    if "sam_anchor_frame" in lp and "sam_anchor_frame_obj1" not in lp:
+        out["sam_anchor_frame_obj1"] = lp.get("sam_anchor_frame")
+    if "sam_clicks" in lp and "sam_clicks_obj1" not in lp:
+        out["sam_clicks_obj1"] = lp.get("sam_clicks", []) or []
+    return out
+
+
+def migrate_legacy_sam_pngs(session_dir) -> None:
+    """Rename legacy single-mask PNGs to MASK 1 namespace.
+
+    sam2_mask.png        -> sam2_mask_obj1.png        (panel hardmask)
+    sam2_gate_raw.png    -> sam2_gate_raw_obj1.png    (viewer soft uint16 gate)
+
+    Idempotent: only migrates when the legacy file exists AND the new file does
+    not. Atomic: copies then unlinks the legacy file (so a crash mid-migration
+    leaves the legacy file intact for the next attempt). Silent on errors;
+    callers may still hit a missing file but won't crash.
+    """
+    try:
+        sd = Path(session_dir)
+    except Exception:
+        return
+    if not sd.exists():
+        return
+    pairs = (
+        ("sam2_mask.png", "sam2_mask_obj1.png"),
+        ("sam2_gate_raw.png", "sam2_gate_raw_obj1.png"),
+    )
+    for old_name, new_name in pairs:
+        old_p = sd / old_name
+        new_p = sd / new_name
+        if old_p.exists() and not new_p.exists():
+            try:
+                shutil.copy2(str(old_p), str(new_p))
+                old_p.unlink()
+            except Exception:
+                pass
 
 
 def trim_gate_by_chroma(gate: np.ndarray, source_rgb: np.ndarray, screen_type: str = "green", strength: int = 0) -> np.ndarray:
