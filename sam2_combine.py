@@ -225,100 +225,112 @@ def apply_sam2_gate_weighted(alpha, gate, source_rgb, screen_type='green', feath
 
 
 def apply_sam2_gate_subtract(alpha, gate, source_rgb=None, screen_type='green',
-                             buffer_px=8, feather_px=4):
-    """Connected-component SUBTRACT — keep NN-FG blobs that overlap SAM2.
+                             buffer_px=20, feather_px=4, halo_px=0,
+                             dilate_into=None):
+    """SUBTRACT — alpha * dilated SAM2 silhouette. The simple multiply.
 
-    ARCHITECTURE 2026-05-03 (geometry-based, replaces distance-based):
+    NN already gives a clean alpha matte where green exists. SAM2 is only
+    needed to define the subject region where green doesn't exist (walls,
+    props, crew, furniture). Multiply NN by a softened keep-zone built from
+    the SAM2 silhouette dilated by `buffer_px`. NN values pass through
+    verbatim inside; fade smoothly to zero outside.
 
-    The previous chroma/distance-based SUBTRACT couldn't kill junk that sits
-    AGAINST the greenscreen — cables in front of green, tracking marks ON
-    green, wall corners flush with green drape. Every distance-based scheme
-    sees those at distance ~0 from green and protects them like hair fringe.
+    This is the standard VFX garbage-matte combine — Nuke + Keylight + RotoPaint,
+    Mocha Pro, Primatte, Silhouette FX all do alpha * roto_or_segmentation_mask.
+    CorridorKey replaces the roto artist with SAM2; the combine is unchanged.
 
-    Geometry signal that DOES distinguish hair from cable: hair is part of
-    the actor's connected NN-FG blob; cable is its own separate blob. We
-    label NN-FG blobs, keep the ones that overlap SAM2's silhouette, kill
-    the rest.
+    Per-mask dispatch (body + feet) handled upstream by _combine_one_mask;
+    union via union_alpha. Each mask's keep-zone is independent.
 
-    Pixel walk on Berto's stunt-vest clip:
-      - Actor body / hair / butt / fingers (one big NN-FG blob, overlaps
-        SAM2 silhouette) → keep, full NN matte preserved
-      - Tracking marks +/× on greenscreen (small isolated blobs, no overlap
-        with SAM2) → killed
-      - Black cable across greenscreen (separate blob, no SAM2 overlap)
-        → killed
-      - Wall corner top-left (separate blob, no SAM2 overlap) → killed
-      - Lift base bottom-left (separate blob, no SAM2 overlap) → killed
-
-    buffer_px (EDGE GUARD): pixels of dilation around kept blobs to recover
-        soft-edge values (hair fringe at alpha<0.10 that wouldn't be in the
-        binary blob). Larger = more soft-edge survives; smaller = tighter cut.
-    feather_px: Gaussian width of the kill / keep boundary.
-    source_rgb / screen_type: signature kept for callsite compatibility.
-        Geometry-based logic doesn't need them; ignored.
-
-    SAM2 gate is binarized at 0.5 to define the silhouette used for blob
-    overlap testing. The soft-edge gate is no longer used for the kill
-    multiplier — keep_mask drives the result instead.
+    buffer_px (EDGE GUARD): isotropic dilation pixels around SAM2 silhouette.
+        Default 20. Slider 0-60 upstream. Hair / butt / fingertips within
+        this distance of the silhouette survive. Beyond that they die — user
+        cranks the slider for hair-heavy / motion-blur shots, drops it for
+        tight cuts. Per-frame keyframing is a future feature.
+    feather_px: Gaussian sigma for the keep-zone boundary so the cut isn't
+        a hard pixel cliff.
+    halo_px (HALO FEET in SUBTRACT mode):
+        < 0: SHRINK silhouette upward from the bottom edge by |halo_px|
+             rows BEFORE EDGE GUARD dilates. Effect: dilation extends only
+             the body, not the feet area — kills the "puffy feet halo"
+             when EDGE GUARD is large for hair / butt recovery.
+        > 0: ignored (positive HALO FEET only meaningful for the OFF-mode
+             apply_sam2_gate; SUBTRACT mode doesn't extend silhouette down).
+        = 0: silhouette used as-is (default behavior).
+    source_rgb / screen_type: signature kept for back-compat; ignored.
 
     Edge cases:
-      - SAM2 silhouette empty / no NN-FG blob overlaps it: degrade to
-        multiplicative (alpha * SAM2 gate) so the user still gets a sane
-        cut.
-      - Junk that physically touches the actor in NN's alpha: would join
-        the actor's blob and survive. Rare in greenscreen footage where
-        green pixels separate the actor from junk; if it happens the user
-        should mark it with a SAM2 negative dot or rely on a future
-        morphological-erosion safety pass.
+      - gate is None → return alpha unchanged.
+      - gate empty (all zeros) → keep-zone empty → output is alpha * 0.
+        Correct: empty silhouette means SAM2 produced nothing, nothing
+        should survive in SUBTRACT mode.
+      - buffer_px=0 → no dilation; raw silhouette + feather.
+      - buffer_px=60 (slider max) → ~95ms on 1080p.
+
+    HISTORY: see corridorkey_subtract_is_simple_multiply.md memory entry.
+    Three weeks of topology / chroma / two-threshold / geodesic variants
+    were rejected by Berto. This is what he asked for from day one.
     """
     if gate is None:
         return alpha
     import cv2 as _cv2
-    gate_bin_uint = (gate > 0.5).astype(np.uint8)
-    gate_bin_soft = _cv2.GaussianBlur(gate_bin_uint.astype(np.float32),
-                                      (11, 11), 2.5)
-    # NN-FG binary at a low threshold so soft hair / motion-blur edges land
-    # in the same blob as the body. 0.10 catches typical hair fringe values
-    # (0.2-0.6) without flooding into pure-green pixels (alpha < 0.05).
-    nn_fg = (alpha > 0.10).astype(np.uint8)
-    if int(nn_fg.sum()) == 0:
-        # Nothing to keep — fall back to legacy multiplicative.
-        return (alpha * gate_bin_soft).astype(alpha.dtype, copy=False)
-    # Connected components on NN-FG. Label 0 is background.
-    n_lab, labels, stats, _ = _cv2.connectedComponentsWithStats(nn_fg, connectivity=8)
-    sam2_bool = gate_bin_uint.astype(bool)
-    keep_mask = np.zeros_like(nn_fg)
-    for i in range(1, n_lab):
-        component_pixels = (labels == i)
-        component_size = int(component_pixels.sum())
-        if component_size == 0:
-            continue
-        overlap = int(np.count_nonzero(component_pixels & sam2_bool))
-        # Keep if the blob has any meaningful SAM2 overlap. The threshold of
-        # max(50, 5% of blob size) tolerates SAM2 silhouettes that don't
-        # cover the full actor (e.g. SAM2 only catches torso, not hair).
-        if overlap >= max(50, int(component_size * 0.05)):
-            keep_mask[component_pixels] = 1
-    # If no blob overlapped SAM2 (user error: SAM2 silhouette empty or
-    # off-mark), degrade to multiplicative so the user still sees something
-    # sensible instead of an entirely black matte.
-    if int(keep_mask.sum()) == 0:
-        return (alpha * gate_bin_soft).astype(alpha.dtype, copy=False)
-    # EDGE GUARD: dilate keep_mask outward so hair fringe (alpha 0.05-0.10
-    # that fell below the nn_fg threshold) and motion-blur tails get
-    # included. Without this, hair just past the binary blob edge dies.
-    bp = max(int(buffer_px), 0)
-    if bp > 0:
-        kb = bp * 2 + 1
-        kernel = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (kb, kb))
-        keep_mask = _cv2.dilate(keep_mask, kernel)
-    # Soft feather at the keep_mask boundary so the cut isn't a hard pixel
-    # cliff. Mirrors the Gaussian feather the legacy SUBTRACT used.
-    keep_soft = keep_mask.astype(np.float32)
+
+    margin_px = max(int(buffer_px), 0)
     fp = max(int(feather_px), 1)
-    if fp > 0:
-        ksize = fp * 2 + 1
-        keep_soft = _cv2.GaussianBlur(keep_soft, (ksize, ksize), float(fp) / 2.0)
+
+    sam2_bin = (gate > 0.5).astype(np.uint8)
+
+    # HALO FEET negative — shrink silhouette from bottom-of-bbox before
+    # dilating, so EDGE GUARD's body margin doesn't extend down into the
+    # floor area. Only erodes within the bottom |halo_px| rows of the
+    # silhouette's bbox so arms / upper body aren't globally eroded.
+    if halo_px and halo_px < 0:
+        h_neg = abs(int(halo_px))
+        ys = np.where(sam2_bin > 0)[0]
+        if len(ys) > 0:
+            bbox_bottom = int(ys.max())
+            feet_zone_top = max(0, bbox_bottom - h_neg + 1)
+            kn = h_neg * 2 + 1
+            erode_kernel = np.zeros((kn, 1), dtype=np.uint8)
+            erode_kernel[h_neg:, 0] = 1  # bottom-half + center → erodes upward
+            eroded = _cv2.erode(sam2_bin, erode_kernel)
+            sam2_bin = sam2_bin.copy()
+            sam2_bin[feet_zone_top:bbox_bottom + 1, :] = (
+                eroded[feet_zone_top:bbox_bottom + 1, :]
+            )
+
+    if margin_px > 0:
+        kernel = _cv2.getStructuringElement(
+            _cv2.MORPH_ELLIPSE, (2 * margin_px + 1, 2 * margin_px + 1))
+        dilated = _cv2.dilate(sam2_bin, kernel)
+        # The DILATION extension (pixels added by dilate, not in silhouette):
+        # restricted by dilate_into so EDGE GUARD only grows into the right
+        # type of region. Berto's stunt-vest clip: MASK 1 over body should
+        # extend into hair (low-alpha green-screen pixels) but NOT into the
+        # floor below the knees (high-alpha non-green pixels). MASK 2 over
+        # feet should extend into floor/wall (high-alpha non-green) but NOT
+        # back up into green-screen area (low-alpha) above MASK 1's territory.
+        if dilate_into in ("low_alpha", "high_alpha"):
+            extension = (dilated & ~sam2_bin).astype(np.uint8)
+            if dilate_into == "low_alpha":
+                # MASK 1: extend into hair / motion blur / green-screen
+                # (alpha < 0.50). Don't extend into wall/floor (alpha >= 0.50).
+                allowed = (alpha < 0.50).astype(np.uint8)
+            else:  # high_alpha
+                # MASK 2: extend into wall/floor (alpha >= 0.30). Don't extend
+                # back into green-screen area (alpha < 0.30) where MASK 1 owns.
+                allowed = (alpha >= 0.30).astype(np.uint8)
+            extension = extension & allowed
+            keep_zone = sam2_bin | extension
+        else:
+            # Single-mask / back-compat — full dilation, no chroma restriction.
+            keep_zone = dilated
+    else:
+        keep_zone = sam2_bin
+
+    ksize = fp * 2 + 1
+    keep_soft = _cv2.GaussianBlur(keep_zone.astype(np.float32),
+                                  (ksize, ksize), float(fp) / 2.0)
     result = alpha * keep_soft
     return np.clip(result, 0.0, 1.0).astype(alpha.dtype, copy=False)
 

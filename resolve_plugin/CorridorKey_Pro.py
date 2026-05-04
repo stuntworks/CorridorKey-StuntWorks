@@ -497,13 +497,21 @@ def get_settings():
         # both are checked. Default False = bit-identical to prior render.
         # Viewer-owned; overridden by _merge_live_params.
         "sam2_weighted": False,
-        # SAM2 SUBTRACT: NN matte preserved in green zones; SAM2 only kills in
-        # non-green regions past the EDGE GUARD buffer. Wins over
-        # sam2_weighted/sam2_additive when toggled. Default False = bit-identical.
+        # SAM2 SUBTRACT: alpha * dilated_SAM2_silhouette. Industry-standard
+        # garbage-matte combine. NN owns matte values; SAM2 owns spatial
+        # bounds; everything outside dilated silhouette killed.
         "sam2_subtract": False,
-        # EDGE GUARD: distance (px) past green edge before SAM2 may kill.
-        # Feather auto-set to half this value. Default 8 px.
+        # EDGE GUARD: isotropic dilation pixels around SAM2 silhouette.
+        # Higher = recovers hair / butt curve SAM2 cut tight. Default 20.
+        # In multi-mask mode, applies to MASK 1 (body / on-green parts).
         "edge_guard_px": 20,
+        # FEET GUARD: per-mask margin override for MASK 2 (off-green parts —
+        # feet on floor, body against wall). Smaller default so the keep-zone
+        # doesn't pillow into non-green junk. Single-mask sessions ignore.
+        "feet_guard_px": 5,
+        # FEET SOFTEN: MASK 2-only Gaussian sigma. Softens the feet edge
+        # without affecting the body. Default 0 = off.
+        "feet_soften": 0.0,
         # SAM2 BYPASS: master switch — when True, all SAM2 paths skipped.
         "sam2_bypass": False,
     }
@@ -610,7 +618,13 @@ def _merge_live_params(settings):
                 except (ValueError, TypeError):
                     pass
         if "edge_guard_px" in lp:
-            try: out["edge_guard_px"] = max(0, min(200, int(lp["edge_guard_px"])))
+            try: out["edge_guard_px"] = max(0, min(60, int(lp["edge_guard_px"])))
+            except: pass
+        if "feet_guard_px" in lp:
+            try: out["feet_guard_px"] = max(0, min(60, int(lp["feet_guard_px"])))
+            except (ValueError, TypeError): pass
+        if "feet_soften" in lp:
+            try: out["feet_soften"] = max(0.0, min(20.0, float(lp["feet_soften"])))
             except (ValueError, TypeError): pass
         if "sam2_bypass" in lp:
             _bv = lp["sam2_bypass"]
@@ -774,10 +788,25 @@ def _panel_combine_one_mask(alpha, gate, src_rgb, settings):
     a2d = alpha[:, :, 0] if alpha.ndim == 3 else alpha
     if sam2_subtract:
         fp = max(int(edge_guard_px) // 2, 1)
-        return apply_sam2_gate_subtract(a2d, gate, src_rgb,
-                                        screen_type=stype,
-                                        buffer_px=int(edge_guard_px),
-                                        feather_px=fp)
+        _di = settings.get("_dilate_into", None)
+        out = apply_sam2_gate_subtract(a2d, gate, src_rgb,
+                                       screen_type=stype,
+                                       buffer_px=int(edge_guard_px),
+                                       feather_px=fp,
+                                       halo_px=int(halo_px),
+                                       dilate_into=_di)
+        # FILL HOLES post-pass — fills NN dropouts in harness/clothing inside
+        # the keep-zone for non-green pixels. Mirrors viewer's _combine_one_mask.
+        if fill_holes > 0 and src_rgb is not None:
+            _bin = (gate > 0.5).astype(np.uint8)
+            _bp = max(int(edge_guard_px), 0)
+            if _bp > 0:
+                _kk = cv2.getStructuringElement(
+                    cv2.MORPH_ELLIPSE, (2 * _bp + 1, 2 * _bp + 1))
+                _bin = cv2.dilate(_bin, _kk)
+            out = fill_holes_color_aware(out, _bin.astype(np.float32),
+                                         src_rgb, stype, fill_holes)
+        return out
     if sam2_weighted:
         return apply_sam2_gate_weighted(a2d, gate, src_rgb, screen_type=stype)
     if sam2_additive:
@@ -810,22 +839,53 @@ def _panel_combine_one_mask(alpha, gate, src_rgb, settings):
 def _panel_dispatch_sam2_combine(alpha, gates, src_rgb, settings, obj_ids=None):
     if not gates:
         return alpha
+    import cv2, numpy as np
     from sam2_combine import union_alpha
+    # Auto-clip MASK 1 by MASK 2 (with a 10-px dilation buffer) so EDGE GUARD
+    # on MASK 1 cannot bleed into MASK 2's territory. Keeps the feet tight
+    # under FEET GUARD even when MASK 1's body silhouette includes feet from
+    # SAM2's segmentation. Mirrors the viewer's render_composite path.
+    if obj_ids is not None and len(gates) == 2:
+        _g_map = {obj_ids[i]: gates[i] for i in range(len(gates))}
+        if 1 in _g_map and 2 in _g_map:
+            _m1, _m2 = _g_map[1], _g_map[2]
+            if _m2.shape != _m1.shape:
+                _m2 = cv2.resize(_m2, (_m1.shape[1], _m1.shape[0]),
+                                 interpolation=cv2.INTER_LINEAR)
+            _ck_p = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
+            _m2_excl = cv2.dilate((_m2 > 0.5).astype(np.uint8),
+                                  _ck_p).astype(np.float32)
+            _g_map[1] = _m1 * (1.0 - _m2_excl)
+            gates = [_g_map[obj_ids[i]] for i in range(len(gates))]
     per_mask = []
     n_active = len(gates)
     halo_px_user = int(settings.get("halo_px", 0))
     halo_body_user = int(settings.get("halo_body_px", 0))
+    edge_guard_user = int(settings.get("edge_guard_px", 20))
+    feet_guard_user = int(settings.get("feet_guard_px", 5))
+    feet_soften_user = float(settings.get("feet_soften", 0))
     for i, g in enumerate(gates):
         oid = obj_ids[i] if (obj_ids is not None and i < len(obj_ids)) else None
         if oid is not None and n_active > 1:
             local = dict(settings)
-            # MASK 1 owns HALO BODY; MASK 2 owns HALO FEET. Other halos zero
-            # out so each mask only acts in its own domain.
+            # MASK 1 owns HALO BODY + EDGE GUARD (body / on-green parts).
+            # MASK 2 owns HALO FEET + FEET GUARD (off-green parts).
             local["halo_body_px"] = halo_body_user if oid == 1 else 0
             local["halo_px"] = halo_px_user if oid == 2 else 0
+            local["edge_guard_px"] = edge_guard_user if oid == 1 else feet_guard_user
         else:
             local = settings
-        per_mask.append(_panel_combine_one_mask(alpha, g, src_rgb, local))
+        a_n = _panel_combine_one_mask(alpha, g, src_rgb, local)
+        # Per-mask SOFTEN: MASK 2 only when multi-mask. Mirrors viewer logic.
+        if n_active > 1 and oid == 2 and feet_soften_user > 0:
+            import cv2 as _cv2
+            _sigma = float(feet_soften_user)
+            _k = int(_sigma * 6) | 1
+            if _k < 3:
+                _k = 3
+            a_n = _cv2.GaussianBlur(a_n, (_k, _k),
+                                    sigmaX=_sigma, sigmaY=_sigma)
+        per_mask.append(a_n)
     out = union_alpha(*per_mask)
     return out if out is not None else alpha
 

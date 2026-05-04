@@ -45,6 +45,28 @@ from PySide6 import QtWidgets, QtGui, QtCore
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from sam2_combine import apply_sam2_gate, apply_sam2_gate_additive, apply_sam2_gate_weighted, apply_sam2_gate_subtract, trim_gate_by_chroma, fill_holes_color_aware, union_alpha, union_sam2_gates
 
+
+# Build tag: short SHA + commit date, computed once at import. Stamped into
+# the viewer window title and bottom-right of the status bar so screenshots
+# tell us which build is running without having to ask the user.
+def _compute_build_tag() -> str:
+    try:
+        import subprocess
+        repo = str(Path(__file__).resolve().parent.parent)
+        sha = subprocess.check_output(
+            ["git", "-C", repo, "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.DEVNULL, timeout=2,
+        ).decode().strip()
+        date = subprocess.check_output(
+            ["git", "-C", repo, "log", "-1", "--format=%cd", "--date=format:%m-%d %H:%M"],
+            stderr=subprocess.DEVNULL, timeout=2,
+        ).decode().strip()
+        return f"build {sha} ({date})"
+    except Exception:
+        return "build dev"
+
+_BUILD_TAG = _compute_build_tag()
+
 # WHAT IT DOES: Installs diagnostic crash / exception loggers as early as possible.
 #   faulthandler dumps Python tracebacks on native signals (SIGSEGV, stack overflow,
 #   access violations that Windows translates into exit code 0xC0000409 etc). The
@@ -445,18 +467,36 @@ def _combine_one_mask(alpha_raw, gate, src_rgb, *,
                       sam2_subtract: bool, sam2_weighted: bool, sam2_additive: bool,
                       halo_px: int, halo_body_px: int, edge_guard_px: int,
                       trim_chroma: int, fill_holes: int,
-                      screen_type: str = "green"):
+                      screen_type: str = "green",
+                      dilate_into: str = None):
     if sam2_subtract:
-        # SUBTRACT mode: NN owns the matte everywhere green exists. SAM2 only
-        # permitted to kill in non-green zones. Hair / fine detail in green
-        # territory protected by the buffer + feather distance ramp. Wins over
-        # weighted/additive when toggled. trim/fill_holes/halo intentionally
-        # not applied — SUBTRACT semantics are independent of gate-shape ops.
+        # SUBTRACT mode: NN owns the matte. SAM2 silhouette + EDGE GUARD margin
+        # gates the keep-zone. HALO FEET (when negative) erodes the silhouette
+        # bottom BEFORE dilation. FILL HOLES (post-pass) fills NN dropouts
+        # inside the keep-zone for non-green pixels — fixes harness holes /
+        # clothing dropouts where NN miskeyed body interior.
         _fp = max(int(edge_guard_px) // 2, 1)
-        return apply_sam2_gate_subtract(alpha_raw, gate, src_rgb,
-                                        screen_type=screen_type,
-                                        buffer_px=int(edge_guard_px),
-                                        feather_px=_fp)
+        out = apply_sam2_gate_subtract(alpha_raw, gate, src_rgb,
+                                       screen_type=screen_type,
+                                       buffer_px=int(edge_guard_px),
+                                       feather_px=_fp,
+                                       halo_px=int(halo_px),
+                                       dilate_into=dilate_into)
+        if fill_holes > 0 and src_rgb is not None:
+            # Build the binary keep-zone the same way apply_sam2_gate_subtract
+            # did (silhouette dilated by buffer_px) and use it as the
+            # fill_holes_color_aware "gate" so fills only happen INSIDE the
+            # keep-zone, never outside.
+            import cv2 as _cv2
+            _bin = (gate > 0.5).astype(np.uint8)
+            _bp = max(int(edge_guard_px), 0)
+            if _bp > 0:
+                _kk = _cv2.getStructuringElement(
+                    _cv2.MORPH_ELLIPSE, (2 * _bp + 1, 2 * _bp + 1))
+                _bin = _cv2.dilate(_bin, _kk)
+            out = fill_holes_color_aware(out, _bin.astype(np.float32),
+                                         src_rgb, screen_type, fill_holes)
+        return out
     if sam2_weighted:
         # SMART BLEND: per-pixel weighted combine — NN trusted in green
         # regions, gate trusted off-green. Boundary smoothed by chroma weight.
@@ -510,6 +550,8 @@ def render_composite(cu, session: Session, params: dict):
     sam2_subtract = bool(params.get("sam2_subtract", False))
     sam2_bypass = bool(params.get("sam2_bypass", False))
     edge_guard_px = int(params.get("edge_guard_px", 20))
+    feet_guard_px = int(params.get("feet_guard_px", 5))
+    feet_soften = float(params.get("feet_soften", 0))
     # Multi-object v0.8 — collect every per-mask gate (paired with obj_id)
     # and run the combine pipeline ONCE PER MASK, then union the per-mask
     # alphas. Per-mask is the correct contract for HALO operations
@@ -523,6 +565,37 @@ def render_composite(cu, session: Session, params: dict):
                        if session.sam2_gates.get(oid) is not None]
     if session.alpha_raw is not None and _per_mask_pairs and not sam2_bypass:
         _src_rgb = session.original_rgb if session.original_rgb is not None else session.fg_rgb
+        # Symmetric auto-clip for two-mask sessions:
+        #   MASK 1 - MASK 2 (with 10 px dilation buffer): EDGE GUARD on body
+        #     mask cannot bleed into MASK 2's feet/off-green territory.
+        #   MASK 2 - is_green (chroma test on source RGB): MASK 2 only acts
+        #     where there is NO green-screen behind. Anything going into green
+        #     is cut from MASK 2 — keeps it confined to off-green zones (floor,
+        #     wall, props) so EDGE GUARD on MASK 1 owns the body-on-green area
+        #     uncontested. Yellow-shirt safe (chroma on background, not on FG).
+        if len(_per_mask_pairs) == 2:
+            _gates_by_oid = {oid: g for oid, g in _per_mask_pairs}
+            m1, m2 = _gates_by_oid.get(1), _gates_by_oid.get(2)
+            if m1 is not None and m2 is not None:
+                if m2.shape != m1.shape:
+                    m2 = cv2.resize(m2, (m1.shape[1], m1.shape[0]),
+                                    interpolation=cv2.INTER_LINEAR)
+                # MASK 1 - MASK 2 (dilated)
+                _clip_buf = 10
+                _ck = cv2.getStructuringElement(
+                    cv2.MORPH_ELLIPSE, (_clip_buf * 2 + 1, _clip_buf * 2 + 1))
+                m2_excl = cv2.dilate(
+                    (m2 > 0.5).astype(np.uint8), _ck).astype(np.float32)
+                _gates_by_oid[1] = m1 * (1.0 - m2_excl)
+                # MASK 2 - is_green (source-chroma test)
+                if _src_rgb is not None and _src_rgb.shape[:2] == m2.shape:
+                    _chroma_g = (_src_rgb[..., 1].astype(np.float32) -
+                                 np.maximum(_src_rgb[..., 0],
+                                            _src_rgb[..., 2]).astype(np.float32))
+                    _is_green = (_chroma_g > 0.05).astype(np.float32)
+                    _gates_by_oid[2] = m2 * (1.0 - _is_green)
+            _per_mask_pairs = [(oid, _gates_by_oid[oid])
+                               for oid, _ in _per_mask_pairs]
         _per_mask_alphas = []
         _n_active = len(_per_mask_pairs)
         for _oid, _gate_n in _per_mask_pairs:
@@ -533,18 +606,31 @@ def render_composite(cu, session: Session, params: dict):
             if _n_active > 1:
                 _h_body = halo_body_px if _oid == 1 else 0
                 _h_feet = halo_px if _oid == 2 else 0
+                # Per-mask margin: MASK 1 = EDGE GUARD (body, generous for
+                # hair/butt). MASK 2 = FEET GUARD (off-green, tight). The
+                # MASK 1 - MASK 2 auto-clip above already removed MASK 2's
+                # area from MASK 1, so EDGE GUARD's dilation can't pillow
+                # into floor — no extra alpha filter needed (would kill butt).
+                _eg = edge_guard_px if _oid == 1 else feet_guard_px
             else:
                 _h_body = halo_body_px
                 _h_feet = halo_px
-            _per_mask_alphas.append(_combine_one_mask(
+                _eg = edge_guard_px
+            _per_mask_alpha = _combine_one_mask(
                 session.alpha_raw, _gate, _src_rgb,
                 sam2_subtract=sam2_subtract,
                 sam2_weighted=sam2_weighted,
                 sam2_additive=sam2_additive,
                 halo_px=_h_feet, halo_body_px=_h_body,
-                edge_guard_px=edge_guard_px,
+                edge_guard_px=_eg,
                 trim_chroma=trim_chroma, fill_holes=fill_holes,
-            ))
+            )
+            # Per-mask SOFTEN: MASK 2 (feet) gets its own softening so the
+            # user can blur the feet edge without affecting the body. Applied
+            # BEFORE union so it only operates on MASK 2's contribution.
+            if _n_active > 1 and _oid == 2 and feet_soften > 0:
+                _per_mask_alpha = _soften_mask(_per_mask_alpha, feet_soften)
+            _per_mask_alphas.append(_per_mask_alpha)
         alpha = union_alpha(*_per_mask_alphas)
         if sam2_margin > 0:
             alpha = _dilate_mask(alpha, sam2_margin)
@@ -671,7 +757,7 @@ class PersistentWindow(QtWidgets.QWidget):
         super().__init__()
         self.cu = cu
         self.session = session
-        self.setWindowTitle("CorridorKey Live Preview")
+        self.setWindowTitle(f"CorridorKey Live Preview — {_BUILD_TAG}")
         self.setStyleSheet(_DARK_STYLE)
         # Stay above the NLE so the user never loses the preview behind the host
         # window. Editors bounce between tools; a hidden preview window defeats
@@ -748,10 +834,15 @@ class PersistentWindow(QtWidgets.QWidget):
             # SHOW SAM2: viewer-only overlay (cyan outline of SAM2 silhouette
             # over the matte/composite view). Does not affect rendered output.
             "show_sam2": False,
-            # EDGE GUARD: distance in pixels past the green edge before SAM2
-            # may begin to kill (buffer). Feather is auto-set to half this
-            # value. Default 8 px works for typical 1080p stunt footage.
+            # EDGE GUARD: MASK 1 (body / on-green) margin in SUBTRACT mode.
+            # Feather auto-set to half. Default 20 for hair / butt recovery.
             "edge_guard_px": 20,
+            # FEET GUARD: MASK 2 (off-green) margin in SUBTRACT mode. Tight
+            # by default so the keep-zone doesn't pillow into wall/floor.
+            "feet_guard_px": 5,
+            # FEET SOFTEN: MASK 2-only Gaussian sigma. Softens the feet edge
+            # without affecting the body. Default 0 = off.
+            "feet_soften": 0.0,
         }
         # Drop-stale: if a new update comes in while we're painting, we only keep
         # the latest one. _pending is None when idle, or a dict when a render is
@@ -897,14 +988,90 @@ class PersistentWindow(QtWidgets.QWidget):
     # so the user can tell which mask is the target. Idempotent — safe to
     # call after every toggle / state change.
     def _refresh_sam_button_labels(self):
+        # Highlight the active MASK select button (cyan for 1, magenta for 2)
+        # and dim the inactive one. Show dot counts in each button label so
+        # the user can SEE which mask has dots and how many — was the #1
+        # frustration when dots were invisible across mask switches.
         try:
-            self._sam_apply_btn.setText(f"APPLY MASK {self._active_mask}")
+            _active_cyan = (
+                "background-color: #003344; color: #0ff; padding: 5px 14px; "
+                "border: 1px solid #0ff; border-radius: 12px; "
+                "font-size: 12px; font-weight: 700;"
+            )
+            _inactive_cyan = (
+                "background-color: #111; color: #266; padding: 5px 14px; "
+                "border: 1px solid #266; border-radius: 12px; "
+                "font-size: 12px; font-weight: 600;"
+            )
+            _active_magenta = (
+                "background-color: #330033; color: #f0f; padding: 5px 14px; "
+                "border: 1px solid #f0f; border-radius: 12px; "
+                "font-size: 12px; font-weight: 700;"
+            )
+            _inactive_magenta = (
+                "background-color: #111; color: #626; padding: 5px 14px; "
+                "border: 1px solid #626; border-radius: 12px; "
+                "font-size: 12px; font-weight: 600;"
+            )
+            # Dot counts per mask
+            _m1_pts = self._sam_pts_by_obj.get(1, []) or []
+            _m2_pts = self._sam_pts_by_obj.get(2, []) or []
+            _m1_pos = sum(1 for p in _m1_pts if p[2])
+            _m1_neg = sum(1 for p in _m1_pts if not p[2])
+            _m2_pos = sum(1 for p in _m2_pts if p[2])
+            _m2_neg = sum(1 for p in _m2_pts if not p[2])
+            # Mark applied with a check; otherwise show counts.
+            _m1_applied = self.session.sam2_gates.get(1) is not None
+            _m2_applied = self.session.sam2_gates.get(2) is not None
+            _m1_label = (f"MASK 1 ({_m1_pos}+{_m1_neg}-)"
+                         + ("✓" if _m1_applied else ""))
+            _m2_label = (f"MASK 2 ({_m2_pos}+{_m2_neg}-)"
+                         + ("✓" if _m2_applied else ""))
+            self._mask1_select_btn.setText(_m1_label)
+            self._mask2_select_btn.setText(_m2_label)
+            if self._active_mask == 1:
+                self._mask1_select_btn.setStyleSheet(_active_cyan)
+                self._mask2_select_btn.setStyleSheet(_inactive_magenta)
+            else:
+                self._mask1_select_btn.setStyleSheet(_inactive_cyan)
+                self._mask2_select_btn.setStyleSheet(_active_magenta)
+        except Exception:
+            pass
+
+    # WHAT IT DOES: Activate a specific mask (so new clicks go to it). Used by
+    # the visible MASK 1 / MASK 2 select buttons. Idempotent if already active.
+    def _set_active_mask(self, mask_id: int):
+        if mask_id not in (1, 2):
+            return
+        if self._active_mask == mask_id:
+            return
+        self._active_mask = mask_id
+        try:
+            self._refresh_sam_button_labels()
         except Exception:
             pass
         try:
-            self._sam_clear_btn.setText(f"CLEAR {self._active_mask}")
+            self.status.setText(
+                f"MASK {self._active_mask} active — clicks add to MASK {self._active_mask}"
+            )
         except Exception:
             pass
+        try:
+            self._draw_sam_overlay()
+        except Exception:
+            pass
+
+    # Convenience: clicking CLEAR 1 / CLEAR 2 / APPLY 1 / APPLY 2 makes that
+    # mask active first (so the existing handler operates on it), then runs
+    # the action. User never has to think "is the right mask active?" — the
+    # button label is the contract.
+    def _activate_and_clear(self, mask_id: int):
+        self._set_active_mask(mask_id)
+        self._clear_sam_points()
+
+    def _activate_and_apply(self, mask_id: int):
+        self._set_active_mask(mask_id)
+        self._apply_sam_mask()
 
     # WHAT IT DOES: Polls live_params.json in the session dir and dispatches to
     #   on_update() when the panel writes a new slider state. Silent on missing
@@ -1199,10 +1366,13 @@ class PersistentWindow(QtWidgets.QWidget):
         mode_row.addStretch(1)  # closing stretch — sandwiches buttons to center
         layout.addLayout(mode_row)
 
-        # SAM click-to-mask toggle + clear
+        # SAM click-to-mask + per-mask CLEAR/APPLY pairs.
+        # Two rows: top = CLICK TO MASK, bottom = [MASK 1 group] [MASK 2 group].
+        # Each group has its own [select] [clear] [apply] buttons. The select
+        # button highlights when the mask is active (where new clicks go).
         sam_row = QtWidgets.QHBoxLayout()
         sam_row.setSpacing(8)
-        sam_row.addStretch(1)  # opening stretch
+        sam_row.addStretch(1)
         self._sam_btn = QtWidgets.QPushButton("CLICK TO MASK")
         self._sam_btn.setCheckable(True)
         self._sam_btn.setStyleSheet(
@@ -1211,22 +1381,77 @@ class PersistentWindow(QtWidgets.QWidget):
         )
         self._sam_btn.clicked.connect(self._toggle_sam_mode)
         sam_row.addWidget(self._sam_btn)
-        self._sam_clear_btn = QtWidgets.QPushButton("CLEAR")
-        self._sam_clear_btn.setStyleSheet(
+        sam_row.addStretch(1)
+        layout.addLayout(sam_row)
+
+        mask_row = QtWidgets.QHBoxLayout()
+        mask_row.setSpacing(6)
+        mask_row.addStretch(1)
+        # MASK 1 group — cyan. Body / on-green parts. EDGE GUARD margin.
+        self._mask1_select_btn = QtWidgets.QPushButton("MASK 1")
+        self._mask1_select_btn.setStyleSheet(
+            "background-color: #003344; color: #0ff; padding: 5px 14px; "
+            "border: 1px solid #0ff; border-radius: 12px; "
+            "font-size: 12px; font-weight: 700;"
+        )
+        self._mask1_select_btn.setToolTip(
+            "Switch active mask to MASK 1 (body / on-green). New dots and "
+            "any unspecified APPLY/CLEAR target this mask."
+        )
+        self._mask1_select_btn.clicked.connect(lambda: self._set_active_mask(1))
+        mask_row.addWidget(self._mask1_select_btn)
+        self._mask1_clear_btn = QtWidgets.QPushButton("CLEAR 1")
+        self._mask1_clear_btn.setStyleSheet(
             "background-color: #111; color: #aaa; padding: 5px 10px; "
             "border: 1px solid #444; border-radius: 12px; font-size: 12px;"
         )
-        self._sam_clear_btn.clicked.connect(self._clear_sam_points)
-        sam_row.addWidget(self._sam_clear_btn)
-        self._sam_apply_btn = QtWidgets.QPushButton("APPLY MASK")
-        self._sam_apply_btn.setStyleSheet(
+        self._mask1_clear_btn.clicked.connect(lambda: self._activate_and_clear(1))
+        mask_row.addWidget(self._mask1_clear_btn)
+        self._mask1_apply_btn = QtWidgets.QPushButton("APPLY 1")
+        self._mask1_apply_btn.setStyleSheet(
             "background-color: #1a4a2a; color: #5b5; padding: 5px 12px; "
             "border: 1px solid #5b5; border-radius: 12px; font-size: 12px; font-weight: 600;"
         )
-        self._sam_apply_btn.clicked.connect(self._apply_sam_mask)
-        sam_row.addWidget(self._sam_apply_btn)
-        sam_row.addStretch(1)  # closing stretch
-        layout.addLayout(sam_row)
+        self._mask1_apply_btn.clicked.connect(lambda: self._activate_and_apply(1))
+        mask_row.addWidget(self._mask1_apply_btn)
+        # Vertical separator
+        _sep = QtWidgets.QLabel("|")
+        _sep.setStyleSheet("color: #444; padding: 0 6px;")
+        mask_row.addWidget(_sep)
+        # MASK 2 group — magenta. Feet / off-green parts. FEET GUARD margin.
+        self._mask2_select_btn = QtWidgets.QPushButton("MASK 2")
+        self._mask2_select_btn.setStyleSheet(
+            "background-color: #111; color: #626; padding: 5px 14px; "
+            "border: 1px solid #626; border-radius: 12px; "
+            "font-size: 12px; font-weight: 600;"
+        )
+        self._mask2_select_btn.setToolTip(
+            "Switch active mask to MASK 2 (feet / off-green). New dots and "
+            "any unspecified APPLY/CLEAR target this mask."
+        )
+        self._mask2_select_btn.clicked.connect(lambda: self._set_active_mask(2))
+        mask_row.addWidget(self._mask2_select_btn)
+        self._mask2_clear_btn = QtWidgets.QPushButton("CLEAR 2")
+        self._mask2_clear_btn.setStyleSheet(
+            "background-color: #111; color: #aaa; padding: 5px 10px; "
+            "border: 1px solid #444; border-radius: 12px; font-size: 12px;"
+        )
+        self._mask2_clear_btn.clicked.connect(lambda: self._activate_and_clear(2))
+        mask_row.addWidget(self._mask2_clear_btn)
+        self._mask2_apply_btn = QtWidgets.QPushButton("APPLY 2")
+        self._mask2_apply_btn.setStyleSheet(
+            "background-color: #1a4a2a; color: #5b5; padding: 5px 12px; "
+            "border: 1px solid #5b5; border-radius: 12px; font-size: 12px; font-weight: 600;"
+        )
+        self._mask2_apply_btn.clicked.connect(lambda: self._activate_and_apply(2))
+        mask_row.addWidget(self._mask2_apply_btn)
+        mask_row.addStretch(1)
+        layout.addLayout(mask_row)
+        # Back-compat aliases — older callers / methods still reference
+        # _sam_apply_btn / _sam_clear_btn. Point them at the active mask's
+        # buttons so calls in _refresh_sam_button_labels keep working.
+        self._sam_apply_btn = self._mask1_apply_btn
+        self._sam_clear_btn = self._mask1_clear_btn
 
         # Background — smaller pills
         bg_row = QtWidgets.QHBoxLayout()
@@ -1311,7 +1536,23 @@ class PersistentWindow(QtWidgets.QWidget):
             "font-family: 'JetBrains Mono', 'SF Mono', 'Consolas', monospace; "
             "font-size: 12px;"
         )
-        layout.addWidget(self.status)
+        # Permanent build-tag readout pinned right of the dynamic status text.
+        # Survives every status.setText() call so screenshots always carry the
+        # build identifier — no more "is this the new version?" guesswork.
+        self._build_label = QtWidgets.QLabel(_BUILD_TAG)
+        self._build_label.setStyleSheet(
+            "color: #888888; border: none; background: transparent; "
+            "font-family: 'JetBrains Mono', 'SF Mono', 'Consolas', monospace; "
+            "font-size: 11px; padding-left: 12px;"
+        )
+        _status_row = QtWidgets.QWidget()
+        _status_row.setStyleSheet("background: transparent;")
+        _sr_layout = QtWidgets.QHBoxLayout(_status_row)
+        _sr_layout.setContentsMargins(0, 0, 0, 0)
+        _sr_layout.setSpacing(0)
+        _sr_layout.addWidget(self.status, 1)
+        _sr_layout.addWidget(self._build_label, 0)
+        layout.addWidget(_status_row)
 
         # Scrubber panel — hidden until panel writes scrub_index.json
         self._scrub_bar = QtWidgets.QWidget()
@@ -1551,7 +1792,7 @@ class PersistentWindow(QtWidgets.QWidget):
         self.halo_label_widget.setToolTip(_HALO_FEET_TOOLTIP)
         grid.addWidget(self.halo_label_widget, 6, 0)
         self.halo_slider = JumpSlider(QtCore.Qt.Horizontal)
-        self.halo_slider.setRange(-100, 150)
+        self.halo_slider.setRange(-500, 150)
         self.halo_slider.setValue(int(self._params["halo_px"]))
         self.halo_slider.valueChanged.connect(self._on_halo_changed)
         self.halo_slider.setToolTip(_HALO_FEET_TOOLTIP)
@@ -1661,17 +1902,15 @@ class PersistentWindow(QtWidgets.QWidget):
         # broken). Underlying flow + helper kept; param defaults to False.
 
         # --- SAM2 SUBTRACT: subtract-only combine toggle (checkbox) ---
-        # NN owns the matte everywhere green exists. SAM2 is permitted to
-        # subtract junk (floor under feet, off-screen props) only in regions
-        # far from the green edge. EDGE GUARD slider controls the protected
-        # buffer width. Wins over SMART BLEND + ADDITIVE when toggled.
-        # SAM2-only — greyed out when SAM2 is inactive.
+        # alpha * dilated_SAM2_silhouette. NN already keys cleanly on green;
+        # SAM2 defines the subject region where green doesn't exist (walls,
+        # props, furniture, crew). Industry-standard garbage-matte combine.
         _SAM2_SUBTRACT_TOOLTIP = (
-            "SAM2 SUBTRACT — NN owns the matte where green exists. SAM2 can "
-            "only kill non-green junk (floor under feet, props off-screen). "
-            "Hair / fine detail protected automatically. EDGE GUARD slider "
-            "controls how far past the green edge SAM2 may reach. Off = "
-            "bit-identical to before."
+            "SAM2 SUBTRACT — multiplies NN's matte by a dilated SAM2 "
+            "silhouette. Anything OUTSIDE the silhouette + EDGE GUARD pixels "
+            "gets killed (walls, props, crew, furniture). Anything INSIDE "
+            "passes through with NN's full alpha (hair, motion blur, "
+            "translucency). Use EDGE GUARD slider to tune margin per shot."
         )
         self.sam2_subtract_label_widget = _label("SUBTRACT")
         self.sam2_subtract_label_widget.setToolTip(_SAM2_SUBTRACT_TOOLTIP)
@@ -1689,22 +1928,22 @@ class PersistentWindow(QtWidgets.QWidget):
         self.sam2_subtract_checkbox.toggled.connect(self._on_sam2_subtract_changed)
         grid.addWidget(self.sam2_subtract_checkbox, 11, 1, 1, 2)
 
-        # --- EDGE GUARD: distance buffer past green edge before SAM2 may kill ---
-        # Slider 0-50 px integer. Higher = more body protection, less aggressive
-        # SAM2 reach. Feather (soft transition) auto-set to half this value.
-        # Only meaningful when SUBTRACT mode is on.
+        # --- EDGE GUARD: isotropic dilation pixels around SAM2 silhouette ---
+        # Slider 0-60 px integer. Higher = wider keep-zone past silhouette
+        # (recovers hair / butt curve / fingertips that SAM2 cut tight).
+        # Smaller = tighter cut, less risk of pulling in junk near subject.
         _EDGE_GUARD_TOOLTIP = (
-            "EDGE GUARD — distance (px) past the green edge before SUBTRACT "
-            "may kill anything. Higher = more protection for body parts "
-            "surrounded by green (no SAM2 dots needed there). A small soft "
-            "transition tail extends past this distance. Default 20. Only "
-            "used when SUBTRACT mode is on."
+            "EDGE GUARD — pixels the keep-zone extends past the SAM2 "
+            "silhouette. Higher = recovers hair / butt curve / fingertips "
+            "SAM2 cut tight; lower = tighter cut, less junk near subject. "
+            "Default 20. Action shots with motion blur: crank up. Tight "
+            "shots: drop down. Only used when SUBTRACT mode is on."
         )
         self.edge_guard_label_widget = _label("EDGE GUARD")
         self.edge_guard_label_widget.setToolTip(_EDGE_GUARD_TOOLTIP)
         grid.addWidget(self.edge_guard_label_widget, 12, 0)
         self.edge_guard_slider = JumpSlider(QtCore.Qt.Horizontal)
-        self.edge_guard_slider.setRange(0, 200)
+        self.edge_guard_slider.setRange(0, 60)
         self.edge_guard_slider.setValue(int(self._params.get("edge_guard_px", 20)))
         self.edge_guard_slider.valueChanged.connect(self._on_edge_guard_changed)
         self.edge_guard_slider.setToolTip(_EDGE_GUARD_TOOLTIP)
@@ -1713,6 +1952,55 @@ class PersistentWindow(QtWidgets.QWidget):
         self.edge_guard_value_label.setMinimumWidth(42)
         self.edge_guard_value_label.setToolTip(_EDGE_GUARD_TOOLTIP)
         grid.addWidget(self.edge_guard_value_label, 12, 2)
+
+        # --- FEET GUARD: per-mask margin override for MASK 2 (off-green region) ---
+        # MASK 1 uses EDGE GUARD (large margin for body parts ON green — recovers
+        # hair / butt / fingertips). MASK 2 uses FEET GUARD (tight margin for body
+        # parts OFF green — feet on floor, body against wall — no halo into junk).
+        # Single-mask sessions ignore FEET GUARD entirely and use EDGE GUARD.
+        _FEET_GUARD_TOOLTIP = (
+            "FEET GUARD — margin (px) around MASK 2's silhouette. Use for "
+            "body parts OFF the green screen (feet on floor, body against "
+            "wall). Set tight (3-8) so the keep-zone doesn't pillow into "
+            "non-green junk. EDGE GUARD controls MASK 1; FEET GUARD controls "
+            "MASK 2. Only used in SUBTRACT mode with two masks active."
+        )
+        self.feet_guard_label_widget = _label("FEET GUARD")
+        self.feet_guard_label_widget.setToolTip(_FEET_GUARD_TOOLTIP)
+        grid.addWidget(self.feet_guard_label_widget, 13, 0)
+        self.feet_guard_slider = JumpSlider(QtCore.Qt.Horizontal)
+        self.feet_guard_slider.setRange(0, 60)
+        self.feet_guard_slider.setValue(int(self._params.get("feet_guard_px", 5)))
+        self.feet_guard_slider.valueChanged.connect(self._on_feet_guard_changed)
+        self.feet_guard_slider.setToolTip(_FEET_GUARD_TOOLTIP)
+        grid.addWidget(self.feet_guard_slider, 13, 1)
+        self.feet_guard_value_label = _label(f"{int(self._params.get('feet_guard_px', 5))}", "#0ff")
+        self.feet_guard_value_label.setMinimumWidth(42)
+        self.feet_guard_value_label.setToolTip(_FEET_GUARD_TOOLTIP)
+        grid.addWidget(self.feet_guard_value_label, 13, 2)
+
+        # --- FEET SOFTEN: MASK 2 only Gaussian softening of the feet edge ---
+        # Same units as global SOFTEN (sigma). Applied to MASK 2's alpha BEFORE
+        # union so it doesn't blur the body.
+        _FEET_SOFTEN_TOOLTIP = (
+            "FEET SOFTEN — Gaussian softening of MASK 2's edge ONLY. "
+            "Use to blend the feet/floor cut without softening the body. "
+            "Default 0. Only used when MASK 2 is active."
+        )
+        self.feet_soften_label_widget = _label("FEET SOFTEN")
+        self.feet_soften_label_widget.setToolTip(_FEET_SOFTEN_TOOLTIP)
+        grid.addWidget(self.feet_soften_label_widget, 14, 0)
+        self.feet_soften_slider = JumpSlider(QtCore.Qt.Horizontal)
+        self.feet_soften_slider.setRange(0, 200)
+        self.feet_soften_slider.setValue(int(float(self._params.get("feet_soften", 0)) * 10))
+        self.feet_soften_slider.valueChanged.connect(self._on_feet_soften_changed)
+        self.feet_soften_slider.setToolTip(_FEET_SOFTEN_TOOLTIP)
+        grid.addWidget(self.feet_soften_slider, 14, 1)
+        self.feet_soften_value_label = _label(
+            f"{float(self._params.get('feet_soften', 0)):.1f}", "#0ff")
+        self.feet_soften_value_label.setMinimumWidth(42)
+        self.feet_soften_value_label.setToolTip(_FEET_SOFTEN_TOOLTIP)
+        grid.addWidget(self.feet_soften_value_label, 14, 2)
 
         # --- SAM2 BYPASS: master switch (checkbox) ---
         # When ON, skip ALL SAM2 combine paths and return NN alpha directly.
@@ -1724,7 +2012,7 @@ class PersistentWindow(QtWidgets.QWidget):
         )
         self.sam2_bypass_label_widget = _label("BYPASS SAM2")
         self.sam2_bypass_label_widget.setToolTip(_SAM2_BYPASS_TOOLTIP)
-        grid.addWidget(self.sam2_bypass_label_widget, 13, 0)
+        grid.addWidget(self.sam2_bypass_label_widget, 15, 0)
         self.sam2_bypass_checkbox = QtWidgets.QCheckBox("")
         self.sam2_bypass_checkbox.setStyleSheet(
             "QCheckBox { color: #8ab; border: none; background: transparent; "
@@ -1736,7 +2024,7 @@ class PersistentWindow(QtWidgets.QWidget):
         self.sam2_bypass_checkbox.setChecked(bool(self._params.get("sam2_bypass", False)))
         self.sam2_bypass_checkbox.setToolTip(_SAM2_BYPASS_TOOLTIP)
         self.sam2_bypass_checkbox.toggled.connect(self._on_sam2_bypass_changed)
-        grid.addWidget(self.sam2_bypass_checkbox, 13, 1, 1, 2)
+        grid.addWidget(self.sam2_bypass_checkbox, 15, 1, 1, 2)
 
         # --- SHOW SAM2: viewer-only silhouette overlay (checkbox) ---
         # Draws a cyan outline of SAM2's mask on top of the matte/composite
@@ -1748,7 +2036,7 @@ class PersistentWindow(QtWidgets.QWidget):
         )
         self.show_sam2_label_widget = _label("SHOW SAM2")
         self.show_sam2_label_widget.setToolTip(_SHOW_SAM2_TOOLTIP)
-        grid.addWidget(self.show_sam2_label_widget, 14, 0)
+        grid.addWidget(self.show_sam2_label_widget, 16, 0)
         self.show_sam2_checkbox = QtWidgets.QCheckBox("")
         self.show_sam2_checkbox.setStyleSheet(
             "QCheckBox { color: #8ab; border: none; background: transparent; "
@@ -1760,7 +2048,7 @@ class PersistentWindow(QtWidgets.QWidget):
         self.show_sam2_checkbox.setChecked(bool(self._params.get("show_sam2", False)))
         self.show_sam2_checkbox.setToolTip(_SHOW_SAM2_TOOLTIP)
         self.show_sam2_checkbox.toggled.connect(self._on_show_sam2_changed)
-        grid.addWidget(self.show_sam2_checkbox, 14, 1, 1, 2)
+        grid.addWidget(self.show_sam2_checkbox, 16, 1, 1, 2)
 
         grid.setColumnStretch(1, 1)
         parent_layout.addWidget(panel)
@@ -1918,11 +2206,28 @@ class PersistentWindow(QtWidgets.QWidget):
         self._render_now()
         self._save_live_params_now()
 
-    # WHAT IT DOES: EDGE GUARD slider handler. 0-50 px integer. Only meaningful
-    #   when SUBTRACT mode is on. Continuous control — debounced save.
+    # WHAT IT DOES: EDGE GUARD slider handler. 0-60 px integer. MASK 1 margin in
+    #   SUBTRACT mode. Continuous control — debounced save.
     def _on_edge_guard_changed(self, value: int):
         self._params["edge_guard_px"] = int(value)
         self.edge_guard_value_label.setText(f"{int(value)}")
+        self._schedule_render()
+        self._schedule_save()
+
+    # WHAT IT DOES: FEET GUARD slider handler. 0-60 px integer. MASK 2 margin in
+    #   SUBTRACT mode. Continuous control — debounced save.
+    def _on_feet_guard_changed(self, value: int):
+        self._params["feet_guard_px"] = int(value)
+        self.feet_guard_value_label.setText(f"{int(value)}")
+        self._schedule_render()
+        self._schedule_save()
+
+    # WHAT IT DOES: FEET SOFTEN slider handler. 0-200 integer mapped to 0.0-20.0
+    #   sigma (same scale as global SOFTEN). Applied to MASK 2's alpha only.
+    def _on_feet_soften_changed(self, value: int):
+        v = float(value) / 10.0
+        self._params["feet_soften"] = v
+        self.feet_soften_value_label.setText(f"{v:.1f}")
         self._schedule_render()
         self._schedule_save()
 
@@ -2135,7 +2440,7 @@ class PersistentWindow(QtWidgets.QWidget):
         # with the correct state.
         merged = dict(self._params)
         for k, v in params.items():
-            if k in ("despill", "despeckle", "despeckleSize", "background", "fg_source", "trim_chroma", "fill_holes", "sam2_additive", "sam2_weighted", "sam2_subtract", "edge_guard_px", "sam2_bypass", "show_sam2"):
+            if k in ("despill", "despeckle", "despeckleSize", "background", "fg_source", "trim_chroma", "fill_holes", "sam2_additive", "sam2_weighted", "sam2_subtract", "edge_guard_px", "feet_guard_px", "feet_soften", "sam2_bypass", "show_sam2"):
                 merged[k] = v
         # Sync checkbox UI and self._params NOW — before any render fires — so that
         # every code path below uses the correct despeckle value. blockSignals prevents
@@ -2253,12 +2558,40 @@ class PersistentWindow(QtWidgets.QWidget):
                 matte_subtract = bool(params_for_matte.get("sam2_subtract", False))
                 matte_bypass = bool(params_for_matte.get("sam2_bypass", False))
                 matte_edge_guard = int(params_for_matte.get("edge_guard_px", 20))
+                matte_feet_guard = int(params_for_matte.get("feet_guard_px", 5))
+                matte_feet_soften = float(params_for_matte.get("feet_soften", 0))
                 # Multi-object v0.8 — same per-mask + union strategy as the
                 # Composite branch, with the same Option C halo binding so
                 # the Matte view matches what render_composite produces.
                 _matte_pairs = [(oid, self.session.sam2_gates.get(oid))
                                 for oid in (1, 2)
                                 if self.session.sam2_gates.get(oid) is not None]
+                # Symmetric auto-clip — same as render_composite.
+                if len(_matte_pairs) == 2:
+                    _g_by_oid_m = {oid: g for oid, g in _matte_pairs}
+                    m1_m, m2_m = _g_by_oid_m.get(1), _g_by_oid_m.get(2)
+                    _src_rgb_m_clip = (self.session.original_rgb
+                                       if self.session.original_rgb is not None
+                                       else self.session.fg_rgb)
+                    if m1_m is not None and m2_m is not None:
+                        if m2_m.shape != m1_m.shape:
+                            m2_m = cv2.resize(
+                                m2_m, (m1_m.shape[1], m1_m.shape[0]),
+                                interpolation=cv2.INTER_LINEAR)
+                        _ck_m = cv2.getStructuringElement(
+                            cv2.MORPH_ELLIPSE, (21, 21))
+                        m2_excl_m = cv2.dilate(
+                            (m2_m > 0.5).astype(np.uint8), _ck_m).astype(np.float32)
+                        _g_by_oid_m[1] = m1_m * (1.0 - m2_excl_m)
+                        if (_src_rgb_m_clip is not None
+                                and _src_rgb_m_clip.shape[:2] == m2_m.shape):
+                            _chroma_gm = (_src_rgb_m_clip[..., 1].astype(np.float32) -
+                                          np.maximum(_src_rgb_m_clip[..., 0],
+                                                     _src_rgb_m_clip[..., 2]).astype(np.float32))
+                            _is_green_m = (_chroma_gm > 0.05).astype(np.float32)
+                            _g_by_oid_m[2] = m2_m * (1.0 - _is_green_m)
+                    _matte_pairs = [(oid, _g_by_oid_m[oid])
+                                    for oid, _ in _matte_pairs]
                 if (self.session.alpha_raw is not None
                         and _matte_pairs
                         and not matte_bypass):
@@ -2279,18 +2612,24 @@ class PersistentWindow(QtWidgets.QWidget):
                         if _n_active_m > 1:
                             _h_body_m = matte_halo_body if _oid_m == 1 else 0
                             _h_feet_m = matte_halo if _oid_m == 2 else 0
+                            _eg_m = matte_edge_guard if _oid_m == 1 else matte_feet_guard
                         else:
                             _h_body_m = matte_halo_body
                             _h_feet_m = matte_halo
-                        _matte_alphas.append(_combine_one_mask(
+                            _eg_m = matte_edge_guard
+                        _ma = _combine_one_mask(
                             self.session.alpha_raw, _gate, _src_rgb_m,
                             sam2_subtract=matte_subtract,
                             sam2_weighted=matte_weighted,
                             sam2_additive=matte_additive,
                             halo_px=_h_feet_m, halo_body_px=_h_body_m,
-                            edge_guard_px=matte_edge_guard,
+                            edge_guard_px=_eg_m,
                             trim_chroma=matte_trim, fill_holes=matte_fill,
-                        ))
+                        )
+                        if (_n_active_m > 1 and _oid_m == 2
+                                and matte_feet_soften > 0):
+                            _ma = _soften_mask(_ma, matte_feet_soften)
+                        _matte_alphas.append(_ma)
                     alpha = union_alpha(*_matte_alphas)
                     if matte_margin > 0:
                         alpha = _dilate_mask(alpha, matte_margin)
@@ -2498,6 +2837,11 @@ class PersistentWindow(QtWidgets.QWidget):
                         f"MASK {self._active_mask}: {pos_count}+ {neg_count}−  "
                         f"(Tab: switch mask, R-click: exclude)"
                     )
+                    # Refresh MASK 1/2 buttons so the dot counts update live.
+                    try:
+                        self._refresh_sam_button_labels()
+                    except Exception:
+                        pass
                     self._draw_sam_overlay()
                     return True
         return super().eventFilter(obj, event)
@@ -2694,11 +3038,13 @@ class PersistentWindow(QtWidgets.QWidget):
     # DEPENDS-ON: self._sam_display_pts (label coords), right_label having a pixmap.
     # AFFECTS: right_label pixmap (in-place QPainter draw).
     def _draw_sam_overlay(self):
-        # Multi-object v0.8 — draw dots for BOTH masks. The active mask's dots
-        # render at full opacity; the inactive mask's dots dim to ~43% so the
-        # user can tell at a glance which mask owns which cluster.
-        any_pts = any(self._sam_pts_by_obj.get(i) for i in (1, 2))
-        if not any_pts:
+        # Only draw dots for the ACTIVE mask. Showing the other mask's dots
+        # at low opacity was confusing — Berto wants a clean view of just the
+        # mask he's currently working on. Switch the active mask to see the
+        # other set.
+        active = self._active_mask
+        pts_active = self._sam_pts_by_obj.get(active, [])
+        if not pts_active:
             return
         g = self._last_right_geom
         if not g:
@@ -2708,14 +3054,7 @@ class PersistentWindow(QtWidgets.QWidget):
             return
         painter = QtGui.QPainter(pixmap)
         painter.setRenderHint(QtGui.QPainter.Antialiasing)
-        # Active mask drawn LAST so its dots paint on top of the inactive's.
-        order = [i for i in (1, 2) if i != self._active_mask] + [self._active_mask]
-        for _obj_id_ovl in order:
-            _pts_ovl = self._sam_pts_by_obj.get(_obj_id_ovl, [])
-            if not _pts_ovl:
-                continue
-            _alpha_ovl = 255 if _obj_id_ovl == self._active_mask else 110
-            self._draw_sam_overlay_pts(painter, g, _pts_ovl, _alpha_ovl)
+        self._draw_sam_overlay_pts(painter, g, pts_active, 255)
         painter.end()
         self.right_label.setPixmap(pixmap)
 
@@ -2910,7 +3249,7 @@ class OneShotWindow(QtWidgets.QWidget):
 
     def __init__(self, paths):
         super().__init__()
-        self.setWindowTitle("CorridorKey Preview")
+        self.setWindowTitle(f"CorridorKey Preview — {_BUILD_TAG}")
         self.setStyleSheet(_DARK_STYLE)
 
         original_bgr = cv2.imread(paths["original"])

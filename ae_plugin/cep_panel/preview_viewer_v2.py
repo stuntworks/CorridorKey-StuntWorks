@@ -1162,14 +1162,13 @@ class PersistentWindow(QtWidgets.QWidget):
         # broken). Underlying flow + helper kept; param defaults to False.
 
         # --- SAM2 SUBTRACT: subtract-only combine toggle (checkbox) ---
-        # NN owns matte where green exists. SAM2 only kills in non-green
-        # regions past the EDGE GUARD buffer. Wins over weighted/additive.
+        # alpha * dilated_SAM2_silhouette. Industry-standard garbage matte combine.
         _SAM2_SUBTRACT_TOOLTIP = (
-            "SAM2 SUBTRACT — NN owns the matte where green exists. SAM2 can "
-            "only kill non-green junk (floor under feet, props off-screen). "
-            "Hair / fine detail protected automatically. EDGE GUARD slider "
-            "controls how far past the green edge SAM2 may reach. Off = "
-            "bit-identical to before."
+            "SAM2 SUBTRACT — multiplies NN's matte by a dilated SAM2 "
+            "silhouette. Anything OUTSIDE the silhouette + EDGE GUARD pixels "
+            "gets killed (walls, props, crew, furniture). Anything INSIDE "
+            "passes through with NN's full alpha (hair, motion blur, "
+            "translucency). Use EDGE GUARD slider to tune margin per shot."
         )
         self.sam2_subtract_label_widget = _label("SUBTRACT")
         self.sam2_subtract_label_widget.setToolTip(_SAM2_SUBTRACT_TOOLTIP)
@@ -1187,17 +1186,19 @@ class PersistentWindow(QtWidgets.QWidget):
         self.sam2_subtract_checkbox.toggled.connect(self._on_sam2_subtract_changed)
         grid.addWidget(self.sam2_subtract_checkbox, 11, 1, 1, 2)
 
-        # --- EDGE GUARD: distance buffer past green edge before SAM2 may kill ---
+        # --- EDGE GUARD: isotropic dilation pixels around SAM2 silhouette ---
         _EDGE_GUARD_TOOLTIP = (
-            "EDGE GUARD — distance (px) past the green edge before SUBTRACT "
-            "may kill. Higher = more protection for body interior surrounded "
-            "by green. Default 20. Only used when SUBTRACT mode is on."
+            "EDGE GUARD — pixels the keep-zone extends past the SAM2 "
+            "silhouette. Higher = recovers hair / butt curve / fingertips "
+            "SAM2 cut tight; lower = tighter cut, less junk near subject. "
+            "Default 20. Action shots with motion blur: crank up. Tight "
+            "shots: drop down. Only used when SUBTRACT mode is on."
         )
         self.edge_guard_label_widget = _label("EDGE GUARD")
         self.edge_guard_label_widget.setToolTip(_EDGE_GUARD_TOOLTIP)
         grid.addWidget(self.edge_guard_label_widget, 12, 0)
         self.edge_guard_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.edge_guard_slider.setRange(0, 200)
+        self.edge_guard_slider.setRange(0, 60)
         self.edge_guard_slider.setValue(int(self._params.get("edge_guard_px", 20)))
         self.edge_guard_slider.valueChanged.connect(self._on_edge_guard_changed)
         self.edge_guard_slider.setToolTip(_EDGE_GUARD_TOOLTIP)
