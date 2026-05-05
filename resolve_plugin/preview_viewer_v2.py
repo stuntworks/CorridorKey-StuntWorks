@@ -552,6 +552,8 @@ def render_composite(cu, session: Session, params: dict):
     edge_guard_px = int(params.get("edge_guard_px", 20))
     feet_guard_px = int(params.get("feet_guard_px", 5))
     feet_soften = float(params.get("feet_soften", 0))
+    mask1_bypass = bool(params.get("mask1_bypass", False))
+    mask2_bypass = bool(params.get("mask2_bypass", False))
     # Multi-object v0.8 — collect every per-mask gate (paired with obj_id)
     # and run the combine pipeline ONCE PER MASK, then union the per-mask
     # alphas. Per-mask is the correct contract for HALO operations
@@ -561,6 +563,9 @@ def render_composite(cu, session: Session, params: dict):
     # around feet" caused by HALO BODY's lateral extension at MASK 2's
     # silhouette row. Single-mask sessions get both halos applied (legacy
     # behaviour preserved for migrated old sessions).
+    # Per-mask bypass is applied at UNION time (below), NOT here. Auto-clip
+    # math always runs on both masks so each mask's "alone" view shows its
+    # real role in the combined output.
     _per_mask_pairs = [(oid, session.sam2_gates.get(oid)) for oid in (1, 2)
                        if session.sam2_gates.get(oid) is not None]
     if session.alpha_raw is not None and _per_mask_pairs and not sam2_bypass:
@@ -580,8 +585,9 @@ def render_composite(cu, session: Session, params: dict):
                 if m2.shape != m1.shape:
                     m2 = cv2.resize(m2, (m1.shape[1], m1.shape[0]),
                                     interpolation=cv2.INTER_LINEAR)
-                # MASK 1 - MASK 2 (dilated)
-                _clip_buf = 10
+                # MASK 1 - MASK 2 (dilated). Buffer must be >= EDGE GUARD,
+                # otherwise SUBTRACT's dilation re-invades MASK 2's zone.
+                _clip_buf = max(10, int(edge_guard_px))
                 _ck = cv2.getStructuringElement(
                     cv2.MORPH_ELLIPSE, (_clip_buf * 2 + 1, _clip_buf * 2 + 1))
                 m2_excl = cv2.dilate(
@@ -596,7 +602,7 @@ def render_composite(cu, session: Session, params: dict):
                     _gates_by_oid[2] = m2 * (1.0 - _is_green)
             _per_mask_pairs = [(oid, _gates_by_oid[oid])
                                for oid, _ in _per_mask_pairs]
-        _per_mask_alphas = []
+        _per_mask_alphas_with_oid = []
         _n_active = len(_per_mask_pairs)
         for _oid, _gate_n in _per_mask_pairs:
             _gate = _gate_n
@@ -630,8 +636,16 @@ def render_composite(cu, session: Session, params: dict):
             # BEFORE union so it only operates on MASK 2's contribution.
             if _n_active > 1 and _oid == 2 and feet_soften > 0:
                 _per_mask_alpha = _soften_mask(_per_mask_alpha, feet_soften)
-            _per_mask_alphas.append(_per_mask_alpha)
-        alpha = union_alpha(*_per_mask_alphas)
+            _per_mask_alphas_with_oid.append((_oid, _per_mask_alpha))
+        # Bypass at union time: each mask's "alone" view shows its real
+        # post-auto-clip role, not the raw greedy version.
+        _kept = [a for oid, a in _per_mask_alphas_with_oid
+                 if not (oid == 1 and mask1_bypass)
+                 and not (oid == 2 and mask2_bypass)]
+        if not _kept:
+            alpha = session.alpha.copy()
+        else:
+            alpha = union_alpha(*_kept)
         if sam2_margin > 0:
             alpha = _dilate_mask(alpha, sam2_margin)
         if sam2_soften > 0:
@@ -831,6 +845,12 @@ class PersistentWindow(QtWidgets.QWidget):
             # paths and return NN alpha directly. Lets the user A/B compare
             # NN-only vs NN+SAM2 without clearing dots.
             "sam2_bypass": False,
+            # MASK 1/2 BYPASS: per-mask isolation. When True, that mask is
+            # dropped from the combine — lets the user dial in one mask's
+            # sliders without the other mask's contribution muddying the view.
+            # Both on = same as sam2_bypass.
+            "mask1_bypass": False,
+            "mask2_bypass": False,
             # SHOW SAM2: viewer-only overlay (cyan outline of SAM2 silhouette
             # over the matte/composite view). Does not affect rendered output.
             "show_sam2": False,
@@ -859,12 +879,12 @@ class PersistentWindow(QtWidgets.QWidget):
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(250)
         self._save_timer.timeout.connect(self._save_live_params_now)
-        # Throttle render: immediate on first drag event, then at most once per 60ms
-        # while still dragging. SingleShot restarts each cycle — stops automatically
-        # when no more events arrive.
+        # Debounce render: any slider tick restarts a 150ms idle timer.
+        # Render fires once when the user stops moving — no UI freeze mid-drag.
+        # FEET GUARD at max takes ~500ms per render; under throttle that froze every drag.
         self._render_timer = QtCore.QTimer(self)
         self._render_timer.setSingleShot(True)
-        self._render_timer.setInterval(60)
+        self._render_timer.setInterval(150)
         self._render_timer.timeout.connect(self._on_render_throttle_tick)
         self._render_pending = False
         self._suppress_poll_mtime = 0.0
@@ -1054,6 +1074,14 @@ class PersistentWindow(QtWidgets.QWidget):
             self.status.setText(
                 f"MASK {self._active_mask} active — clicks add to MASK {self._active_mask}"
             )
+        except Exception:
+            pass
+        # Repaint the cached base image first to clear the OLD mask's dots,
+        # then draw the new active mask's dots on top. Without the repaint,
+        # old dots stayed visible because _draw_sam_overlay paints additively.
+        try:
+            if self._last_right_full is not None:
+                self._paint_right(self._last_right_full)
         except Exception:
             pass
         try:
@@ -2026,6 +2054,38 @@ class PersistentWindow(QtWidgets.QWidget):
         self.sam2_bypass_checkbox.toggled.connect(self._on_sam2_bypass_changed)
         grid.addWidget(self.sam2_bypass_checkbox, 15, 1, 1, 2)
 
+        # --- BYPASS MASK 1 / MASK 2: per-mask isolation (checkboxes) ---
+        # Lets the user dial in one mask's sliders by hiding the other.
+        _CB_STYLE = (
+            "QCheckBox { color: #8ab; border: none; background: transparent; "
+            "font-size: 12px; font-weight: 600; letter-spacing: 0.5px; } "
+            "QCheckBox::indicator { width: 12px; height: 12px; border: 1px solid "
+            "#2a6a7a; border-radius: 2px; background: #001a28; } "
+            "QCheckBox::indicator:checked { background: #0ff; border-color: #0ff; }"
+        )
+        _M1_TIP = ("BYPASS MASK 1 — drop MASK 1 from the combine. Use to dial in "
+                   "MASK 2 (feet) sliders in isolation.")
+        _M2_TIP = ("BYPASS MASK 2 — drop MASK 2 from the combine. Use to dial in "
+                   "MASK 1 (body) sliders in isolation.")
+        self.mask1_bypass_label_widget = _label("BYPASS MASK 1")
+        self.mask1_bypass_label_widget.setToolTip(_M1_TIP)
+        grid.addWidget(self.mask1_bypass_label_widget, 16, 0)
+        self.mask1_bypass_checkbox = QtWidgets.QCheckBox("")
+        self.mask1_bypass_checkbox.setStyleSheet(_CB_STYLE)
+        self.mask1_bypass_checkbox.setChecked(bool(self._params.get("mask1_bypass", False)))
+        self.mask1_bypass_checkbox.setToolTip(_M1_TIP)
+        self.mask1_bypass_checkbox.toggled.connect(self._on_mask1_bypass_changed)
+        grid.addWidget(self.mask1_bypass_checkbox, 16, 1, 1, 2)
+        self.mask2_bypass_label_widget = _label("BYPASS MASK 2")
+        self.mask2_bypass_label_widget.setToolTip(_M2_TIP)
+        grid.addWidget(self.mask2_bypass_label_widget, 17, 0)
+        self.mask2_bypass_checkbox = QtWidgets.QCheckBox("")
+        self.mask2_bypass_checkbox.setStyleSheet(_CB_STYLE)
+        self.mask2_bypass_checkbox.setChecked(bool(self._params.get("mask2_bypass", False)))
+        self.mask2_bypass_checkbox.setToolTip(_M2_TIP)
+        self.mask2_bypass_checkbox.toggled.connect(self._on_mask2_bypass_changed)
+        grid.addWidget(self.mask2_bypass_checkbox, 17, 1, 1, 2)
+
         # --- SHOW SAM2: viewer-only silhouette overlay (checkbox) ---
         # Draws a cyan outline of SAM2's mask on top of the matte/composite
         # view. Does NOT affect rendered output. For debugging dot placement.
@@ -2036,7 +2096,7 @@ class PersistentWindow(QtWidgets.QWidget):
         )
         self.show_sam2_label_widget = _label("SHOW SAM2")
         self.show_sam2_label_widget.setToolTip(_SHOW_SAM2_TOOLTIP)
-        grid.addWidget(self.show_sam2_label_widget, 16, 0)
+        grid.addWidget(self.show_sam2_label_widget, 18, 0)
         self.show_sam2_checkbox = QtWidgets.QCheckBox("")
         self.show_sam2_checkbox.setStyleSheet(
             "QCheckBox { color: #8ab; border: none; background: transparent; "
@@ -2048,7 +2108,7 @@ class PersistentWindow(QtWidgets.QWidget):
         self.show_sam2_checkbox.setChecked(bool(self._params.get("show_sam2", False)))
         self.show_sam2_checkbox.setToolTip(_SHOW_SAM2_TOOLTIP)
         self.show_sam2_checkbox.toggled.connect(self._on_show_sam2_changed)
-        grid.addWidget(self.show_sam2_checkbox, 16, 1, 1, 2)
+        grid.addWidget(self.show_sam2_checkbox, 18, 1, 1, 2)
 
         grid.setColumnStretch(1, 1)
         parent_layout.addWidget(panel)
@@ -2240,6 +2300,25 @@ class PersistentWindow(QtWidgets.QWidget):
         self._render_now()
         self._save_live_params_now()
 
+    # WHAT IT DOES: BYPASS MASK 1 handler. Drops MASK 1 from the combine so
+    #   only MASK 2's contribution is visible. Lets the user dial MASK 2
+    #   sliders without MASK 1 overlapping the view.
+    def _on_mask1_bypass_changed(self, checked: bool):
+        self._params["mask1_bypass"] = bool(checked)
+        self._local_change_time = time.perf_counter()
+        self._last_activity_time = self._local_change_time
+        self._render_now()
+        self._save_live_params_now()
+
+    # WHAT IT DOES: BYPASS MASK 2 handler. Drops MASK 2 from the combine so
+    #   only MASK 1's contribution is visible.
+    def _on_mask2_bypass_changed(self, checked: bool):
+        self._params["mask2_bypass"] = bool(checked)
+        self._local_change_time = time.perf_counter()
+        self._last_activity_time = self._local_change_time
+        self._render_now()
+        self._save_live_params_now()
+
     # WHAT IT DOES: SHOW SAM2 overlay toggle handler. Viewer-only; does not
     #   affect render output. Discrete control.
     def _on_show_sam2_changed(self, checked: bool):
@@ -2323,16 +2402,15 @@ class PersistentWindow(QtWidgets.QWidget):
     # DEPENDS-ON: self._save_timer QTimer already built in __init__.
     # AFFECTS: restarts the save timer — does not touch disk.
     def _schedule_render(self):
-        # Throttle: render immediately if not in cooldown, otherwise flag for next tick.
+        # Debounce: every slider tick restarts the timer. Render only fires
+        # when the slider has been idle for the timer interval.
         self._render_pending = True
-        if not self._render_timer.isActive():
-            self._on_render_throttle_tick()
+        self._render_timer.start()
 
     def _on_render_throttle_tick(self):
         if self._render_pending:
             self._render_pending = False
             self._render_now()
-            self._render_timer.start()  # start 60ms cooldown for next tick
 
     def _schedule_save(self):
         self._local_change_time = time.perf_counter()
@@ -2440,7 +2518,7 @@ class PersistentWindow(QtWidgets.QWidget):
         # with the correct state.
         merged = dict(self._params)
         for k, v in params.items():
-            if k in ("despill", "despeckle", "despeckleSize", "background", "fg_source", "trim_chroma", "fill_holes", "sam2_additive", "sam2_weighted", "sam2_subtract", "edge_guard_px", "feet_guard_px", "feet_soften", "sam2_bypass", "show_sam2"):
+            if k in ("despill", "despeckle", "despeckleSize", "background", "fg_source", "trim_chroma", "fill_holes", "sam2_additive", "sam2_weighted", "sam2_subtract", "edge_guard_px", "feet_guard_px", "feet_soften", "sam2_bypass", "mask1_bypass", "mask2_bypass", "show_sam2"):
                 merged[k] = v
         # Sync checkbox UI and self._params NOW — before any render fires — so that
         # every code path below uses the correct despeckle value. blockSignals prevents
@@ -2560,9 +2638,12 @@ class PersistentWindow(QtWidgets.QWidget):
                 matte_edge_guard = int(params_for_matte.get("edge_guard_px", 20))
                 matte_feet_guard = int(params_for_matte.get("feet_guard_px", 5))
                 matte_feet_soften = float(params_for_matte.get("feet_soften", 0))
+                _matte_m1_bypass = bool(params_for_matte.get("mask1_bypass", False))
+                _matte_m2_bypass = bool(params_for_matte.get("mask2_bypass", False))
                 # Multi-object v0.8 — same per-mask + union strategy as the
                 # Composite branch, with the same Option C halo binding so
                 # the Matte view matches what render_composite produces.
+                # Bypass applied at union time, not here — keeps auto-clip math intact.
                 _matte_pairs = [(oid, self.session.sam2_gates.get(oid))
                                 for oid in (1, 2)
                                 if self.session.sam2_gates.get(oid) is not None]
@@ -2578,8 +2659,11 @@ class PersistentWindow(QtWidgets.QWidget):
                             m2_m = cv2.resize(
                                 m2_m, (m1_m.shape[1], m1_m.shape[0]),
                                 interpolation=cv2.INTER_LINEAR)
+                        # Buffer must be >= EDGE GUARD to keep MASK 1's
+                        # SUBTRACT dilation out of MASK 2's zone.
+                        _cb_m = max(10, int(matte_edge_guard))
                         _ck_m = cv2.getStructuringElement(
-                            cv2.MORPH_ELLIPSE, (21, 21))
+                            cv2.MORPH_ELLIPSE, (_cb_m * 2 + 1, _cb_m * 2 + 1))
                         m2_excl_m = cv2.dilate(
                             (m2_m > 0.5).astype(np.uint8), _ck_m).astype(np.float32)
                         _g_by_oid_m[1] = m1_m * (1.0 - m2_excl_m)
@@ -2598,7 +2682,7 @@ class PersistentWindow(QtWidgets.QWidget):
                     _src_rgb_m = (self.session.original_rgb
                                   if self.session.original_rgb is not None
                                   else self.session.fg_rgb)
-                    _matte_alphas = []
+                    _matte_alphas_with_oid = []
                     _n_active_m = len(_matte_pairs)
                     for _oid_m, _gate_m in _matte_pairs:
                         _gate = _gate_m
@@ -2629,8 +2713,14 @@ class PersistentWindow(QtWidgets.QWidget):
                         if (_n_active_m > 1 and _oid_m == 2
                                 and matte_feet_soften > 0):
                             _ma = _soften_mask(_ma, matte_feet_soften)
-                        _matte_alphas.append(_ma)
-                    alpha = union_alpha(*_matte_alphas)
+                        _matte_alphas_with_oid.append((_oid_m, _ma))
+                    _matte_kept = [a for oid, a in _matte_alphas_with_oid
+                                   if not (oid == 1 and _matte_m1_bypass)
+                                   and not (oid == 2 and _matte_m2_bypass)]
+                    if not _matte_kept:
+                        alpha = self.session.alpha.copy()
+                    else:
+                        alpha = union_alpha(*_matte_kept)
                     if matte_margin > 0:
                         alpha = _dilate_mask(alpha, matte_margin)
                     if matte_soften > 0:
@@ -2639,6 +2729,24 @@ class PersistentWindow(QtWidgets.QWidget):
                     # SAM2 inactive — Matte view shows the raw NN alpha
                     # without margin/soften (those are SAM2-only controls).
                     alpha = self.session.alpha.copy()
+                # CHOKE: same erode as render_composite (line 647). Was missing
+                # from this branch — Matte view's slider showed no effect.
+                _matte_choke_px = float(params_for_matte.get("choke", 0))
+                if _matte_choke_px > 0:
+                    _ic = int(_matte_choke_px)
+                    _frac = _matte_choke_px - _ic
+                    _a8 = (np.clip(alpha, 0, 1) * 255).astype(np.uint8)
+                    _alpha_lo = cv2.erode(_a8, cv2.getStructuringElement(
+                        cv2.MORPH_ELLIPSE, (_ic * 2 + 1, _ic * 2 + 1)
+                    )).astype(np.float32) / 255.0 if _ic > 0 else alpha.copy()
+                    if _frac > 0:
+                        _k2 = (_ic + 1) * 2 + 1
+                        _alpha_hi = cv2.erode(_a8, cv2.getStructuringElement(
+                            cv2.MORPH_ELLIPSE, (_k2, _k2)
+                        )).astype(np.float32) / 255.0
+                        alpha = _alpha_lo * (1.0 - _frac) + _alpha_hi * _frac
+                    else:
+                        alpha = _alpha_lo
                 if params_for_matte.get("despeckle", True):
                     alpha = self.cu.clean_matte_opencv(
                         alpha, area_threshold=int(params_for_matte.get("despeckleSize", 400))

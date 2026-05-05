@@ -514,6 +514,9 @@ def get_settings():
         "feet_soften": 0.0,
         # SAM2 BYPASS: master switch — when True, all SAM2 paths skipped.
         "sam2_bypass": False,
+        # MASK 1/2 BYPASS: per-mask isolation, mirrors viewer.
+        "mask1_bypass": False,
+        "mask2_bypass": False,
     }
 
 # WHAT IT DOES: Overrides panel's despill / despeckle settings with the v2 viewer's
@@ -637,6 +640,18 @@ def _merge_live_params(settings):
                     out["sam2_bypass"] = bool(int(_bv))
                 except (ValueError, TypeError):
                     pass
+        for _bk in ("mask1_bypass", "mask2_bypass"):
+            if _bk in lp:
+                _bv = lp[_bk]
+                if isinstance(_bv, bool):
+                    out[_bk] = _bv
+                elif isinstance(_bv, str):
+                    out[_bk] = _bv.strip().lower() in ("true", "1", "yes", "on")
+                else:
+                    try:
+                        out[_bk] = bool(int(_bv))
+                    except (ValueError, TypeError):
+                        pass
         if "sam_positive" in lp or "sam_negative" in lp:
             sam_points["positive"] = [tuple(p) for p in lp.get("sam_positive", [])]
             sam_points["negative"] = [tuple(p) for p in lp.get("sam_negative", [])]
@@ -841,6 +856,10 @@ def _panel_dispatch_sam2_combine(alpha, gates, src_rgb, settings, obj_ids=None):
         return alpha
     import cv2, numpy as np
     from sam2_combine import union_alpha
+    # Per-mask bypass is applied at UNION time below — auto-clip math always
+    # runs so each mask's "alone" view shows its real role in the union.
+    _m1b = bool(settings.get("mask1_bypass", False))
+    _m2b = bool(settings.get("mask2_bypass", False))
     # Auto-clip MASK 1 by MASK 2 (with a 10-px dilation buffer) so EDGE GUARD
     # on MASK 1 cannot bleed into MASK 2's territory. Keeps the feet tight
     # under FEET GUARD even when MASK 1's body silhouette includes feet from
@@ -852,7 +871,11 @@ def _panel_dispatch_sam2_combine(alpha, gates, src_rgb, settings, obj_ids=None):
             if _m2.shape != _m1.shape:
                 _m2 = cv2.resize(_m2, (_m1.shape[1], _m1.shape[0]),
                                  interpolation=cv2.INTER_LINEAR)
-            _ck_p = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
+            # Buffer must be >= EDGE GUARD so MASK 1's SUBTRACT dilation
+            # doesn't re-invade MASK 2's territory.
+            _cb_p = max(10, int(settings.get("edge_guard_px", 20)))
+            _ck_p = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (_cb_p * 2 + 1, _cb_p * 2 + 1))
             _m2_excl = cv2.dilate((_m2 > 0.5).astype(np.uint8),
                                   _ck_p).astype(np.float32)
             _g_map[1] = _m1 * (1.0 - _m2_excl)
@@ -885,8 +908,15 @@ def _panel_dispatch_sam2_combine(alpha, gates, src_rgb, settings, obj_ids=None):
                 _k = 3
             a_n = _cv2.GaussianBlur(a_n, (_k, _k),
                                     sigmaX=_sigma, sigmaY=_sigma)
-        per_mask.append(a_n)
-    out = union_alpha(*per_mask)
+        per_mask.append((oid, a_n))
+    # Bypass at union time — keeps auto-clip math intact so each mask's
+    # "alone" view shows its real post-clip role.
+    kept = [a for oid, a in per_mask
+            if not (oid == 1 and _m1b)
+            and not (oid == 2 and _m2b)]
+    if not kept:
+        return alpha
+    out = union_alpha(*kept)
     return out if out is not None else alpha
 
 
@@ -1169,16 +1199,12 @@ def run_sam2_video_propagation(fp, ss, cs, in_f, out_f, pos_pts, neg_pts, anchor
         log(f"SAM2 video: loading predictor, anchor=range-frame {anchor_rel} (obj_ids={active_obj_ids})...")
         status("SAM2: loading video model...")
         from sam2.build_sam import build_sam2_video_predictor
-        # vos_optimized=True compiles the video model with torch.compile —
-        # Kimi research benchmarks: 2-3x speedup at 1080p with no quality
-        # change. Falls back gracefully on older SAM2 builds that don't
-        # accept the kwarg.
-        try:
-            predictor = build_sam2_video_predictor(cfg, ckpt, device=device, vos_optimized=True)
-            log("SAM2 video: vos_optimized=True (torch.compile)")
-        except TypeError:
-            predictor = build_sam2_video_predictor(cfg, ckpt, device=device)
-            log("SAM2 video: vos_optimized unsupported in this SAM2 build")
+        # vos_optimized=True needs a C compiler (Triton JIT) which most
+        # Windows users don't have. Without it, propagation crashes and the
+        # panel falls back to stamping the anchor mask on every frame. Run
+        # uncompiled — slower but correct on a stock Windows install.
+        predictor = build_sam2_video_predictor(cfg, ckpt, device=device)
+        log("SAM2 video: vos_optimized=False (no Triton C compiler dep)")
 
         # Per-object click sets — labels (1=positive, 0=negative).
         obj_pts = {
