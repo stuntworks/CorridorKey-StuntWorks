@@ -357,58 +357,20 @@ def render_composite(cu, session: Session, params: dict):
     sam2_subtract = bool(params.get("sam2_subtract", False))
     sam2_bypass = bool(params.get("sam2_bypass", False))
     edge_guard_px = int(params.get("edge_guard_px", 20))
-    # DaVinci formula exactly: multiply NN × gate first, then dilate+soften the result.
-    # Dilating the product spreads existing NN alpha values outward so MARGIN visibly
-    # grows the body. Gate cuts background bleed. SOFTEN feathers the expanded edge.
-    # halo_px>0 dilates the gate inside apply_sam2_gate so a band of NN values around
-    # the SAM2 silhouette survives — recovers hair / motion-blur detail at the edge.
-    # trim_chroma>0 removes screen-colored pixels from the gate before combine.
-    # fill_holes>0 fills alpha=0 holes inside the gate at non-screen-color pixels —
-    # rescues NN dropouts on yellow/skin/red. Applied AFTER the combine using the
-    # SAME (post-trim) gate so fill respects whatever TRIM SAM2 did.
+    # PATH B (per Berto 2026-05-05): SAM gate binarised at 0.5 and OR-blended
+    # into CK alpha. CK preserved; SAM only contributes where CK is lower.
+    # final = clip(CK + clip(SAM_binary - CK, 0, 1), 0, 1).
+    # Mode flags (sam2_subtract / _weighted / _additive) and HALO / EDGE GUARD
+    # / TRIM SAM2 / FILL HOLES are NO-OPS under Path B — sliders remain wired
+    # but feed nothing. apply_sam2_gate_* in sam2_combine.py are now orphan
+    # dead code, kept on disk for hot-revert per Berto's instruction.
     if session.alpha_nn is not None and session.sam2_gate_raw is not None and not sam2_bypass:
+        from corridorkey_sam_merge import binarize_sam_silhouette, merge_ck_with_sam
         _gate = session.sam2_gate_raw.copy()
         if _gate.shape != session.alpha_nn.shape:
             _gate = cv2.resize(_gate, (session.alpha_nn.shape[1], session.alpha_nn.shape[0]),
                                interpolation=cv2.INTER_LINEAR)
-        _src_rgb = session.original_rgb if session.original_rgb is not None else session.fg_rgb
-        if sam2_subtract:
-            # REVERTED to f6fa072: EDGE GUARD = hard buffer, feather = half.
-            _fp = max(int(edge_guard_px) // 2, 1)
-            alpha = np.clip(apply_sam2_gate_subtract(session.alpha_nn, _gate, _src_rgb,
-                                                     screen_type="green",
-                                                     buffer_px=int(edge_guard_px),
-                                                     feather_px=_fp),
-                            0.0, 1.0)
-        elif sam2_weighted:
-            # SMART BLEND: per-pixel weighted combine — NN trusted in green
-            # regions, SAM2 trusted off-green. Skips trim/fill/halo (the
-            # chroma-derived weight handles boundary blending).
-            alpha = np.clip(apply_sam2_gate_weighted(session.alpha_nn, _gate,
-                                                     _src_rgb, screen_type="green"),
-                            0.0, 1.0)
-        elif sam2_additive:
-            # ADDITIVE mode: alpha = max(NN, gate * non_screen). SAM2 can ADD
-            # confidence where NN missed but never SUBTRACT NN's correct alpha.
-            # trim_chroma / fill_holes don't apply here (additive math has no
-            # multiplicative combine to gate). HALO still functional but its
-            # semantics shift — it dilates the SAM2 gate so the additive
-            # contribution extends outward, rather than preserving NN's edge band.
-            _gate_for_add = _gate
-            if halo_px and halo_px > 0:
-                _bin = (_gate_for_add > 0.5).astype(np.uint8)
-                _k = int(halo_px) * 2 + 1
-                _kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_k, _k))
-                _gate_for_add = cv2.dilate(_bin, _kernel).astype(np.float32)
-            alpha = np.clip(apply_sam2_gate_additive(session.alpha_nn, _gate_for_add,
-                                                     _src_rgb, screen_type="green"),
-                            0.0, 1.0)
-        else:
-            if trim_chroma > 0:
-                _gate = trim_gate_by_chroma(_gate, _src_rgb, "green", trim_chroma)
-            alpha = np.clip(apply_sam2_gate(session.alpha_nn, _gate, invert=False, halo_px=halo_px, halo_body_px=halo_body_px), 0.0, 1.0)
-            if fill_holes > 0:
-                alpha = fill_holes_color_aware(alpha, _gate, _src_rgb, "green", fill_holes)
+        alpha = merge_ck_with_sam(session.alpha_nn, binarize_sam_silhouette(_gate))
     else:
         alpha = session.alpha.copy()
     if sam2_margin > 0:
@@ -1679,15 +1641,14 @@ class PersistentWindow(QtWidgets.QWidget):
                 _subtract = bool(params_for_matte.get("sam2_subtract", False))
                 _bypass = bool(params_for_matte.get("sam2_bypass", False))
                 _edge_guard = int(params_for_matte.get("edge_guard_px", 20))
+                # PATH B (per Berto 2026-05-05) — Matte view mirror of the
+                # Composite branch above. SAM gate binarised at 0.5 and
+                # OR-blended into CK alpha. Mode flags and HALO / EDGE GUARD /
+                # TRIM SAM2 / FILL HOLES are NO-OPS — sliders remain wired
+                # but feed nothing.
                 if self.session.alpha_nn is not None and self.session.sam2_gate_raw is not None and not _bypass:
+                    from corridorkey_sam_merge import binarize_sam_silhouette, merge_ck_with_sam
                     _gate = self.session.sam2_gate_raw.copy()
-                    # SAM2 returns the gate at 256x256 — must resize to alpha
-                    # shape or the multiply throws "operands could not be
-                    # broadcast together" and the Matte view goes blank /
-                    # the Split view shows a render error. The Composite
-                    # branch (render_composite) has this resize already; the
-                    # Matte branch was missing it. Fix re-applied 2026-04-28
-                    # after a cleanup revert that wiped it.
                     if _gate.shape != self.session.alpha_nn.shape:
                         _gate = cv2.resize(
                             _gate,
@@ -1695,46 +1656,8 @@ class PersistentWindow(QtWidgets.QWidget):
                              self.session.alpha_nn.shape[0]),
                             interpolation=cv2.INTER_LINEAR,
                         )
-                    _src_rgb_m = (self.session.original_rgb
-                                  if self.session.original_rgb is not None
-                                  else self.session.fg_rgb)
-                    if _subtract:
-                        # SUBTRACT mirror — see Composite branch.
-                        _fp_m = max(int(_edge_guard) // 2, 1)
-                        alpha = np.clip(apply_sam2_gate_subtract(self.session.alpha_nn,
-                                                                 _gate, _src_rgb_m,
-                                                                 screen_type="green",
-                                                                 buffer_px=int(_edge_guard),
-                                                                 feather_px=_fp_m),
-                                        0.0, 1.0)
-                    elif _weighted:
-                        # SMART BLEND mirror of Composite branch — per-pixel
-                        # weighted NN/SAM2 by chroma. trim/fill_holes/halo
-                        # intentionally not applied here either.
-                        alpha = np.clip(apply_sam2_gate_weighted(self.session.alpha_nn,
-                                                                 _gate, _src_rgb_m,
-                                                                 screen_type="green"),
-                                        0.0, 1.0)
-                    elif _additive:
-                        # ADDITIVE mode mirrors the Composite branch. HALO still
-                        # functional but its semantics shift (extends additive
-                        # contribution outward rather than preserving NN edge band).
-                        _gate_for_add = _gate
-                        if _halo and _halo > 0:
-                            _bin = (_gate_for_add > 0.5).astype(np.uint8)
-                            _k = int(_halo) * 2 + 1
-                            _kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_k, _k))
-                            _gate_for_add = cv2.dilate(_bin, _kernel).astype(np.float32)
-                        alpha = np.clip(apply_sam2_gate_additive(self.session.alpha_nn,
-                                                                 _gate_for_add, _src_rgb_m,
-                                                                 screen_type="green"),
-                                        0.0, 1.0)
-                    else:
-                        if _trim > 0:
-                            _gate = trim_gate_by_chroma(_gate, _src_rgb_m, "green", _trim)
-                        alpha = np.clip(apply_sam2_gate(self.session.alpha_nn, _gate, invert=False, halo_px=_halo, halo_body_px=_halo_body), 0.0, 1.0)
-                        if _fill > 0:
-                            alpha = fill_holes_color_aware(alpha, _gate, _src_rgb_m, "green", _fill)
+                    alpha = merge_ck_with_sam(self.session.alpha_nn,
+                                              binarize_sam_silhouette(_gate))
                 else:
                     alpha = self.session.alpha.copy()
                 if _m > 0:
