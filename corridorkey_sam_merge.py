@@ -1,4 +1,4 @@
-# Last modified: 2026-05-06 | Change: drop CHROMA_GATE_THRESHOLD 0.05->0.01 for dim green screens | Full history: git log
+# Last modified: 2026-05-06 | Change: ADD diagnostic dump (6 PNGs + stats.txt + branch print) | Full history: git log
 """Path B SAM2 + CK alpha merge — final = max(CK, threshold(SAM)).
 
 REPLACES the apply_sam2_junk_kill / apply_sam2_gate_* post-hoc combine
@@ -23,6 +23,7 @@ updating the docstring and Berto's brief.
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Iterable, Optional
 
 import numpy as np
@@ -32,6 +33,16 @@ import numpy as np
 # binarisation site (post-sigmoid SAM output). Raise to make SAM more
 # conservative; lower to let more of SAM's confidence band contribute.
 SAM_BINARIZE_THRESHOLD = 0.5
+
+# Diagnostic toggle — per Berto 2026-05-06 to confirm what chroma-gated merge
+# actually computes on the dim-greenscreen test clip (output observed identical
+# to SAM-alone, possible causes: chroma_score zero everywhere, or a stale code
+# path overriding our merge). When True, every chroma-gated call dumps 6 PNGs
+# + stats.txt to DEBUG_DIR. Flip to False once diagnosis is done — debug write
+# overwrites previous run, so only the LAST merge survives. Costs ~30-50 ms per
+# call on a 4K frame.
+DEBUG_ENABLED = True
+DEBUG_DIR = Path(__file__).parent / ".chroma_debug"
 
 # Active merge mode toggle. Flip and re-deploy to A/B between Path B and chroma-gated.
 # Per Berto 2026-05-06: True for chroma-gated test; flip to False to fall back to Path B.
@@ -155,6 +166,69 @@ def compute_chroma_weight(
     return weight
 
 
+def _write_debug_dump(ck, sam, source_rgb, weight, final, screen_type, threshold, dilate_px):
+    # WHAT IT DOES: Diagnostic dump — writes 6 PNGs + debug_stats.txt to DEBUG_DIR
+    #   so Berto can see what chroma-gated merge actually saw + produced. Called
+    #   only when DEBUG_ENABLED is True. Recomputes raw chroma_score (cheap) for
+    #   the pre-clip / pre-threshold view; everything else is what merge already
+    #   computed. Overwrites previous dump; only the LAST merge call survives.
+    # DEPENDS ON:   cv2 (lazy), numpy, pathlib. Inputs are the merge function's
+    #               local state at the moment of return.
+    # AFFECTS:      writes 7 files to DEBUG_DIR; no return; no logic side effect.
+    import cv2 as _cv2
+    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Recompute raw (pre-clip) chroma to expose negative scores too.
+    if screen_type == "blue":
+        raw_chroma = source_rgb[..., 2] - np.maximum(source_rgb[..., 0], source_rgb[..., 1])
+    else:
+        raw_chroma = source_rgb[..., 1] - np.maximum(source_rgb[..., 0], source_rgb[..., 2])
+
+    # raw_chroma in [-1, 1] (typically [-0.5, +0.5]) → mid-grey at zero.
+    raw_vis = np.clip((raw_chroma + 0.5) * 255.0, 0.0, 255.0).astype(np.uint8)
+    _cv2.imwrite(str(DEBUG_DIR / "debug_chroma_score_raw.png"), raw_vis)
+
+    weight_vis = np.clip(weight * 255.0, 0.0, 255.0).astype(np.uint8)
+    _cv2.imwrite(str(DEBUG_DIR / "debug_chroma_weight_final.png"), weight_vis)
+
+    # source_rgb is RGB float [0,1]; OpenCV writes BGR.
+    source_vis = np.clip(source_rgb * 255.0, 0.0, 255.0).astype(np.uint8)
+    source_bgr = _cv2.cvtColor(source_vis, _cv2.COLOR_RGB2BGR)
+    _cv2.imwrite(str(DEBUG_DIR / "debug_source_rgb.png"), source_bgr)
+
+    ck_vis = np.clip(ck * 255.0, 0.0, 255.0).astype(np.uint8)
+    _cv2.imwrite(str(DEBUG_DIR / "debug_ck_alpha.png"), ck_vis)
+
+    sam_vis = np.clip(sam * 255.0, 0.0, 255.0).astype(np.uint8)
+    _cv2.imwrite(str(DEBUG_DIR / "debug_sam_silhouette.png"), sam_vis)
+
+    final_vis = np.clip(final * 255.0, 0.0, 255.0).astype(np.uint8)
+    _cv2.imwrite(str(DEBUG_DIR / "debug_merge_output.png"), final_vis)
+
+    n_pixels = float(raw_chroma.size)
+    pct_above_threshold = float(np.sum(raw_chroma >= threshold)) / n_pixels * 100.0
+    pct_weight_high = float(np.sum(weight > 0.5)) / n_pixels * 100.0
+    ck_times_weight = ck * weight
+
+    stats = (
+        "=== chroma-gated merge debug dump ===\n"
+        f"raw_chroma  min={float(raw_chroma.min()):.4f}  "
+        f"max={float(raw_chroma.max()):.4f}  "
+        f"mean={float(raw_chroma.mean()):.4f}\n"
+        f"threshold (CHROMA_GATE_THRESHOLD)  = {threshold}\n"
+        f"dilate_px (CHROMA_GATE_DILATE_PX)  = {dilate_px}\n"
+        f"% pixels chroma>=threshold  (pre-dilate)  = {pct_above_threshold:.2f}%\n"
+        f"% pixels weight>0.5         (post-dilate) = {pct_weight_high:.2f}%\n"
+        f"sum(chroma_weight) = {float(weight.sum()):.2f}\n"
+        f"sum(merge_output)  = {float(final.sum()):.2f}\n"
+        f"mean(CK * weight)  = {float(ck_times_weight.mean()):.6f}  "
+        f"# nonzero means CK is contributing somewhere\n"
+        f"shapes: ck={ck.shape} sam={sam.shape} source_rgb={source_rgb.shape} "
+        f"weight={weight.shape} final={final.shape}\n"
+    )
+    (DEBUG_DIR / "debug_stats.txt").write_text(stats)
+
+
 def merge_ck_with_sam_chroma_gated(
     ck_alpha: np.ndarray,
     sam_silhouette: Optional[np.ndarray],
@@ -191,7 +265,13 @@ def merge_ck_with_sam_chroma_gated(
     if weight.shape != ck.shape:
         raise ValueError(f"chroma weight shape mismatch: weight={weight.shape}, ck={ck.shape}")
     final = weight * ck + (1.0 - weight) * sam
-    return np.clip(final, 0.0, 1.0).astype(np.float32)
+    final = np.clip(final, 0.0, 1.0).astype(np.float32)
+    if DEBUG_ENABLED:
+        try:
+            _write_debug_dump(ck, sam, source_rgb, weight, final, screen_type, threshold, dilate_px)
+        except Exception as _e:
+            print(f"[merge debug] dump failed: {_e}")
+    return final
 
 
 def merge_ck_with_sam_active(
@@ -210,7 +290,13 @@ def merge_ck_with_sam_active(
     # AFFECTS:      every site that imports this dispatcher. Currently:
     #               resolve renderer, resolve viewer, AE viewer (composite + matte).
     if USE_CHROMA_GATED_MERGE and source_rgb is not None:
+        print(
+            f"[merge] chroma-gated branch  USE_CHROMA_GATED_MERGE=True  "
+            f"source_rgb.shape={getattr(source_rgb, 'shape', None)}"
+        )
         return merge_ck_with_sam_chroma_gated(
             ck_alpha, sam_silhouette, source_rgb, screen_type=screen_type,
         )
+    _reason = "flag=False" if not USE_CHROMA_GATED_MERGE else "source_rgb=None"
+    print(f"[merge] Path B fallback branch  ({_reason})")
     return merge_ck_with_sam(ck_alpha, sam_silhouette)
