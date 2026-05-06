@@ -842,82 +842,43 @@ def _panel_combine_one_mask(alpha, gate, src_rgb, settings):
     return out
 
 
-# WHAT IT DOES: Runs _panel_combine_one_mask across each per-mask gate and
-#   unions the alphas. Implements Option C halo binding: when 2+ masks are
-#   active, HALO BODY only applies to MASK 1 and HALO FEET only applies to
-#   MASK 2. When exactly one mask is active (single-mask sessions, including
-#   legacy migrated sessions), both halos apply to that mask — preserves the
-#   pre-multi-object behaviour so old workflows don't regress.
-# DEPENDS-ON: _panel_combine_one_mask, union_alpha from sam2_combine.
+# WHAT IT DOES: Path B CK+SAM merge per Berto 2026-05-05 — CK preserved;
+#   each per-mask SAM gate binarised at 0.5, gates unioned, then OR-blended
+#   into CK so missing off-green regions are filled WITHOUT overriding CK
+#   detail. Algebraic form: final = clip(CK + clip(SAM_union - CK, 0, 1), 0, 1).
+#   Per-mask BYPASS toggles preserved (user-facing UI for disabling a mask).
+#   Mode flags (sam2_subtract / _weighted / _additive) and HALO / EDGE GUARD /
+#   FEET GUARD / TRIM SAM2 / FILL HOLES sliders are NO-OPS under Path B —
+#   _panel_combine_one_mask() above and apply_sam2_gate_* in sam2_combine.py
+#   are now dead code, kept on disk for hot-revert per Berto's instruction.
+# DEPENDS-ON: corridorkey_sam_merge.{binarize_sam_silhouette,
+#   union_binary_silhouettes, merge_ck_with_sam}.
 # AFFECTS: returns a fresh alpha array; inputs unchanged. Returns alpha
-#   unchanged when gates list is empty (NN-only fallback).
+#   when gates list is empty or all masks bypassed (NN-only fallback).
 def _panel_dispatch_sam2_combine(alpha, gates, src_rgb, settings, obj_ids=None):
     if not gates:
         return alpha
-    import cv2, numpy as np
-    from sam2_combine import union_alpha
-    # Per-mask bypass is applied at UNION time below — auto-clip math always
-    # runs so each mask's "alone" view shows its real role in the union.
+    from corridorkey_sam_merge import (
+        binarize_sam_silhouette, union_binary_silhouettes, merge_ck_with_sam,
+    )
     _m1b = bool(settings.get("mask1_bypass", False))
     _m2b = bool(settings.get("mask2_bypass", False))
-    # Auto-clip MASK 1 by MASK 2 (with a 10-px dilation buffer) so EDGE GUARD
-    # on MASK 1 cannot bleed into MASK 2's territory. Keeps the feet tight
-    # under FEET GUARD even when MASK 1's body silhouette includes feet from
-    # SAM2's segmentation. Mirrors the viewer's render_composite path.
-    if obj_ids is not None and len(gates) == 2:
-        _g_map = {obj_ids[i]: gates[i] for i in range(len(gates))}
-        if 1 in _g_map and 2 in _g_map:
-            _m1, _m2 = _g_map[1], _g_map[2]
-            if _m2.shape != _m1.shape:
-                _m2 = cv2.resize(_m2, (_m1.shape[1], _m1.shape[0]),
-                                 interpolation=cv2.INTER_LINEAR)
-            # Buffer must be >= EDGE GUARD so MASK 1's SUBTRACT dilation
-            # doesn't re-invade MASK 2's territory.
-            _cb_p = max(10, int(settings.get("edge_guard_px", 20)))
-            _ck_p = cv2.getStructuringElement(
-                cv2.MORPH_ELLIPSE, (_cb_p * 2 + 1, _cb_p * 2 + 1))
-            _m2_excl = cv2.dilate((_m2 > 0.5).astype(np.uint8),
-                                  _ck_p).astype(np.float32)
-            _g_map[1] = _m1 * (1.0 - _m2_excl)
-            gates = [_g_map[obj_ids[i]] for i in range(len(gates))]
-    per_mask = []
-    n_active = len(gates)
-    halo_px_user = int(settings.get("halo_px", 0))
-    halo_body_user = int(settings.get("halo_body_px", 0))
-    edge_guard_user = int(settings.get("edge_guard_px", 20))
-    feet_guard_user = int(settings.get("feet_guard_px", 5))
-    feet_soften_user = float(settings.get("feet_soften", 0))
-    for i, g in enumerate(gates):
+    # Per-mask BYPASS: drop gate(s) the user toggled off. Order doesn't matter
+    # in the union (commutative). src_rgb is unused — Path B is chroma-blind.
+    active_silhouettes = []
+    for i, gate in enumerate(gates):
+        if gate is None:
+            continue
         oid = obj_ids[i] if (obj_ids is not None and i < len(obj_ids)) else None
-        if oid is not None and n_active > 1:
-            local = dict(settings)
-            # MASK 1 owns HALO BODY + EDGE GUARD (body / on-green parts).
-            # MASK 2 owns HALO FEET + FEET GUARD (off-green parts).
-            local["halo_body_px"] = halo_body_user if oid == 1 else 0
-            local["halo_px"] = halo_px_user if oid == 2 else 0
-            local["edge_guard_px"] = edge_guard_user if oid == 1 else feet_guard_user
-        else:
-            local = settings
-        a_n = _panel_combine_one_mask(alpha, g, src_rgb, local)
-        # Per-mask SOFTEN: MASK 2 only when multi-mask. Mirrors viewer logic.
-        if n_active > 1 and oid == 2 and feet_soften_user > 0:
-            import cv2 as _cv2
-            _sigma = float(feet_soften_user)
-            _k = int(_sigma * 6) | 1
-            if _k < 3:
-                _k = 3
-            a_n = _cv2.GaussianBlur(a_n, (_k, _k),
-                                    sigmaX=_sigma, sigmaY=_sigma)
-        per_mask.append((oid, a_n))
-    # Bypass at union time — keeps auto-clip math intact so each mask's
-    # "alone" view shows its real post-clip role.
-    kept = [a for oid, a in per_mask
-            if not (oid == 1 and _m1b)
-            and not (oid == 2 and _m2b)]
-    if not kept:
+        if oid == 1 and _m1b:
+            continue
+        if oid == 2 and _m2b:
+            continue
+        active_silhouettes.append(binarize_sam_silhouette(gate))
+    if not active_silhouettes:
         return alpha
-    out = union_alpha(*kept)
-    return out if out is not None else alpha
+    sam_union = union_binary_silhouettes(active_silhouettes)
+    return merge_ck_with_sam(alpha, sam_union)
 
 
 # WHAT IT DOES: Reads per-object SAM2 silhouette PNGs (sam2_mask_obj1.png and
