@@ -1,4 +1,4 @@
-# Last modified: 2026-05-06 | Change: bump CHROMA_GATE_DILATE_PX default 0->50 (butt-notch + fingertip fix) | Full history: git log
+# Last modified: 2026-05-06 | Change: drop CHROMA_GATE_THRESHOLD 0.05->0.01 for dim green screens | Full history: git log
 """Path B SAM2 + CK alpha merge — final = max(CK, threshold(SAM)).
 
 REPLACES the apply_sam2_junk_kill / apply_sam2_gate_* post-hoc combine
@@ -40,10 +40,13 @@ SAM_BINARIZE_THRESHOLD = 0.5
 USE_CHROMA_GATED_MERGE = True
 
 # Chroma test threshold — per-pixel green excess (G - max(R, B)) above which the pixel
-# counts as "on-green" and CK rules. 0.05 matches sam2_combine.apply_sam2_gate_additive's
-# is_screen threshold (line 185) for cross-module consistency. Lower catches more
-# spilled-edge pixels as on-green; higher restricts CK rule to clearly-green pixels.
-CHROMA_GATE_THRESHOLD = 0.05
+# counts as "on-green" and CK rules. Dropped 0.05 -> 0.01 on 2026-05-06 after dim
+# green screen test clip showed chroma_score < 0.05 across the whole frame — zero
+# pixels registered as on-green, CK contributed nothing, output collapsed to SAM-alone.
+# 0.01 sits below sam2_combine.apply_sam2_gate_additive's 0.1 threshold (line 185)
+# precisely to handle dim/under-lit green-screen sets. Lower catches more spilled-edge
+# pixels as on-green; higher restricts CK rule to clearly-green pixels.
+CHROMA_GATE_THRESHOLD = 0.01
 
 # On-green region dilation in pixels. Extends the binary chroma mask inward so body
 # pixels with low chroma (no green spill on skin / dark fabric) but spatially inside
