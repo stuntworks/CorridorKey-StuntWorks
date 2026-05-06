@@ -554,109 +554,45 @@ def render_composite(cu, session: Session, params: dict):
     feet_soften = float(params.get("feet_soften", 0))
     mask1_bypass = bool(params.get("mask1_bypass", False))
     mask2_bypass = bool(params.get("mask2_bypass", False))
-    # Multi-object v0.8 — collect every per-mask gate (paired with obj_id)
-    # and run the combine pipeline ONCE PER MASK, then union the per-mask
-    # alphas. Per-mask is the correct contract for HALO operations
-    # (apply_sam2_gate uses the mask's OWN bbox internally).
-    # Option C halo binding: when 2+ masks are active, HALO BODY only acts
-    # on MASK 1 and HALO FEET only acts on MASK 2 — eliminates the "pillow
-    # around feet" caused by HALO BODY's lateral extension at MASK 2's
-    # silhouette row. Single-mask sessions get both halos applied (legacy
-    # behaviour preserved for migrated old sessions).
-    # Per-mask bypass is applied at UNION time (below), NOT here. Auto-clip
-    # math always runs on both masks so each mask's "alone" view shows its
-    # real role in the combined output.
+    # PATH B (per Berto 2026-05-05): each per-mask SAM gate binarised at 0.5,
+    # gates unioned, then OR-blended into CK alpha. CK preserved everywhere;
+    # SAM contributes only where CK is lower. Per-mask BYPASS preserved (UI).
+    # Mode flags (sam2_subtract / _weighted / _additive) and HALO / EDGE GUARD
+    # / FEET GUARD / TRIM SAM2 / FILL HOLES are NO-OPS under Path B — their
+    # sliders remain wired into params but feed nothing. _combine_one_mask
+    # and _trimap_fuse above + apply_sam2_gate_* in sam2_combine.py are
+    # orphan dead code, left on disk for hot-revert.
     _per_mask_pairs = [(oid, session.sam2_gates.get(oid)) for oid in (1, 2)
                        if session.sam2_gates.get(oid) is not None]
     if session.alpha_raw is not None and _per_mask_pairs and not sam2_bypass:
-        _src_rgb = session.original_rgb if session.original_rgb is not None else session.fg_rgb
-        # Symmetric auto-clip for two-mask sessions:
-        #   MASK 1 - MASK 2 (with 10 px dilation buffer): EDGE GUARD on body
-        #     mask cannot bleed into MASK 2's feet/off-green territory.
-        #   MASK 2 - is_green (chroma test on source RGB): MASK 2 only acts
-        #     where there is NO green-screen behind. Anything going into green
-        #     is cut from MASK 2 — keeps it confined to off-green zones (floor,
-        #     wall, props) so EDGE GUARD on MASK 1 owns the body-on-green area
-        #     uncontested. Yellow-shirt safe (chroma on background, not on FG).
-        if len(_per_mask_pairs) == 2:
-            _gates_by_oid = {oid: g for oid, g in _per_mask_pairs}
-            m1, m2 = _gates_by_oid.get(1), _gates_by_oid.get(2)
-            if m1 is not None and m2 is not None:
-                if m2.shape != m1.shape:
-                    m2 = cv2.resize(m2, (m1.shape[1], m1.shape[0]),
-                                    interpolation=cv2.INTER_LINEAR)
-                # MASK 1 - MASK 2 (dilated). Buffer must be >= EDGE GUARD,
-                # otherwise SUBTRACT's dilation re-invades MASK 2's zone.
-                _clip_buf = max(10, int(edge_guard_px))
-                _ck = cv2.getStructuringElement(
-                    cv2.MORPH_ELLIPSE, (_clip_buf * 2 + 1, _clip_buf * 2 + 1))
-                m2_excl = cv2.dilate(
-                    (m2 > 0.5).astype(np.uint8), _ck).astype(np.float32)
-                _gates_by_oid[1] = m1 * (1.0 - m2_excl)
-                # MASK 2 - is_green (source-chroma test)
-                if _src_rgb is not None and _src_rgb.shape[:2] == m2.shape:
-                    _chroma_g = (_src_rgb[..., 1].astype(np.float32) -
-                                 np.maximum(_src_rgb[..., 0],
-                                            _src_rgb[..., 2]).astype(np.float32))
-                    _is_green = (_chroma_g > 0.05).astype(np.float32)
-                    _gates_by_oid[2] = m2 * (1.0 - _is_green)
-            _per_mask_pairs = [(oid, _gates_by_oid[oid])
-                               for oid, _ in _per_mask_pairs]
-        _per_mask_alphas_with_oid = []
-        _n_active = len(_per_mask_pairs)
-        for _oid, _gate_n in _per_mask_pairs:
-            _gate = _gate_n
+        from corridorkey_sam_merge import (
+            binarize_sam_silhouette, union_binary_silhouettes, merge_ck_with_sam,
+        )
+        # Per-mask BYPASS: drop gates the user toggled off. Resize each
+        # surviving gate to alpha_raw shape before binarising — the engine
+        # may downscale internally so gate H,W can differ from alpha H,W.
+        _active_silhouettes = []
+        for _oid, _gate in _per_mask_pairs:
+            if _oid == 1 and mask1_bypass:
+                continue
+            if _oid == 2 and mask2_bypass:
+                continue
             if _gate.shape != session.alpha_raw.shape:
                 _gate = cv2.resize(_gate, (session.alpha_raw.shape[1], session.alpha_raw.shape[0]),
                                    interpolation=cv2.INTER_LINEAR)
-            if _n_active > 1:
-                _h_body = halo_body_px if _oid == 1 else 0
-                _h_feet = halo_px if _oid == 2 else 0
-                # Per-mask margin: MASK 1 = EDGE GUARD (body, generous for
-                # hair/butt). MASK 2 = FEET GUARD (off-green, tight). The
-                # MASK 1 - MASK 2 auto-clip above already removed MASK 2's
-                # area from MASK 1, so EDGE GUARD's dilation can't pillow
-                # into floor — no extra alpha filter needed (would kill butt).
-                _eg = edge_guard_px if _oid == 1 else feet_guard_px
-            else:
-                _h_body = halo_body_px
-                _h_feet = halo_px
-                _eg = edge_guard_px
-            _per_mask_alpha = _combine_one_mask(
-                session.alpha_raw, _gate, _src_rgb,
-                sam2_subtract=sam2_subtract,
-                sam2_weighted=sam2_weighted,
-                sam2_additive=sam2_additive,
-                halo_px=_h_feet, halo_body_px=_h_body,
-                edge_guard_px=_eg,
-                trim_chroma=trim_chroma, fill_holes=fill_holes,
-            )
-            # Per-mask SOFTEN: MASK 2 (feet) gets its own softening so the
-            # user can blur the feet edge without affecting the body. Applied
-            # BEFORE union so it only operates on MASK 2's contribution.
-            if _n_active > 1 and _oid == 2 and feet_soften > 0:
-                _per_mask_alpha = _soften_mask(_per_mask_alpha, feet_soften)
-            _per_mask_alphas_with_oid.append((_oid, _per_mask_alpha))
-        # Bypass at union time: each mask's "alone" view shows its real
-        # post-auto-clip role, not the raw greedy version.
-        _kept = [a for oid, a in _per_mask_alphas_with_oid
-                 if not (oid == 1 and mask1_bypass)
-                 and not (oid == 2 and mask2_bypass)]
-        if not _kept:
+            _active_silhouettes.append(binarize_sam_silhouette(_gate))
+        if not _active_silhouettes:
             alpha = session.alpha.copy()
         else:
-            alpha = union_alpha(*_kept)
+            _sam_union = union_binary_silhouettes(_active_silhouettes)
+            alpha = merge_ck_with_sam(session.alpha_raw, _sam_union)
         if sam2_margin > 0:
             alpha = _dilate_mask(alpha, sam2_margin)
         if sam2_soften > 0:
             alpha = _soften_mask(alpha, sam2_soften)
     else:
-        # SAM2 inactive — Margin and Soften are SAM2-only controls and do
-        # nothing here. The sliders grey out in the viewer UI to make this
-        # visible to the user. Render output (PROCESS RANGE / SCRUB RANGE)
-        # has always behaved this way; the previous viewer-only branch that
-        # applied margin/soften to NN alpha was a parity bug — preview
-        # showed the user something the render couldn't deliver.
+        # SAM2 inactive — sam2_margin and sam2_soften are SAM2-only globals
+        # and don't apply here. The sliders grey out in the viewer UI.
         alpha = session.alpha.copy()
     if choke_px > 0:
         int_choke = int(choke_px)
