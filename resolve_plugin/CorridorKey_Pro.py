@@ -852,19 +852,22 @@ def _panel_combine_one_mask(alpha, gate, src_rgb, settings):
 #   _panel_combine_one_mask() above and apply_sam2_gate_* in sam2_combine.py
 #   are now dead code, kept on disk for hot-revert per Berto's instruction.
 # DEPENDS-ON: corridorkey_sam_merge.{binarize_sam_silhouette,
-#   union_binary_silhouettes, merge_ck_with_sam}.
+#   union_binary_silhouettes, merge_ck_with_sam_active}. The active dispatcher
+#   routes to chroma-gated merge when USE_CHROMA_GATED_MERGE flag is True and
+#   src_rgb is provided; falls back to Path B (chroma-blind max) otherwise.
 # AFFECTS: returns a fresh alpha array; inputs unchanged. Returns alpha
 #   when gates list is empty or all masks bypassed (NN-only fallback).
 def _panel_dispatch_sam2_combine(alpha, gates, src_rgb, settings, obj_ids=None):
     if not gates:
         return alpha
     from corridorkey_sam_merge import (
-        binarize_sam_silhouette, union_binary_silhouettes, merge_ck_with_sam,
+        binarize_sam_silhouette, union_binary_silhouettes, merge_ck_with_sam_active,
     )
     _m1b = bool(settings.get("mask1_bypass", False))
     _m2b = bool(settings.get("mask2_bypass", False))
     # Per-mask BYPASS: drop gate(s) the user toggled off. Order doesn't matter
-    # in the union (commutative). src_rgb is unused — Path B is chroma-blind.
+    # in the union (commutative). src_rgb is forwarded to the active dispatcher
+    # — chroma-gated merge needs it; Path B fallback ignores it.
     active_silhouettes = []
     for i, gate in enumerate(gates):
         if gate is None:
@@ -878,7 +881,7 @@ def _panel_dispatch_sam2_combine(alpha, gates, src_rgb, settings, obj_ids=None):
     if not active_silhouettes:
         return alpha
     sam_union = union_binary_silhouettes(active_silhouettes)
-    return merge_ck_with_sam(alpha, sam_union)
+    return merge_ck_with_sam_active(alpha, sam_union, source_rgb=src_rgb)
 
 
 # WHAT IT DOES: Reads per-object SAM2 silhouette PNGs (sam2_mask_obj1.png and

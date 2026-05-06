@@ -566,8 +566,13 @@ def render_composite(cu, session: Session, params: dict):
                        if session.sam2_gates.get(oid) is not None]
     if session.alpha_raw is not None and _per_mask_pairs and not sam2_bypass:
         from corridorkey_sam_merge import (
-            binarize_sam_silhouette, union_binary_silhouettes, merge_ck_with_sam,
+            binarize_sam_silhouette, union_binary_silhouettes, merge_ck_with_sam_active,
         )
+        # source_rgb passed to the active dispatcher: chroma-gated merge needs
+        # the un-despilled source frame to compute on-green vs off-green pixel
+        # weights. original_rgb is the raw plate (preferred); fg_rgb is the
+        # post-despill output and falls back when original wasn't loaded.
+        _src_rgb = session.original_rgb if session.original_rgb is not None else session.fg_rgb
         # Per-mask BYPASS: drop gates the user toggled off. Resize each
         # surviving gate to alpha_raw shape before binarising — the engine
         # may downscale internally so gate H,W can differ from alpha H,W.
@@ -585,7 +590,7 @@ def render_composite(cu, session: Session, params: dict):
             alpha = session.alpha.copy()
         else:
             _sam_union = union_binary_silhouettes(_active_silhouettes)
-            alpha = merge_ck_with_sam(session.alpha_raw, _sam_union)
+            alpha = merge_ck_with_sam_active(session.alpha_raw, _sam_union, source_rgb=_src_rgb)
         if sam2_margin > 0:
             alpha = _dilate_mask(alpha, sam2_margin)
         if sam2_soften > 0:

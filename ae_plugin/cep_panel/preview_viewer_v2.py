@@ -365,12 +365,16 @@ def render_composite(cu, session: Session, params: dict):
     # but feed nothing. apply_sam2_gate_* in sam2_combine.py are now orphan
     # dead code, kept on disk for hot-revert per Berto's instruction.
     if session.alpha_nn is not None and session.sam2_gate_raw is not None and not sam2_bypass:
-        from corridorkey_sam_merge import binarize_sam_silhouette, merge_ck_with_sam
+        from corridorkey_sam_merge import binarize_sam_silhouette, merge_ck_with_sam_active
+        # source_rgb fed to the active dispatcher: chroma-gated merge needs the
+        # un-despilled source plate to compute on-green vs off-green pixel weights.
+        _src_rgb = session.original_rgb if session.original_rgb is not None else session.fg_rgb
         _gate = session.sam2_gate_raw.copy()
         if _gate.shape != session.alpha_nn.shape:
             _gate = cv2.resize(_gate, (session.alpha_nn.shape[1], session.alpha_nn.shape[0]),
                                interpolation=cv2.INTER_LINEAR)
-        alpha = merge_ck_with_sam(session.alpha_nn, binarize_sam_silhouette(_gate))
+        alpha = merge_ck_with_sam_active(session.alpha_nn, binarize_sam_silhouette(_gate),
+                                         source_rgb=_src_rgb)
     else:
         alpha = session.alpha.copy()
     if sam2_margin > 0:
@@ -1647,7 +1651,11 @@ class PersistentWindow(QtWidgets.QWidget):
                 # TRIM SAM2 / FILL HOLES are NO-OPS — sliders remain wired
                 # but feed nothing.
                 if self.session.alpha_nn is not None and self.session.sam2_gate_raw is not None and not _bypass:
-                    from corridorkey_sam_merge import binarize_sam_silhouette, merge_ck_with_sam
+                    from corridorkey_sam_merge import binarize_sam_silhouette, merge_ck_with_sam_active
+                    # source_rgb for the active dispatcher (chroma-gated merge).
+                    _src_rgb_m = (self.session.original_rgb
+                                  if self.session.original_rgb is not None
+                                  else self.session.fg_rgb)
                     _gate = self.session.sam2_gate_raw.copy()
                     if _gate.shape != self.session.alpha_nn.shape:
                         _gate = cv2.resize(
@@ -1656,8 +1664,9 @@ class PersistentWindow(QtWidgets.QWidget):
                              self.session.alpha_nn.shape[0]),
                             interpolation=cv2.INTER_LINEAR,
                         )
-                    alpha = merge_ck_with_sam(self.session.alpha_nn,
-                                              binarize_sam_silhouette(_gate))
+                    alpha = merge_ck_with_sam_active(self.session.alpha_nn,
+                                                     binarize_sam_silhouette(_gate),
+                                                     source_rgb=_src_rgb_m)
                 else:
                     alpha = self.session.alpha.copy()
                 if _m > 0:
