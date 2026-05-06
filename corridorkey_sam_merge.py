@@ -1,4 +1,4 @@
-# Last modified: 2026-05-06 | Change: ADD chroma-gated merge + dispatcher (USE_CHROMA_GATED_MERGE flag) | Full history: git log
+# Last modified: 2026-05-06 | Change: bump CHROMA_GATE_DILATE_PX default 0->50 (butt-notch + fingertip fix) | Full history: git log
 """Path B SAM2 + CK alpha merge — final = max(CK, threshold(SAM)).
 
 REPLACES the apply_sam2_junk_kill / apply_sam2_gate_* post-hoc combine
@@ -44,6 +44,16 @@ USE_CHROMA_GATED_MERGE = True
 # is_screen threshold (line 185) for cross-module consistency. Lower catches more
 # spilled-edge pixels as on-green; higher restricts CK rule to clearly-green pixels.
 CHROMA_GATE_THRESHOLD = 0.05
+
+# On-green region dilation in pixels. Extends the binary chroma mask inward so body
+# pixels with low chroma (no green spill on skin / dark fabric) but spatially inside
+# the green-screen area still register as on-green and let CK rule. Solves the
+# butt-notch + fingertip-cut cases observed 2026-05-06 in DaVinci testing — body
+# skin is chroma~0, SAM under-clipped at butt + fingertips, without dilation those
+# pixels were ruled by SAM's wrong silhouette. 50 px works on the woman-with-foot-
+# off-green clip (notch depth ~30-50 px). Tune lower if walls re-appear (dilation
+# reaching junk pixels close to green); tune higher if more body parts get cut.
+CHROMA_GATE_DILATE_PX = 50
 
 
 def binarize_sam_silhouette(sam: np.ndarray, threshold: float = SAM_BINARIZE_THRESHOLD) -> np.ndarray:
@@ -96,7 +106,7 @@ def compute_chroma_weight(
     screen_type: str = "green",
     threshold: float = CHROMA_GATE_THRESHOLD,
     soft_band: float = 0.0,
-    dilate_px: int = 0,
+    dilate_px: int = CHROMA_GATE_DILATE_PX,
 ) -> np.ndarray:
     # WHAT IT DOES: Per-pixel float [0, 1] weight encoding "is this pixel on the
     #   green-screen side?" 1 = on-green (CK rules), 0 = off-green (SAM rules).
@@ -127,11 +137,11 @@ def compute_chroma_weight(
         weight = (t * t * (3.0 - 2.0 * t)).astype(np.float32)
 
     if dilate_px > 0:
-        # Optional: extend on-green region into body interior by dilate_px pixels.
-        # Solves the case where body-skin pixels have low chroma (no green spill)
-        # but spatially sit inside the green-screen area (e.g., the butt-notch
-        # case from 2026-05-05 testing). OFF by default; turn on if the test
-        # clip shows that failure mode.
+        # Extend on-green region into body interior by dilate_px pixels. Solves the
+        # case where body-skin pixels have low chroma (no green spill) but spatially
+        # sit inside the green-screen area — the butt-notch + fingertip-cut cases
+        # observed 2026-05-06 in DaVinci. ON by default at CHROMA_GATE_DILATE_PX=50.
+        # Set dilate_px=0 to disable.
         import cv2 as _cv2
         binary = (weight > 0.5).astype(np.uint8)
         _k = int(dilate_px) * 2 + 1
@@ -149,7 +159,7 @@ def merge_ck_with_sam_chroma_gated(
     screen_type: str = "green",
     threshold: float = CHROMA_GATE_THRESHOLD,
     soft_band: float = 0.0,
-    dilate_px: int = 0,
+    dilate_px: int = CHROMA_GATE_DILATE_PX,
 ) -> np.ndarray:
     # WHAT IT DOES: Chroma-gated CK + SAM merge per Berto 2026-05-06.
     #     final = weight * CK + (1 - weight) * SAM_binary
