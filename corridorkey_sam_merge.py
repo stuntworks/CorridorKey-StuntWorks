@@ -1,4 +1,4 @@
-# Last modified: 2026-05-07 | Change: gate soft zone with dilated SAM (SOFT_ZONE_SAM_BUFFER_PX=15) so wall/floor/drape transitions die while body soft edges and hair tendrils survive | Full history: git log
+# Last modified: 2026-05-07 | Change: SOFT_ZONE_SAM_BUFFER_PX 15->40 to widen buffer past CK natural soft edge extent so hair/fringe survives | Full history: git log
 """CK-confidence-based merge per Berto 2026-05-07.
 
 REPLACES the chroma-gated merge + outer SAM kill mask architecture. The
@@ -76,7 +76,7 @@ CK_SOFT_HI = 0.7
 # the soft zone with a SAM silhouette dilated by this many pixels so hair
 # tendrils just past the tight SAM edge survive while wall outlines far from
 # SAM die. Tune up if hair clips, down if wall outlines persist.
-SOFT_ZONE_SAM_BUFFER_PX = 15
+SOFT_ZONE_SAM_BUFFER_PX = 40
 
 
 def binarize_sam_silhouette(sam: np.ndarray, threshold: float = SAM_BINARIZE_THRESHOLD) -> np.ndarray:
