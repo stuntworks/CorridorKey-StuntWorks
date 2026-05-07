@@ -1,4 +1,4 @@
-# Last modified: 2026-05-06 | Change: tighten SAM_KILL_DILATE_PX 120->30 to remove shoe halo while preserving CK soft edges | Full history: git log
+# Last modified: 2026-05-06 | Change: chroma-aware kill mask dilation - large buffer on-green for CK soft edges, small buffer off-green for junk halos | Full history: git log
 """Path B SAM2 + CK alpha merge — final = max(CK, threshold(SAM)).
 
 REPLACES the apply_sam2_junk_kill / apply_sam2_gate_* post-hoc combine
@@ -79,11 +79,16 @@ CHROMA_GATE_DILATE_PX = 50
 # CLOSE_KERNEL_PX fills internal holes/notches in the SAM silhouette before it
 # becomes a kill mask — prevents the butt-notch from punching through the kill
 # mask and over-killing valid CK body pixels.
-# DILATE_PX is the outward buffer past the closed SAM silhouette, sized to
-# preserve CK soft edges (hair strands, fingertip wisps) that extend slightly
-# past SAM's tight silhouette.
+#
+# DILATE_ON_GREEN_PX vs DILATE_OFF_GREEN_PX: per Berto 2026-05-06 evening, a
+# single uniform dilation can't satisfy both ends of the trade-off — hair / butt
+# soft edges need a LARGE buffer (they live on-green where CK supplies soft
+# alpha past SAM), while leg / shoe halos need a SMALL buffer (off-green where
+# CK leftover alpha leaks through). Buffer is chroma-aware: large in on-green
+# zones, small in off-green zones.
 SAM_KILL_CLOSE_KERNEL_PX = 75
-SAM_KILL_DILATE_PX = 30
+SAM_KILL_DILATE_ON_GREEN_PX = 100
+SAM_KILL_DILATE_OFF_GREEN_PX = 15
 
 
 def binarize_sam_silhouette(sam: np.ndarray, threshold: float = SAM_BINARIZE_THRESHOLD) -> np.ndarray:
@@ -184,23 +189,30 @@ def compute_chroma_weight(
 
 def compute_sam_kill_mask(
     sam_silhouette: np.ndarray,
+    chroma_weight: np.ndarray,
     close_kernel_px: int = SAM_KILL_CLOSE_KERNEL_PX,
-    dilate_px: int = SAM_KILL_DILATE_PX,
+    on_green_dilate_px: int = SAM_KILL_DILATE_ON_GREEN_PX,
+    off_green_dilate_px: int = SAM_KILL_DILATE_OFF_GREEN_PX,
 ) -> np.ndarray:
-    # WHAT IT DOES: Build a binary kill mask from the SAM silhouette so the
-    #   chroma-gated merge result can be zeroed far from any body indication.
-    #   1 = inside SAM (with notches filled by morph close) plus an outward
-    #       dilation buffer — merge result is allowed to vote.
-    #   0 = far from any plausible body location — final merge is forced to 0.
-    #   Wraps the merge output to kill walls/forklift/junk where chroma weight
-    #   was 1 (green spill or within chroma dilate of green tarp) and CK had
-    #   false positives.
-    # DEPENDS ON:   cv2 (lazy), numpy. sam_silhouette is (H, W) float32 in [0, 1],
-    #               typically already binarized. Caller passes the silhouette
-    #               that participated in the merge.
+    # WHAT IT DOES: Build a chroma-aware binary kill mask from the SAM
+    #   silhouette. 1 = merge votes survive. 0 = merge forced to 0.
+    #   Buffer size depends on chroma_weight per pixel:
+    #     on-green  (weight > 0.5): LARGE outward buffer — preserves CK soft
+    #                                edges (hair, butt fringe).
+    #     off-green (weight <= 0.5): SMALL outward buffer — kills shoe/leg
+    #                                halos and CK leftover alpha bleed.
+    #   Per Berto 2026-05-06 evening — uniform dilation hit a hard trade-off
+    #   between hair preservation and shoe halo elimination; chroma-aware
+    #   buffer breaks the trade-off because the two failure modes live in
+    #   different chroma zones.
+    # DEPENDS ON:   cv2 (lazy), numpy. sam_silhouette is (H, W) float32 in [0,1],
+    #               typically already binarized. chroma_weight is (H, W) float32
+    #               in [0,1] from compute_chroma_weight (binary at the merge
+    #               site, soft band off by default).
     # AFFECTS:      multiplies the chroma-gated merge result inside
-    #               merge_ck_with_sam_chroma_gated. No direct call from outside
-    #               that function in normal use.
+    #               merge_ck_with_sam_chroma_gated. Caller MUST pass the same
+    #               weight it used in the per-pixel merge — using a recomputed
+    #               weight risks zone mismatch at edges.
     import cv2 as _cv2
     sam_uint8 = sam_silhouette.astype(np.uint8)
     # Morphological close fills internal notches (butt notch, finger gaps) so
@@ -208,10 +220,15 @@ def compute_sam_kill_mask(
     close_size = max(1, int(close_kernel_px))
     close_kernel = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (close_size, close_size))
     sam_closed = _cv2.morphologyEx(sam_uint8, _cv2.MORPH_CLOSE, close_kernel)
-    # Outward buffer — keeps CK soft hair/finger detail past SAM's tight edge.
-    dilate_size = max(1, int(dilate_px))
-    dilate_kernel = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (dilate_size, dilate_size))
-    sam_kill = _cv2.dilate(sam_closed, dilate_kernel)
+    # Two dilations — big (on-green) and small (off-green) — then per-pixel
+    # selection by chroma zone.
+    big_size = max(1, int(on_green_dilate_px))
+    small_size = max(1, int(off_green_dilate_px))
+    big_kernel = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (big_size, big_size))
+    small_kernel = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (small_size, small_size))
+    sam_kill_big = _cv2.dilate(sam_closed, big_kernel)
+    sam_kill_small = _cv2.dilate(sam_closed, small_kernel)
+    sam_kill = np.where(chroma_weight > 0.5, sam_kill_big, sam_kill_small)
     return sam_kill.astype(np.float32)
 
 
@@ -280,14 +297,29 @@ def _write_debug_dump(ck, sam, source_rgb, weight, final, screen_type, threshold
         f"weight={weight.shape} final={final.shape}",
     ]
     if sam_kill is not None:
-        pct_kill_one = float(np.sum(sam_kill > 0.5)) / n_pixels * 100.0
+        on_green = weight > 0.5
+        off_green = ~on_green
+        kill_one = sam_kill > 0.5
+        pct_kill_one = float(kill_one.sum()) / n_pixels * 100.0
+        on_green_pixels = float(on_green.sum())
+        off_green_pixels = float(off_green.sum())
+        pct_kill_in_ongreen = (
+            float(np.sum(kill_one & on_green)) / on_green_pixels * 100.0
+            if on_green_pixels > 0 else 0.0
+        )
+        pct_kill_in_offgreen = (
+            float(np.sum(kill_one & off_green)) / off_green_pixels * 100.0
+            if off_green_pixels > 0 else 0.0
+        )
         stats_lines.append(
             f"SAM_KILL_CLOSE_KERNEL_PX={SAM_KILL_CLOSE_KERNEL_PX} "
-            f"SAM_KILL_DILATE_PX={SAM_KILL_DILATE_PX}"
+            f"SAM_KILL_DILATE_ON_GREEN_PX={SAM_KILL_DILATE_ON_GREEN_PX} "
+            f"SAM_KILL_DILATE_OFF_GREEN_PX={SAM_KILL_DILATE_OFF_GREEN_PX}"
         )
         stats_lines.append(
             f"% pixels sam_kill=1 = {pct_kill_one:.2f}%  "
-            f"# expect ~30-50% on a body-in-frame shot"
+            f"(on-green zones: {pct_kill_in_ongreen:.2f}%, "
+            f"off-green zones: {pct_kill_in_offgreen:.2f}%)"
         )
         if merge_pre_kill is not None:
             mean_after = float((merge_pre_kill * sam_kill).mean())
@@ -337,7 +369,7 @@ def merge_ck_with_sam_chroma_gated(
     # Outer SAM-based kill mask. Wraps the chroma-gated result so walls /
     # forklift / junk that the chroma weight allowed CK to vote on get killed
     # if they sit far from the SAM body silhouette. Per Berto 2026-05-06.
-    sam_kill = compute_sam_kill_mask(sam)
+    sam_kill = compute_sam_kill_mask(sam, weight)
     final = merge_result * sam_kill
     final = np.clip(final, 0.0, 1.0).astype(np.float32)
     if DEBUG_ENABLED:
