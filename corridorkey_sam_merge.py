@@ -1,4 +1,4 @@
-# Last modified: 2026-05-06 | Change: ADD write_matte_final_dump for matte-branch post-merge tracing | Full history: git log
+# Last modified: 2026-05-06 | Change: ADD outer SAM-based kill mask wrapping chroma-gated merge (compute_sam_kill_mask) | Full history: git log
 """Path B SAM2 + CK alpha merge — final = max(CK, threshold(SAM)).
 
 REPLACES the apply_sam2_junk_kill / apply_sam2_gate_* post-hoc combine
@@ -68,6 +68,22 @@ CHROMA_GATE_THRESHOLD = 0.01
 # off-green clip (notch depth ~30-50 px). Tune lower if walls re-appear (dilation
 # reaching junk pixels close to green); tune higher if more body parts get cut.
 CHROMA_GATE_DILATE_PX = 50
+
+# Outer SAM-derived kill-mask kernel sizes. Per Berto 2026-05-06 — chroma-gated
+# weight=1 covers walls/forklift when those pixels have green spill or are within
+# CHROMA_GATE_DILATE_PX of a green tarp; CK rules there with all its false
+# positives. The kill-mask wraps the merge output: 1 = inside (SAM closed +
+# outward buffer) so merge votes survive, 0 = far from any plausible body so
+# merge output is forced to 0 regardless of what CK said.
+#
+# CLOSE_KERNEL_PX fills internal holes/notches in the SAM silhouette before it
+# becomes a kill mask — prevents the butt-notch from punching through the kill
+# mask and over-killing valid CK body pixels.
+# DILATE_PX is the outward buffer past the closed SAM silhouette, sized to
+# preserve CK soft edges (hair strands, fingertip wisps) that extend slightly
+# past SAM's tight silhouette.
+SAM_KILL_CLOSE_KERNEL_PX = 75
+SAM_KILL_DILATE_PX = 120
 
 
 def binarize_sam_silhouette(sam: np.ndarray, threshold: float = SAM_BINARIZE_THRESHOLD) -> np.ndarray:
@@ -166,7 +182,40 @@ def compute_chroma_weight(
     return weight
 
 
-def _write_debug_dump(ck, sam, source_rgb, weight, final, screen_type, threshold, dilate_px):
+def compute_sam_kill_mask(
+    sam_silhouette: np.ndarray,
+    close_kernel_px: int = SAM_KILL_CLOSE_KERNEL_PX,
+    dilate_px: int = SAM_KILL_DILATE_PX,
+) -> np.ndarray:
+    # WHAT IT DOES: Build a binary kill mask from the SAM silhouette so the
+    #   chroma-gated merge result can be zeroed far from any body indication.
+    #   1 = inside SAM (with notches filled by morph close) plus an outward
+    #       dilation buffer — merge result is allowed to vote.
+    #   0 = far from any plausible body location — final merge is forced to 0.
+    #   Wraps the merge output to kill walls/forklift/junk where chroma weight
+    #   was 1 (green spill or within chroma dilate of green tarp) and CK had
+    #   false positives.
+    # DEPENDS ON:   cv2 (lazy), numpy. sam_silhouette is (H, W) float32 in [0, 1],
+    #               typically already binarized. Caller passes the silhouette
+    #               that participated in the merge.
+    # AFFECTS:      multiplies the chroma-gated merge result inside
+    #               merge_ck_with_sam_chroma_gated. No direct call from outside
+    #               that function in normal use.
+    import cv2 as _cv2
+    sam_uint8 = sam_silhouette.astype(np.uint8)
+    # Morphological close fills internal notches (butt notch, finger gaps) so
+    # they don't punch through the kill mask after dilation.
+    close_size = max(1, int(close_kernel_px))
+    close_kernel = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (close_size, close_size))
+    sam_closed = _cv2.morphologyEx(sam_uint8, _cv2.MORPH_CLOSE, close_kernel)
+    # Outward buffer — keeps CK soft hair/finger detail past SAM's tight edge.
+    dilate_size = max(1, int(dilate_px))
+    dilate_kernel = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (dilate_size, dilate_size))
+    sam_kill = _cv2.dilate(sam_closed, dilate_kernel)
+    return sam_kill.astype(np.float32)
+
+
+def _write_debug_dump(ck, sam, source_rgb, weight, final, screen_type, threshold, dilate_px, sam_kill=None, merge_pre_kill=None):
     # WHAT IT DOES: Diagnostic dump — writes 6 PNGs + debug_stats.txt to DEBUG_DIR
     #   so Berto can see what chroma-gated merge actually saw + produced. Called
     #   only when DEBUG_ENABLED is True. Recomputes raw chroma_score (cheap) for
@@ -205,28 +254,48 @@ def _write_debug_dump(ck, sam, source_rgb, weight, final, screen_type, threshold
     final_vis = np.clip(final * 255.0, 0.0, 255.0).astype(np.uint8)
     _cv2.imwrite(str(DEBUG_DIR / "debug_merge_output.png"), final_vis)
 
+    if sam_kill is not None:
+        kill_vis = np.clip(sam_kill * 255.0, 0.0, 255.0).astype(np.uint8)
+        _cv2.imwrite(str(DEBUG_DIR / "debug_sam_kill_mask.png"), kill_vis)
+
     n_pixels = float(raw_chroma.size)
     pct_above_threshold = float(np.sum(raw_chroma >= threshold)) / n_pixels * 100.0
     pct_weight_high = float(np.sum(weight > 0.5)) / n_pixels * 100.0
     ck_times_weight = ck * weight
 
-    stats = (
-        "=== chroma-gated merge debug dump ===\n"
+    stats_lines = [
+        "=== chroma-gated merge debug dump ===",
         f"raw_chroma  min={float(raw_chroma.min()):.4f}  "
         f"max={float(raw_chroma.max()):.4f}  "
-        f"mean={float(raw_chroma.mean()):.4f}\n"
-        f"threshold (CHROMA_GATE_THRESHOLD)  = {threshold}\n"
-        f"dilate_px (CHROMA_GATE_DILATE_PX)  = {dilate_px}\n"
-        f"% pixels chroma>=threshold  (pre-dilate)  = {pct_above_threshold:.2f}%\n"
-        f"% pixels weight>0.5         (post-dilate) = {pct_weight_high:.2f}%\n"
-        f"sum(chroma_weight) = {float(weight.sum()):.2f}\n"
-        f"sum(merge_output)  = {float(final.sum()):.2f}\n"
+        f"mean={float(raw_chroma.mean()):.4f}",
+        f"threshold (CHROMA_GATE_THRESHOLD)  = {threshold}",
+        f"dilate_px (CHROMA_GATE_DILATE_PX)  = {dilate_px}",
+        f"% pixels chroma>=threshold  (pre-dilate)  = {pct_above_threshold:.2f}%",
+        f"% pixels weight>0.5         (post-dilate) = {pct_weight_high:.2f}%",
+        f"sum(chroma_weight) = {float(weight.sum()):.2f}",
+        f"sum(merge_output)  = {float(final.sum()):.2f}",
         f"mean(CK * weight)  = {float(ck_times_weight.mean()):.6f}  "
-        f"# nonzero means CK is contributing somewhere\n"
+        f"# nonzero means CK is contributing somewhere",
         f"shapes: ck={ck.shape} sam={sam.shape} source_rgb={source_rgb.shape} "
-        f"weight={weight.shape} final={final.shape}\n"
-    )
-    (DEBUG_DIR / "debug_stats.txt").write_text(stats)
+        f"weight={weight.shape} final={final.shape}",
+    ]
+    if sam_kill is not None:
+        pct_kill_one = float(np.sum(sam_kill > 0.5)) / n_pixels * 100.0
+        stats_lines.append(
+            f"SAM_KILL_CLOSE_KERNEL_PX={SAM_KILL_CLOSE_KERNEL_PX} "
+            f"SAM_KILL_DILATE_PX={SAM_KILL_DILATE_PX}"
+        )
+        stats_lines.append(
+            f"% pixels sam_kill=1 = {pct_kill_one:.2f}%  "
+            f"# expect ~30-50% on a body-in-frame shot"
+        )
+        if merge_pre_kill is not None:
+            mean_after = float((merge_pre_kill * sam_kill).mean())
+            stats_lines.append(
+                f"mean(merge_result * sam_kill) = {mean_after:.6f}  "
+                f"(mean(merge_result alone) = {float(merge_pre_kill.mean()):.6f})"
+            )
+    (DEBUG_DIR / "debug_stats.txt").write_text("\n".join(stats_lines) + "\n")
 
 
 def merge_ck_with_sam_chroma_gated(
@@ -264,11 +333,19 @@ def merge_ck_with_sam_chroma_gated(
     )
     if weight.shape != ck.shape:
         raise ValueError(f"chroma weight shape mismatch: weight={weight.shape}, ck={ck.shape}")
-    final = weight * ck + (1.0 - weight) * sam
+    merge_result = weight * ck + (1.0 - weight) * sam
+    # Outer SAM-based kill mask. Wraps the chroma-gated result so walls /
+    # forklift / junk that the chroma weight allowed CK to vote on get killed
+    # if they sit far from the SAM body silhouette. Per Berto 2026-05-06.
+    sam_kill = compute_sam_kill_mask(sam)
+    final = merge_result * sam_kill
     final = np.clip(final, 0.0, 1.0).astype(np.float32)
     if DEBUG_ENABLED:
         try:
-            _write_debug_dump(ck, sam, source_rgb, weight, final, screen_type, threshold, dilate_px)
+            _write_debug_dump(
+                ck, sam, source_rgb, weight, final, screen_type, threshold, dilate_px,
+                sam_kill=sam_kill, merge_pre_kill=merge_result,
+            )
         except Exception as _e:
             print(f"[merge debug] dump failed: {_e}")
     return final
@@ -326,6 +403,7 @@ def write_matte_final_dump(alpha_final: np.ndarray, ops_applied) -> None:
         ("debug_chroma_score_raw.png", "matte_debug_chroma_score_raw.png"),
         ("debug_chroma_weight_final.png", "matte_debug_chroma_weight_final.png"),
         ("debug_merge_output.png", "matte_debug_merge_output.png"),
+        ("debug_sam_kill_mask.png", "matte_debug_sam_kill_mask.png"),
     ]
     for src_name, dst_name in snapshot_pairs:
         src_p = DEBUG_DIR / src_name
