@@ -1,4 +1,4 @@
-# Last modified: 2026-05-06 | Change: chroma-aware kill mask dilation - large buffer on-green for CK soft edges, small buffer off-green for junk halos | Full history: git log
+# Last modified: 2026-05-06 | Change: diagnostic tracing for chroma-aware kill mask - 3-panel split image, branch selection stats, sample pixel checks | Full history: git log
 """Path B SAM2 + CK alpha merge — final = max(CK, threshold(SAM)).
 
 REPLACES the apply_sam2_junk_kill / apply_sam2_gate_* post-hoc combine
@@ -193,6 +193,7 @@ def compute_sam_kill_mask(
     close_kernel_px: int = SAM_KILL_CLOSE_KERNEL_PX,
     on_green_dilate_px: int = SAM_KILL_DILATE_ON_GREEN_PX,
     off_green_dilate_px: int = SAM_KILL_DILATE_OFF_GREEN_PX,
+    _components_out: Optional[dict] = None,
 ) -> np.ndarray:
     # WHAT IT DOES: Build a chroma-aware binary kill mask from the SAM
     #   silhouette. 1 = merge votes survive. 0 = merge forced to 0.
@@ -229,10 +230,21 @@ def compute_sam_kill_mask(
     sam_kill_big = _cv2.dilate(sam_closed, big_kernel)
     sam_kill_small = _cv2.dilate(sam_closed, small_kernel)
     sam_kill = np.where(chroma_weight > 0.5, sam_kill_big, sam_kill_small)
+    if _components_out is not None:
+        _components_out["sam_closed"] = sam_closed.astype(np.float32)
+        _components_out["sam_kill_big"] = sam_kill_big.astype(np.float32)
+        _components_out["sam_kill_small"] = sam_kill_small.astype(np.float32)
+        _components_out["received_chroma_weight"] = bool(
+            isinstance(chroma_weight, np.ndarray)
+            and chroma_weight.shape == sam_silhouette.shape
+        )
+        _components_out["close_kernel_px"] = int(close_kernel_px)
+        _components_out["on_green_dilate_px"] = int(on_green_dilate_px)
+        _components_out["off_green_dilate_px"] = int(off_green_dilate_px)
     return sam_kill.astype(np.float32)
 
 
-def _write_debug_dump(ck, sam, source_rgb, weight, final, screen_type, threshold, dilate_px, sam_kill=None, merge_pre_kill=None):
+def _write_debug_dump(ck, sam, source_rgb, weight, final, screen_type, threshold, dilate_px, sam_kill=None, merge_pre_kill=None, kill_components=None):
     # WHAT IT DOES: Diagnostic dump — writes 6 PNGs + debug_stats.txt to DEBUG_DIR
     #   so Berto can see what chroma-gated merge actually saw + produced. Called
     #   only when DEBUG_ENABLED is True. Recomputes raw chroma_score (cheap) for
@@ -274,6 +286,24 @@ def _write_debug_dump(ck, sam, source_rgb, weight, final, screen_type, threshold
     if sam_kill is not None:
         kill_vis = np.clip(sam_kill * 255.0, 0.0, 255.0).astype(np.uint8)
         _cv2.imwrite(str(DEBUG_DIR / "debug_sam_kill_mask.png"), kill_vis)
+
+    # Side-by-side split: sam_kill_big | sam_kill_small | np.where result.
+    # Proves both branches compute correctly and that np.where picks the
+    # expected branch per pixel.
+    if (
+        sam_kill is not None
+        and kill_components is not None
+        and "sam_kill_big" in kill_components
+        and "sam_kill_small" in kill_components
+    ):
+        big = kill_components["sam_kill_big"]
+        small = kill_components["sam_kill_small"]
+        H_split, W_split = sam_kill.shape
+        sep_w = max(8, W_split // 200)
+        sep = np.full((H_split, sep_w), 0.5, dtype=np.float32)
+        composite = np.concatenate([big, sep, small, sep, sam_kill], axis=1)
+        composite_vis = np.clip(composite * 255.0, 0.0, 255.0).astype(np.uint8)
+        _cv2.imwrite(str(DEBUG_DIR / "debug_kill_mask_split.png"), composite_vis)
 
     n_pixels = float(raw_chroma.size)
     pct_above_threshold = float(np.sum(raw_chroma >= threshold)) / n_pixels * 100.0
@@ -327,6 +357,80 @@ def _write_debug_dump(ck, sam, source_rgb, weight, final, screen_type, threshold
                 f"mean(merge_result * sam_kill) = {mean_after:.6f}  "
                 f"(mean(merge_result alone) = {float(merge_pre_kill.mean()):.6f})"
             )
+        # Chroma-aware split tracing: confirm np.where is picking the right
+        # branch per pixel and quantify the difference between the two
+        # dilations across the frame.
+        if kill_components is not None:
+            received = bool(kill_components.get("received_chroma_weight", False))
+            stats_lines.append(
+                f"compute_sam_kill_mask called with chroma_weight="
+                f"{'YES' if received else 'NO'}"
+            )
+            stats_lines.append(
+                "compute_sam_kill_mask runtime kernels: "
+                f"close={kill_components.get('close_kernel_px')} "
+                f"big={kill_components.get('on_green_dilate_px')} "
+                f"small={kill_components.get('off_green_dilate_px')}"
+            )
+            big = kill_components.get("sam_kill_big")
+            small = kill_components.get("sam_kill_small")
+            if big is not None and small is not None:
+                big_b = big > 0.5
+                small_b = small > 0.5
+                # Where np.where actually selected each branch within sam_kill=1
+                from_big = kill_one & on_green
+                from_small = kill_one & off_green
+                pct_from_big = float(from_big.sum()) / n_pixels * 100.0
+                pct_from_small = float(from_small.sum()) / n_pixels * 100.0
+                stats_lines.append(
+                    f"% sam_kill=1 selected from sam_kill_big  = {pct_from_big:.2f}%"
+                )
+                stats_lines.append(
+                    f"% sam_kill=1 selected from sam_kill_small = {pct_from_small:.2f}%"
+                )
+                # Edge zone: pixels where the two dilations actually differ.
+                # If this is small, the two kernels are producing nearly
+                # identical kill masks regardless of the chroma split.
+                edge_zone = big_b != small_b
+                edge_count = float(edge_zone.sum())
+                pct_edge = edge_count / n_pixels * 100.0
+                stats_lines.append(
+                    f"edge zone (big!=small): {int(edge_count)} px ({pct_edge:.2f}% of frame) "
+                    "— if tiny, the two kernels are basically the same"
+                )
+                if edge_count > 0:
+                    edge_big_pct = (
+                        float((edge_zone & on_green).sum()) / edge_count * 100.0
+                    )
+                    edge_small_pct = (
+                        float((edge_zone & off_green).sum()) / edge_count * 100.0
+                    )
+                    stats_lines.append(
+                        f"  in edge zone: on-green={edge_big_pct:.2f}% "
+                        f"off-green={edge_small_pct:.2f}%"
+                    )
+                # Sample pixels — pick one clearly on-green and one clearly
+                # off-green near the body to verify np.where picked correctly.
+                on_idx = np.argwhere(on_green)
+                off_idx = np.argwhere(off_green)
+                if len(on_idx) > 0:
+                    yo, xo = on_idx[len(on_idx) // 2]
+                    stats_lines.append(
+                        f"sample on-green pixel ({int(yo)}, {int(xo)}): "
+                        f"big={float(big[yo, xo]):.2f} "
+                        f"small={float(small[yo, xo]):.2f} "
+                        f"kill={float(sam_kill[yo, xo]):.2f}  "
+                        f"(np.where should pick big)"
+                    )
+                if len(off_idx) > 0:
+                    yf, xf = off_idx[len(off_idx) // 2]
+                    stats_lines.append(
+                        f"sample off-green pixel ({int(yf)}, {int(xf)}): "
+                        f"big={float(big[yf, xf]):.2f} "
+                        f"small={float(small[yf, xf]):.2f} "
+                        f"kill={float(sam_kill[yf, xf]):.2f}  "
+                        f"(np.where should pick small)"
+                    )
     (DEBUG_DIR / "debug_stats.txt").write_text("\n".join(stats_lines) + "\n")
 
 
@@ -369,7 +473,8 @@ def merge_ck_with_sam_chroma_gated(
     # Outer SAM-based kill mask. Wraps the chroma-gated result so walls /
     # forklift / junk that the chroma weight allowed CK to vote on get killed
     # if they sit far from the SAM body silhouette. Per Berto 2026-05-06.
-    sam_kill = compute_sam_kill_mask(sam, weight)
+    _kill_components: Optional[dict] = {} if DEBUG_ENABLED else None
+    sam_kill = compute_sam_kill_mask(sam, weight, _components_out=_kill_components)
     final = merge_result * sam_kill
     final = np.clip(final, 0.0, 1.0).astype(np.float32)
     if DEBUG_ENABLED:
@@ -377,6 +482,7 @@ def merge_ck_with_sam_chroma_gated(
             _write_debug_dump(
                 ck, sam, source_rgb, weight, final, screen_type, threshold, dilate_px,
                 sam_kill=sam_kill, merge_pre_kill=merge_result,
+                kill_components=_kill_components,
             )
         except Exception as _e:
             print(f"[merge debug] dump failed: {_e}")
@@ -436,6 +542,7 @@ def write_matte_final_dump(alpha_final: np.ndarray, ops_applied) -> None:
         ("debug_chroma_weight_final.png", "matte_debug_chroma_weight_final.png"),
         ("debug_merge_output.png", "matte_debug_merge_output.png"),
         ("debug_sam_kill_mask.png", "matte_debug_sam_kill_mask.png"),
+        ("debug_kill_mask_split.png", "matte_debug_kill_mask_split.png"),
     ]
     for src_name, dst_name in snapshot_pairs:
         src_p = DEBUG_DIR / src_name
