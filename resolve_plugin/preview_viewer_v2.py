@@ -2581,94 +2581,53 @@ class PersistentWindow(QtWidgets.QWidget):
                 matte_feet_soften = float(params_for_matte.get("feet_soften", 0))
                 _matte_m1_bypass = bool(params_for_matte.get("mask1_bypass", False))
                 _matte_m2_bypass = bool(params_for_matte.get("mask2_bypass", False))
-                # Multi-object v0.8 — same per-mask + union strategy as the
-                # Composite branch, with the same Option C halo binding so
-                # the Matte view matches what render_composite produces.
-                # Bypass applied at union time, not here — keeps auto-clip math intact.
+                # PATH B / chroma-gated mirror of render_composite — replaces the
+                # orphan _combine_one_mask + union_alpha block that was multiplying
+                # CK by the SAM silhouette via apply_sam2_gate (the bug Berto
+                # identified 2026-05-06: Matte view ignored every chroma-gated tweak
+                # because it ran the OLD trimap dispatch on this code path).
+                # Now this branch produces exactly what render_composite produces.
                 _matte_pairs = [(oid, self.session.sam2_gates.get(oid))
                                 for oid in (1, 2)
                                 if self.session.sam2_gates.get(oid) is not None]
-                # Symmetric auto-clip — same as render_composite.
-                if len(_matte_pairs) == 2:
-                    _g_by_oid_m = {oid: g for oid, g in _matte_pairs}
-                    m1_m, m2_m = _g_by_oid_m.get(1), _g_by_oid_m.get(2)
-                    _src_rgb_m_clip = (self.session.original_rgb
-                                       if self.session.original_rgb is not None
-                                       else self.session.fg_rgb)
-                    if m1_m is not None and m2_m is not None:
-                        if m2_m.shape != m1_m.shape:
-                            m2_m = cv2.resize(
-                                m2_m, (m1_m.shape[1], m1_m.shape[0]),
-                                interpolation=cv2.INTER_LINEAR)
-                        # Buffer must be >= EDGE GUARD to keep MASK 1's
-                        # SUBTRACT dilation out of MASK 2's zone.
-                        _cb_m = max(10, int(matte_edge_guard))
-                        _ck_m = cv2.getStructuringElement(
-                            cv2.MORPH_ELLIPSE, (_cb_m * 2 + 1, _cb_m * 2 + 1))
-                        m2_excl_m = cv2.dilate(
-                            (m2_m > 0.5).astype(np.uint8), _ck_m).astype(np.float32)
-                        _g_by_oid_m[1] = m1_m * (1.0 - m2_excl_m)
-                        if (_src_rgb_m_clip is not None
-                                and _src_rgb_m_clip.shape[:2] == m2_m.shape):
-                            _chroma_gm = (_src_rgb_m_clip[..., 1].astype(np.float32) -
-                                          np.maximum(_src_rgb_m_clip[..., 0],
-                                                     _src_rgb_m_clip[..., 2]).astype(np.float32))
-                            _is_green_m = (_chroma_gm > 0.05).astype(np.float32)
-                            _g_by_oid_m[2] = m2_m * (1.0 - _is_green_m)
-                    _matte_pairs = [(oid, _g_by_oid_m[oid])
-                                    for oid, _ in _matte_pairs]
                 if (self.session.alpha_raw is not None
                         and _matte_pairs
                         and not matte_bypass):
+                    from corridorkey_sam_merge import (
+                        binarize_sam_silhouette, union_binary_silhouettes, merge_ck_with_sam_active,
+                    )
                     _src_rgb_m = (self.session.original_rgb
                                   if self.session.original_rgb is not None
                                   else self.session.fg_rgb)
-                    _matte_alphas_with_oid = []
-                    _n_active_m = len(_matte_pairs)
+                    _active_silhouettes_m = []
                     for _oid_m, _gate_m in _matte_pairs:
-                        _gate = _gate_m
-                        if _gate.shape != self.session.alpha_raw.shape:
-                            _gate = cv2.resize(
-                                _gate,
+                        if _oid_m == 1 and _matte_m1_bypass:
+                            continue
+                        if _oid_m == 2 and _matte_m2_bypass:
+                            continue
+                        if _gate_m.shape != self.session.alpha_raw.shape:
+                            _gate_m = cv2.resize(
+                                _gate_m,
                                 (self.session.alpha_raw.shape[1],
                                  self.session.alpha_raw.shape[0]),
                                 interpolation=cv2.INTER_LINEAR,
                             )
-                        if _n_active_m > 1:
-                            _h_body_m = matte_halo_body if _oid_m == 1 else 0
-                            _h_feet_m = matte_halo if _oid_m == 2 else 0
-                            _eg_m = matte_edge_guard if _oid_m == 1 else matte_feet_guard
-                        else:
-                            _h_body_m = matte_halo_body
-                            _h_feet_m = matte_halo
-                            _eg_m = matte_edge_guard
-                        _ma = _combine_one_mask(
-                            self.session.alpha_raw, _gate, _src_rgb_m,
-                            sam2_subtract=matte_subtract,
-                            sam2_weighted=matte_weighted,
-                            sam2_additive=matte_additive,
-                            halo_px=_h_feet_m, halo_body_px=_h_body_m,
-                            edge_guard_px=_eg_m,
-                            trim_chroma=matte_trim, fill_holes=matte_fill,
-                        )
-                        if (_n_active_m > 1 and _oid_m == 2
-                                and matte_feet_soften > 0):
-                            _ma = _soften_mask(_ma, matte_feet_soften)
-                        _matte_alphas_with_oid.append((_oid_m, _ma))
-                    _matte_kept = [a for oid, a in _matte_alphas_with_oid
-                                   if not (oid == 1 and _matte_m1_bypass)
-                                   and not (oid == 2 and _matte_m2_bypass)]
-                    if not _matte_kept:
+                        _active_silhouettes_m.append(binarize_sam_silhouette(_gate_m))
+                    if not _active_silhouettes_m:
                         alpha = self.session.alpha.copy()
                     else:
-                        alpha = union_alpha(*_matte_kept)
+                        _sam_union_m = union_binary_silhouettes(_active_silhouettes_m)
+                        alpha = merge_ck_with_sam_active(
+                            self.session.alpha_raw, _sam_union_m,
+                            source_rgb=_src_rgb_m,
+                        )
                     if matte_margin > 0:
                         alpha = _dilate_mask(alpha, matte_margin)
                     if matte_soften > 0:
                         alpha = _soften_mask(alpha, matte_soften)
                 else:
-                    # SAM2 inactive — Matte view shows the raw NN alpha
-                    # without margin/soften (those are SAM2-only controls).
+                    # SAM2 inactive — Matte view shows the raw NN alpha;
+                    # matte_margin/soften are SAM2-only globals and don't apply.
                     alpha = self.session.alpha.copy()
                 # CHOKE: same erode as render_composite (line 647). Was missing
                 # from this branch — Matte view's slider showed no effect.
