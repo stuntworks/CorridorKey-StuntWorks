@@ -1,4 +1,4 @@
-# Last modified: 2026-05-07 | Change: replace chroma-gated merge with CK-confidence-based routing - soft zone trusts CK exclusively, confident zone gated by SAM | Full history: git log
+# Last modified: 2026-05-07 | Change: narrow CK soft zone CK_SOFT_HI 0.95->0.7 to send almost-confident pixels through SAM gate, killing wall/junk false positives and filling butt solid | Full history: git log
 """CK-confidence-based merge per Berto 2026-05-07.
 
 REPLACES the chroma-gated merge + outer SAM kill mask architecture. The
@@ -68,7 +68,7 @@ USE_CHROMA_GATED_MERGE = True
 #                          and bypasses SAM, which is fine functionally
 #                          (interior is fg either way) but masks bugs.
 CK_SOFT_LO = 0.05
-CK_SOFT_HI = 0.95
+CK_SOFT_HI = 0.7
 
 
 def binarize_sam_silhouette(sam: np.ndarray, threshold: float = SAM_BINARIZE_THRESHOLD) -> np.ndarray:
