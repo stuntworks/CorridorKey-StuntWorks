@@ -1,4 +1,4 @@
-# Last modified: 2026-05-06 | Change: ADD diagnostic dump (6 PNGs + stats.txt + branch print) | Full history: git log
+# Last modified: 2026-05-06 | Change: ADD write_matte_final_dump for matte-branch post-merge tracing | Full history: git log
 """Path B SAM2 + CK alpha merge — final = max(CK, threshold(SAM)).
 
 REPLACES the apply_sam2_junk_kill / apply_sam2_gate_* post-hoc combine
@@ -300,3 +300,53 @@ def merge_ck_with_sam_active(
     _reason = "flag=False" if not USE_CHROMA_GATED_MERGE else "source_rgb=None"
     print(f"[merge] Path B fallback branch  ({_reason})")
     return merge_ck_with_sam(ck_alpha, sam_silhouette)
+
+
+def write_matte_final_dump(alpha_final: np.ndarray, ops_applied) -> None:
+    # WHAT IT DOES: Snapshots the chroma-gated debug PNGs (debug_*.png) under matte_-
+    #   prefixed names so they survive any subsequent composite-mode re-render that
+    #   would overwrite them, then saves the final post-processed alpha as
+    #   matte_debug_final_displayed.png + writes matte_debug_stats.txt with the
+    #   ordered list of ops applied to the merge output before display.
+    # DEPENDS ON:   cv2 (lazy), shutil, numpy, pathlib. DEBUG_DIR mkdir-on-write.
+    #               Assumes the caller's most recent merge_ck_with_sam_chroma_gated
+    #               call dumped to debug_*.png moments earlier (true for the resolve
+    #               viewer matte branch where merge runs once per render before this).
+    # AFFECTS:      writes 7 matte_-prefixed files to DEBUG_DIR; no return; no logic
+    #               side effect. No-op when DEBUG_ENABLED is False.
+    if not DEBUG_ENABLED:
+        return
+    import cv2 as _cv2
+    import shutil as _shutil
+    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+    snapshot_pairs = [
+        ("debug_source_rgb.png", "matte_debug_source_rgb.png"),
+        ("debug_ck_alpha.png", "matte_debug_ck_alpha.png"),
+        ("debug_sam_silhouette.png", "matte_debug_sam_silhouette.png"),
+        ("debug_chroma_score_raw.png", "matte_debug_chroma_score_raw.png"),
+        ("debug_chroma_weight_final.png", "matte_debug_chroma_weight_final.png"),
+        ("debug_merge_output.png", "matte_debug_merge_output.png"),
+    ]
+    for src_name, dst_name in snapshot_pairs:
+        src_p = DEBUG_DIR / src_name
+        dst_p = DEBUG_DIR / dst_name
+        try:
+            if src_p.exists():
+                _shutil.copy2(str(src_p), str(dst_p))
+        except Exception:
+            pass
+    a = np.asarray(alpha_final, dtype=np.float32)
+    final_vis = np.clip(a * 255.0, 0.0, 255.0).astype(np.uint8)
+    _cv2.imwrite(str(DEBUG_DIR / "matte_debug_final_displayed.png"), final_vis)
+    stats = (
+        "=== matte view final-displayed dump ===\n"
+        f"ops applied to merge_output before display: {list(ops_applied)}\n"
+        f"final alpha shape={a.shape}  "
+        f"mean={float(a.mean()):.4f}  "
+        f"min={float(a.min()):.4f}  "
+        f"max={float(a.max()):.4f}\n"
+        "Compare matte_debug_merge_output.png vs matte_debug_final_displayed.png:\n"
+        "  - If different: a downstream op killed CK content.\n"
+        "  - If identical: the merge inputs (matte_debug_ck_alpha + matte_debug_sam_silhouette) explain the output.\n"
+    )
+    (DEBUG_DIR / "matte_debug_stats.txt").write_text(stats)

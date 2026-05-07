@@ -2581,6 +2581,36 @@ class PersistentWindow(QtWidgets.QWidget):
                 matte_feet_soften = float(params_for_matte.get("feet_soften", 0))
                 _matte_m1_bypass = bool(params_for_matte.get("mask1_bypass", False))
                 _matte_m2_bypass = bool(params_for_matte.get("mask2_bypass", False))
+                # Diagnostic 2026-05-06 — confirm the new chroma-gated matte path
+                # is the one DaVinci is actually executing, list the ops that will
+                # touch the matte before display, and track which ops actually ran.
+                _matte_ops_queued = []
+                if matte_margin > 0:
+                    _matte_ops_queued.append(f"matte_margin({matte_margin})")
+                if matte_soften > 0:
+                    _matte_ops_queued.append(f"matte_soften({matte_soften})")
+                _matte_choke_pre = float(params_for_matte.get("choke", 0))
+                if _matte_choke_pre > 0:
+                    _matte_ops_queued.append(f"choke({_matte_choke_pre})")
+                if params_for_matte.get("despeckle", True):
+                    _matte_ops_queued.append(
+                        f"despeckle({int(params_for_matte.get('despeckleSize', 400))})"
+                    )
+                _matte_src_rgb_shape = (
+                    self.session.original_rgb.shape
+                    if self.session.original_rgb is not None
+                    else (self.session.fg_rgb.shape
+                          if hasattr(self.session, 'fg_rgb') and self.session.fg_rgb is not None
+                          else None)
+                )
+                print(
+                    f"[matte branch] new chroma-gated path running  "
+                    f"src_rgb={_matte_src_rgb_shape}  "
+                    f"bypass_sam2={matte_bypass}  m1_bypass={_matte_m1_bypass}  "
+                    f"m2_bypass={_matte_m2_bypass}  "
+                    f"ops_queued={_matte_ops_queued}"
+                )
+                _matte_ops_applied = []
                 # PATH B / chroma-gated mirror of render_composite — replaces the
                 # orphan _combine_one_mask + union_alpha block that was multiplying
                 # CK by the SAM silhouette via apply_sam2_gate (the bug Berto
@@ -2623,8 +2653,10 @@ class PersistentWindow(QtWidgets.QWidget):
                         )
                     if matte_margin > 0:
                         alpha = _dilate_mask(alpha, matte_margin)
+                        _matte_ops_applied.append(f"matte_margin({matte_margin})")
                     if matte_soften > 0:
                         alpha = _soften_mask(alpha, matte_soften)
+                        _matte_ops_applied.append(f"matte_soften({matte_soften})")
                 else:
                     # SAM2 inactive — Matte view shows the raw NN alpha;
                     # matte_margin/soften are SAM2-only globals and don't apply.
@@ -2647,10 +2679,22 @@ class PersistentWindow(QtWidgets.QWidget):
                         alpha = _alpha_lo * (1.0 - _frac) + _alpha_hi * _frac
                     else:
                         alpha = _alpha_lo
+                    _matte_ops_applied.append(f"choke({_matte_choke_px})")
                 if params_for_matte.get("despeckle", True):
                     alpha = self.cu.clean_matte_opencv(
                         alpha, area_threshold=int(params_for_matte.get("despeckleSize", 400))
                     )
+                    _matte_ops_applied.append(
+                        f"despeckle({int(params_for_matte.get('despeckleSize', 400))})"
+                    )
+                # Diagnostic 2026-05-06 — snapshot merge inputs/output to matte_-
+                # prefixed PNGs (so they survive composite re-renders) + dump the
+                # final post-processed alpha so we can A/B merge_output vs final.
+                try:
+                    from corridorkey_sam_merge import write_matte_final_dump
+                    write_matte_final_dump(alpha, _matte_ops_applied)
+                except Exception as _matte_dump_e:
+                    print(f"[matte branch] dump failed: {_matte_dump_e}")
                 img = alpha_to_rgb_u8(alpha)
 
             # SHOW SAM2: viewer-only overlay. Draws cyan outline of SAM2's
