@@ -1,4 +1,4 @@
-# Last modified: 2026-05-07 | Change: narrow CK soft zone CK_SOFT_HI 0.95->0.7 to send almost-confident pixels through SAM gate, killing wall/junk false positives and filling butt solid | Full history: git log
+# Last modified: 2026-05-07 | Change: gate soft zone with dilated SAM (SOFT_ZONE_SAM_BUFFER_PX=15) so wall/floor/drape transitions die while body soft edges and hair tendrils survive | Full history: git log
 """CK-confidence-based merge per Berto 2026-05-07.
 
 REPLACES the chroma-gated merge + outer SAM kill mask architecture. The
@@ -70,6 +70,14 @@ USE_CHROMA_GATED_MERGE = True
 CK_SOFT_LO = 0.05
 CK_SOFT_HI = 0.7
 
+# Soft-zone SAM gate buffer — per Berto 2026-05-07 morning. Without a SAM gate
+# in the soft zone, every CK transition (wall outlines, floor edges, drape
+# edges, cube outlines) trusts CK exclusively and survives in the matte. Gate
+# the soft zone with a SAM silhouette dilated by this many pixels so hair
+# tendrils just past the tight SAM edge survive while wall outlines far from
+# SAM die. Tune up if hair clips, down if wall outlines persist.
+SOFT_ZONE_SAM_BUFFER_PX = 15
+
 
 def binarize_sam_silhouette(sam: np.ndarray, threshold: float = SAM_BINARIZE_THRESHOLD) -> np.ndarray:
     # WHAT IT DOES: Threshold a continuous SAM mask to binary {0.0, 1.0} float32.
@@ -109,12 +117,18 @@ def merge_ck_with_sam(ck_alpha: np.ndarray, sam_silhouette: Optional[np.ndarray]
     return final
 
 
-def _save_debug_dump(ck: np.ndarray, sam: np.ndarray, soft_zone: np.ndarray, final: np.ndarray) -> None:
-    # WHAT IT DOES: Diagnostic dump for the confidence-based merge. Writes 4
+def _save_debug_dump(
+    ck: np.ndarray,
+    sam: np.ndarray,
+    soft_zone: np.ndarray,
+    final: np.ndarray,
+    sam_buffered: Optional[np.ndarray] = None,
+) -> None:
+    # WHAT IT DOES: Diagnostic dump for the confidence-based merge. Writes 4-5
     #   PNGs + debug_stats.txt to DEBUG_DIR. Overwrites previous dump; only the
     #   LAST merge call survives.
     # DEPENDS ON:   cv2 (lazy), numpy, pathlib. DEBUG_DIR mkdir-on-write.
-    # AFFECTS:      writes 5 files to DEBUG_DIR; no return; no logic side effect.
+    # AFFECTS:      writes 5-6 files to DEBUG_DIR; no return; no logic side effect.
     import cv2 as _cv2
     DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -126,6 +140,10 @@ def _save_debug_dump(ck: np.ndarray, sam: np.ndarray, soft_zone: np.ndarray, fin
 
     soft_vis = (soft_zone.astype(np.uint8)) * 255
     _cv2.imwrite(str(DEBUG_DIR / "debug_soft_zone.png"), soft_vis)
+
+    if sam_buffered is not None:
+        buffered_vis = np.clip(sam_buffered * 255.0, 0.0, 255.0).astype(np.uint8)
+        _cv2.imwrite(str(DEBUG_DIR / "debug_sam_buffered.png"), buffered_vis)
 
     final_vis = np.clip(final * 255.0, 0.0, 255.0).astype(np.uint8)
     _cv2.imwrite(str(DEBUG_DIR / "debug_final.png"), final_vis)
@@ -141,10 +159,15 @@ def _save_debug_dump(ck: np.ndarray, sam: np.ndarray, soft_zone: np.ndarray, fin
     sample_halo_y, sample_halo_x = int(H * 0.85), int(W * 0.6)
 
     def _fmt_sample(name: str, y: int, x: int) -> str:
+        buf_str = (
+            f" sam_buffered={float(sam_buffered[y, x]):.2f}"
+            if sam_buffered is not None else ""
+        )
         return (
             f"sample {name} ({y}, {x}): "
             f"ck={float(ck[y, x]):.4f} "
-            f"sam={float(sam[y, x]):.2f} "
+            f"sam={float(sam[y, x]):.2f}"
+            f"{buf_str} "
             f"soft_zone={bool(soft_zone[y, x])} "
             f"final={float(final[y, x]):.4f}"
         )
@@ -152,15 +175,30 @@ def _save_debug_dump(ck: np.ndarray, sam: np.ndarray, soft_zone: np.ndarray, fin
     stats_lines = [
         "=== confidence-based merge debug dump ===",
         f"shapes: ck={ck.shape} sam={sam.shape} final={final.shape}",
-        f"CK_SOFT_LO={CK_SOFT_LO} CK_SOFT_HI={CK_SOFT_HI}",
-        f"% pixels in soft_zone (CK exclusive)        = {pct_soft:.2f}%",
+        f"CK_SOFT_LO={CK_SOFT_LO} CK_SOFT_HI={CK_SOFT_HI} "
+        f"SOFT_ZONE_SAM_BUFFER_PX={SOFT_ZONE_SAM_BUFFER_PX}",
+        f"% pixels in soft_zone (CK gate via sam_buffered)      = {pct_soft:.2f}%",
         f"% pixels CK >= {CK_SOFT_HI} (confident fg, SAM gates) = {pct_confident_fg:.2f}%",
         f"% pixels CK <= {CK_SOFT_LO} (confident bg, output 0)  = {pct_confident_bg:.2f}%",
         f"mean(final) = {float(final.mean()):.4f}",
+    ]
+    if sam_buffered is not None:
+        soft_pixels = float(soft_zone.sum())
+        if soft_pixels > 0:
+            soft_in_buffered = (
+                float((soft_zone & (sam_buffered > 0.5)).sum()) / soft_pixels * 100.0
+            )
+        else:
+            soft_in_buffered = 0.0
+        stats_lines.append(
+            f"% soft_zone pixels inside sam_buffered = {soft_in_buffered:.2f}%  "
+            f"(high = body edges; low = wall edges far from SAM)"
+        )
+    stats_lines.extend([
         _fmt_sample("top-left   ", sample_tl_y, sample_tl_x),
         _fmt_sample("frame ctr  ", sample_ctr_y, sample_ctr_x),
         _fmt_sample("halo zone  ", sample_halo_y, sample_halo_x),
-    ]
+    ])
     (DEBUG_DIR / "debug_stats.txt").write_text("\n".join(stats_lines) + "\n")
 
 
@@ -194,11 +232,21 @@ def merge_ck_with_sam_chroma_gated(
     sam = (np.asarray(sam_silhouette, dtype=np.float32) > 0.5).astype(np.float32)
     if ck.shape != sam.shape:
         raise ValueError(f"shape mismatch: ck={ck.shape}, sam={sam.shape}")
+    # Soft-zone gate via SAM dilated by SOFT_ZONE_SAM_BUFFER_PX. Body edges
+    # sit inside this buffer (CK soft alpha preserved); wall outlines and
+    # other transitions far from SAM fall outside it (killed).
+    import cv2 as _cv2
+    _k = max(1, int(SOFT_ZONE_SAM_BUFFER_PX))
+    _kernel = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (_k, _k))
+    sam_buffered = _cv2.dilate(sam.astype(np.uint8), _kernel).astype(np.float32)
     soft_zone = (ck > CK_SOFT_LO) & (ck < CK_SOFT_HI)
-    final = np.where(soft_zone, ck, ck * sam).astype(np.float32)
+    final = np.where(soft_zone, ck * sam_buffered, ck * sam).astype(np.float32)
     if DEBUG_ENABLED:
         try:
-            _save_debug_dump(ck=ck, sam=sam, soft_zone=soft_zone, final=final)
+            _save_debug_dump(
+                ck=ck, sam=sam, soft_zone=soft_zone, final=final,
+                sam_buffered=sam_buffered,
+            )
         except Exception as _e:
             print(f"[merge debug] dump failed: {_e}")
     return final
@@ -249,6 +297,7 @@ def write_matte_final_dump(alpha_final: np.ndarray, ops_applied) -> None:
     snapshot_pairs = [
         ("debug_ck_alpha.png", "matte_debug_ck_alpha.png"),
         ("debug_sam_silhouette.png", "matte_debug_sam_silhouette.png"),
+        ("debug_sam_buffered.png", "matte_debug_sam_buffered.png"),
         ("debug_soft_zone.png", "matte_debug_soft_zone.png"),
         ("debug_final.png", "matte_debug_final.png"),
     ]
