@@ -1,4 +1,4 @@
-# Last modified: 2026-05-06 | Change: ADD outer SAM-based kill mask wrapping chroma-gated merge (compute_sam_kill_mask) | Full history: git log
+# Last modified: 2026-05-06 | Change: tighten SAM_KILL_DILATE_PX 120->30 to remove shoe halo while preserving CK soft edges | Full history: git log
 """Path B SAM2 + CK alpha merge — final = max(CK, threshold(SAM)).
 
 REPLACES the apply_sam2_junk_kill / apply_sam2_gate_* post-hoc combine
@@ -83,7 +83,7 @@ CHROMA_GATE_DILATE_PX = 50
 # preserve CK soft edges (hair strands, fingertip wisps) that extend slightly
 # past SAM's tight silhouette.
 SAM_KILL_CLOSE_KERNEL_PX = 75
-SAM_KILL_DILATE_PX = 120
+SAM_KILL_DILATE_PX = 30
 
 
 def binarize_sam_silhouette(sam: np.ndarray, threshold: float = SAM_BINARIZE_THRESHOLD) -> np.ndarray:
