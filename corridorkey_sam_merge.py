@@ -1,28 +1,30 @@
-# Last modified: 2026-05-07 | Change: v2.1 connectivity filter — replace merge math with topology-based component selection. Walls/junk eliminated by definition, hair preserved by connection to body. Vectorized via np.isin. Empty SAM warning logged. Debug gated by DEBUG_MODE | Full history: git log
-"""v2.1 connectivity-based CK + SAM merge per Berto 2026-05-07.
+# Last modified: 2026-05-07 | Change: v2.2 trimap + Closed-Form Matting. Replaces topology filter with pymatting CFM at 2x downsample. SAM-only trimap, CK injected post-solve in unknown band only. Hard clamp outside dilated SAM. | Full history: git log
+"""v2.2 trimap + Closed-Form Matting (pymatting) + CK hair injection.
 
-REPLACES the chroma-gated merge + outer SAM kill mask + soft-zone +
-SAM-buffer architecture. Distance-based heuristics (chroma threshold,
-chroma dilation, kill-mask buffers, soft-zone SAM buffer) all hit the
-same ceiling: at body edges they could not distinguish "body part on
-green that needs CK soft alpha" from "wall outline transition that needs
-killing." Topology can.
+REPLACES the v2.1 topology connectivity filter. v2.1 failed when CK had
+soft-alpha paths > threshold connecting body to walls / frame corners
+through green spill — the filter kept the entire connected blob (50%+
+of frame on the test clip).
 
-The new architecture:
+v2.2 abandons CK-driven topology and uses image-driven alpha matting:
 
-  1. Fill SAM notches (close + flood) so it is a stable body anchor.
-  2. Threshold CK permissively to catch hair tendrils.
-  3. Find connected components of CK foreground.
-  4. Keep ONLY components that intersect the filled SAM body.
-  5. Output is CK alpha within kept components, zero elsewhere.
+  1. Build a SAM-only trimap (CK NOT used in trimap):
+       fg_def      = erode(sam_filled, ~20px)   -> definite foreground
+       sam_dilated = dilate(sam_filled, ~80px)  -> outer boundary
+       trimap = 0.5 elsewhere; 1.0 in fg_def; 0.0 outside sam_dilated.
+  2. Downsample 2x.
+  3. Closed-Form Matting via pymatting on the downsampled image.
+  4. Upsample alpha 2x.
+  5. CK injection in the unknown band only: alpha = max(alpha, ck).
+     This recovers hair/fringe detail that CFM smooths over but CK
+     keyed correctly.
+  6. Hard clamp outside dilated SAM: alpha = 0 there.
 
-Walls / forklift / cubes are disconnected from the body by definition,
-so they are eliminated without any distance tuning. Hair tendrils that
-touch the body silhouette get carried along with the body component.
+The hard clamp is the safety rail. Walls / forklift / drape edges that
+sit outside the dilation buffer cannot survive, no matter what CK or
+CFM produced. The dilation radius is the spatial trust budget.
 
-The old apply_sam2_junk_kill / apply_sam2_gate_* helpers in
-sam2_combine.py remain on disk as dead code (unreferenced from any call
-site) for hot-revert.
+source_rgb is REQUIRED in v2.2 (was optional in v2.1). If None, raises.
 """
 from __future__ import annotations
 
@@ -43,17 +45,16 @@ SAM_BINARIZE_THRESHOLD = 0.5
 DEBUG_ENABLED = True
 DEBUG_DIR = Path(__file__).parent / ".chroma_debug"
 
-# Active merge mode toggle. True = v2.1 connectivity filter (current).
+# Active merge mode toggle. True = v2.2 trimap + CFM (current).
 # False = Path B fallback (chroma-blind max(CK, SAM)). Call sites use the
 # single dispatcher merge_ck_with_sam_active so flipping this flag is a
 # one-deploy A/B without touching call sites. Path B kept on disk for
-# hot-revert; the chroma-gated math is gone.
+# hot-revert; v2.1 connectivity logic is gone.
 USE_CHROMA_GATED_MERGE = True
 
-# v2.1 connectivity filter constants
+# v2.2 debug toggle. Separate from DEBUG_ENABLED so the merge dump can be
+# disabled for production renders independently of the matte snapshot.
 DEBUG_MODE = True   # set False for production renders
-CK_FILTER_THRESHOLD = 0.02
-CK_FILTER_CLOSE_PX = 75
 
 
 def binarize_sam_silhouette(sam: np.ndarray, threshold: float = SAM_BINARIZE_THRESHOLD) -> np.ndarray:
@@ -94,25 +95,22 @@ def merge_ck_with_sam(ck_alpha: np.ndarray, sam_silhouette: Optional[np.ndarray]
     return final
 
 
-def _save_debug_dump(
+def _save_debug_dump_v22(
     ck: np.ndarray,
     sam: np.ndarray,
     sam_filled: np.ndarray,
-    ck_binary: np.ndarray,
-    keep_mask: np.ndarray,
+    fg_def: np.ndarray,
+    sam_dilated: np.ndarray,
+    trimap: np.ndarray,
+    alpha_solved: np.ndarray,
     final: np.ndarray,
-    source_rgb: Optional[np.ndarray] = None,
-    num_components: int = 0,
-    num_components_kept: int = 0,
-    sam_pixel_count: int = 0,
-    empty_sam_warning: bool = False,
+    scale: int,
 ) -> None:
-    # WHAT IT DOES: Diagnostic dump for the v2.1 connectivity filter. Writes
-    #   the per-stage masks + stats to DEBUG_DIR. Overwrites previous dump;
-    #   only the LAST merge call survives.
+    # WHAT IT DOES: Diagnostic dump for the v2.2 trimap + CFM merge. Writes the
+    #   per-stage masks + CFM output + final to DEBUG_DIR. Overwrites previous
+    #   dump; only the LAST merge call survives.
     # DEPENDS ON:   cv2 (lazy), numpy, pathlib. DEBUG_DIR mkdir-on-write.
-    #               Handles source_rgb=None gracefully (skips that one image).
-    # AFFECTS:      writes 6-7 files to DEBUG_DIR; no return; no logic side effect.
+    # AFFECTS:      writes 8 files to DEBUG_DIR; no return; no logic side effect.
     import cv2 as _cv2
     DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -125,26 +123,28 @@ def _save_debug_dump(
     sam_filled_vis = (sam_filled.astype(np.uint8)) * 255
     _cv2.imwrite(str(DEBUG_DIR / "debug_sam_filled.png"), sam_filled_vis)
 
-    ck_binary_vis = (ck_binary.astype(np.uint8)) * 255
-    _cv2.imwrite(str(DEBUG_DIR / "debug_ck_binary.png"), ck_binary_vis)
+    fg_def_vis = (fg_def.astype(np.uint8)) * 255
+    _cv2.imwrite(str(DEBUG_DIR / "debug_fg_def.png"), fg_def_vis)
 
-    keep_vis = (keep_mask.astype(np.uint8)) * 255
-    _cv2.imwrite(str(DEBUG_DIR / "debug_keep_mask.png"), keep_vis)
+    sam_dilated_vis = (sam_dilated.astype(np.uint8)) * 255
+    _cv2.imwrite(str(DEBUG_DIR / "debug_sam_dilated.png"), sam_dilated_vis)
+
+    # trimap visualization: 0.0 -> 0, 0.5 -> 128, 1.0 -> 255.
+    trimap_vis = np.clip(trimap * 255.0, 0.0, 255.0).astype(np.uint8)
+    _cv2.imwrite(str(DEBUG_DIR / "debug_trimap.png"), trimap_vis)
+
+    alpha_solved_vis = np.clip(alpha_solved * 255.0, 0.0, 255.0).astype(np.uint8)
+    _cv2.imwrite(str(DEBUG_DIR / "debug_alpha_solved.png"), alpha_solved_vis)
 
     final_vis = np.clip(final * 255.0, 0.0, 255.0).astype(np.uint8)
     _cv2.imwrite(str(DEBUG_DIR / "debug_final.png"), final_vis)
 
-    if source_rgb is not None:
-        src_vis = np.clip(source_rgb * 255.0, 0.0, 255.0).astype(np.uint8)
-        src_bgr = _cv2.cvtColor(src_vis, _cv2.COLOR_RGB2BGR)
-        _cv2.imwrite(str(DEBUG_DIR / "debug_source_rgb.png"), src_bgr)
-
     H, W = ck.shape
     n_pixels = float(ck.size)
-    pct_keep = float(keep_mask.sum()) / n_pixels * 100.0
+    unknown_band_pixels = int(((trimap > 0.4) & (trimap < 0.6)).sum())
+    fg_pixels = int((trimap >= 1.0).sum())
+    bg_pixels = int((trimap <= 0.0).sum())
 
-    # Sample pixel locations — picked for Berto's woman-on-greenscreen test
-    # clip. Adjust per shot if needed; top-left should always be confident bg.
     sample_topleft = (0, 0)
     sample_body_ctr = (H // 2, W // 2)
     sample_wall = (int(H * 0.10), int(W * 0.15))
@@ -154,20 +154,23 @@ def _save_debug_dump(
         return (
             f"PIXEL_{name}: ck={float(ck[y, x]):.4f} "
             f"sam={int(sam[y, x])} "
+            f"trimap={float(trimap[y, x]):.2f} "
             f"final={float(final[y, x]):.4f}  ({y}, {x})"
         )
 
     stats_lines = [
-        "=== v2.1 connectivity filter debug dump ===",
-        f"EMPTY_SAM_WARNING: {empty_sam_warning}",
-        f"SAM_PIXEL_COUNT: {sam_pixel_count}",
-        f"NUM_COMPONENTS_FOUND: {num_components}",
-        f"NUM_COMPONENTS_KEPT: {num_components_kept}",
-        f"KEEP_MASK_PERCENT_WHITE: {pct_keep:.4f}",
-        f"MEAN_FINAL: {float(final.mean()):.6f}",
+        "=== v2.2 trimap + CFM debug dump ===",
         f"SHAPE_CK: {ck.shape}",
-        f"SHAPE_SAM: {sam.shape}",
-        f"CK_FILTER_THRESHOLD={CK_FILTER_THRESHOLD} CK_FILTER_CLOSE_PX={CK_FILTER_CLOSE_PX}",
+        f"DOWNSAMPLE_SCALE: {scale}x",
+        f"TRIMAP_FG_PIXELS: {fg_pixels}",
+        f"TRIMAP_BG_PIXELS: {bg_pixels}",
+        f"TRIMAP_UNKNOWN_PIXELS: {unknown_band_pixels}",
+        f"FRACTION_UNKNOWN: {unknown_band_pixels / n_pixels * 100.0:.4f}%",
+        f"ALPHA_SOLVED_RANGE: min={float(alpha_solved.min()):.4f} "
+        f"max={float(alpha_solved.max()):.4f} mean={float(alpha_solved.mean()):.4f}",
+        f"FINAL_RANGE: min={float(final.min()):.4f} "
+        f"max={float(final.max()):.4f} mean={float(final.mean()):.4f}",
+        f"SAM_DILATED_COVERAGE: {float(sam_dilated.sum()) / n_pixels * 100.0:.4f}%",
         _fmt("TOPLEFT     ", *sample_topleft),
         _fmt("BODY_CENTER ", *sample_body_ctr),
         _fmt("WALL        ", *sample_wall),
@@ -178,74 +181,102 @@ def _save_debug_dump(
 
 def merge_ck_with_sam_chroma_gated(ck_alpha, sam_silhouette, source_rgb=None):
     """
-    v2.1 connectivity-based filter.
+    v2.2 trimap + Closed-Form Matting with CK hair injection.
 
-    Keeps only CK regions that are topologically connected to the SAM body.
-    Walls, forklift, ceiling, and other disconnected junk are removed by
-    definition, not by distance tuning.
-
-    source_rgb is unused but kept in signature for backward compatibility.
+    source_rgb is REQUIRED in v2.2. If None, raise ValueError.
     """
     import numpy as np
     import cv2
-    from scipy import ndimage
+    from scipy.ndimage import binary_fill_holes
+    from pymatting import estimate_alpha_cf
 
+    if source_rgb is None:
+        raise ValueError("v2.2 requires source_rgb input")
+
+    H, W = ck_alpha.shape
     ck = np.clip(ck_alpha.astype(np.float32), 0.0, 1.0)
     sam = (sam_silhouette > 0.5).astype(np.uint8)
+    rgb = np.clip(source_rgb.astype(np.float32) / 255.0, 0.0, 1.0) \
+          if source_rgb.dtype != np.float32 \
+          else np.clip(source_rgb, 0.0, 1.0)
 
-    # Step 1: Fill SAM notches so the body anchor is topologically stable.
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE,
-        (CK_FILTER_CLOSE_PX, CK_FILTER_CLOSE_PX)
+    # 1. Preprocess SAM
+    k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (40, 40))
+    sam_closed = cv2.morphologyEx(sam, cv2.MORPH_CLOSE, k_close)
+    sam_filled = binary_fill_holes(sam_closed).astype(np.uint8)
+
+    # 2. Definite foreground (eroded SAM)
+    k_erode = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (41, 41))
+    fg_def = cv2.erode(sam_filled, k_erode, iterations=1)
+
+    # 3. Outer boundary (dilated SAM)
+    k_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (161, 161))
+    sam_dilated = cv2.dilate(sam_filled, k_dilate, iterations=1)
+
+    # 4. Build trimap (SAM only, CK not used)
+    trimap = np.full((H, W), 0.5, dtype=np.float32)
+    trimap[fg_def > 0] = 1.0
+    trimap[sam_dilated == 0] = 0.0
+
+    # 5. Downsample for CFM
+    scale = 2 if H > 3000 else 1
+    if scale > 1:
+        h, w = H // scale, W // scale
+        trimap_small = cv2.resize(trimap, (w, h), cv2.INTER_NEAREST)
+        rgb_small = cv2.resize(rgb, (w, h), cv2.INTER_AREA)
+    else:
+        trimap_small = trimap
+        rgb_small = rgb
+
+    # 6. Run CFM. pymatting's Numba kernels expect float64; cast immediately
+    # before the call so upstream stays float32 for memory.
+    alpha_small = estimate_alpha_cf(
+        rgb_small.astype(np.float64),
+        trimap_small.astype(np.float64),
     )
-    sam_filled = cv2.morphologyEx(sam, cv2.MORPH_CLOSE, kernel)
-    sam_filled = ndimage.binary_fill_holes(sam_filled).astype(np.uint8)
 
-    # Empty SAM detection. Output will be all zeros if this triggers.
-    sam_pixel_count = int(sam_filled.sum())
-    empty_sam_warning = (sam_pixel_count == 0)
+    # 7. Upsample
+    if scale > 1:
+        alpha = cv2.resize(alpha_small.astype(np.float32), (W, H), cv2.INTER_LINEAR)
+    else:
+        alpha = alpha_small.astype(np.float32)
+    alpha = np.clip(alpha, 0.0, 1.0)
 
-    # Step 2: Threshold CK permissively to catch hair tendrils.
-    ck_binary = (ck > CK_FILTER_THRESHOLD).astype(np.uint8)
+    # 8. CK hair injection in unknown band only
+    unknown_band = (trimap == 0.5)
+    alpha[unknown_band] = np.maximum(alpha[unknown_band], ck[unknown_band])
 
-    # Step 3: Find connected components of the CK foreground.
-    num_components, labels = cv2.connectedComponents(ck_binary, connectivity=8)
-
-    # Step 4: Keep only components that intersect the filled SAM body.
-    # Vectorized via np.isin to avoid O(N) full-resolution boolean allocs
-    # in a Python loop on 4K frames.
-    component_ids_to_keep = np.unique(labels[sam_filled > 0])
-    component_ids_to_keep = component_ids_to_keep[component_ids_to_keep != 0]
-    keep_mask = np.isin(labels, component_ids_to_keep).astype(np.uint8)
-
-    # Step 5: Output is CK alpha within the kept components, zero elsewhere.
-    final = ck * keep_mask
+    # 9. Hard clamp outside dilated SAM
+    alpha[sam_dilated == 0] = 0.0
 
     if DEBUG_MODE:
-        _save_debug_dump(
-            ck=ck,
-            sam=sam,
-            sam_filled=sam_filled,
-            ck_binary=ck_binary,
-            keep_mask=keep_mask,
-            final=final,
-            source_rgb=source_rgb,
-            num_components=num_components,
-            num_components_kept=len(component_ids_to_keep),
-            sam_pixel_count=sam_pixel_count,
-            empty_sam_warning=empty_sam_warning,
+        _save_debug_dump_v22(
+            ck=ck, sam=sam, sam_filled=sam_filled,
+            fg_def=fg_def, sam_dilated=sam_dilated,
+            trimap=trimap, alpha_solved=alpha_small,
+            final=alpha,
+            scale=scale,
         )
 
-    return final
+    return alpha.astype(np.float32)
 
-# Tuning guide:
-# If foot halo appears (foot connects to floor through weak CK pickup):
-#   RAISE CK_FILTER_THRESHOLD toward 0.03 or 0.05 so floor pixels drop
-#   out of ck_binary and the connection breaks. Tradeoff: hair fringe
-#   below the new threshold is also lost. If both happen at the same
-#   threshold, this is the v2.2 geodesic propagation case.
-# If hair clipped: LOWER CK_FILTER_THRESHOLD toward 0.01.
-# If butt notch returns: RAISE CK_FILTER_CLOSE_PX toward 100 or 150.
+# Tuning guide (v2.2):
+# If foot halo within dilated band (CFM extends alpha into floor near foot):
+#   This is the dark-on-dark concern. Two levers:
+#   - Reduce dilation kernel from 161 toward 121 or 81 (tighter trust budget,
+#     hard-clamp kicks in sooner). Watch hair clipping.
+#   - The CK injection in the unknown band uses max(); CK can only INCREASE
+#     alpha, not decrease. Halos from CFM cannot be killed by CK.
+# If hair tendrils clipped beyond dilated SAM:
+#   Increase dilation kernel from 161 toward 181 or 201. Trust budget grows.
+#   Tradeoff: more room for CFM and CK to bleed into junk.
+# If butt notch returns (SAM under-clipping not absorbed by close):
+#   Increase close kernel from 40 toward 60 or 80.
+# If CFM runtime exceeds budget on a real shot:
+#   The downsample threshold is H > 3000. Lower it (e.g. H > 2000) to force
+#   downsample on smaller frames.
+# DO NOT use CK in the trimap.
+# DO NOT skip the hard clamp at the end.
 
 
 def merge_ck_with_sam_active(
@@ -254,18 +285,18 @@ def merge_ck_with_sam_active(
     source_rgb: Optional[np.ndarray] = None,
     screen_type: str = "green",
 ) -> np.ndarray:
-    # WHAT IT DOES: Public dispatcher. Routes to the v2.1 connectivity merge
-    #   when USE_CHROMA_GATED_MERGE is True, otherwise falls back to Path B
-    #   (max). Call sites use this single entry point so the A/B switch is a
-    #   one-flag flip with no call-site changes. screen_type kwarg accepted
-    #   for backward compatibility; v2.1 ignores it.
+    # WHAT IT DOES: Public dispatcher. Routes to the v2.2 trimap+CFM merge when
+    #   USE_CHROMA_GATED_MERGE is True, otherwise falls back to Path B (max).
+    #   Call sites use this single entry point so the A/B switch is a one-flag
+    #   flip with no call-site changes. screen_type kwarg accepted for backward
+    #   compatibility; v2.2 ignores it.
     # DEPENDS ON:   USE_CHROMA_GATED_MERGE module flag, merge_ck_with_sam (Path B),
-    #               merge_ck_with_sam_chroma_gated (v2.1 connectivity).
+    #               merge_ck_with_sam_chroma_gated (v2.2 trimap+CFM).
     # AFFECTS:      every site that imports this dispatcher. Currently:
     #               resolve renderer, resolve viewer, AE viewer (composite + matte).
     if USE_CHROMA_GATED_MERGE:
         print(
-            f"[merge] v2.1 connectivity branch  USE_CHROMA_GATED_MERGE=True  "
+            f"[merge] v2.2 trimap+CFM branch  USE_CHROMA_GATED_MERGE=True  "
             f"source_rgb.shape={getattr(source_rgb, 'shape', None)}"
         )
         return merge_ck_with_sam_chroma_gated(
@@ -276,7 +307,7 @@ def merge_ck_with_sam_active(
 
 
 def write_matte_final_dump(alpha_final: np.ndarray, ops_applied) -> None:
-    # WHAT IT DOES: Snapshots the v2.1 debug PNGs (debug_*.png) under matte_-
+    # WHAT IT DOES: Snapshots the v2.2 debug PNGs (debug_*.png) under matte_-
     #   prefixed names so they survive any subsequent composite-mode re-render
     #   that would overwrite them, then saves the final post-processed alpha as
     #   matte_debug_final_displayed.png + writes matte_debug_stats.txt with the
@@ -295,10 +326,11 @@ def write_matte_final_dump(alpha_final: np.ndarray, ops_applied) -> None:
         ("debug_ck_alpha.png", "matte_debug_ck_alpha.png"),
         ("debug_sam_silhouette.png", "matte_debug_sam_silhouette.png"),
         ("debug_sam_filled.png", "matte_debug_sam_filled.png"),
-        ("debug_ck_binary.png", "matte_debug_ck_binary.png"),
-        ("debug_keep_mask.png", "matte_debug_keep_mask.png"),
+        ("debug_fg_def.png", "matte_debug_fg_def.png"),
+        ("debug_sam_dilated.png", "matte_debug_sam_dilated.png"),
+        ("debug_trimap.png", "matte_debug_trimap.png"),
+        ("debug_alpha_solved.png", "matte_debug_alpha_solved.png"),
         ("debug_final.png", "matte_debug_final.png"),
-        ("debug_source_rgb.png", "matte_debug_source_rgb.png"),
         ("debug_stats.txt", "matte_debug_merge_stats.txt"),
     ]
     for src_name, dst_name in snapshot_pairs:
@@ -321,6 +353,6 @@ def write_matte_final_dump(alpha_final: np.ndarray, ops_applied) -> None:
         f"max={float(a.max()):.4f}\n"
         "Compare matte_debug_final.png vs matte_debug_final_displayed.png:\n"
         "  - If different: a downstream op altered the merge output.\n"
-        "  - If identical: the merge inputs (matte_debug_ck_alpha + matte_debug_sam_filled + matte_debug_keep_mask) explain the output.\n"
+        "  - If identical: the merge inputs (matte_debug_ck_alpha + matte_debug_trimap + matte_debug_alpha_solved) explain the output.\n"
     )
     (DEBUG_DIR / "matte_debug_stats.txt").write_text(stats)
