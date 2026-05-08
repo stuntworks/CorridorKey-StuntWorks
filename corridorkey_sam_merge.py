@@ -1,4 +1,4 @@
-# Last modified: 2026-05-07 | Change: v2.2 tuning - tighten dilation 161 to 81, gate CK injection on CFM agreement. Reduces foot halo from floor-under-feet inclusion. | Full history: git log
+# Last modified: 2026-05-08 | Change: v2.2 fix downsample trigger - max(H, W) > 2500 so 4K UHD (2160 high) takes the 2x downsample path. Resolves 20s runtime in matte view. | Full history: git log
 """v2.2 trimap + Closed-Form Matting (pymatting) + CK hair injection.
 
 REPLACES the v2.1 topology connectivity filter. v2.1 failed when CK had
@@ -219,7 +219,7 @@ def merge_ck_with_sam_chroma_gated(ck_alpha, sam_silhouette, source_rgb=None):
     trimap[sam_dilated == 0] = 0.0
 
     # 5. Downsample for CFM
-    scale = 2 if H > 3000 else 1
+    scale = 2 if max(H, W) > 2500 else 1
     if scale > 1:
         h, w = H // scale, W // scale
         trimap_small = cv2.resize(trimap, (w, h), cv2.INTER_NEAREST)
