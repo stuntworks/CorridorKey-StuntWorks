@@ -1,31 +1,26 @@
-# Last modified: 2026-05-07 | Change: SOFT_ZONE_SAM_BUFFER_PX 15->40 to widen buffer past CK natural soft edge extent so hair/fringe survives | Full history: git log
-"""CK-confidence-based merge per Berto 2026-05-07.
+# Last modified: 2026-05-07 | Change: v2.1 connectivity filter — replace merge math with topology-based component selection. Walls/junk eliminated by definition, hair preserved by connection to body. Vectorized via np.isin. Empty SAM warning logged. Debug gated by DEBUG_MODE | Full history: git log
+"""v2.1 connectivity-based CK + SAM merge per Berto 2026-05-07.
 
-REPLACES the chroma-gated merge + outer SAM kill mask architecture. The
-chroma signal cannot distinguish "body part on green that needs CK soft
-alpha" from "body part on floor that needs SAM tight cut" — both are
-body-edge pixels near a transition, and any combination of chroma
-threshold / dilation / kill-mask buffer keeps trading hair preservation
-against shoe halo elimination. The 2026-05-06 evening diagnostic confirmed
-this: in the kill-mask edge zone, on-green=100% / off-green=0%, meaning
-the small buffer was never selected at body edges.
+REPLACES the chroma-gated merge + outer SAM kill mask + soft-zone +
+SAM-buffer architecture. Distance-based heuristics (chroma threshold,
+chroma dilation, kill-mask buffers, soft-zone SAM buffer) all hit the
+same ceiling: at body edges they could not distinguish "body part on
+green that needs CK soft alpha" from "wall outline transition that needs
+killing." Topology can.
 
-Routing now uses CK's own alpha values, not chroma:
+The new architecture:
 
-    soft_zone = (CK_SOFT_LO < ck < CK_SOFT_HI)
-    final     = where(soft_zone, ck, ck * sam_binary)
+  1. Fill SAM notches (close + flood) so it is a stable body anchor.
+  2. Threshold CK permissively to catch hair tendrils.
+  3. Find connected components of CK foreground.
+  4. Keep ONLY components that intersect the filled SAM body.
+  5. Output is CK alpha within kept components, zero elsewhere.
 
-  - CK soft transition (ck typically 0.05..0.95 at green edges): CK wins
-    outright. Hair, butt, fingers, fine detail preserved exactly as CK
-    keys them. SAM does not vote here.
-  - CK confident foreground (ck >= 0.95): SAM gates it. SAM=1 keeps it
-    (body, foot below knee). SAM=0 kills it (walls, forklift, shoe halo
-    against floor — CK false positives that SAM correctly excludes).
-  - CK confident background (ck <= 0.05): output is 0. Green killed.
+Walls / forklift / cubes are disconnected from the body by definition,
+so they are eliminated without any distance tuning. Hair tendrils that
+touch the body silhouette get carried along with the body component.
 
-No chroma signal. No dilation parameters. No kill mask buffers.
-
-The post-hoc apply_sam2_junk_kill / apply_sam2_gate_* helpers in
+The old apply_sam2_junk_kill / apply_sam2_gate_* helpers in
 sam2_combine.py remain on disk as dead code (unreferenced from any call
 site) for hot-revert.
 """
@@ -42,41 +37,23 @@ import numpy as np
 # conservative; lower to let more of SAM's confidence band contribute.
 SAM_BINARIZE_THRESHOLD = 0.5
 
-# Diagnostic toggle — when True, every confidence-based merge call dumps
-# 4 PNGs + stats.txt to DEBUG_DIR. Flip False once architecture is
-# validated. Costs ~10-20 ms per call on a 4K frame.
+# Diagnostic toggle for the matte-branch snapshot. The merge-time debug
+# dump is gated by DEBUG_MODE below (separate flag so the matte snapshot
+# can be turned off independently). Both default True until validated.
 DEBUG_ENABLED = True
 DEBUG_DIR = Path(__file__).parent / ".chroma_debug"
 
-# Active merge mode toggle. True = confidence-based routing (current).
+# Active merge mode toggle. True = v2.1 connectivity filter (current).
 # False = Path B fallback (chroma-blind max(CK, SAM)). Call sites use the
 # single dispatcher merge_ck_with_sam_active so flipping this flag is a
 # one-deploy A/B without touching call sites. Path B kept on disk for
 # hot-revert; the chroma-gated math is gone.
 USE_CHROMA_GATED_MERGE = True
 
-# CK confidence band for the soft-zone gate. Per Berto 2026-05-07 brief.
-# The two knobs to tune if results are off:
-#   CK_SOFT_LO too low  -> noisy near-zero CK pixels enter soft zone, get
-#                          preserved instead of killed. Raise toward 0.10.
-#   CK_SOFT_HI too high -> CK confident-fg false positives (walls keyed at
-#                          0.95+) enter soft zone, escape SAM's gate, walls
-#                          re-appear. Drop toward 0.90.
-#   CK_SOFT_LO too high -> hair tendrils with low alpha get killed instead
-#                          of preserved. Drop toward 0.02.
-#   CK_SOFT_HI too low  -> body interior (CK alpha 0.95+) enters soft zone
-#                          and bypasses SAM, which is fine functionally
-#                          (interior is fg either way) but masks bugs.
-CK_SOFT_LO = 0.05
-CK_SOFT_HI = 0.7
-
-# Soft-zone SAM gate buffer — per Berto 2026-05-07 morning. Without a SAM gate
-# in the soft zone, every CK transition (wall outlines, floor edges, drape
-# edges, cube outlines) trusts CK exclusively and survives in the matte. Gate
-# the soft zone with a SAM silhouette dilated by this many pixels so hair
-# tendrils just past the tight SAM edge survive while wall outlines far from
-# SAM die. Tune up if hair clips, down if wall outlines persist.
-SOFT_ZONE_SAM_BUFFER_PX = 40
+# v2.1 connectivity filter constants
+DEBUG_MODE = True   # set False for production renders
+CK_FILTER_THRESHOLD = 0.02
+CK_FILTER_CLOSE_PX = 75
 
 
 def binarize_sam_silhouette(sam: np.ndarray, threshold: float = SAM_BINARIZE_THRESHOLD) -> np.ndarray:
@@ -120,136 +97,155 @@ def merge_ck_with_sam(ck_alpha: np.ndarray, sam_silhouette: Optional[np.ndarray]
 def _save_debug_dump(
     ck: np.ndarray,
     sam: np.ndarray,
-    soft_zone: np.ndarray,
+    sam_filled: np.ndarray,
+    ck_binary: np.ndarray,
+    keep_mask: np.ndarray,
     final: np.ndarray,
-    sam_buffered: Optional[np.ndarray] = None,
+    source_rgb: Optional[np.ndarray] = None,
+    num_components: int = 0,
+    num_components_kept: int = 0,
+    sam_pixel_count: int = 0,
+    empty_sam_warning: bool = False,
 ) -> None:
-    # WHAT IT DOES: Diagnostic dump for the confidence-based merge. Writes 4-5
-    #   PNGs + debug_stats.txt to DEBUG_DIR. Overwrites previous dump; only the
-    #   LAST merge call survives.
+    # WHAT IT DOES: Diagnostic dump for the v2.1 connectivity filter. Writes
+    #   the per-stage masks + stats to DEBUG_DIR. Overwrites previous dump;
+    #   only the LAST merge call survives.
     # DEPENDS ON:   cv2 (lazy), numpy, pathlib. DEBUG_DIR mkdir-on-write.
-    # AFFECTS:      writes 5-6 files to DEBUG_DIR; no return; no logic side effect.
+    #               Handles source_rgb=None gracefully (skips that one image).
+    # AFFECTS:      writes 6-7 files to DEBUG_DIR; no return; no logic side effect.
     import cv2 as _cv2
     DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 
     ck_vis = np.clip(ck * 255.0, 0.0, 255.0).astype(np.uint8)
     _cv2.imwrite(str(DEBUG_DIR / "debug_ck_alpha.png"), ck_vis)
 
-    sam_vis = np.clip(sam * 255.0, 0.0, 255.0).astype(np.uint8)
+    sam_vis = (sam.astype(np.uint8)) * 255
     _cv2.imwrite(str(DEBUG_DIR / "debug_sam_silhouette.png"), sam_vis)
 
-    soft_vis = (soft_zone.astype(np.uint8)) * 255
-    _cv2.imwrite(str(DEBUG_DIR / "debug_soft_zone.png"), soft_vis)
+    sam_filled_vis = (sam_filled.astype(np.uint8)) * 255
+    _cv2.imwrite(str(DEBUG_DIR / "debug_sam_filled.png"), sam_filled_vis)
 
-    if sam_buffered is not None:
-        buffered_vis = np.clip(sam_buffered * 255.0, 0.0, 255.0).astype(np.uint8)
-        _cv2.imwrite(str(DEBUG_DIR / "debug_sam_buffered.png"), buffered_vis)
+    ck_binary_vis = (ck_binary.astype(np.uint8)) * 255
+    _cv2.imwrite(str(DEBUG_DIR / "debug_ck_binary.png"), ck_binary_vis)
+
+    keep_vis = (keep_mask.astype(np.uint8)) * 255
+    _cv2.imwrite(str(DEBUG_DIR / "debug_keep_mask.png"), keep_vis)
 
     final_vis = np.clip(final * 255.0, 0.0, 255.0).astype(np.uint8)
     _cv2.imwrite(str(DEBUG_DIR / "debug_final.png"), final_vis)
 
+    if source_rgb is not None:
+        src_vis = np.clip(source_rgb * 255.0, 0.0, 255.0).astype(np.uint8)
+        src_bgr = _cv2.cvtColor(src_vis, _cv2.COLOR_RGB2BGR)
+        _cv2.imwrite(str(DEBUG_DIR / "debug_source_rgb.png"), src_bgr)
+
     H, W = ck.shape
     n_pixels = float(ck.size)
-    pct_soft = float(soft_zone.sum()) / n_pixels * 100.0
-    pct_confident_fg = float((ck >= CK_SOFT_HI).sum()) / n_pixels * 100.0
-    pct_confident_bg = float((ck <= CK_SOFT_LO).sum()) / n_pixels * 100.0
+    pct_keep = float(keep_mask.sum()) / n_pixels * 100.0
 
-    sample_tl_y, sample_tl_x = 0, 0
-    sample_ctr_y, sample_ctr_x = H // 2, W // 2
-    sample_halo_y, sample_halo_x = int(H * 0.85), int(W * 0.6)
+    # Sample pixel locations — picked for Berto's woman-on-greenscreen test
+    # clip. Adjust per shot if needed; top-left should always be confident bg.
+    sample_topleft = (0, 0)
+    sample_body_ctr = (H // 2, W // 2)
+    sample_wall = (int(H * 0.10), int(W * 0.15))
+    sample_foot = (int(H * 0.90), int(W * 0.50))
 
-    def _fmt_sample(name: str, y: int, x: int) -> str:
-        buf_str = (
-            f" sam_buffered={float(sam_buffered[y, x]):.2f}"
-            if sam_buffered is not None else ""
-        )
+    def _fmt(name: str, y: int, x: int) -> str:
         return (
-            f"sample {name} ({y}, {x}): "
-            f"ck={float(ck[y, x]):.4f} "
-            f"sam={float(sam[y, x]):.2f}"
-            f"{buf_str} "
-            f"soft_zone={bool(soft_zone[y, x])} "
-            f"final={float(final[y, x]):.4f}"
+            f"PIXEL_{name}: ck={float(ck[y, x]):.4f} "
+            f"sam={int(sam[y, x])} "
+            f"final={float(final[y, x]):.4f}  ({y}, {x})"
         )
 
     stats_lines = [
-        "=== confidence-based merge debug dump ===",
-        f"shapes: ck={ck.shape} sam={sam.shape} final={final.shape}",
-        f"CK_SOFT_LO={CK_SOFT_LO} CK_SOFT_HI={CK_SOFT_HI} "
-        f"SOFT_ZONE_SAM_BUFFER_PX={SOFT_ZONE_SAM_BUFFER_PX}",
-        f"% pixels in soft_zone (CK gate via sam_buffered)      = {pct_soft:.2f}%",
-        f"% pixels CK >= {CK_SOFT_HI} (confident fg, SAM gates) = {pct_confident_fg:.2f}%",
-        f"% pixels CK <= {CK_SOFT_LO} (confident bg, output 0)  = {pct_confident_bg:.2f}%",
-        f"mean(final) = {float(final.mean()):.4f}",
+        "=== v2.1 connectivity filter debug dump ===",
+        f"EMPTY_SAM_WARNING: {empty_sam_warning}",
+        f"SAM_PIXEL_COUNT: {sam_pixel_count}",
+        f"NUM_COMPONENTS_FOUND: {num_components}",
+        f"NUM_COMPONENTS_KEPT: {num_components_kept}",
+        f"KEEP_MASK_PERCENT_WHITE: {pct_keep:.4f}",
+        f"MEAN_FINAL: {float(final.mean()):.6f}",
+        f"SHAPE_CK: {ck.shape}",
+        f"SHAPE_SAM: {sam.shape}",
+        f"CK_FILTER_THRESHOLD={CK_FILTER_THRESHOLD} CK_FILTER_CLOSE_PX={CK_FILTER_CLOSE_PX}",
+        _fmt("TOPLEFT     ", *sample_topleft),
+        _fmt("BODY_CENTER ", *sample_body_ctr),
+        _fmt("WALL        ", *sample_wall),
+        _fmt("FOOT        ", *sample_foot),
     ]
-    if sam_buffered is not None:
-        soft_pixels = float(soft_zone.sum())
-        if soft_pixels > 0:
-            soft_in_buffered = (
-                float((soft_zone & (sam_buffered > 0.5)).sum()) / soft_pixels * 100.0
-            )
-        else:
-            soft_in_buffered = 0.0
-        stats_lines.append(
-            f"% soft_zone pixels inside sam_buffered = {soft_in_buffered:.2f}%  "
-            f"(high = body edges; low = wall edges far from SAM)"
-        )
-    stats_lines.extend([
-        _fmt_sample("top-left   ", sample_tl_y, sample_tl_x),
-        _fmt_sample("frame ctr  ", sample_ctr_y, sample_ctr_x),
-        _fmt_sample("halo zone  ", sample_halo_y, sample_halo_x),
-    ])
     (DEBUG_DIR / "debug_stats.txt").write_text("\n".join(stats_lines) + "\n")
 
 
-def merge_ck_with_sam_chroma_gated(
-    ck_alpha: np.ndarray,
-    sam_silhouette: Optional[np.ndarray],
-    source_rgb: Optional[np.ndarray] = None,
-    **_kwargs,
-) -> np.ndarray:
-    # WHAT IT DOES: Confidence-based merge per Berto 2026-05-07. Routes
-    #   per-pixel using CK's own alpha values:
-    #     - soft_zone (CK_SOFT_LO < ck < CK_SOFT_HI): final = ck. SAM does
-    #       not vote. Preserves hair, butt, fingertips — wherever CK is
-    #       transitioning, CK is the truth.
-    #     - confident (ck <= LO or ck >= HI): final = ck * sam. SAM gates
-    #       confident pixels. Walls / forklift / shoe halos where CK has
-    #       false positives get killed because SAM=0; foot below knee
-    #       where CK is right gets kept because SAM=1.
-    #   Function name kept stable so dispatcher and call sites are untouched.
-    #   Function signature accepts source_rgb + **_kwargs for backward
-    #   compatibility with the chroma-gated dispatcher's screen_type kwarg;
-    #   neither is used in the new logic.
-    # DEPENDS ON:   numpy. ck_alpha and sam_silhouette are (H, W) float32 in
-    #               [0, 1] with matching shapes when sam is not None. CK_SOFT_LO,
-    #               CK_SOFT_HI, DEBUG_ENABLED, _save_debug_dump.
-    # AFFECTS:      every per-frame and per-preview matte. Replaces both Path B
-    #               (max) and the chroma-gated + kill-mask architecture.
-    ck = np.clip(np.asarray(ck_alpha, dtype=np.float32), 0.0, 1.0)
-    if sam_silhouette is None:
-        return ck.copy()
-    sam = (np.asarray(sam_silhouette, dtype=np.float32) > 0.5).astype(np.float32)
-    if ck.shape != sam.shape:
-        raise ValueError(f"shape mismatch: ck={ck.shape}, sam={sam.shape}")
-    # Soft-zone gate via SAM dilated by SOFT_ZONE_SAM_BUFFER_PX. Body edges
-    # sit inside this buffer (CK soft alpha preserved); wall outlines and
-    # other transitions far from SAM fall outside it (killed).
-    import cv2 as _cv2
-    _k = max(1, int(SOFT_ZONE_SAM_BUFFER_PX))
-    _kernel = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (_k, _k))
-    sam_buffered = _cv2.dilate(sam.astype(np.uint8), _kernel).astype(np.float32)
-    soft_zone = (ck > CK_SOFT_LO) & (ck < CK_SOFT_HI)
-    final = np.where(soft_zone, ck * sam_buffered, ck * sam).astype(np.float32)
-    if DEBUG_ENABLED:
-        try:
-            _save_debug_dump(
-                ck=ck, sam=sam, soft_zone=soft_zone, final=final,
-                sam_buffered=sam_buffered,
-            )
-        except Exception as _e:
-            print(f"[merge debug] dump failed: {_e}")
+def merge_ck_with_sam_chroma_gated(ck_alpha, sam_silhouette, source_rgb=None):
+    """
+    v2.1 connectivity-based filter.
+
+    Keeps only CK regions that are topologically connected to the SAM body.
+    Walls, forklift, ceiling, and other disconnected junk are removed by
+    definition, not by distance tuning.
+
+    source_rgb is unused but kept in signature for backward compatibility.
+    """
+    import numpy as np
+    import cv2
+    from scipy import ndimage
+
+    ck = np.clip(ck_alpha.astype(np.float32), 0.0, 1.0)
+    sam = (sam_silhouette > 0.5).astype(np.uint8)
+
+    # Step 1: Fill SAM notches so the body anchor is topologically stable.
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (CK_FILTER_CLOSE_PX, CK_FILTER_CLOSE_PX)
+    )
+    sam_filled = cv2.morphologyEx(sam, cv2.MORPH_CLOSE, kernel)
+    sam_filled = ndimage.binary_fill_holes(sam_filled).astype(np.uint8)
+
+    # Empty SAM detection. Output will be all zeros if this triggers.
+    sam_pixel_count = int(sam_filled.sum())
+    empty_sam_warning = (sam_pixel_count == 0)
+
+    # Step 2: Threshold CK permissively to catch hair tendrils.
+    ck_binary = (ck > CK_FILTER_THRESHOLD).astype(np.uint8)
+
+    # Step 3: Find connected components of the CK foreground.
+    num_components, labels = cv2.connectedComponents(ck_binary, connectivity=8)
+
+    # Step 4: Keep only components that intersect the filled SAM body.
+    # Vectorized via np.isin to avoid O(N) full-resolution boolean allocs
+    # in a Python loop on 4K frames.
+    component_ids_to_keep = np.unique(labels[sam_filled > 0])
+    component_ids_to_keep = component_ids_to_keep[component_ids_to_keep != 0]
+    keep_mask = np.isin(labels, component_ids_to_keep).astype(np.uint8)
+
+    # Step 5: Output is CK alpha within the kept components, zero elsewhere.
+    final = ck * keep_mask
+
+    if DEBUG_MODE:
+        _save_debug_dump(
+            ck=ck,
+            sam=sam,
+            sam_filled=sam_filled,
+            ck_binary=ck_binary,
+            keep_mask=keep_mask,
+            final=final,
+            source_rgb=source_rgb,
+            num_components=num_components,
+            num_components_kept=len(component_ids_to_keep),
+            sam_pixel_count=sam_pixel_count,
+            empty_sam_warning=empty_sam_warning,
+        )
+
     return final
+
+# Tuning guide:
+# If foot halo appears (foot connects to floor through weak CK pickup):
+#   RAISE CK_FILTER_THRESHOLD toward 0.03 or 0.05 so floor pixels drop
+#   out of ck_binary and the connection breaks. Tradeoff: hair fringe
+#   below the new threshold is also lost. If both happen at the same
+#   threshold, this is the v2.2 geodesic propagation case.
+# If hair clipped: LOWER CK_FILTER_THRESHOLD toward 0.01.
+# If butt notch returns: RAISE CK_FILTER_CLOSE_PX toward 100 or 150.
 
 
 def merge_ck_with_sam_active(
@@ -258,17 +254,18 @@ def merge_ck_with_sam_active(
     source_rgb: Optional[np.ndarray] = None,
     screen_type: str = "green",
 ) -> np.ndarray:
-    # WHAT IT DOES: Public dispatcher. Routes to the active confidence-based
-    #   merge when USE_CHROMA_GATED_MERGE is True, otherwise falls back to
-    #   Path B (max). Call sites use this single entry point so the A/B
-    #   switch is a one-flag flip with no call-site changes.
+    # WHAT IT DOES: Public dispatcher. Routes to the v2.1 connectivity merge
+    #   when USE_CHROMA_GATED_MERGE is True, otherwise falls back to Path B
+    #   (max). Call sites use this single entry point so the A/B switch is a
+    #   one-flag flip with no call-site changes. screen_type kwarg accepted
+    #   for backward compatibility; v2.1 ignores it.
     # DEPENDS ON:   USE_CHROMA_GATED_MERGE module flag, merge_ck_with_sam (Path B),
-    #               merge_ck_with_sam_chroma_gated (confidence-based).
+    #               merge_ck_with_sam_chroma_gated (v2.1 connectivity).
     # AFFECTS:      every site that imports this dispatcher. Currently:
     #               resolve renderer, resolve viewer, AE viewer (composite + matte).
     if USE_CHROMA_GATED_MERGE:
         print(
-            f"[merge] confidence-based branch  USE_CHROMA_GATED_MERGE=True  "
+            f"[merge] v2.1 connectivity branch  USE_CHROMA_GATED_MERGE=True  "
             f"source_rgb.shape={getattr(source_rgb, 'shape', None)}"
         )
         return merge_ck_with_sam_chroma_gated(
@@ -279,11 +276,11 @@ def merge_ck_with_sam_active(
 
 
 def write_matte_final_dump(alpha_final: np.ndarray, ops_applied) -> None:
-    # WHAT IT DOES: Snapshots the confidence-based debug PNGs (debug_*.png) under
-    #   matte_-prefixed names so they survive any subsequent composite-mode
-    #   re-render that would overwrite them, then saves the final post-processed
-    #   alpha as matte_debug_final_displayed.png + writes matte_debug_stats.txt
-    #   with the ordered list of ops applied to the merge output before display.
+    # WHAT IT DOES: Snapshots the v2.1 debug PNGs (debug_*.png) under matte_-
+    #   prefixed names so they survive any subsequent composite-mode re-render
+    #   that would overwrite them, then saves the final post-processed alpha as
+    #   matte_debug_final_displayed.png + writes matte_debug_stats.txt with the
+    #   ordered list of ops applied to the merge output before display.
     # DEPENDS ON:   cv2 (lazy), shutil, numpy, pathlib. DEBUG_DIR mkdir-on-write.
     #               Assumes the caller's most recent merge_ck_with_sam_chroma_gated
     #               call dumped to debug_*.png moments earlier.
@@ -297,9 +294,12 @@ def write_matte_final_dump(alpha_final: np.ndarray, ops_applied) -> None:
     snapshot_pairs = [
         ("debug_ck_alpha.png", "matte_debug_ck_alpha.png"),
         ("debug_sam_silhouette.png", "matte_debug_sam_silhouette.png"),
-        ("debug_sam_buffered.png", "matte_debug_sam_buffered.png"),
-        ("debug_soft_zone.png", "matte_debug_soft_zone.png"),
+        ("debug_sam_filled.png", "matte_debug_sam_filled.png"),
+        ("debug_ck_binary.png", "matte_debug_ck_binary.png"),
+        ("debug_keep_mask.png", "matte_debug_keep_mask.png"),
         ("debug_final.png", "matte_debug_final.png"),
+        ("debug_source_rgb.png", "matte_debug_source_rgb.png"),
+        ("debug_stats.txt", "matte_debug_merge_stats.txt"),
     ]
     for src_name, dst_name in snapshot_pairs:
         src_p = DEBUG_DIR / src_name
@@ -321,6 +321,6 @@ def write_matte_final_dump(alpha_final: np.ndarray, ops_applied) -> None:
         f"max={float(a.max()):.4f}\n"
         "Compare matte_debug_final.png vs matte_debug_final_displayed.png:\n"
         "  - If different: a downstream op altered the merge output.\n"
-        "  - If identical: the merge inputs (matte_debug_ck_alpha + matte_debug_sam_silhouette + matte_debug_soft_zone) explain the output.\n"
+        "  - If identical: the merge inputs (matte_debug_ck_alpha + matte_debug_sam_filled + matte_debug_keep_mask) explain the output.\n"
     )
     (DEBUG_DIR / "matte_debug_stats.txt").write_text(stats)
