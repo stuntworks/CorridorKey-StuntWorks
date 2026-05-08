@@ -1,4 +1,4 @@
-# Last modified: 2026-05-08 | Change: v2.2 fix downsample trigger - max(H, W) > 2500 so 4K UHD (2160 high) takes the 2x downsample path. Resolves 20s runtime in matte view. | Full history: git log
+# Last modified: 2026-05-08 | Change: v2.2 lower CK injection gate from 0.1 to 0.01. Restores hair tendril detail lost at 2K downsample. | Full history: git log
 """v2.2 trimap + Closed-Form Matting (pymatting) + CK hair injection.
 
 REPLACES the v2.1 topology connectivity filter. v2.1 failed when CK had
@@ -247,7 +247,7 @@ def merge_ck_with_sam_chroma_gated(ck_alpha, sam_silhouette, source_rgb=None):
     # Only inject CK where CFM also found foreground signal.
     # Prevents CK = 1.0 floor pixels from blowing up alpha where
     # CFM correctly assigned them low alpha.
-    inject_zone = unknown_band & (alpha > 0.1)
+    inject_zone = unknown_band & (alpha > 0.01)
     alpha[inject_zone] = np.maximum(alpha[inject_zone], ck[inject_zone])
 
     # 9. Hard clamp outside dilated SAM
