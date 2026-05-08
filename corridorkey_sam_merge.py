@@ -145,6 +145,41 @@ def _save_debug_dump_v22(
     fg_pixels = int((trimap >= 1.0).sum())
     bg_pixels = int((trimap <= 0.0).sum())
 
+    # Feet-zone crops + floor-probe coords from sam_dilated bbox.
+    bbox_y, bbox_x = np.where(sam_dilated > 0.5)
+    floor_probes = []  # list of (name, y, x) appended to stats_lines below
+    if bbox_y.size > 0:
+        y_min, y_max = int(bbox_y.min()), int(bbox_y.max())
+        x_min, x_max = int(bbox_x.min()), int(bbox_x.max())
+        feet_y_start = int(y_min + 0.75 * (y_max - y_min))
+        feet_y_end   = min(H, y_max + 100)
+        feet_x_start = max(0, x_min - 200)
+        feet_x_end   = min(W, x_max + 200)
+
+        crop_final  = final [feet_y_start:feet_y_end, feet_x_start:feet_x_end]
+        crop_ck     = ck    [feet_y_start:feet_y_end, feet_x_start:feet_x_end]
+        crop_trimap = trimap[feet_y_start:feet_y_end, feet_x_start:feet_x_end]
+
+        _cv2.imwrite(str(DEBUG_DIR / "matte_debug_feet_final.png"),
+                     np.clip(crop_final * 255.0, 0.0, 255.0).astype(np.uint8))
+        _cv2.imwrite(str(DEBUG_DIR / "matte_debug_feet_ck.png"),
+                     np.clip(crop_ck * 255.0, 0.0, 255.0).astype(np.uint8))
+        _cv2.imwrite(str(DEBUG_DIR / "matte_debug_feet_trimap.png"),
+                     np.clip(crop_trimap * 255.0, 0.0, 255.0).astype(np.uint8))
+
+        floor_probes = [
+            ("FLOOR_LEFT_OF_FEET ",  min(H - 1, max(0, feet_y_start + 50)),
+                                     min(W - 1, max(0, feet_x_start + 50))),
+            ("FLOOR_RIGHT_OF_FEET",  min(H - 1, max(0, feet_y_start + 50)),
+                                     min(W - 1, max(0, feet_x_end - 50))),
+            ("FLOOR_DIRECT_UNDER ",  min(H - 1, max(0, feet_y_end - 30)),
+                                     min(W - 1, max(0, (x_min + x_max) // 2))),
+            ("FLOOR_FAR_LEFT     ",  min(H - 1, max(0, feet_y_end - 30)),
+                                     min(W - 1, max(0, feet_x_start + 30))),
+            ("FLOOR_FAR_RIGHT    ",  min(H - 1, max(0, feet_y_end - 30)),
+                                     min(W - 1, max(0, feet_x_end - 30))),
+        ]
+
     sample_topleft = (0, 0)
     sample_body_ctr = (H // 2, W // 2)
     sample_wall = (int(H * 0.10), int(W * 0.15))
@@ -176,6 +211,8 @@ def _save_debug_dump_v22(
         _fmt("WALL        ", *sample_wall),
         _fmt("FOOT        ", *sample_foot),
     ]
+    for _name, _y, _x in floor_probes:
+        stats_lines.append(_fmt(_name, _y, _x))
     (DEBUG_DIR / "debug_stats.txt").write_text("\n".join(stats_lines) + "\n")
 
 
