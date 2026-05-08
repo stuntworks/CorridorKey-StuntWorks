@@ -167,6 +167,21 @@ def _save_debug_dump_v22(
         _cv2.imwrite(str(DEBUG_DIR / "matte_debug_feet_trimap.png"),
                      np.clip(crop_trimap * 255.0, 0.0, 255.0).astype(np.uint8))
 
+        # Hair-zone crops: top 25% of bbox + 100 px above + 200 px lateral.
+        hair_y_start = max(0, y_min - 100)
+        hair_y_end   = int(y_min + 0.25 * (y_max - y_min))
+        hair_x_start = max(0, x_min - 200)
+        hair_x_end   = min(W, x_max + 200)
+        crop_hair_final  = final [hair_y_start:hair_y_end, hair_x_start:hair_x_end]
+        crop_hair_ck     = ck    [hair_y_start:hair_y_end, hair_x_start:hair_x_end]
+        crop_hair_trimap = trimap[hair_y_start:hair_y_end, hair_x_start:hair_x_end]
+        _cv2.imwrite(str(DEBUG_DIR / "matte_debug_hair_final.png"),
+                     np.clip(crop_hair_final * 255.0, 0.0, 255.0).astype(np.uint8))
+        _cv2.imwrite(str(DEBUG_DIR / "matte_debug_hair_ck.png"),
+                     np.clip(crop_hair_ck * 255.0, 0.0, 255.0).astype(np.uint8))
+        _cv2.imwrite(str(DEBUG_DIR / "matte_debug_hair_trimap.png"),
+                     np.clip(crop_hair_trimap * 255.0, 0.0, 255.0).astype(np.uint8))
+
         floor_probes = [
             ("FLOOR_LEFT_OF_FEET ",  min(H - 1, max(0, feet_y_start + 50)),
                                      min(W - 1, max(0, feet_x_start + 50))),
@@ -295,7 +310,7 @@ def merge_ck_with_sam_chroma_gated(ck_alpha, sam_silhouette, source_rgb=None):
     # transitions over ~8 pixels. Outside sam_dilated, alpha is
     # left untouched (the boundary feather below will handle that).
     INTERNAL_BLUR_KERNEL = 15      # odd
-    INTERNAL_BLUR_SIGMA  = 2.5     # ~8 px effective transition
+    INTERNAL_BLUR_SIGMA  = 1.0     # ~3 px effective transition (was 2.5)
     alpha_smooth = cv2.GaussianBlur(
         alpha, (INTERNAL_BLUR_KERNEL, INTERNAL_BLUR_KERNEL),
         INTERNAL_BLUR_SIGMA
