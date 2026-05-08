@@ -35,7 +35,7 @@ StuntWorks Cinema is **Roberto Lopez and Elvis Lopez** — stunt performers and 
 ---
 
 > **Which version should I download?**
-> For a verified, tested build use the latest **[release tag](https://github.com/stuntworks/CorridorKey-StuntWorks/releases)** (currently `v0.7.0`). The `main` branch is active development and may include unfinished work.
+> For a verified, tested build use the latest **[release tag](https://github.com/stuntworks/CorridorKey-StuntWorks/releases)** (currently `v1.0.0`). The `main` branch is active development and may include unfinished work.
 
 ---
 
@@ -84,6 +84,17 @@ Real stunt/action greenscreen clips for testing are attached to the [v0.7.0 rele
 | **GPU** | NVIDIA with CUDA, 8GB+ VRAM recommended |
 | **Editor** | Resolve Studio 18+, After Effects 2020+, or Premiere Pro 2020+ |
 
+### Hardware sizing — what to expect
+
+| GPU VRAM | What works | What tends to fall over |
+|---|---|---|
+| **6 GB** | 1080p single frames, short ranges (<60 frames). Live preview OK. | 4K processing, long batch ranges, SAM 2 on 4K. Out-of-memory likely. |
+| **8 GB** | 1080p batch processing, 1440p single frames, SAM 2 on 1080p. Recommended baseline. | 4K SAM 2 video propagation, very long ranges. |
+| **12 GB+** | 1080p batch + SAM 2, 4K single frames, 4K live preview. | 4K SAM 2 video propagation on long ranges still tight. |
+| **16 GB+** | 4K batch processing, 4K SAM 2 single-frame and short ranges. Comfortable headroom. | Sustained 4K SAM 2 over hundreds of frames may still need a closer eye on VRAM. |
+
+> If you hit CUDA out-of-memory: drop to a lower-resolution proxy track, shorten the processing range, or skip SAM 2 (key with CK alone) on that clip. See [Troubleshooting](#troubleshooting).
+
 ---
 
 ## Install
@@ -131,6 +142,23 @@ python install.py
 
 Output saves to a `CorridorKey` folder next to your project.
 
+### Refine Edges with AI Mask (SAM 2) — the headline feature
+
+CorridorKey's neural keyer handles the chroma. **SAM 2** handles everything else — it's the difference between a 90% key and a clean 4K-ready edge. Click on the actor, the AI builds a silhouette, and your matte snaps to it.
+
+| Step | Action |
+|:---:|---|
+| 1 | Open **SHOW PREVIEW** with a frame loaded |
+| 2 | **Left-click** on the actor to add a positive dot (green) — the area you want to keep |
+| 3 | **Right-click** on the background to add a negative dot (red) — the area to exclude |
+| 4 | **APPLY MASK** — SAM 2 runs and refines the matte. The preview updates with the cleaner edge. |
+| 5 | Add more dots and APPLY MASK again to refine further |
+| 6 | **CLEAR** — removes all dots and resets the AI mask |
+
+**Multi-object** for tricky shots — actor + separate prop, body + feet on a floor that the chroma can't kill. Press **Tab** to switch between **MASK 1** (cyan, body / on-green) and **MASK 2** (magenta, feet / off-green). Each mask gets its own dots and APPLY MASK action.
+
+> **PROCESS ALL with SAM 2:** when you batch a range, SAM 2 propagates your anchor-frame dots through the whole sequence so the cleanup tracks with the actor. No re-clicking per frame.
+
 </details>
 
 ---
@@ -153,6 +181,23 @@ Output saves to a `CorridorKey` folder next to your project.
 Output saves to a `CorridorKey` folder next to your project.
 
 > **Note:** Batch processing runs in one shot — AE will freeze while processing, then come back with all frames ready.
+
+### Refine Edges with AI Mask (SAM 2) — the headline feature
+
+CorridorKey's neural keyer handles the chroma. **SAM 2** handles everything else — it's the difference between a 90% key and a clean 4K-ready edge. Click on the actor in the preview window, the AI builds a silhouette, your matte snaps to it.
+
+| Step | Action |
+|:---:|---|
+| 1 | **PREVIEW FRAME (LIVE)** to open the floating preview |
+| 2 | **Left-click** on the actor to add a positive dot (green) — the area you want to keep |
+| 3 | **Right-click** on the background to add a negative dot (red) — the area to exclude |
+| 4 | **APPLY MASK** — SAM 2 runs and refines the matte. The preview updates with the cleaner edge. |
+| 5 | Add more dots and APPLY MASK again to refine further |
+| 6 | **CLEAR** — removes all dots and resets the AI mask |
+
+**Multi-object** for tricky shots — press **Tab** to switch between **MASK 1** and **MASK 2**. Each mask gets its own dots and APPLY MASK action.
+
+> **PROCESS WORK AREA with SAM 2:** when you batch the work area, SAM 2 propagates your anchor-frame dots through the whole range so the cleanup tracks with the actor.
 
 </details>
 
@@ -185,7 +230,104 @@ Output saves to a `CorridorKey` folder next to your project.
 
 > **Note:** Keyed files appear in a "CorridorKey" bin in your project panel. You need V1 + V2 tracks for auto-placement.
 
+### Refine Edges with AI Mask (SAM 2) — the headline feature
+
+CorridorKey's neural keyer handles the chroma. **SAM 2** handles everything else — it's the difference between a 90% key and a clean 4K-ready edge. Click on the actor in the preview window, the AI builds a silhouette, your matte snaps to it.
+
+| Step | Action |
+|:---:|---|
+| 1 | **PREVIEW FRAME (LIVE)** to open the floating preview |
+| 2 | **Left-click** on the actor to add a positive dot (green) — the area you want to keep |
+| 3 | **Right-click** on the background to add a negative dot (red) — the area to exclude |
+| 4 | **APPLY MASK** — SAM 2 runs and refines the matte. The preview updates with the cleaner edge. |
+| 5 | Add more dots and APPLY MASK again to refine further |
+| 6 | **CLEAR** — removes all dots and resets the AI mask |
+
+**Multi-object** for tricky shots — press **Tab** to switch between **MASK 1** and **MASK 2**. Each mask gets its own dots and APPLY MASK action.
+
+> **PROCESS IN/OUT RANGE with SAM 2:** when you batch a range, SAM 2 propagates your anchor-frame dots through the whole range so the cleanup tracks with the actor.
+
 </details>
+
+---
+
+## Troubleshooting
+
+### CUDA out of memory
+
+Symptom: a `CUDA out of memory` error in the panel status, or the engine crashes mid-batch.
+
+Causes and fixes:
+- **Frame size too large for your VRAM.** Drop to a 1080p proxy track for the keying pass and reconnect to the 4K master in your editor. See [Hardware sizing](#hardware-sizing--what-to-expect).
+- **SAM 2 on 4K with limited VRAM.** Skip SAM 2 on that clip — key with CorridorKey alone (no APPLY MASK), or do SAM 2 only on a 1080p proxy.
+- **Other GPU apps running.** Close Chrome / OBS / other CUDA apps. DaVinci itself uses 2–4 GB on a working timeline before CorridorKey loads.
+- **Stuck VRAM after a crash.** Restart the editor (DaVinci or AE). The OS reclaims the leaked VRAM on process exit.
+
+### "Engine not found" / `CORRIDORKEY_ROOT` env var
+
+Symptom: panel shows *"CorridorKey engine not found"* or the install script fails to locate the engine repo.
+
+Fix: set the `CORRIDORKEY_ROOT` environment variable to the path where you cloned [CorridorKey](https://github.com/nikopueringer/CorridorKey).
+
+**Windows (PowerShell, persistent):**
+```powershell
+[Environment]::SetEnvironmentVariable("CORRIDORKEY_ROOT", "C:\path\to\CorridorKey", "User")
+```
+
+**macOS / Linux (bash/zsh, add to `~/.bashrc` or `~/.zshrc`):**
+```bash
+export CORRIDORKEY_ROOT="/path/to/CorridorKey"
+```
+
+Restart your editor (and the terminal) after setting it. The installer also probes a sibling directory next to this plugin's folder — if you cloned both repos side by side, you usually don't need the env var.
+
+### SAM 2 weights missing
+
+Symptom: APPLY MASK errors with a missing `sam2.1_hiera_small.pt` file, or the engine fails to load on first SAM 2 use.
+
+Fix: SAM 2 weights live at `<CorridorKey engine>/sam2_weights/sam2.1_hiera_small.pt`. The setup script downloads them automatically — re-run `setup.bat` (Windows) or `./setup.sh` (macOS / Linux) in the engine folder. If automatic download fails (firewall, gated host), grab the file manually from the [SAM 2 release page](https://github.com/facebookresearch/sam2) and drop it into `sam2_weights/`.
+
+### DaVinci Resolve — script doesn't appear under `Workspace > Scripts`
+
+Resolve only runs external scripts when scripting is set to **Local**:
+
+1. **Preferences → System → General → External scripting using:** set to **Local**
+2. **Restart Resolve** (the menu doesn't pick up new scripts on Reload Apps).
+
+If `CorridorKey` still doesn't appear, confirm `CorridorKey.py` exists at:
+- Windows: `%PROGRAMDATA%\Blackmagic Design\DaVinci Resolve\Fusion\Scripts\Utility\CorridorKey.py`
+- macOS: `/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility/CorridorKey.py`
+
+Re-run `python install.py --resolve` if the file is missing.
+
+### After Effects / Premiere Pro — panel doesn't load or shows blank
+
+Adobe blocks unsigned CEP extensions by default. The installer enables debug mode on first install, but if the panel still doesn't appear, set the debug flag manually:
+
+**Windows (Registry Editor):**
+```
+HKEY_CURRENT_USER\Software\Adobe\CSXS.11
+   PlayerDebugMode = "1"  (String value)
+HKEY_CURRENT_USER\Software\Adobe\CSXS.10
+   PlayerDebugMode = "1"  (String value)
+HKEY_CURRENT_USER\Software\Adobe\CSXS.9
+   PlayerDebugMode = "1"  (String value)
+```
+
+**macOS (Terminal):**
+```bash
+defaults write com.adobe.CSXS.11 PlayerDebugMode 1
+defaults write com.adobe.CSXS.10 PlayerDebugMode 1
+defaults write com.adobe.CSXS.9 PlayerDebugMode 1
+```
+
+Restart AE / Premiere after setting the flag. Note: `CSXS.X` matches your AE / Premiere version family — set the flag for whichever version you're using (CSXS.9 for CC 2019, CSXS.10 for CC 2020, CSXS.11 for CC 2021+).
+
+If the panel loads blank, open the editor's CEP debug log:
+- Windows: `%APPDATA%\Adobe\CEP\logs\CEPHtmlEngine*.log`
+- macOS: `~/Library/Logs/CSXS/CEPHtmlEngine*.log`
+
+Most blank-panel errors trace back to a missing engine path — fix `CORRIDORKEY_ROOT` first (see above).
 
 ---
 
@@ -215,6 +357,9 @@ Rebuild the engine venv: `setup.bat` (Windows) or `./setup.sh` (macOS / Linux).
 If this saves you time, consider buying me a coffee: https://ko-fi.com/stuntworks
 
 [![Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/stuntworks)
+
+**Bug? Feature request? Open an issue:**
+https://github.com/stuntworks/CorridorKey-StuntWorks/issues
 
 ---
 
