@@ -250,6 +250,22 @@ def merge_ck_with_sam_chroma_gated(ck_alpha, sam_silhouette, source_rgb=None):
     inject_zone = unknown_band & (alpha > 0.01)
     alpha[inject_zone] = np.maximum(alpha[inject_zone], ck[inject_zone])
 
+    # Internal smoothing - soften hard transitions inside sam_dilated.
+    # The fg_def to unknown band transition and any CK-driven hard
+    # jumps (e.g., green tarp edges meeting floor within the unknown
+    # band) produce visible 1-2 pixel cliffs in the matte. We low-
+    # pass filter alpha only within sam_dilated to feather these
+    # transitions over ~8 pixels. Outside sam_dilated, alpha is
+    # left untouched (the boundary feather below will handle that).
+    INTERNAL_BLUR_KERNEL = 15      # odd
+    INTERNAL_BLUR_SIGMA  = 2.5     # ~8 px effective transition
+    alpha_smooth = cv2.GaussianBlur(
+        alpha, (INTERNAL_BLUR_KERNEL, INTERNAL_BLUR_KERNEL),
+        INTERNAL_BLUR_SIGMA
+    )
+    inside_band = sam_dilated > 0
+    alpha = np.where(inside_band, alpha_smooth, alpha)
+
     # 9. Hard clamp outside dilated SAM
     alpha[sam_dilated == 0] = 0.0
 
