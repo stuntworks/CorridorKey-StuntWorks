@@ -1,4 +1,4 @@
-# Last modified: 2026-05-07 | Change: v2.2 trimap + Closed-Form Matting. Replaces topology filter with pymatting CFM at 2x downsample. SAM-only trimap, CK injected post-solve in unknown band only. Hard clamp outside dilated SAM. | Full history: git log
+# Last modified: 2026-05-07 | Change: v2.2 tuning - tighten dilation 161 to 81, gate CK injection on CFM agreement. Reduces foot halo from floor-under-feet inclusion. | Full history: git log
 """v2.2 trimap + Closed-Form Matting (pymatting) + CK hair injection.
 
 REPLACES the v2.1 topology connectivity filter. v2.1 failed when CK had
@@ -210,7 +210,7 @@ def merge_ck_with_sam_chroma_gated(ck_alpha, sam_silhouette, source_rgb=None):
     fg_def = cv2.erode(sam_filled, k_erode, iterations=1)
 
     # 3. Outer boundary (dilated SAM)
-    k_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (161, 161))
+    k_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (81, 81))
     sam_dilated = cv2.dilate(sam_filled, k_dilate, iterations=1)
 
     # 4. Build trimap (SAM only, CK not used)
@@ -244,7 +244,11 @@ def merge_ck_with_sam_chroma_gated(ck_alpha, sam_silhouette, source_rgb=None):
 
     # 8. CK hair injection in unknown band only
     unknown_band = (trimap == 0.5)
-    alpha[unknown_band] = np.maximum(alpha[unknown_band], ck[unknown_band])
+    # Only inject CK where CFM also found foreground signal.
+    # Prevents CK = 1.0 floor pixels from blowing up alpha where
+    # CFM correctly assigned them low alpha.
+    inject_zone = unknown_band & (alpha > 0.1)
+    alpha[inject_zone] = np.maximum(alpha[inject_zone], ck[inject_zone])
 
     # 9. Hard clamp outside dilated SAM
     alpha[sam_dilated == 0] = 0.0
