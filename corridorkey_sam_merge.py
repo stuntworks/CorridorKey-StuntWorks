@@ -310,7 +310,7 @@ def merge_ck_with_sam_chroma_gated(ck_alpha, sam_silhouette, source_rgb=None):
     # transitions over ~8 pixels. Outside sam_dilated, alpha is
     # left untouched (the boundary feather below will handle that).
     INTERNAL_BLUR_KERNEL = 15      # odd
-    INTERNAL_BLUR_SIGMA  = 1.0     # ~3 px effective transition (was 2.5)
+    INTERNAL_BLUR_SIGMA  = 2.5     # ~8 px effective transition
     alpha_smooth = cv2.GaussianBlur(
         alpha, (INTERNAL_BLUR_KERNEL, INTERNAL_BLUR_KERNEL),
         INTERNAL_BLUR_SIGMA
