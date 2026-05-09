@@ -2719,13 +2719,28 @@ def _key_one_scrub_frame():
             out_dir = ctx["scrub_dir"] / f"{frame_idx:03d}"
             out_dir.mkdir(parents=True, exist_ok=True)
             fg_16 = (fg * 65535).clip(0, 65535).astype(_np.uint16)
-            _cv2.imwrite(str(out_dir / "fg.png"),    _cv2.cvtColor(fg_16, _cv2.COLOR_RGB2BGR))
             mt2d  = mt[:, :, 0] if len(mt.shape) == 3 else mt
             al_16 = (mt2d * 65535).clip(0, 65535).astype(_np.uint16)
-            _cv2.imwrite(str(out_dir / "alpha.png"), al_16)
-            _scrub_key_done += 1
+            # Verify each imwrite actually landed a file on disk — Berto bug
+            # 2026-05-09: imwrite was silently returning False for frames 1-9
+            # while the success counter still incremented, so the viewer read
+            # scrub_index.json count=N and asked for files that didn't exist.
+            _fg_path = out_dir / "fg.png"
+            _al_path = out_dir / "alpha.png"
+            _fg_ok = _cv2.imwrite(str(_fg_path), _cv2.cvtColor(fg_16, _cv2.COLOR_RGB2BGR))
+            _al_ok = _cv2.imwrite(str(_al_path), al_16)
+            if (_fg_ok and _al_ok and _fg_path.exists() and _al_path.exists()):
+                _scrub_key_done += 1
+            else:
+                log(f"Scrub frame {frame_idx}: imwrite returned ok={_fg_ok}/{_al_ok}, "
+                    f"on-disk fg={_fg_path.exists()} alpha={_al_path.exists()} "
+                    f"out_dir={out_dir} fg_shape={fg_16.shape} alpha_shape={al_16.shape}")
+        else:
+            log(f"Scrub frame {frame_idx}: engine returned fg={fg is not None} mt={mt is not None} — skipping write")
     except Exception as _ke:
+        import traceback as _tb
         log(f"Scrub frame {frame_idx}: keying failed: {_ke}")
+        log(_tb.format_exc())
     # When the queue is empty write the index and signal done.
     if not _scrub_key_queue:
         import json as _json2
