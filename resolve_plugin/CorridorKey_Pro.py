@@ -297,6 +297,14 @@ winLayout = ui.VGroup({"Spacing": 4}, [
         ui.Label({"Text": "Codec:", "Weight": 0}),
         ui.ComboBox({"ID": "OutputCodec", "Weight": 2, "StyleSheet": "QComboBox { background-color: #1a1a1a; border: 1px solid #333; border-radius: 3px; padding: 4px 8px; color: #ccc; } QComboBox:hover { border-color: #0dcaf0; background-color: #222; } QComboBox::drop-down { border-left: 1px solid #333; width: 24px; } QComboBox::down-arrow { border-top: 5px solid #0dcaf0; border-left: 4px solid transparent; border-right: 4px solid transparent; width: 0; height: 0; }"}),
     ]),
+    # v1.0 OutputContent — pick what gets written to disk. Combined is the
+    # drag-and-drop default (CK x SAM single RGBA clip). Both is the legacy
+    # two-mask power-user mode (CK clip + SAM matte sidecar). CK / SAM only
+    # are escape hatches when one of the two is unwanted.
+    ui.HGroup({"Weight": 0, "Spacing": 5}, [
+        ui.Label({"Text": "Content:", "Weight": 0}),
+        ui.ComboBox({"ID": "OutputContent", "Weight": 2, "StyleSheet": "QComboBox { background-color: #1a1a1a; border: 1px solid #333; border-radius: 3px; padding: 4px 8px; color: #ccc; } QComboBox:hover { border-color: #0dcaf0; background-color: #222; } QComboBox::drop-down { border-left: 1px solid #333; width: 24px; } QComboBox::down-arrow { border-top: 5px solid #0dcaf0; border-left: 4px solid transparent; border-right: 4px solid transparent; width: 0; height: 0; }"}),
+    ]),
     ui.HGroup({"Weight": 0, "Spacing": 5}, [
         ui.Label({"Text": "Output:", "Weight": 0}),
         ui.ComboBox({"ID": "OutputMode", "Weight": 2, "StyleSheet": "QComboBox { background-color: #1a1a1a; border: 1px solid #333; border-radius: 3px; padding: 4px 8px; color: #ccc; } QComboBox:hover { border-color: #0dcaf0; background-color: #222; } QComboBox::drop-down { border-left: 1px solid #333; width: 24px; } QComboBox::down-arrow { border-top: 5px solid #0dcaf0; border-left: 4px solid transparent; border-right: 4px solid transparent; width: 0; height: 0; }"}),
@@ -436,6 +444,11 @@ items["OutputCodec"].AddItem("PNG 8-bit (default)")
 items["OutputCodec"].AddItem("PNG 16-bit (lossless)")
 items["OutputCodec"].AddItem("TIFF 16-bit (lossless)")
 items["OutputCodec"].AddItem("EXR 32-bit (VFX float)")
+# OutputContent: which file(s) to write. Default 0 = Combined.
+items["OutputContent"].AddItem("Combined (CK x SAM)")
+items["OutputContent"].AddItem("Both (CK + SAM sidecar)")
+items["OutputContent"].AddItem("CK only")
+items["OutputContent"].AddItem("SAM matte only")
 items["OutputMode"].AddItem("Track 2 (Above Source)")
 items["OutputMode"].AddItem("MediaPool Only")
 items["OutputMode"].AddItem("Fusion Comp")
@@ -477,6 +490,8 @@ def get_settings():
         "despeckle_enabled": True,  # viewer-owned; overridden by _merge_live_params — default ON matches viewer checkbox default
         "despeckle_size": 400,      # viewer-owned; overridden by _merge_live_params
         "export_format": items["ExportFormat"].CurrentIndex,
+        # 0 = Combined CK x SAM, 1 = Both, 2 = CK only, 3 = SAM only
+        "output_content": items["OutputContent"].CurrentIndex,
         # v1.0 codec selector: 0=PNG8 / 1=PNG16 / 2=TIFF16 / 3=EXR32. Default
         # PNG8 keeps current renders byte-identical for users who don't change it.
         "output_codec": items["OutputCodec"].CurrentIndex,
@@ -3380,13 +3395,30 @@ def on_process_range(ev):
                 mt = _apply_despeckle_to_alpha(mt, settings)
                 if fg is not None and mt is not None:
                     _ext = _codec_extension(settings.get("output_codec", 0))
-                    op = od / f"CK_{cn}_{pr:06d}{_ext}"
-                    save_output(fg, mt, op, settings["export_format"], codec=settings.get("output_codec", 0))
-                    ofs.append(str(op))
-                    # v1.0 SAM matte sidecar — alpha-only file in the user's
-                    # selected codec. Imported by _do_import on the next-higher
-                    # track than the keyed clip.
-                    if _sam_matte_v1 is not None:
+                    # OutputContent: 0=Combined, 1=Both, 2=CK only, 3=SAM only.
+                    _content = int(settings.get("output_content", 0))
+                    _write_ck = _content in (1, 2)  # both / CK-only
+                    _write_sam = _content in (1, 3) and _sam_matte_v1 is not None  # both / SAM-only
+                    _write_combined = _content == 0
+                    if _write_combined:
+                        # CK alpha multiplied by SAM gate. Falls back to CK alone
+                        # when SAM matte is absent (e.g. user didn't drop dots).
+                        _mt_for_save = mt
+                        if _sam_matte_v1 is not None:
+                            _sam_arr = np.asarray(_sam_matte_v1, dtype=np.float32)
+                            _mt_2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
+                            if _sam_arr.shape != _mt_2d.shape:
+                                _sam_arr = cv2.resize(_sam_arr, (_mt_2d.shape[1], _mt_2d.shape[0]),
+                                                      interpolation=cv2.INTER_LINEAR)
+                            _mt_for_save = np.clip(_mt_2d * _sam_arr, 0.0, 1.0)
+                        op = od / f"CK_{cn}_{pr:06d}{_ext}"
+                        save_output(fg, _mt_for_save, op, settings["export_format"], codec=settings.get("output_codec", 0))
+                        ofs.append(str(op))
+                    elif _write_ck:
+                        op = od / f"CK_{cn}_{pr:06d}{_ext}"
+                        save_output(fg, mt, op, settings["export_format"], codec=settings.get("output_codec", 0))
+                        ofs.append(str(op))
+                    if _write_sam:
                         sam_op = od / f"SAM_{cn}_{pr:06d}{_ext}"
                         save_alpha_only(_sam_matte_v1, sam_op, codec=settings.get("output_codec", 0))
                         sam_ofs.append(str(sam_op))
@@ -3653,45 +3685,60 @@ def on_process_range(ev):
                 if fg is not None and mt is not None:
                     _codec = int(settings.get("output_codec", 0))
                     _ext = _codec_extension(_codec)
-                    op = od / f"CK_{cn}_{pr:06d}{_ext}"
-                    # Encode IN MEMORY — no file I/O on the worker thread, no
-                    # Defender block. Codec selection picks bit depth + format:
-                    #   0 PNG8, 1 PNG16, 2 TIFF16, 3 EXR32 (float).
+                    # OutputContent: 0=Combined, 1=Both, 2=CK only, 3=SAM only.
+                    _content = int(settings.get("output_content", 0))
+                    _write_ck = _content in (1, 2)
+                    _write_sam = _content in (1, 3) and _sam_matte_v1 is not None
+                    _write_combined = _content == 0
                     _fmt = settings["export_format"]
                     _m = mt[:, :, 0] if len(mt.shape) == 3 else mt
                     _m = np.clip(_m, 0.0, 1.0).astype(np.float32)
                     _fg_clip = np.clip(fg, 0.0, 1.0).astype(np.float32)
-                    if _codec == 3:
-                        # EXR float32. RGBA = BGR + alpha float; matte-only single channel.
-                        if _fmt == 0:
-                            _fb = cv2.cvtColor(_fg_clip, cv2.COLOR_RGB2BGR)
-                            _img = cv2.merge([_fb[:,:,0], _fb[:,:,1], _fb[:,:,2], _m])
-                        elif _fmt == 1:
-                            _img = _m
-                        else:
-                            _img = cv2.cvtColor(_fg_clip, cv2.COLOR_RGB2BGR)
+                    # Pre-compute combined alpha for the Combined-output branch.
+                    if _write_combined:
+                        _m_combined = _m
+                        if _sam_matte_v1 is not None:
+                            _sam_arr = np.asarray(_sam_matte_v1, dtype=np.float32)
+                            if _sam_arr.shape != _m.shape:
+                                _sam_arr = cv2.resize(_sam_arr, (_m.shape[1], _m.shape[0]),
+                                                      interpolation=cv2.INTER_LINEAR)
+                            _m_combined = np.clip(_m * _sam_arr, 0.0, 1.0)
+                        _m_active = _m_combined
                     else:
-                        # uint8 (codec 0) or uint16 (codec 1, 2)
-                        if _codec == 0:
-                            _au = (_m * 255.0).astype(np.uint8)
-                            _fg_int = (_fg_clip * 255.0).astype(np.uint8)
+                        _m_active = _m
+                    # Encode CK / Combined clip in memory — no file I/O on the
+                    # worker thread. Codec selection picks bit depth + format.
+                    if _write_ck or _write_combined:
+                        if _codec == 3:
+                            if _fmt == 0:
+                                _fb = cv2.cvtColor(_fg_clip, cv2.COLOR_RGB2BGR)
+                                _img = cv2.merge([_fb[:,:,0], _fb[:,:,1], _fb[:,:,2], _m_active])
+                            elif _fmt == 1:
+                                _img = _m_active
+                            else:
+                                _img = cv2.cvtColor(_fg_clip, cv2.COLOR_RGB2BGR)
                         else:
-                            _au = (_m * 65535.0).astype(np.uint16)
-                            _fg_int = (_fg_clip * 65535.0).astype(np.uint16)
-                        if _fmt == 0:
-                            _fb = cv2.cvtColor(_fg_int, cv2.COLOR_RGB2BGR)
-                            _img = cv2.merge([_fb[:,:,0], _fb[:,:,1], _fb[:,:,2], _au])
-                        elif _fmt == 1:
-                            _img = _au
-                        else:
-                            _img = cv2.cvtColor(_fg_int, cv2.COLOR_RGB2BGR)
-                    _ret, _buf = cv2.imencode(_ext, _img)
-                    if _ret:
-                        _save_queue.put(("save", str(op), _buf.tobytes()))
-                        ofs.append(str(op))
-                    # v1.0 SAM matte sidecar — alpha-only file in the user's
-                    # selected codec. Imported by _do_import on output_track + 1.
-                    if _sam_matte_v1 is not None:
+                            if _codec == 0:
+                                _au = (_m_active * 255.0).astype(np.uint8)
+                                _fg_int = (_fg_clip * 255.0).astype(np.uint8)
+                            else:
+                                _au = (_m_active * 65535.0).astype(np.uint16)
+                                _fg_int = (_fg_clip * 65535.0).astype(np.uint16)
+                            if _fmt == 0:
+                                _fb = cv2.cvtColor(_fg_int, cv2.COLOR_RGB2BGR)
+                                _img = cv2.merge([_fb[:,:,0], _fb[:,:,1], _fb[:,:,2], _au])
+                            elif _fmt == 1:
+                                _img = _au
+                            else:
+                                _img = cv2.cvtColor(_fg_int, cv2.COLOR_RGB2BGR)
+                        op = od / f"CK_{cn}_{pr:06d}{_ext}"
+                        _ret, _buf = cv2.imencode(_ext, _img)
+                        if _ret:
+                            _save_queue.put(("save", str(op), _buf.tobytes()))
+                            ofs.append(str(op))
+                    # SAM matte sidecar — alpha-only file in the user's selected
+                    # codec. Skipped in Combined / CK-only modes.
+                    if _write_sam:
                         sam_op = od / f"SAM_{cn}_{pr:06d}{_ext}"
                         _sam = np.clip(_sam_matte_v1, 0.0, 1.0).astype(np.float32)
                         if _codec == 3:
@@ -3987,12 +4034,18 @@ def _highest_used_video_track(tl):
 
 
 def _do_import(task):
-    ofs = task["ofs"]
+    ofs = task.get("ofs", []) or []
     output_track = task["output_track"]
     source_track = task["source_track"]
     in_f = task["in_f"]
     settings = task["settings"]
     sam_ofs = task.get("sam_ofs", []) or []  # v1.0 two-mask: SAM matte sidecar PNGs
+    # OutputContent-aware import: ofs / sam_ofs may be empty depending on the
+    # user's Content choice. SAM-only mode lands the SAM matte on output_track
+    # (not output_track+1) since there's no CK clip to sit above.
+    if not ofs and not sam_ofs:
+        status("Nothing to import — no frames written")
+        return
     try:
         root = media_pool.GetRootFolder()
         ckb = None
@@ -4000,9 +4053,11 @@ def _do_import(task):
             if f.GetName() == "CorridorKey": ckb = f; break
         if not ckb: ckb = media_pool.AddSubFolder(root, "CorridorKey")
         media_pool.SetCurrentFolder(ckb)
-        imp = media_pool.ImportMedia(ofs)
-        if not imp: status("Import failed — check MediaPool bin"); return
-        log(f"Imported {len(imp)} items to MediaPool")
+        imp = media_pool.ImportMedia(ofs) if ofs else None
+        if ofs and not imp:
+            status("CK import failed — check MediaPool bin"); return
+        if imp:
+            log(f"Imported {len(imp)} items to MediaPool")
         # v1.0: also import the SAM matte sidecar sequence when present.
         sam_imp = None
         if sam_ofs:
@@ -4010,21 +4065,27 @@ def _do_import(task):
             if sam_imp:
                 log(f"Imported {len(sam_imp)} SAM matte items to MediaPool")
             else:
-                log("SAM matte import returned nothing — keyed clip imported, sidecar missing")
+                log("SAM matte import returned nothing")
         if settings["output_mode"] in [0, 2]:
-            sam_track = output_track + 1 if sam_imp else None
-            tracks_needed = sam_track if sam_track is not None else output_track
+            # When no CK clip exists (SAM-only), place SAM directly on
+            # output_track. When both, CK on output_track + SAM on +1.
+            ck_track = output_track if imp else None
+            sam_track = (output_track + 1) if (sam_imp and imp) else (output_track if sam_imp else None)
+            tracks_needed = max(t for t in (ck_track, sam_track) if t is not None)
             current_tracks = timeline.GetTrackCount("video")
             while current_tracks < tracks_needed:
                 timeline.AddTrack("video")
                 current_tracks += 1
                 log(f"Added video track V{current_tracks}")
-            seq_item = imp[0]
-            log(f"Placing CK matte on V{output_track} — frames 0-{len(ofs)-1}")
-            ci_list = [{"mediaPoolItem": seq_item, "startFrame": 0, "endFrame": len(ofs) - 1,
-                        "trackIndex": output_track, "recordFrame": int(in_f), "mediaType": 1}]
-            result = media_pool.AppendToTimeline(ci_list)
-            log(f"AppendToTimeline (CK) result: {result}")
+            result = None
+            if imp and ck_track is not None:
+                seq_item = imp[0]
+                _label = "Combined (CK x SAM)" if int(settings.get("output_content", 0)) == 0 else "CK matte"
+                log(f"Placing {_label} on V{ck_track} — frames 0-{len(ofs)-1}")
+                ci_list = [{"mediaPoolItem": seq_item, "startFrame": 0, "endFrame": len(ofs) - 1,
+                            "trackIndex": ck_track, "recordFrame": int(in_f), "mediaType": 1}]
+                result = media_pool.AppendToTimeline(ci_list)
+                log(f"AppendToTimeline (CK/Combined) result: {result}")
             sam_result = None
             if sam_imp and sam_track is not None:
                 sam_seq = sam_imp[0]
@@ -4033,19 +4094,21 @@ def _do_import(task):
                            "trackIndex": sam_track, "recordFrame": int(in_f), "mediaType": 1}]
                 sam_result = media_pool.AppendToTimeline(sam_ci)
                 log(f"AppendToTimeline (SAM) result: {sam_result}")
-            if result:
+            if result or sam_result:
                 if items["DisableTrack1"].Checked:
                     timeline.SetTrackEnable("video", source_track, False)
                     log(f"V{source_track} hidden — press D in timeline to re-enable source clip")
-                if sam_result:
-                    status(f"DONE! {len(ofs)} frames on V{output_track} + SAM matte on V{sam_track}")
-                else:
-                    status(f"DONE! {len(ofs)} frames on V{output_track}")
+                _parts = []
+                if result and ofs: _parts.append(f"{len(ofs)} CK frames on V{ck_track}")
+                if sam_result and sam_ofs: _parts.append(f"SAM matte on V{sam_track}")
+                status("DONE! " + " + ".join(_parts))
             else:
                 status("Timeline place failed — clips are in MediaPool")
         else:
-            status(f"{len(ofs)} frames in MediaPool"
-                   + (f" + {len(sam_ofs)} SAM matte frames" if sam_ofs else ""))
+            _parts = []
+            if ofs: _parts.append(f"{len(ofs)} CK frames")
+            if sam_ofs: _parts.append(f"{len(sam_ofs)} SAM matte frames")
+            status(" + ".join(_parts) + " in MediaPool")
     except Exception as e:
         import traceback
         status("Import ERROR!")
