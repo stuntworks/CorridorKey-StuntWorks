@@ -3094,6 +3094,7 @@ def on_process_range(ev):
         _range_running = True
         try:
             ofs = []
+            sam_ofs = []  # v1.0 two-mask sidecar — populated when SAM is active
             pr = 0
             st = time.time()
             try:
@@ -3182,45 +3183,55 @@ def on_process_range(ev):
                 fg, mt = res.get("fg"), res.get("alpha")
                 if _despill_str > 0 and fg is not None:
                     fg = _cu.despill_opencv(fg, green_limit_mode="average", strength=_despill_str)
-                # Apply SAM2 matte to BRAW frame — per-frame tracking mask (propagation)
-                # preferred over static gate; static gate used only as fallback.
-                # WHAT IT DOES: Multiplies NN alpha by SAM2 mask for this frame.
-                # DEPENDS-ON: _braw_sam2_video_masks (propagation), _braw_sam2_gate (fallback)
-                # AFFECTS: mt for this frame only
-                if mt is not None:
-                    # Multi-object v0.8 — gather per-object gates (video-prop
-                    # output is dict[obj_id, mask]; static fallback is
-                    # dict[obj_id, gate] from _load_per_object_sam2_gates).
-                    # Track obj_ids so Option C halo binding routes HALO BODY
-                    # to MASK 1 and HALO FEET to MASK 2.
-                    if not bool(settings.get("sam2_bypass", False)):
-                        _gates_list = []
-                        _obj_ids = []
-                        if _braw_sam2_video_masks and fidx in _braw_sam2_video_masks:
-                            _per = _braw_sam2_video_masks[fidx]
-                            if isinstance(_per, dict):
-                                _items = list(_per.items())
-                            elif isinstance(_per, (list, tuple)):
-                                _items = list(enumerate(_per, start=1))
-                            else:
-                                _items = [(1, _per)]
-                            for _oid, _gm in _items:
-                                _gx = _dilate_sam2_mask(_gm, margin=settings.get("sam2_margin", SAM2_MATTE_MARGIN))
-                                _gx = _soften_sam2_mask(_gx, soften=settings.get("sam2_soften", 0))
-                                _gates_list.append(_gx)
-                                _obj_ids.append(_oid)
-                        elif _braw_sam2_gate:
-                            if isinstance(_braw_sam2_gate, dict):
-                                _items = list(_braw_sam2_gate.items())
-                            elif isinstance(_braw_sam2_gate, (list, tuple)):
-                                _items = list(enumerate(_braw_sam2_gate, start=1))
-                            else:
-                                _items = [(1, _braw_sam2_gate)]
-                            for _oid, _g in _items:
-                                _gates_list.append(_g)
-                                _obj_ids.append(_oid)
-                        if _gates_list:
-                            mt = _panel_dispatch_sam2_combine(mt, _gates_list, fr, settings, obj_ids=_obj_ids)
+                # v1.0 TWO-MASK MODE — CK matte unchanged, SAM matte saved as
+                # a separate alpha-only sidecar PNG. The user composites the
+                # two in their host (Fusion / AE) using the matte they need.
+                # CK matte = mt unchanged below. SAM matte built here when a
+                # video-prop or static gate exists for this frame.
+                _sam_matte_v1 = None
+                if mt is not None and not bool(settings.get("sam2_bypass", False)):
+                    from corridorkey_sam_merge import (
+                        binarize_sam_silhouette, union_binary_silhouettes, process_sam_matte,
+                    )
+                    _gates_for_sam = []
+                    _obj_ids = []
+                    if _braw_sam2_video_masks and fidx in _braw_sam2_video_masks:
+                        _per = _braw_sam2_video_masks[fidx]
+                        if isinstance(_per, dict):
+                            _items = list(_per.items())
+                        elif isinstance(_per, (list, tuple)):
+                            _items = list(enumerate(_per, start=1))
+                        else:
+                            _items = [(1, _per)]
+                        for _oid, _gm in _items:
+                            if _oid == 1 and bool(settings.get("mask1_bypass", False)):
+                                continue
+                            if _oid == 2 and bool(settings.get("mask2_bypass", False)):
+                                continue
+                            _gates_for_sam.append(binarize_sam_silhouette(_gm))
+                            _obj_ids.append(_oid)
+                    elif _braw_sam2_gate:
+                        if isinstance(_braw_sam2_gate, dict):
+                            _items = list(_braw_sam2_gate.items())
+                        elif isinstance(_braw_sam2_gate, (list, tuple)):
+                            _items = list(enumerate(_braw_sam2_gate, start=1))
+                        else:
+                            _items = [(1, _braw_sam2_gate)]
+                        for _oid, _g in _items:
+                            if _oid == 1 and bool(settings.get("mask1_bypass", False)):
+                                continue
+                            if _oid == 2 and bool(settings.get("mask2_bypass", False)):
+                                continue
+                            _gates_for_sam.append(binarize_sam_silhouette(_g))
+                            _obj_ids.append(_oid)
+                    if _gates_for_sam:
+                        _sam_union = union_binary_silhouettes(_gates_for_sam)
+                        _sam_matte_v1 = process_sam_matte(
+                            _sam_union,
+                            margin_px=float(settings.get("sam2_margin", 0)),
+                            softness_sigma=float(settings.get("sam2_soften", 0)),
+                            fill_kernel_px=int(settings.get("fill_holes", 0)),
+                        )
                 choke_px = int(settings.get("choke", 0))
                 if choke_px > 0 and mt is not None:
                     _k = choke_px * 2 + 1
@@ -3234,6 +3245,14 @@ def on_process_range(ev):
                     op = od / f"CK_{cn}_{pr:06d}.png"
                     save_output(fg, mt, op, settings["export_format"])
                     ofs.append(str(op))
+                    # v1.0 SAM matte sidecar — saved as alpha-only PNG when SAM
+                    # is active for this frame. Imported by _do_import on the
+                    # next-higher track than the keyed clip.
+                    if _sam_matte_v1 is not None:
+                        sam_op = od / f"SAM_{cn}_{pr:06d}.png"
+                        _sam_u8 = (np.clip(_sam_matte_v1, 0, 1) * 255).astype(np.uint8)
+                        cv2.imwrite(str(sam_op), _sam_u8)
+                        sam_ofs.append(str(sam_op))
                 del frame  # Release this frame's numpy array before the next decode
                 pr += 1
                 el = time.time() - st
@@ -3273,6 +3292,7 @@ def on_process_range(ev):
                 _do_import({
                     "ofs": ofs, "output_track": output_track,
                     "source_track": source_track, "in_f": in_f, "settings": settings,
+                    "sam_ofs": sam_ofs,  # v1.0 two-mask: alpha sidecar imported on output_track + 1
                 })
         except Exception as _e:
             log(f"Range error: {_e}")
@@ -3315,6 +3335,7 @@ def on_process_range(ev):
             return
 
         ofs = []
+        sam_ofs = []  # v1.0 two-mask: SAM matte sidecar PNGs
         pr = 0
         st = time.time()
         try:
@@ -3420,18 +3441,17 @@ def on_process_range(ev):
                 fg, mt = res.get("fg"), res.get("alpha")
                 if _despill_str > 0 and fg is not None:
                     fg = _cu.despill_opencv(fg, green_limit_mode="average", strength=_despill_str)
-                # WHAT IT DOES: Apply SAM2 garbage matte to the keyed alpha for this frame.
-                #   Primary path: per-frame propagated mask from sam2_video_masks.
-                #   Fallback path: static sam2_mask.png loaded once and reused every frame —
-                #     handles Resolve-restart case where sam_points were lost but PNG still exists.
-                # DEPENDS-ON: sam2_video_masks, _static_sam2_gate, _load_sam2_output_gate
-                # AFFECTS: mt (alpha) — multiplied by gate, zeroing pixels outside the matte.
+                # v1.0 TWO-MASK MODE — CK matte (mt) is unchanged; SAM matte
+                # is computed separately for sidecar export. Same per-mask
+                # gather as before, but with bidirectional MARGIN + simple
+                # FILL HOLES via process_sam_matte. CK keying output is the
+                # master clip; SAM matte ships as a separate alpha sidecar.
+                _sam_matte_v1 = None
                 if mt is not None and not bool(settings.get("sam2_bypass", False)):
-                    # Multi-object v0.8 — gather per-mask gates (video-prop or
-                    # static fallback) plus their obj_ids so Option C halo
-                    # binding can route HALO BODY to MASK 1 and HALO FEET to
-                    # MASK 2.
-                    _gates_list = []
+                    from corridorkey_sam_merge import (
+                        binarize_sam_silhouette, union_binary_silhouettes, process_sam_matte,
+                    )
+                    _gates_for_sam = []
                     _obj_ids = []
                     if sam2_video_masks and range_idx in sam2_video_masks:
                         _per = sam2_video_masks[range_idx]
@@ -3442,9 +3462,11 @@ def on_process_range(ev):
                         else:
                             _items = [(1, _per)]
                         for _oid, _gm in _items:
-                            _gx = _dilate_sam2_mask(_gm, margin=settings.get("sam2_margin", SAM2_MATTE_MARGIN))
-                            _gx = _soften_sam2_mask(_gx, soften=settings.get("sam2_soften", 0))
-                            _gates_list.append(_gx)
+                            if _oid == 1 and bool(settings.get("mask1_bypass", False)):
+                                continue
+                            if _oid == 2 and bool(settings.get("mask2_bypass", False)):
+                                continue
+                            _gates_for_sam.append(binarize_sam_silhouette(_gm))
                             _obj_ids.append(_oid)
                     else:
                         # Fallback path — static per-object gates loaded lazily on
@@ -3462,10 +3484,20 @@ def on_process_range(ev):
                             else:
                                 _items = [(1, _static_sam2_gate)]
                             for _oid, _g in _items:
-                                _gates_list.append(_g)
+                                if _oid == 1 and bool(settings.get("mask1_bypass", False)):
+                                    continue
+                                if _oid == 2 and bool(settings.get("mask2_bypass", False)):
+                                    continue
+                                _gates_for_sam.append(binarize_sam_silhouette(_g))
                                 _obj_ids.append(_oid)
-                    if _gates_list:
-                        mt = _panel_dispatch_sam2_combine(mt, _gates_list, fr, settings, obj_ids=_obj_ids)
+                    if _gates_for_sam:
+                        _sam_union = union_binary_silhouettes(_gates_for_sam)
+                        _sam_matte_v1 = process_sam_matte(
+                            _sam_union,
+                            margin_px=float(settings.get("sam2_margin", 0)),
+                            softness_sigma=float(settings.get("sam2_soften", 0)),
+                            fill_kernel_px=int(settings.get("fill_holes", 0)),
+                        )
                 choke_px = int(settings.get("choke", 0))
                 if choke_px > 0 and mt is not None:
                     k = choke_px * 2 + 1
@@ -3492,6 +3524,16 @@ def on_process_range(ev):
                     if _ret:
                         _save_queue.put(("save", str(op), _buf.tobytes()))
                         ofs.append(str(op))
+                    # v1.0 SAM matte sidecar — alpha-only PNG saved alongside
+                    # the keyed clip when SAM is active. Imported by _do_import
+                    # on the next-higher track than the keyed clip.
+                    if _sam_matte_v1 is not None:
+                        sam_op = od / f"SAM_{cn}_{pr:06d}.png"
+                        _sam_u8 = (np.clip(_sam_matte_v1, 0, 1) * 255).astype(np.uint8)
+                        _ret_s, _buf_s = cv2.imencode('.png', _sam_u8)
+                        if _ret_s:
+                            _save_queue.put(("save", str(sam_op), _buf_s.tobytes()))
+                            sam_ofs.append(str(sam_op))
                     pr += 1
                     el = time.time() - st
                     fpsr = pr / el if el > 0 else 0
@@ -3511,6 +3553,7 @@ def on_process_range(ev):
                 _save_queue.put(("import", {
                     "ofs": ofs, "output_track": output_track,
                     "source_track": source_track, "in_f": in_f, "settings": settings,
+                    "sam_ofs": sam_ofs,  # v1.0 two-mask: SAM matte sidecar PNGs
                 }))
             else:
                 _ui_queue.put(("progress", -1))
@@ -3756,6 +3799,7 @@ def _do_import(task):
     source_track = task["source_track"]
     in_f = task["in_f"]
     settings = task["settings"]
+    sam_ofs = task.get("sam_ofs", []) or []  # v1.0 two-mask: SAM matte sidecar PNGs
     try:
         root = media_pool.GetRootFolder()
         ckb = None
@@ -3766,27 +3810,49 @@ def _do_import(task):
         imp = media_pool.ImportMedia(ofs)
         if not imp: status("Import failed — check MediaPool bin"); return
         log(f"Imported {len(imp)} items to MediaPool")
+        # v1.0: also import the SAM matte sidecar sequence when present.
+        sam_imp = None
+        if sam_ofs:
+            sam_imp = media_pool.ImportMedia(sam_ofs)
+            if sam_imp:
+                log(f"Imported {len(sam_imp)} SAM matte items to MediaPool")
+            else:
+                log("SAM matte import returned nothing — keyed clip imported, sidecar missing")
         if settings["output_mode"] in [0, 2]:
+            sam_track = output_track + 1 if sam_imp else None
+            tracks_needed = sam_track if sam_track is not None else output_track
             current_tracks = timeline.GetTrackCount("video")
-            while current_tracks < output_track:
+            while current_tracks < tracks_needed:
                 timeline.AddTrack("video")
                 current_tracks += 1
                 log(f"Added video track V{current_tracks}")
             seq_item = imp[0]
-            log(f"Placing on V{output_track} — frames 0-{len(ofs)-1}")
+            log(f"Placing CK matte on V{output_track} — frames 0-{len(ofs)-1}")
             ci_list = [{"mediaPoolItem": seq_item, "startFrame": 0, "endFrame": len(ofs) - 1,
                         "trackIndex": output_track, "recordFrame": int(in_f), "mediaType": 1}]
             result = media_pool.AppendToTimeline(ci_list)
-            log(f"AppendToTimeline result: {result}")
+            log(f"AppendToTimeline (CK) result: {result}")
+            sam_result = None
+            if sam_imp and sam_track is not None:
+                sam_seq = sam_imp[0]
+                log(f"Placing SAM matte on V{sam_track} — frames 0-{len(sam_ofs)-1}")
+                sam_ci = [{"mediaPoolItem": sam_seq, "startFrame": 0, "endFrame": len(sam_ofs) - 1,
+                           "trackIndex": sam_track, "recordFrame": int(in_f), "mediaType": 1}]
+                sam_result = media_pool.AppendToTimeline(sam_ci)
+                log(f"AppendToTimeline (SAM) result: {sam_result}")
             if result:
                 if items["DisableTrack1"].Checked:
                     timeline.SetTrackEnable("video", source_track, False)
                     log(f"V{source_track} hidden — press D in timeline to re-enable source clip")
-                status(f"DONE! {len(ofs)} frames on V{output_track}")
+                if sam_result:
+                    status(f"DONE! {len(ofs)} frames on V{output_track} + SAM matte on V{sam_track}")
+                else:
+                    status(f"DONE! {len(ofs)} frames on V{output_track}")
             else:
                 status("Timeline place failed — clips are in MediaPool")
         else:
-            status(f"{len(ofs)} frames in MediaPool")
+            status(f"{len(ofs)} frames in MediaPool"
+                   + (f" + {len(sam_ofs)} SAM matte frames" if sam_ofs else ""))
     except Exception as e:
         import traceback
         status("Import ERROR!")

@@ -197,7 +197,7 @@ CorridorKey's neural keyer handles the chroma. **SAM 2** handles everything else
 
 **Multi-object** for tricky shots — press **Tab** to switch between **MASK 1** and **MASK 2**. Each mask gets its own dots and APPLY MASK action.
 
-> **PROCESS WORK AREA with SAM 2:** when you batch the work area, SAM 2 propagates your anchor-frame dots through the whole range so the cleanup tracks with the actor.
+> **AE v1.0 limitation:** the SAM 2 click flow currently runs in the **live preview window only** (it cleans the matte while you're scrubbing). The PROCESS WORK AREA batch render in v1.0 outputs the CK matte alone — SAM 2 video propagation through the range is shipping in **v1.1**. Until then, use the Resolve plugin for the full two-mask batch flow, or use the AE preview to verify your dots before keying.
 
 </details>
 
@@ -245,7 +245,7 @@ CorridorKey's neural keyer handles the chroma. **SAM 2** handles everything else
 
 **Multi-object** for tricky shots — press **Tab** to switch between **MASK 1** and **MASK 2**. Each mask gets its own dots and APPLY MASK action.
 
-> **PROCESS IN/OUT RANGE with SAM 2:** when you batch a range, SAM 2 propagates your anchor-frame dots through the whole range so the cleanup tracks with the actor.
+> **Premiere v1.0 limitation:** SAM 2 runs in the live preview window only. The PROCESS IN/OUT RANGE batch render in v1.0 outputs the CK matte alone — SAM 2 video propagation through the range is shipping in **v1.1**. Until then, use Resolve for the full two-mask batch flow.
 
 </details>
 
