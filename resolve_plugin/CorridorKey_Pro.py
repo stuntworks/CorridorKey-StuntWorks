@@ -1146,6 +1146,19 @@ def run_sam2_video_propagation(fp, ss, cs, in_f, out_f, pos_pts, neg_pts, anchor
     active_obj_ids = [1] + ([2] if has_obj2 else [])
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="ck_sam2_frames_"))
+    # Phase 0a + 0b setup. We compute the per-range pad-box once on the FIRST
+    # readable frame's shape, then write every frame letterbox-padded to that
+    # square size as LOSSLESS PNG. SAM 2's input pipeline now sees uniform
+    # downsampling (no aspect warp) and zero JPEG compression artifacts.
+    from corridorkey_sam_merge import (
+        pad_to_square as _pad_to_square,
+        unpad_from_square as _unpad_from_square,
+        shift_points_for_padding as _shift_pts,
+        patch_sam2_loader_for_png as _patch_sam2_png,
+        logits_to_soft_mask as _ramp,
+    )
+    _patch_sam2_png()
+    _src_h = _src_w = _pad_box = None
     try:
         # --- Export frames ---
         log(f"SAM2 video: exporting {dur} frames to {tmp_dir} ...")
@@ -1177,8 +1190,16 @@ def run_sam2_video_propagation(fp, ss, cs, in_f, out_f, pos_pts, neg_pts, anchor
                 if not ret:
                     log(f"SAM2 video: skipped unreadable frame {in_f + i}")
                     continue
-            cv2.imwrite(str(tmp_dir / f"{i:06d}.jpg"), frame,
-                        [cv2.IMWRITE_JPEG_QUALITY, 95])
+            if _src_h is None:
+                _src_h, _src_w = frame.shape[:2]
+                _, _pad_box = _pad_to_square(frame)
+                log(f"SAM2 video: source {_src_w}x{_src_h} -> "
+                    f"padded square {max(_src_h, _src_w)} (pad_box={_pad_box})")
+            _padded, _ = _pad_to_square(frame)
+            # Lossless PNG (compression level 1 is fast — bigger files but the
+            # frames live in tempfile; cleaned up at the end of propagation).
+            cv2.imwrite(str(tmp_dir / f"{i:06d}.png"), _padded,
+                        [cv2.IMWRITE_PNG_COMPRESSION, 1])
         if _cap:
             _cap.release()
 
@@ -1194,14 +1215,22 @@ def run_sam2_video_propagation(fp, ss, cs, in_f, out_f, pos_pts, neg_pts, anchor
         log("SAM2 video: vos_optimized=False (no Triton C compiler dep)")
 
         # Per-object click sets — labels (1=positive, 0=negative).
+        # Phase 0a — point coords are in source pixel space; SAM 2 is now
+        # operating on padded-square frames, so shift each (x, y) by the
+        # pad_box's (left, top) offset.
+        _all1 = [[p[0], p[1]] for p in pos_pts] + [[p[0], p[1]] for p in neg_pts]
         obj_pts = {
-            1: ([[p[0], p[1]] for p in pos_pts] + [[p[0], p[1]] for p in neg_pts],
+            1: (_shift_pts(_all1, _pad_box) if _pad_box is not None else _all1,
                 [1] * len(pos_pts) + [0] * len(neg_pts),
                 anchor_rel),
         }
         if has_obj2:
+            _all2 = (
+                [[p[0], p[1]] for p in (pos_pts_obj2 or [])]
+                + [[p[0], p[1]] for p in (neg_pts_obj2 or [])]
+            )
             obj_pts[2] = (
-                [[p[0], p[1]] for p in (pos_pts_obj2 or [])] + [[p[0], p[1]] for p in (neg_pts_obj2 or [])],
+                _shift_pts(_all2, _pad_box) if _pad_box is not None else _all2,
                 [1] * len(pos_pts_obj2 or []) + [0] * len(neg_pts_obj2 or []),
                 anchor_rel_obj2,
             )
@@ -1249,14 +1278,12 @@ def run_sam2_video_propagation(fp, ss, cs, in_f, out_f, pos_pts, neg_pts, anchor
             #
             # Option C 2026-05-09: this used to hard-threshold mask_logits > 0 and
             # then run MORPH_CLOSE k=101 to bridge inter-dot confidence dips inside
-            # the silhouette. Trouble: hard threshold gave a binary edge with no
-            # soft band, MORPH_CLOSE(101) inflated and rounded silhouette geometry,
-            # net effect was the bumpy/blocky SAM matte. Replaced with the same
-            # saturation ramp the viewer uses — interior pins to 1.0, edges get a
-            # 2-4 px feather. If the user genuinely needs hole-bridging on a tough
-            # shot they raise FILL HOLES; the 101 px hardcoded close was nuking
-            # geometry on every shot to fix a problem only some shots have.
-            from corridorkey_sam_merge import logits_to_soft_mask as _ramp
+            # the silhouette. Replaced with the saturation ramp the viewer uses —
+            # interior pins to 1.0, edges get a 2-4 px feather.
+            #
+            # Phase 0a 2026-05-09: SAM 2 is now seeing letterbox-padded square
+            # frames, so the logits come back at the padded square shape. Crop
+            # the soft mask back to source frame shape before storing.
 
             def _store_propagated(frame_idx, _obj_ids_returned, mask_logits, direction):
                 """Convert per-object logits to soft float masks and stash in masks_per_obj."""
@@ -1269,10 +1296,14 @@ def run_sam2_video_propagation(fp, ss, cs, in_f, out_f, pos_pts, neg_pts, anchor
                         # Forward pass already filled this frame for this obj — keep it.
                         continue
                     L = mask_logits[slot].squeeze().cpu().numpy()
-                    m = _ramp(L)
-                    # Empty-mask check still uses a >0.5 sum threshold so the
-                    # "actor not in frame" tail-empty resolver downstream
-                    # behaves the same way as on the binary path.
+                    m_padded = _ramp(L)
+                    if _pad_box is not None:
+                        m = _unpad_from_square(m_padded, _pad_box)
+                    else:
+                        m = m_padded
+                    # Empty-mask check uses a >0.5 sum threshold so the "actor
+                    # not in frame" tail-empty resolver downstream behaves the
+                    # same way as on the binary path.
                     if (m > 0.5).sum() < 100:
                         masks_per_obj[oid][frame_idx] = np.zeros_like(m, dtype=np.float32)
                     else:

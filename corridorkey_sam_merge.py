@@ -64,6 +64,134 @@ def binarize_sam_silhouette(sam: np.ndarray, threshold: float = SAM_BINARIZE_THR
     return (np.asarray(sam, dtype=np.float32) >= float(threshold)).astype(np.float32)
 
 
+def pad_to_square(arr: np.ndarray, fill: int = 0):
+    """Letterbox-pad an HxW or HxWxC array to a square. Fixes SAM 2's anisotropic
+    stretch (Phase 0a, 2026-05-09).
+
+    SAM 2's image encoder hard-resizes any input to a 1024x1024 SQUARE — not
+    long-edge fit. A 4K landscape (3840x2160) gets x-scale 3.75 and y-scale
+    2.11, a 1.78x non-uniform distortion the model never saw at training time.
+    The wavy contour Berto called out is partly that geometry warp; padding
+    to square first gives SAM uniform downsampling and uniform output.
+
+    Returns:
+        (padded, (top, bottom, left, right)) — padding amounts in source pixels.
+        padded.shape is (target, target) or (target, target, C).
+    """
+    h, w = arr.shape[:2]
+    target = max(int(h), int(w))
+    pad_h = target - h
+    pad_w = target - w
+    top = pad_h // 2
+    bottom = pad_h - top
+    left = pad_w // 2
+    right = pad_w - left
+    if arr.ndim == 3:
+        padded = np.full((target, target, arr.shape[2]), fill, dtype=arr.dtype)
+        padded[top:top + h, left:left + w, :] = arr
+    else:
+        padded = np.full((target, target), fill, dtype=arr.dtype)
+        padded[top:top + h, left:left + w] = arr
+    return padded, (top, bottom, left, right)
+
+
+def unpad_from_square(arr: np.ndarray, padding) -> np.ndarray:
+    """Inverse of pad_to_square — crop a square padded array back to the source
+    rectangle. padding = (top, bottom, left, right) returned by pad_to_square.
+    """
+    top, bottom, left, right = padding
+    h = arr.shape[0] - top - bottom
+    w = arr.shape[1] - left - right
+    if arr.ndim == 3:
+        return arr[top:top + h, left:left + w, :]
+    return arr[top:top + h, left:left + w]
+
+
+def shift_points_for_padding(points, padding):
+    """Shift (x, y) prompt point coords from source-frame space into padded-square
+    space. SAM 2 sees the padded frame, so click coords have to follow.
+
+    points: iterable of (x, y) or [x, y] in source pixel coords.
+    padding: (top, bottom, left, right) returned by pad_to_square.
+    """
+    top, _bottom, left, _right = padding
+    return [[int(p[0]) + int(left), int(p[1]) + int(top)] for p in points]
+
+
+_SAM2_PNG_LOADER_PATCHED = False
+
+
+def patch_sam2_loader_for_png() -> None:
+    """One-time monkey patch — make SAM 2's video predictor accept PNG (and PNG-
+    stored frames) in its init_state(video_path=...) directory mode.
+
+    SAM 2 vendored `load_video_frames_from_jpg_images` at sam2/utils/misc.py:213
+    filters os.listdir to .jpg/.jpeg only. The underlying loader
+    (_load_img_as_tensor) opens with PIL, which already auto-detects format from
+    magic bytes — so PNG works once it gets past the extension filter. This
+    patch re-implements the function with a widened whitelist (.jpg/.jpeg/.png)
+    and is idempotent — calling it twice is a no-op.
+
+    Why we need it (Phase 0b, 2026-05-09): the previous JPEG q=95 re-encode in
+    the frame export path was a self-inflicted lossy step. Switching to PNG
+    keeps the source data intact through SAM's ingest.
+    """
+    global _SAM2_PNG_LOADER_PATCHED
+    if _SAM2_PNG_LOADER_PATCHED:
+        return
+
+    import os
+    import torch
+    try:
+        from tqdm import tqdm
+    except ImportError:
+        def tqdm(x, **_):
+            return x
+    import sam2.utils.misc as _sam_misc
+
+    _orig_loader = _sam_misc.load_video_frames_from_jpg_images
+    _ALLOWED_EXT = (".jpg", ".jpeg", ".JPG", ".JPEG", ".png", ".PNG")
+
+    def _patched(video_path, image_size, offload_video_to_cpu,
+                 img_mean=(0.485, 0.456, 0.406),
+                 img_std=(0.229, 0.224, 0.225),
+                 async_loading_frames=False,
+                 compute_device=torch.device("cuda")):
+        if not (isinstance(video_path, str) and os.path.isdir(video_path)):
+            return _orig_loader(video_path, image_size, offload_video_to_cpu,
+                                img_mean, img_std, async_loading_frames, compute_device)
+        names = [p for p in os.listdir(video_path)
+                 if os.path.splitext(p)[-1] in _ALLOWED_EXT]
+        names.sort(key=lambda p: int(os.path.splitext(p)[0]))
+        n = len(names)
+        if n == 0:
+            raise RuntimeError(f"no images found in {video_path}")
+        paths = [os.path.join(video_path, p) for p in names]
+        mean_t = torch.tensor(img_mean, dtype=torch.float32)[:, None, None]
+        std_t = torch.tensor(img_std, dtype=torch.float32)[:, None, None]
+
+        if async_loading_frames:
+            lazy = _sam_misc.AsyncVideoFrameLoader(
+                paths, image_size, offload_video_to_cpu, mean_t, std_t, compute_device,
+            )
+            return lazy, lazy.video_height, lazy.video_width
+
+        images = torch.zeros(n, 3, image_size, image_size, dtype=torch.float32)
+        video_height = video_width = 0
+        for i, p in enumerate(tqdm(paths, desc="frame loading (PNG/JPEG)")):
+            images[i], video_height, video_width = _sam_misc._load_img_as_tensor(p, image_size)
+        if not offload_video_to_cpu:
+            images = images.to(compute_device)
+            mean_t = mean_t.to(compute_device)
+            std_t = std_t.to(compute_device)
+        images -= mean_t
+        images /= std_t
+        return images, video_height, video_width
+
+    _sam_misc.load_video_frames_from_jpg_images = _patched
+    _SAM2_PNG_LOADER_PATCHED = True
+
+
 def logits_to_soft_mask(
     logits: np.ndarray,
     lo: float = SAM_SOFT_LOGIT_LO,

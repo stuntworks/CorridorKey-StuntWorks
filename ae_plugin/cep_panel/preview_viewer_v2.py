@@ -1969,6 +1969,15 @@ class PersistentWindow(QtWidgets.QWidget):
                 return
             # Source image for SAM2: uint8 RGB (session stores float32 RGB 0..1)
             frame_rgb = np.clip(self.session.fg_rgb * 255.0, 0, 255).astype(np.uint8)
+            # Phase 0a — letterbox-pad to square BEFORE SAM (mirrors Resolve
+            # viewer). Removes the anisotropic 16:9-to-1024² squash that was
+            # warping the silhouette. Output mask is cropped back to source.
+            from corridorkey_sam_merge import (
+                pad_to_square, unpad_from_square,
+                shift_points_for_padding, logits_to_soft_mask,
+            )
+            padded_frame, _pad_box = pad_to_square(frame_rgb)
+            adjusted_pts = shift_points_for_padding(all_pts, _pad_box)
             # CORRIDORKEY_ROOT is injected by the CEP panel's spawnViewer() env block.
             # Fall back to parent.parent for the Resolve plugin where __file__ is
             # inside resolve_plugin/core/ so parent.parent IS the engine root.
@@ -1980,15 +1989,12 @@ class PersistentWindow(QtWidgets.QWidget):
             from sam2.sam2_image_predictor import SAM2ImagePredictor
             model = build_sam2(cfg, ckpt, device=device)
             pred  = SAM2ImagePredictor(model)
-            pred.set_image(frame_rgb)
+            pred.set_image(padded_frame)
             # Option C — return_logits=True so we can run our own saturation
             # ramp. Default predict() binarises masks at logit 0 and we lose
             # the 2-4 px soft edge band that makes the matte composit-able.
-            # See logits_to_soft_mask in corridorkey_sam_merge.py for the
-            # rationale (interior pinned to 1.0 to kill decoder texture, soft
-            # feather only across the contour).
             masks, scores, logits = pred.predict(
-                point_coords=np.array(all_pts),
+                point_coords=np.array(adjusted_pts),
                 point_labels=np.array(labels),
                 multimask_output=True,
                 return_logits=True,
@@ -1997,8 +2003,10 @@ class PersistentWindow(QtWidgets.QWidget):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             best_idx = int(np.argmax(scores))
-            from corridorkey_sam_merge import logits_to_soft_mask
-            best = logits_to_soft_mask(logits[best_idx])
+            # logits[best_idx] is at padded square shape — apply the soft-mask
+            # ramp first, then crop the square back to source frame shape.
+            _soft_padded = logits_to_soft_mask(logits[best_idx])
+            best = unpad_from_square(_soft_padded, _pad_box)
             # Save soft gate as uint16 PNG so the 0..1 precision survives the
             # save/load roundtrip (uint8 would quantize to 256 levels and undo
             # the soft-edge benefit). _to_float01 handles uint16 on read.

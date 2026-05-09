@@ -366,11 +366,23 @@ def cmd_batch(source_video, output_folder, settings,
             else:
                 sam_anchor_rel = 0
 
-            # Export the N range frames as JPEGs to a temp dir — SAM2 video
-            # predictor reads frames from disk via init_state(video_path=...).
+            # Export the N range frames to a temp dir — SAM2 video predictor
+            # reads frames from disk via init_state(video_path=...). Phase 0
+            # 2026-05-09: lossless PNG (was JPEG q=95) and letterbox-padded
+            # to a square BEFORE SAM sees them, so the encoder downsample is
+            # uniform.
             _count = int(end_frame - start_frame)
             sam_tmp_dir = Path(_sam_tmp.mkdtemp(prefix="ck_sam2_batch_"))
             log.info(f"SAM2 video: exporting {_count} frames to {sam_tmp_dir}")
+            from corridorkey_sam_merge import (
+                pad_to_square as _pad_to_square,
+                unpad_from_square as _unpad_from_square,
+                shift_points_for_padding as _shift_pts,
+                patch_sam2_loader_for_png as _patch_sam2_png,
+                logits_to_soft_mask as _ramp,
+            )
+            _patch_sam2_png()
+            _src_h = _src_w = _pad_box = None
             try:
                 _exp_cap = cv2.VideoCapture(str(source_video))
                 _exp_cap.set(cv2.CAP_PROP_POS_MSEC, float(start_frame) / source_fps * 1000.0)
@@ -380,8 +392,15 @@ def cmd_batch(source_video, output_folder, settings,
                     if not _ok or _fr is None:
                         log.warning(f"SAM2 video: skipped unreadable frame {start_frame + _i}")
                         continue
-                    cv2.imwrite(str(sam_tmp_dir / f"{_i:06d}.jpg"), _fr,
-                                [cv2.IMWRITE_JPEG_QUALITY, 95])
+                    if _src_h is None:
+                        _src_h, _src_w = _fr.shape[:2]
+                        _, _pad_box = _pad_to_square(_fr)
+                        log.info(f"SAM2 video: source {_src_w}x{_src_h} -> "
+                                 f"padded square {max(_src_h, _src_w)} "
+                                 f"(pad_box={_pad_box})")
+                    _padded, _ = _pad_to_square(_fr)
+                    cv2.imwrite(str(sam_tmp_dir / f"{_i:06d}.png"), _padded,
+                                [cv2.IMWRITE_PNG_COMPRESSION, 1])
                     _exported += 1
                 _exp_cap.release()
                 log.info(f"SAM2 video: {_exported} frames exported")
@@ -389,11 +408,8 @@ def cmd_batch(source_video, output_folder, settings,
                 _video_predictor = build_sam2_video_predictor(cfg, ckpt, device=device)
                 _all_pts = list(sam_pos) + list(sam_neg)
                 _labels  = [1] * len(sam_pos) + [0] * len(sam_neg)
+                _all_pts_padded = _shift_pts(_all_pts, _pad_box) if _pad_box is not None else _all_pts
                 log.info(f"SAM2 video: anchor at range frame {sam_anchor_rel} (absolute {sam_anchor_abs})")
-                # Option C — saturation ramp (not sigmoid). Same canonical soft-
-                # mask path the viewer uses; sidecar matte is composit-ready in
-                # the host without re-binarising.
-                from corridorkey_sam_merge import logits_to_soft_mask as _ramp
                 with sam_torch.inference_mode():
                     _state = _video_predictor.init_state(
                         video_path=str(sam_tmp_dir),
@@ -404,21 +420,30 @@ def cmd_batch(source_video, output_folder, settings,
                         inference_state=_state,
                         frame_idx=sam_anchor_rel,
                         obj_id=1,
-                        points=np.array(_all_pts, dtype=np.float32),
+                        points=np.array(_all_pts_padded, dtype=np.float32),
                         labels=np.array(_labels, dtype=np.int32),
                         clear_old_points=True,
                     )
-                    # Forward: anchor → last frame.
+                    # Forward: anchor → last frame. Logits are at padded square
+                    # shape — apply ramp, then unpad to source frame shape.
                     for _fi, _obj_ids, _mask_logits in _video_predictor.propagate_in_video(_state):
                         _L = _mask_logits[0].squeeze().cpu().numpy()
-                        sam_video_masks[_fi] = _ramp(_L)
+                        _m_padded = _ramp(_L)
+                        sam_video_masks[_fi] = (
+                            _unpad_from_square(_m_padded, _pad_box)
+                            if _pad_box is not None else _m_padded
+                        )
                     # Backward: anchor → frame 0. Forward wins on overlap.
                     if sam_anchor_rel > 0:
                         for _fi, _obj_ids, _mask_logits in _video_predictor.propagate_in_video(_state, reverse=True):
                             if _fi in sam_video_masks:
                                 continue
                             _L = _mask_logits[0].squeeze().cpu().numpy()
-                            sam_video_masks[_fi] = _ramp(_L)
+                            _m_padded = _ramp(_L)
+                            sam_video_masks[_fi] = (
+                                _unpad_from_square(_m_padded, _pad_box)
+                                if _pad_box is not None else _m_padded
+                            )
                 del _video_predictor
                 if sam_torch.cuda.is_available():
                     sam_torch.cuda.empty_cache()
@@ -631,10 +656,21 @@ def cmd_batch_scrub(source_video, scrub_folder, settings,
             cfg = "configs/sam2.1/sam2.1_hiera_s.yaml"
             device = "cuda" if sam_torch.cuda.is_available() else "cpu"
 
-            # Export the N scrub frames as JPEGs to a temp dir — SAM2 video
-            # predictor reads frames from disk via init_state(video_path=...).
+            # Export the N scrub frames to a temp dir — SAM2 video predictor
+            # reads frames from disk via init_state(video_path=...). Phase 0
+            # 2026-05-09: lossless PNG (was JPEG q=95) and letterbox-padded to
+            # square BEFORE SAM sees them, so the encoder downsample is uniform.
             sam_tmp_dir = Path(_sam_tmp.mkdtemp(prefix="ck_sam2_scrub_"))
             log.info(f"SAM2 video: exporting {count} frames to {sam_tmp_dir}")
+            from corridorkey_sam_merge import (
+                pad_to_square as _pad_to_square,
+                unpad_from_square as _unpad_from_square,
+                shift_points_for_padding as _shift_pts,
+                patch_sam2_loader_for_png as _patch_sam2_png,
+                logits_to_soft_mask as _ramp,
+            )
+            _patch_sam2_png()
+            _src_h = _src_w = _pad_box = None
             try:
                 _exp_cap = cv2.VideoCapture(str(source_video))
                 _exp_cap.set(cv2.CAP_PROP_POS_MSEC, float(start_frame) / source_fps * 1000.0)
@@ -644,8 +680,15 @@ def cmd_batch_scrub(source_video, scrub_folder, settings,
                     if not _ok or _fr is None:
                         log.warning(f"SAM2 video: skipped unreadable frame {start_frame + _i}")
                         continue
-                    cv2.imwrite(str(sam_tmp_dir / f"{_i:06d}.jpg"), _fr,
-                                [cv2.IMWRITE_JPEG_QUALITY, 95])
+                    if _src_h is None:
+                        _src_h, _src_w = _fr.shape[:2]
+                        _, _pad_box = _pad_to_square(_fr)
+                        log.info(f"SAM2 video: source {_src_w}x{_src_h} -> "
+                                 f"padded square {max(_src_h, _src_w)} "
+                                 f"(pad_box={_pad_box})")
+                    _padded, _ = _pad_to_square(_fr)
+                    cv2.imwrite(str(sam_tmp_dir / f"{_i:06d}.png"), _padded,
+                                [cv2.IMWRITE_PNG_COMPRESSION, 1])
                     _exported += 1
                 _exp_cap.release()
                 log.info(f"SAM2 video: {_exported} frames exported")
@@ -659,6 +702,7 @@ def cmd_batch_scrub(source_video, scrub_folder, settings,
                 _video_predictor = build_sam2_video_predictor(cfg, ckpt, device=device)
                 _all_pts = list(sam_pos) + list(sam_neg)
                 _labels  = [1] * len(sam_pos) + [0] * len(sam_neg)
+                _all_pts_padded = _shift_pts(_all_pts, _pad_box) if _pad_box is not None else _all_pts
                 log.info(f"SAM2 video: anchor at range frame {sam_anchor_rel} (absolute {sam_anchor_abs})")
                 with sam_torch.inference_mode():
                     _state = _video_predictor.init_state(
@@ -670,17 +714,19 @@ def cmd_batch_scrub(source_video, scrub_folder, settings,
                         inference_state=_state,
                         frame_idx=sam_anchor_rel,
                         obj_id=1,
-                        points=np.array(_all_pts, dtype=np.float32),
+                        points=np.array(_all_pts_padded, dtype=np.float32),
                         labels=np.array(_labels, dtype=np.int32),
                         clear_old_points=True,
                     )
-                    # Forward: anchor → last frame. Saturation ramp on logits
-                    # (Option C), same canonical soft-mask path as the viewer
-                    # and cmd_batch.
-                    from corridorkey_sam_merge import logits_to_soft_mask as _ramp
+                    # Forward: anchor → last frame. Logits at padded square
+                    # shape — apply ramp then unpad back to source frame shape.
                     for _fi, _obj_ids, _mask_logits in _video_predictor.propagate_in_video(_state):
                         _L = _mask_logits[0].squeeze().cpu().numpy()
-                        sam_video_masks[_fi] = _ramp(_L)
+                        _m_padded = _ramp(_L)
+                        sam_video_masks[_fi] = (
+                            _unpad_from_square(_m_padded, _pad_box)
+                            if _pad_box is not None else _m_padded
+                        )
                     # Backward: anchor → frame 0. Skip frames the forward pass
                     # already filled (forward wins on overlap, same as DaVinci).
                     if sam_anchor_rel > 0:
@@ -688,7 +734,11 @@ def cmd_batch_scrub(source_video, scrub_folder, settings,
                             if _fi in sam_video_masks:
                                 continue
                             _L = _mask_logits[0].squeeze().cpu().numpy()
-                            sam_video_masks[_fi] = _ramp(_L)
+                            _m_padded = _ramp(_L)
+                            sam_video_masks[_fi] = (
+                                _unpad_from_square(_m_padded, _pad_box)
+                                if _pad_box is not None else _m_padded
+                            )
                 del _video_predictor
                 if sam_torch.cuda.is_available():
                     sam_torch.cuda.empty_cache()

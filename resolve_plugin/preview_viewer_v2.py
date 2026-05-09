@@ -3085,6 +3085,19 @@ class PersistentWindow(QtWidgets.QWidget):
             # Source image for SAM2: uint8 RGB (session stores float32 RGB 0..1)
             # Tried feeding original.png (raw greenscreen) — didn't help, reverted.
             frame_rgb = np.clip(self.session.fg_rgb * 255.0, 0, 255).astype(np.uint8)
+            # Phase 0a — letterbox-pad to square BEFORE SAM. SAM 2's image
+            # encoder hard-resizes whatever we feed to 1024x1024 (square,
+            # not long-edge fit). A 16:9 frame fed direct gets x scale 3.75 /
+            # y scale 2.11 — non-uniform geometry warp. Padding to square
+            # first gives uniform downsampling and removes the warp from
+            # the contour. Output mask is cropped back to source shape so
+            # the user never sees the padding.
+            from corridorkey_sam_merge import (
+                pad_to_square, unpad_from_square,
+                shift_points_for_padding, logits_to_soft_mask,
+            )
+            padded_frame, _pad_box = pad_to_square(frame_rgb)
+            adjusted_pts = shift_points_for_padding(all_pts, _pad_box)
             # CK_ROOT is two levels up from this script (resolve_plugin/ → engine root)
             ck_root = Path(__file__).parent.parent
             ckpt = str(ck_root / "sam2_weights" / "sam2.1_hiera_small.pt")
@@ -3094,16 +3107,12 @@ class PersistentWindow(QtWidgets.QWidget):
             from sam2.sam2_image_predictor import SAM2ImagePredictor
             model = build_sam2(cfg, ckpt, device=device)
             pred  = SAM2ImagePredictor(model)
-            pred.set_image(frame_rgb)
+            pred.set_image(padded_frame)
             # Option C — return_logits=True so we can run the saturation
             # ramp ourselves. Default predict() binarises the masks at logit 0
             # and we lose the 2-4 px soft-edge feather across the contour.
-            # Multiplying NN alpha by a hard 0/1 gate is what creates the
-            # "bumpy / polygonal" matte Berto saw 2026-05-09. The ramp pins
-            # confident interior to 1.0 (no decoder texture) and only soft-
-            # feathers within [-2, +2] logit at the silhouette edge.
             masks, scores, logits = pred.predict(
-                point_coords=np.array(all_pts),
+                point_coords=np.array(adjusted_pts),
                 point_labels=np.array(labels),
                 multimask_output=True,
                 return_logits=True,
@@ -3112,8 +3121,10 @@ class PersistentWindow(QtWidgets.QWidget):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             best_idx = int(np.argmax(scores))
-            from corridorkey_sam_merge import logits_to_soft_mask
-            best = logits_to_soft_mask(logits[best_idx])
+            # logits[best_idx] is at padded square shape — apply the soft-mask
+            # ramp first, then crop the square back to source frame shape.
+            _soft_padded = logits_to_soft_mask(logits[best_idx])
+            best = unpad_from_square(_soft_padded, _pad_box)
             # Backup the NN alpha if it exists and hasn't been backed up yet.
             # CLEAR restores this backup so the actress comes back without re-processing.
             alpha_path = self.session.session_dir / "alpha.png"
