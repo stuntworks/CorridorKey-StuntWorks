@@ -138,6 +138,18 @@ function ae_getWorkAreaInfo() {
 // ============================================================
 // AFTER EFFECTS — timeline mutators
 // ============================================================
+//
+// v1.0 layer placement note: AE's comp.layers.add() inserts the new layer at
+// position 1 (topmost), then newLayer.moveBefore(sourceLayer) moves it to
+// one position above the source — never overwriting any existing layer
+// above the source. The relative shift produces "stack up, no overwrite"
+// behavior automatically. For SAM matte sidecar (v1.1 item 2) the SAM
+// layer will moveBefore the keyed layer so the order is:
+//   ... above-source layers untouched ...
+//   SAM matte (NEW)
+//   keyed clip (NEW)
+//   source layer
+// No code change needed for item 1 in AE.
 
 // WHAT IT DOES: Imports a single PNG produced by Python above the currently selected layer,
 //   trimmed to one frame at the current comp time.
@@ -200,6 +212,33 @@ function ae_importSequence(firstFramePath, fps, compStartTime, hideSource) {
         comp.time = comp.time;
         return JSON.stringify({ ok: true });
     } catch (e) { return JSON.stringify({ ok: false, error: String(e) }); }
+}
+
+// ============================================================
+// PREMIERE PRO — track placement helper (v1.0 two-mask)
+// ============================================================
+
+// WHAT IT DOES: Returns the highest video-track number (1-based, user-visible Vn)
+//   in `seq` that currently contains at least one clip. Returns 0 if every track
+//   is empty.
+// WHY: v1.0 placement must never overwrite an existing clip on a higher track.
+//   Source on V1 + leftover output on V3 → next CK render lands on V4, not V2.
+// AFFECTS: pure read; returns int.
+function ppro_highest_used_video_track(seq) {
+    var n = 0;
+    try { n = Number(seq.videoTracks.numTracks) || 0; } catch (e) { n = 0; }
+    var highest = 0;
+    for (var i = 0; i < n; i++) {
+        try {
+            var tr = seq.videoTracks[i];
+            if (tr && tr.clips && tr.clips.numItems > 0) {
+                highest = i + 1; // user-visible Vn (1-based)
+            }
+        } catch (e) {
+            // Skip unreadable tracks rather than aborting placement entirely.
+        }
+    }
+    return highest;
 }
 
 // ============================================================
@@ -412,16 +451,25 @@ function ppro_importFrame(outputPath, playheadSeconds, fps) {
         if (!ckBin) { try { ckBin = root.createBin("CorridorKey"); } catch (_) {} }
         if (ckBin) { try { imported.moveBin(ckBin); } catch (_) {} }
 
-        // Place on V2 at exact playhead time.
-        if (seq.videoTracks.numTracks < 2) { try { seq.videoTracks.addTracks(1); } catch (_) {} }
-        var v2 = seq.videoTracks[1];
-        if (!v2) return JSON.stringify({ ok: true, placed: false, note: "Imported but V2 unavailable" });
+        // v1.0 placement — find highest-used video track so we never overwrite
+        // a previous-run output. CK keyed clip lands on max(source, used) + 1.
+        // Source assumed on V1 (the input clip the panel keys); fall back to
+        // (highest_used + 1) when source detection fails.
+        var highestUsed = ppro_highest_used_video_track(seq);
+        var ckTrackV = (highestUsed >= 1) ? (highestUsed + 1) : 2;
+        var ckTrackIdx = ckTrackV - 1; // JSX videoTracks is 0-indexed
+        // Make sure that track exists; addTracks tops up by one as needed.
+        while (seq.videoTracks.numTracks <= ckTrackIdx) {
+            try { seq.videoTracks.addTracks(1); } catch (_) { break; }
+        }
+        var v2 = seq.videoTracks[ckTrackIdx];
+        if (!v2) return JSON.stringify({ ok: true, placed: false, note: "Imported but V" + ckTrackV + " unavailable" });
 
         var placeSec = Number(playheadSeconds);
         if (isNaN(placeSec) || placeSec < 0) placeSec = 0;
         try {
             v2.overwriteClip(imported, placeSec);
-            return JSON.stringify({ ok: true, placed: true });
+            return JSON.stringify({ ok: true, placed: true, trackV: ckTrackV });
         } catch (e) {
             return JSON.stringify({ ok: true, placed: false, note: "Imported but overwriteClip failed: " + String(e) });
         }
@@ -510,11 +558,18 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate)
         if (!ckBin) { try { ckBin = root.createBin("CorridorKey"); } catch (_) {} }
         if (ckBin) { try { imported.moveBin(ckBin); } catch (_) {} }
 
-        // Ensure V2 exists, then overwrite onto it. +1 frame nudge matches the -1 in
-        // ppro_getFrameInfo for playhead-boundary compensation.
-        if (seq.videoTracks.numTracks < 2) { try { seq.videoTracks.addTracks(1); } catch (_) {} }
-        var v2 = seq.videoTracks[1];
-        if (!v2) return JSON.stringify({ ok: true, placed: false, note: "Imported but V2 unavailable" });
+        // v1.0 placement — find highest-used video track so we never overwrite
+        // previous-run output. CK keyed sequence lands on max(source, used)+1.
+        // +1 frame nudge matches the -1 in ppro_getFrameInfo for playhead-
+        // boundary compensation.
+        var highestUsedSeq = ppro_highest_used_video_track(seq);
+        var ckTrackVSeq = (highestUsedSeq >= 1) ? (highestUsedSeq + 1) : 2;
+        var ckTrackIdxSeq = ckTrackVSeq - 1;
+        while (seq.videoTracks.numTracks <= ckTrackIdxSeq) {
+            try { seq.videoTracks.addTracks(1); } catch (_) { break; }
+        }
+        var v2 = seq.videoTracks[ckTrackIdxSeq];
+        if (!v2) return JSON.stringify({ ok: true, placed: false, note: "Imported but V" + ckTrackVSeq + " unavailable" });
 
         var placeSec = Number(startSeconds);
         if (isNaN(placeSec) || placeSec < 0) placeSec = 0;
@@ -525,7 +580,7 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate)
         var nudge = 1.0 / Number(rateForNudge || 24);
         try {
             v2.overwriteClip(imported, placeSec + nudge);
-            return JSON.stringify({ ok: true, placed: true, binName: imported.name, appliedRate: appliedRate });
+            return JSON.stringify({ ok: true, placed: true, binName: imported.name, appliedRate: appliedRate, trackV: ckTrackVSeq });
         } catch (e) {
             return JSON.stringify({ ok: true, placed: false, binName: imported.name,
                 note: "Imported into bin but overwriteClip failed: " + String(e) });

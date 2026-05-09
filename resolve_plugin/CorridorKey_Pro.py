@@ -2445,12 +2445,29 @@ def process_current_frame(preview_only=False):
         imp = media_pool.ImportMedia([str(op)])
         if not imp: status("Import failed"); return
         if settings["output_mode"] in [0, 2]:
+            # v1.0 two-mask placement — find highest-used video track so we
+            # never overwrite a previous-run output. Source clip's track itself
+            # counts as "used" so highest_used >= source_track always. CK
+            # lands on highest_used + 1.
+            _src_track_now = 1
+            try:
+                _tc_for_scan = timeline.GetTrackCount("video")
+                for _ti_scan in range(1, int(_tc_for_scan) + 1):
+                    _scan_clips = timeline.GetItemListInTrack("video", _ti_scan) or []
+                    for _sc in _scan_clips:
+                        if _sc.GetStart() <= cf < _sc.GetEnd():
+                            _src_track_now = _ti_scan
+                            break
+            except Exception:
+                pass
+            _highest_used_now = _highest_used_video_track(timeline)
+            _ck_track = max(int(_src_track_now), int(_highest_used_now)) + 1
             tc = timeline.GetTrackCount("video")
-            log(f"[v0.7] Video tracks: {tc}")
-            if tc < 2:
+            log(f"[v1.0] Video tracks={tc}, source on V{_src_track_now}, highest-used V{_highest_used_now} → CK on V{_ck_track}")
+            while tc < _ck_track:
                 timeline.AddTrack("video")
                 tc = timeline.GetTrackCount("video")
-                log(f"Tracks after add: {tc}")
+                log(f"Added video track (now V{tc})")
             # Try multiple append methods
             # Set clip In/Out to 1 frame before append (helps recordFrame work)
             try:
@@ -2459,14 +2476,14 @@ def process_current_frame(preview_only=False):
             except: pass
             # Try recordFrame with constrained clip first
             target_frame = cf + 1
-            log(f"[v1.2] Track 2, recordFrame={target_frame}")
-            result = media_pool.AppendToTimeline([{"mediaPoolItem": imp[0], "trackIndex": 2, "recordFrame": target_frame}])
+            log(f"[v1.0] Placing on V{_ck_track}, recordFrame={target_frame}")
+            result = media_pool.AppendToTimeline([{"mediaPoolItem": imp[0], "trackIndex": _ck_track, "recordFrame": target_frame}])
             if not result:
                 log("recordFrame failed, append without it")
-                result = media_pool.AppendToTimeline([{"mediaPoolItem": imp[0], "trackIndex": 2}])
+                result = media_pool.AppendToTimeline([{"mediaPoolItem": imp[0], "trackIndex": _ck_track}])
             if result:
                 try:
-                    track2_items = timeline.GetItemListInTrack("video", 2)
+                    track2_items = timeline.GetItemListInTrack("video", _ck_track)
                     if track2_items:
                         placed = track2_items[-1]
                         # Trim to 1 frame
@@ -2485,9 +2502,9 @@ def process_current_frame(preview_only=False):
                 except Exception as trim_err:
                     log(f"Trim/Move: {trim_err}")
                 if items["DisableTrack1"].Checked:
-                    timeline.SetTrackEnable("video", 1, False)
-                    log("Track 1 disabled — uncheck 'Disable source clip' or press D in timeline to re-enable")
-                status("DONE! Track 2")
+                    timeline.SetTrackEnable("video", _src_track_now, False)
+                    log(f"V{_src_track_now} disabled — uncheck 'Disable source clip' or press D in timeline to re-enable")
+                status(f"DONE! V{_ck_track}")
             else:
                 log(f"AppendToTimeline FAILED")
                 status("MediaPool only — drag from CorridorKey bin")
@@ -3029,8 +3046,13 @@ def on_process_range(ev):
         if clip:
             break
     if not clip: status("ERROR: No clip at playhead!"); return
-    output_track = source_track + 1
-    log(f"Source on V{source_track} → output to V{output_track}")
+    # v1.0 two-mask track stacking: never overwrite an existing higher track.
+    # CK matte lands on max(source, highest_used) + 1, SAM matte on +2 (decided
+    # in _do_import). source_track + 1 used to be the hardcode, which would
+    # silently overwrite previous-run output sitting on V2 / V3.
+    _highest_used = _highest_used_video_track(timeline)
+    output_track = max(int(source_track), int(_highest_used)) + 1
+    log(f"Source on V{source_track}, highest-used V{_highest_used} → CK output to V{output_track} (SAM sidecar on V{output_track + 1} when active)")
     cs, ce = clip.GetStart(), clip.GetEnd()
     in_f = frame_range["in_frame"] if frame_range["in_frame"] is not None else cs
     out_f = frame_range["out_frame"] if frame_range["out_frame"] is not None else ce
@@ -3901,6 +3923,29 @@ def on_poll_timer(ev):
 #   Must run on the main thread — Resolve's MediaPool/Timeline API is not thread-safe.
 # DEPENDS-ON: media_pool, timeline globals; task dict from _import_queue
 # AFFECTS: MediaPool (CorridorKey bin), Timeline (output track), source track enable state
+# WHAT IT DOES: Returns the highest video track index in the active timeline that
+#   currently contains at least one clip. Returns 0 if every track is empty.
+# WHY: v1.0 two-mask placement must never overwrite an existing clip on a higher
+#   track. Source on V1 + leftover output on V3 → next CK render lands on V4
+#   (not V2). Same logic applies whether SAM matte sidecar comes along or not.
+# DEPENDS-ON: timeline object exposes GetTrackCount("video") + GetItemListInTrack.
+# AFFECTS: pure read; returns int.
+def _highest_used_video_track(tl):
+    try:
+        track_count = tl.GetTrackCount("video")
+    except Exception:
+        return 0
+    highest = 0
+    for ti in range(1, int(track_count) + 1):
+        try:
+            clips = tl.GetItemListInTrack("video", ti) or []
+        except Exception:
+            clips = []
+        if clips:
+            highest = ti
+    return highest
+
+
 def _do_import(task):
     ofs = task["ofs"]
     output_track = task["output_track"]
