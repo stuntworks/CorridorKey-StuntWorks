@@ -1549,7 +1549,10 @@ class PersistentWindow(QtWidgets.QWidget):
         _sb_hdr.setAlignment(QtCore.Qt.AlignCenter)
         _sb_hdr.setStyleSheet("color: #a5f; font-size: 11px; font-weight: bold;")
         _sb_layout.addWidget(_sb_hdr)
-        self._scrub_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        # Use JumpSlider so track-click jumps to that position. The plain
+        # QSlider track-click only single-steps, which on a 10-frame range
+        # with a 20 px handle reads as "frozen" — Berto bug 2026-05-09.
+        self._scrub_slider = JumpSlider(QtCore.Qt.Horizontal)
         self._scrub_slider.setRange(0, 9)
         self._scrub_slider.setValue(0)
         self._scrub_slider.setStyleSheet(
