@@ -424,9 +424,13 @@ document.getElementById('refiner').onchange = function() {
 //   Despill/despeckle/choke are owned by the preview viewer — read from its
 //   live_params.json so KEY CURRENT FRAME applies exactly what the user dialed.
 //   Falls back to sensible defaults if no viewer session is active.
+//   v1.0 two-mask: also forwards SAM2 click points + matte sliders so BATCH
+//   can run SAM2 video propagation and write a sidecar matte sequence.
 function getSettings() {
     const refiner = parseFloat(document.getElementById('refiner').value) / 100;
     let despill = 1.0, despeckle = true, despeckleSize = 400, choke = 0;
+    let sam_positive = [], sam_negative = [], sam_anchor_frame = null;
+    let sam2_margin = 0, sam2_soften = 0, fill_holes = 0;
     if (CURRENT_SESSION_DIR) {
         try {
             const lp = JSON.parse(fs.readFileSync(
@@ -435,6 +439,12 @@ function getSettings() {
             if (typeof lp.despeckle === 'boolean') despeckle = lp.despeckle;
             if (typeof lp.despeckleSize === 'number') despeckleSize = lp.despeckleSize;
             if (typeof lp.choke === 'number') choke = lp.choke;
+            if (Array.isArray(lp.sam_positive)) sam_positive = lp.sam_positive;
+            if (Array.isArray(lp.sam_negative)) sam_negative = lp.sam_negative;
+            if (typeof lp.sam_anchor_frame === 'number') sam_anchor_frame = lp.sam_anchor_frame;
+            if (typeof lp.sam2_margin === 'number') sam2_margin = lp.sam2_margin;
+            if (typeof lp.sam2_soften === 'number') sam2_soften = lp.sam2_soften;
+            if (typeof lp.fill_holes === 'number') fill_holes = lp.fill_holes;
         } catch (_) {}
     }
     return {
@@ -443,7 +453,13 @@ function getSettings() {
         refiner: isFinite(refiner) && refiner >= 0 && refiner <= 1 ? refiner : 1.0,
         despeckle: despeckle,
         despeckleSize: despeckleSize,
-        choke: choke
+        choke: choke,
+        sam_positive: sam_positive,
+        sam_negative: sam_negative,
+        sam_anchor_frame: sam_anchor_frame,
+        sam2_margin: sam2_margin,
+        sam2_soften: sam2_soften,
+        fill_holes: fill_holes
     };
 }
 
@@ -903,14 +919,23 @@ function processBatch() {
                     const firstFrame = path.join(outDir, 'output_00000.png');
                     if (!fs.existsSync(firstFrame)) throw new Error('No output frames produced');
 
+                    // v1.0 two-mask: optional SAM matte sidecar sequence. Present
+                    // only when SAM2 click points were active during BATCH.
+                    const samFirstFrame = path.join(outDir, 'sam_mattes', 'sam_00000.png');
+                    const samSidecar = fs.existsSync(samFirstFrame) ? samFirstFrame : null;
+
                     const importFn = HOST_APP === 'ppro' ? 'ppro_importSequence' : 'ae_importSequence';
                     const hideSource = document.getElementById('hideSourceLayer').checked;
                     const importArgs = HOST_APP === 'ppro'
-                        ? [firstFrame, info.inPointSeconds, info.fps, info.sourceFrameRate || info.fps]
-                        : [firstFrame, info.fps, info.compStartTime, hideSource];
+                        ? [firstFrame, info.inPointSeconds, info.fps, info.sourceFrameRate || info.fps, samSidecar]
+                        : [firstFrame, info.fps, info.compStartTime, hideSource, samSidecar];
                     jsxCall(importFn, importArgs, (imp) => {
                         if (!imp.ok) { logLine('import error: ' + imp.error, true); status('Import failed'); }
-                        else { status('Batch done — source layer hidden'); logLine('Sequence imported, source hidden'); }
+                        else {
+                            const samNote = samSidecar ? ' + SAM matte sidecar' : '';
+                            status('Batch done — source layer hidden' + samNote);
+                            logLine('Sequence imported' + samNote);
+                        }
                         setBusy(false);
                     });
                 } catch (e) {

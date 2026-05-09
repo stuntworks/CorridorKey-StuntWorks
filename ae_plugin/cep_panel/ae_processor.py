@@ -333,6 +333,110 @@ def cmd_batch(source_video, output_folder, settings,
         refiner_strength=settings["refiner"],
     )
 
+    # v1.0 SAM 2 batch propagation. If the user dropped SAM 2 click points in the
+    # viewer, run SAM 2's VIDEO predictor over the same frame range and write a
+    # per-frame SAM matte sidecar to <out_dir>/sam_mattes/. Mirrors cmd_batch_scrub
+    # so render matches the side-by-side preview the user just signed off on.
+    sam_pos = settings.get("sam_positive", []) or []
+    sam_neg = settings.get("sam_negative", []) or []
+    sam_anchor_abs = settings.get("sam_anchor_frame")
+    sam_margin   = float(settings.get("sam2_margin", 0))
+    sam_soften   = float(settings.get("sam2_soften", 0))
+    sam_fill     = int(settings.get("fill_holes", 0))
+
+    sam_active = (len(sam_pos) + len(sam_neg)) > 0
+    sam_video_masks = {}  # {seq_num: float32 mask 0..1}
+    sam_torch = None
+    if sam_active:
+        try:
+            import torch as sam_torch
+            import tempfile as _sam_tmp
+            import shutil as _sam_shutil
+            from sam2.build_sam import build_sam2_video_predictor
+            ck_root = Path(os.environ["CORRIDORKEY_ROOT"]) if "CORRIDORKEY_ROOT" in os.environ else Path(__file__).parent.parent
+            ckpt = str(ck_root / "sam2_weights" / "sam2.1_hiera_small.pt")
+            cfg = "configs/sam2.1/sam2.1_hiera_s.yaml"
+            device = "cuda" if sam_torch.cuda.is_available() else "cpu"
+
+            # Map absolute click frame → range-relative anchor. If the click was
+            # outside the batch range (or never recorded), anchor at frame 0 and
+            # forward-propagate only — same fallback cmd_batch_scrub uses.
+            if sam_anchor_abs is not None and start_frame <= int(sam_anchor_abs) < end_frame:
+                sam_anchor_rel = int(sam_anchor_abs) - int(start_frame)
+            else:
+                sam_anchor_rel = 0
+
+            # Export the N range frames as JPEGs to a temp dir — SAM2 video
+            # predictor reads frames from disk via init_state(video_path=...).
+            _count = int(end_frame - start_frame)
+            sam_tmp_dir = Path(_sam_tmp.mkdtemp(prefix="ck_sam2_batch_"))
+            log.info(f"SAM2 video: exporting {_count} frames to {sam_tmp_dir}")
+            try:
+                _exp_cap = cv2.VideoCapture(str(source_video))
+                _exp_cap.set(cv2.CAP_PROP_POS_MSEC, float(start_frame) / source_fps * 1000.0)
+                _exported = 0
+                for _i in range(_count):
+                    _ok, _fr = _exp_cap.read()
+                    if not _ok or _fr is None:
+                        log.warning(f"SAM2 video: skipped unreadable frame {start_frame + _i}")
+                        continue
+                    cv2.imwrite(str(sam_tmp_dir / f"{_i:06d}.jpg"), _fr,
+                                [cv2.IMWRITE_JPEG_QUALITY, 95])
+                    _exported += 1
+                _exp_cap.release()
+                log.info(f"SAM2 video: {_exported} frames exported")
+
+                _video_predictor = build_sam2_video_predictor(cfg, ckpt, device=device)
+                _all_pts = list(sam_pos) + list(sam_neg)
+                _labels  = [1] * len(sam_pos) + [0] * len(sam_neg)
+                log.info(f"SAM2 video: anchor at range frame {sam_anchor_rel} (absolute {sam_anchor_abs})")
+                with sam_torch.inference_mode():
+                    _state = _video_predictor.init_state(
+                        video_path=str(sam_tmp_dir),
+                        offload_video_to_cpu=True,
+                        async_loading_frames=False,
+                    )
+                    _video_predictor.add_new_points_or_box(
+                        inference_state=_state,
+                        frame_idx=sam_anchor_rel,
+                        obj_id=1,
+                        points=np.array(_all_pts, dtype=np.float32),
+                        labels=np.array(_labels, dtype=np.int32),
+                        clear_old_points=True,
+                    )
+                    # Forward: anchor → last frame.
+                    for _fi, _obj_ids, _mask_logits in _video_predictor.propagate_in_video(_state):
+                        _soft = sam_torch.sigmoid(_mask_logits[0]).squeeze().cpu().numpy().astype(np.float32)
+                        sam_video_masks[_fi] = np.clip(_soft, 0.0, 1.0)
+                    # Backward: anchor → frame 0. Forward wins on overlap.
+                    if sam_anchor_rel > 0:
+                        for _fi, _obj_ids, _mask_logits in _video_predictor.propagate_in_video(_state, reverse=True):
+                            if _fi in sam_video_masks:
+                                continue
+                            _soft = sam_torch.sigmoid(_mask_logits[0]).squeeze().cpu().numpy().astype(np.float32)
+                            sam_video_masks[_fi] = np.clip(_soft, 0.0, 1.0)
+                del _video_predictor
+                if sam_torch.cuda.is_available():
+                    sam_torch.cuda.empty_cache()
+                log.info(f"SAM2 video: {len(sam_video_masks)} per-frame masks ready")
+            finally:
+                try:
+                    _sam_shutil.rmtree(sam_tmp_dir, ignore_errors=True)
+                except Exception:
+                    pass
+        except Exception as _e:
+            log.warning(f"SAM2 video predictor failed for batch: {_e} — keying without SAM matte sidecar")
+            sam_video_masks = {}
+
+    # Sidecar dir is created up front so the dummy-first-frame write never
+    # races a missing parent. Empty dir is cheap; gets removed by the caller
+    # if no SAM points were active and no files were ever written.
+    sam_dir = out_dir / "sam_mattes" if sam_active else None
+    if sam_dir is not None:
+        sam_dir.mkdir(parents=True, exist_ok=True)
+        # process_sam_matte lives in the engine root; it is on sys.path already.
+        from corridorkey_sam_merge import binarize_sam_silhouette, process_sam_matte
+
     processed = 0
     failed = []
     total = max(1, end_frame - start_frame)
@@ -385,6 +489,30 @@ def cmd_batch(source_video, output_folder, settings,
                 matte_dir = out_dir / "mattes"
                 matte_dir.mkdir(parents=True, exist_ok=True)
                 cv2.imwrite(str(matte_dir / f"matte_{seq_num:05d}.png"), alpha_uint8)
+                # v1.0 SAM matte sidecar — one file per frame in sam_mattes/.
+                # uint8 PNG matches the CK matte's format so the host imports
+                # both as identical numbered-stills sequences.
+                if sam_dir is not None and seq_num in sam_video_masks:
+                    try:
+                        _gate_soft = sam_video_masks[seq_num]
+                        if _gate_soft.shape[:2] != alpha.shape[:2]:
+                            _gate_soft = cv2.resize(
+                                _gate_soft,
+                                (alpha.shape[1], alpha.shape[0]),
+                                interpolation=cv2.INTER_LINEAR,
+                            )
+                        _sam_processed = process_sam_matte(
+                            binarize_sam_silhouette(_gate_soft),
+                            margin_px=sam_margin,
+                            softness_sigma=sam_soften,
+                            fill_kernel_px=sam_fill,
+                        )
+                        _sam_u8 = (np.clip(_sam_processed, 0, 1) * 255).astype(np.uint8)
+                        cv2.imwrite(str(sam_dir / f"sam_{seq_num:05d}.png"), _sam_u8)
+                        if processed == 0:
+                            cv2.imwrite(str(sam_dir / "sam_00000.png"), _sam_u8)
+                    except Exception as _se:
+                        log.warning(f"SAM frame {frame_idx}: sidecar save failed: {_se}")
                 # Premiere Pro's sequence importer silently drops the first frame. Write
                 # a dummy output_00000.png (and matching matte) so the user's actual
                 # frame range survives the import intact.
@@ -399,6 +527,13 @@ def cmd_batch(source_video, output_folder, settings,
     finally:
         cap.release()
         processor.cleanup()
+        # Flush any leftover SAM2 video predictor allocations.
+        if sam_torch is not None:
+            try:
+                if sam_torch.cuda.is_available():
+                    sam_torch.cuda.empty_cache()
+            except Exception:
+                pass
 
     (out_dir / "batch_result.txt").write_text(f"{processed},{total},{len(failed)}")
     log.info(f"Done: {processed}/{total} ({len(failed)} failed)")

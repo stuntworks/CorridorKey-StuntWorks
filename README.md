@@ -210,7 +210,7 @@ CorridorKey's neural keyer handles the chroma. **SAM 2** handles everything else
 
 **Multi-object** for tricky shots — press **Tab** to switch between **MASK 1** and **MASK 2**. Each mask gets its own dots and APPLY MASK action.
 
-> **AE v1.0 limitation:** the SAM 2 click flow currently runs in the **live preview window only** (it cleans the matte while you're scrubbing). The PROCESS WORK AREA batch render in v1.0 outputs the CK matte alone — SAM 2 video propagation through the range is shipping in **v1.1**. Until then, use the Resolve plugin for the full two-mask batch flow, or use the AE preview to verify your dots before keying.
+> **AE batch + SAM 2 (v1.0):** when SAM 2 dots are active in the preview window at the time you click PROCESS WORK AREA, the SAM 2 video predictor propagates them across the whole range and writes a separate matte sequence as a sidecar. The SAM matte imports as its own layer, sitting one slot above the CK keyed sequence in the comp — use it as a track matte, Roto Brush source, or luma key. CK and SAM are independent: pick whichever the shot needs, or combine them in the comp.
 
 </details>
 
@@ -258,7 +258,7 @@ CorridorKey's neural keyer handles the chroma. **SAM 2** handles everything else
 
 **Multi-object** for tricky shots — press **Tab** to switch between **MASK 1** and **MASK 2**. Each mask gets its own dots and APPLY MASK action.
 
-> **Premiere v1.0 limitation:** SAM 2 runs in the live preview window only. The PROCESS IN/OUT RANGE batch render in v1.0 outputs the CK matte alone — SAM 2 video propagation through the range is shipping in **v1.1**. Until then, use Resolve for the full two-mask batch flow.
+> **Premiere batch + SAM 2 (v1.0):** when SAM 2 dots are active in the preview window at the time you click PROCESS IN/OUT RANGE, the SAM 2 video predictor propagates them across the whole range and writes a separate matte sequence as a sidecar. The SAM matte imports as a clip on the track immediately above the CK keyed clip — use it as a track matte (Track Matte Key), luma key source, or just toggle which track is visible. CK and SAM are independent: pick whichever the shot needs, or combine them.
 
 </details>
 

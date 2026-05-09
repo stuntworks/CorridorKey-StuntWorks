@@ -186,7 +186,7 @@ function ae_importFrame(outputPath) {
 //   hides the source layer so the keyed result is immediately visible.
 // DEPENDS-ON: firstFramePath exists; comp has a selected layer (the original source clip).
 // AFFECTS: Adds a new layer to the comp; optionally sets source layer.enabled = false.
-function ae_importSequence(firstFramePath, fps, compStartTime, hideSource) {
+function ae_importSequence(firstFramePath, fps, compStartTime, hideSource, samFirstFramePath) {
     try {
         var comp = app.project.activeItem;
         if (!(comp instanceof CompItem)) return JSON.stringify({ ok: false, error: "No composition selected" });
@@ -199,18 +199,47 @@ function ae_importSequence(firstFramePath, fps, compStartTime, hideSource) {
         var importOptions = new ImportOptions(firstFrame);
         importOptions.sequence = true;
         var importedSeq = app.project.importFile(importOptions);
+        var ckLayer = null;
         if (importedSeq) {
             importedSeq.mainSource.conformFrameRate = Number(fps);
-            var newLayer = comp.layers.add(importedSeq);
-            newLayer.moveBefore(layer);
-            newLayer.startTime = Number(compStartTime);
+            ckLayer = comp.layers.add(importedSeq);
+            // moveBefore drops ckLayer immediately ABOVE the source layer (lower
+            // index = higher in stack). v1.0 track-stacking parity with Resolve
+            // / Premiere already comes from this — moveBefore never overwrites
+            // existing layers, only inserts.
+            ckLayer.moveBefore(layer);
+            ckLayer.startTime = Number(compStartTime);
+        }
+        // v1.0 two-mask: optional SAM matte sidecar sequence imported as a
+        // separate layer ABOVE the CK keyed sequence. The user can then use it
+        // as a track matte / Roto Brush source / luma mask without re-running
+        // anything in AE.
+        var samImported = null;
+        if (samFirstFramePath) {
+            try {
+                var samFirst = new File(String(samFirstFramePath));
+                if (samFirst.exists) {
+                    var samOpts = new ImportOptions(samFirst);
+                    samOpts.sequence = true;
+                    samImported = app.project.importFile(samOpts);
+                    if (samImported) {
+                        samImported.mainSource.conformFrameRate = Number(fps);
+                        var samLayer = comp.layers.add(samImported);
+                        // Sit above the CK layer if we have one, else above source.
+                        samLayer.moveBefore(ckLayer || layer);
+                        samLayer.startTime = Number(compStartTime);
+                    }
+                }
+            } catch (eSam) {
+                // Non-fatal — CK sequence is in. Caller logs the message.
+            }
         }
         if (String(hideSource) === 'true') {
             layer.enabled = false;
         }
         app.endUndoGroup();
         comp.time = comp.time;
-        return JSON.stringify({ ok: true });
+        return JSON.stringify({ ok: true, samImported: !!samImported });
     } catch (e) { return JSON.stringify({ ok: false, error: String(e) }); }
 }
 
@@ -483,7 +512,7 @@ function ppro_importFrame(outputPath, playheadSeconds, fps) {
 // DEPENDS-ON: firstFramePath exists; its folder contains a clean output_NNNNN.png pattern
 //   with no other PNG series (mattes live in a subfolder).
 // AFFECTS: Project panel (bin + imported item), timeline V2 (overwriteClip).
-function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate) {
+function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate, samFirstFramePath) {
     try {
         var seq = app.project.activeSequence;
         if (!seq) return JSON.stringify({ ok: false, error: "No active sequence" });
@@ -515,6 +544,34 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate)
                 error: "Import ran but no new project item appeared. Folder: " +
                        (new File(firstFramePath)).parent.fsName
             });
+        }
+
+        // v1.0 two-mask: optional SAM matte sidecar sequence. Imported the same
+        // way as the CK sequence but tracked separately so we can place it on
+        // the track above CK. Snapshot before the second import so we diff
+        // against the post-CK state, not the pre-CK state.
+        var samImported = null;
+        if (samFirstFramePath) {
+            try {
+                var samFile = new File(String(samFirstFramePath));
+                if (samFile.exists) {
+                    var beforeIdsSam = {};
+                    for (var iSam = 0; iSam < root.children.numItems; iSam++) {
+                        var chSam = root.children[iSam];
+                        beforeIdsSam[chSam.nodeId || String(iSam) + "-" + chSam.name] = true;
+                    }
+                    var okSam = app.project.importFiles([String(samFirstFramePath)], true, root, true);
+                    if (okSam) {
+                        for (var jSam = 0; jSam < root.children.numItems; jSam++) {
+                            var cSam = root.children[jSam];
+                            var idSam = cSam.nodeId || String(jSam) + "-" + cSam.name;
+                            if (!beforeIdsSam[idSam]) { samImported = cSam; break; }
+                        }
+                    }
+                }
+            } catch (eSamImport) {
+                // Non-fatal — CK still goes through.
+            }
         }
 
         // Force the imported PNG sequence's footage frame rate to match V1's. Without
@@ -565,7 +622,11 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate)
         var highestUsedSeq = ppro_highest_used_video_track(seq);
         var ckTrackVSeq = (highestUsedSeq >= 1) ? (highestUsedSeq + 1) : 2;
         var ckTrackIdxSeq = ckTrackVSeq - 1;
-        while (seq.videoTracks.numTracks <= ckTrackIdxSeq) {
+        // SAM sidecar (when present) lives on the track immediately above CK.
+        var samTrackVSeq = samImported ? (ckTrackVSeq + 1) : 0;
+        var samTrackIdxSeq = samImported ? (samTrackVSeq - 1) : -1;
+        var topNeededIdx = samImported ? samTrackIdxSeq : ckTrackIdxSeq;
+        while (seq.videoTracks.numTracks <= topNeededIdx) {
             try { seq.videoTracks.addTracks(1); } catch (_) { break; }
         }
         var v2 = seq.videoTracks[ckTrackIdxSeq];
@@ -580,10 +641,41 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate)
         var nudge = 1.0 / Number(rateForNudge || 24);
         try {
             v2.overwriteClip(imported, placeSec + nudge);
-            return JSON.stringify({ ok: true, placed: true, binName: imported.name, appliedRate: appliedRate, trackV: ckTrackVSeq });
         } catch (e) {
             return JSON.stringify({ ok: true, placed: false, binName: imported.name,
                 note: "Imported into bin but overwriteClip failed: " + String(e) });
         }
+
+        // SAM matte sidecar — conform rate, move into bin, place above CK.
+        // Failures here don't roll back CK placement; the user keeps the keyed
+        // sequence either way.
+        var samPlaced = false;
+        if (samImported) {
+            try {
+                if (typeof samImported.setOverrideFrameRate === "function") {
+                    samImported.setOverrideFrameRate(targetRate);
+                } else {
+                    var fiSam = samImported.getFootageInterpretation();
+                    if (fiSam) {
+                        fiSam.frameRate = targetRate;
+                        samImported.setFootageInterpretation(fiSam);
+                    }
+                }
+            } catch (_) {}
+            try { if (ckBin) samImported.moveBin(ckBin); } catch (_) {}
+            try {
+                var vSam = seq.videoTracks[samTrackIdxSeq];
+                if (vSam) {
+                    vSam.overwriteClip(samImported, placeSec + nudge);
+                    samPlaced = true;
+                }
+            } catch (_) {}
+        }
+
+        return JSON.stringify({
+            ok: true, placed: true, binName: imported.name, appliedRate: appliedRate,
+            trackV: ckTrackVSeq, samPlaced: samPlaced,
+            samTrackV: samImported ? samTrackVSeq : 0
+        });
     } catch (e) { return JSON.stringify({ ok: false, error: String(e) }); }
 }
