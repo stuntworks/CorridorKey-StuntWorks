@@ -367,13 +367,17 @@ def render_composite(cu, session: Session, params: dict):
     # v2.2-experimental-2026-05-08 for hot-revert.
     session.sam_matte_v1 = None
     if session.alpha_nn is not None and session.sam2_gate_raw is not None and not sam2_bypass:
-        from corridorkey_sam_merge import binarize_sam_silhouette, process_sam_matte
+        # Option C — soft gate flows straight through. The binarise step that
+        # used to live here was the source of the bumpy contour from
+        # 2026-05-09 — it collapsed the 2-4 px feather the saturation ramp
+        # produced.
+        from corridorkey_sam_merge import process_sam_matte
         _gate = session.sam2_gate_raw.copy()
         if _gate.shape != session.alpha_nn.shape:
             _gate = cv2.resize(_gate, (session.alpha_nn.shape[1], session.alpha_nn.shape[0]),
                                interpolation=cv2.INTER_LINEAR)
         session.sam_matte_v1 = process_sam_matte(
-            binarize_sam_silhouette(_gate),
+            _gate,
             margin_px=float(sam2_margin),
             softness_sigma=float(sam2_soften),
             fill_kernel_px=int(fill_holes),
@@ -501,8 +505,10 @@ class PersistentWindow(QtWidgets.QWidget):
             # green but NN keyed transparent. SAM2-only control.
             "trim_chroma": 0,
             # FILL HOLES: morphological close kernel size (px). v1.0 spec.
-            # 0 = no-op. 5 default. SAM2-only control.
-            "fill_holes": 5,
+            # 0 = no-op (default). User opts in only when a shot has actual
+            # interior holes; running close on every frame baked polygonal
+            # facets into the contour. SAM2-only control.
+            "fill_holes": 0,
             "choke": 0,
             # FG SOURCE: "nn" = model FG (default, original behavior)
             #            "source" = original plate inside the matte (yellow-shirt rescue)
@@ -1975,10 +1981,12 @@ class PersistentWindow(QtWidgets.QWidget):
             model = build_sam2(cfg, ckpt, device=device)
             pred  = SAM2ImagePredictor(model)
             pred.set_image(frame_rgb)
-            # return_logits=True returns the raw probability map (pre-threshold).
-            # SAM2 internally produces smooth logits (-32..+32); the default API
-            # binarizes them at 0 and we lose the soft transition at the edges.
-            # Multiplying NN by a hard 0/1 gate is what creates the jagged matte.
+            # Option C — return_logits=True so we can run our own saturation
+            # ramp. Default predict() binarises masks at logit 0 and we lose
+            # the 2-4 px soft edge band that makes the matte composit-able.
+            # See logits_to_soft_mask in corridorkey_sam_merge.py for the
+            # rationale (interior pinned to 1.0 to kill decoder texture, soft
+            # feather only across the contour).
             masks, scores, logits = pred.predict(
                 point_coords=np.array(all_pts),
                 point_labels=np.array(labels),
@@ -1988,28 +1996,9 @@ class PersistentWindow(QtWidgets.QWidget):
             del pred, model
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            # Pick the highest-IoU candidate, then convert logits to a soft 0..1
-            # gate using a SATURATION RAMP (not sigmoid).
-            #
-            # WHY NOT SIGMOID: SAM2 mask-decoder logits in confident interior
-            # pixels often sit in the +2..+6 range (not +20..+30). Sigmoid maps
-            # that to 0.88..0.998 — with subtle per-pixel variation that tracks
-            # image texture. Multiplied by the solid-white NN alpha, that
-            # variation prints as horizontal banding + checker artifacts inside
-            # the body silhouette. The artifact is invisible at 1080p but very
-            # visible at 4K and above (the gate's 256x256 native res, when
-            # upsampled, makes the variation block-sized).
-            #
-            # WHAT THE RAMP DOES: linear ramp on raw logits.
-            #   logit >= +2  -> 1.0  (solid interior, kills decoder texture)
-            #   logit <= -2  -> 0.0  (solid background)
-            #   -2 < L < +2  -> linear ramp (soft edge band, ~2-4 px feather)
-            #
-            # Same fix Resolve plugin shipped earlier — porting to AE now.
-            # Berto verified the checker artifact on 4K footage 2026-04-28.
             best_idx = int(np.argmax(scores))
-            logits_best = logits[best_idx].astype(np.float32)
-            best = np.clip(0.5 + logits_best * 0.25, 0.0, 1.0)
+            from corridorkey_sam_merge import logits_to_soft_mask
+            best = logits_to_soft_mask(logits[best_idx])
             # Save soft gate as uint16 PNG so the 0..1 precision survives the
             # save/load roundtrip (uint8 would quantize to 256 levels and undo
             # the soft-edge benefit). _to_float01 handles uint16 on read.

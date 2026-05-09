@@ -1246,26 +1246,20 @@ def run_sam2_video_propagation(fp, ss, cs, in_f, out_f, pos_pts, neg_pts, anchor
             # pass must reuse the same state object so the tracker memory from the forward
             # pass carries over. Reinitialising state between passes loses anchor context.
             # breaks: if state is reset between passes, backward masks drift from forward.
-            # WHAT IT DOES: Bridges inter-dot confidence dips inside the
-            #   actor silhouette. With many positives placed on joints, SAM2
-            #   sometimes drops confidence between adjacent dots along fabric
-            #   creases, shadows, or motion blur — producing black holes in
-            #   the matte. Closing with a kernel ~size of the longest plausible
-            #   inter-dot gap (~100 px on a 4K subject) fills those holes
-            #   without bloating the silhouette outward into hair / background.
-            # AFFECTS: every non-empty propagated mask (forward and backward).
-            CLOSE_KERNEL_PX = 101
-            _close_kernel = np.ones((CLOSE_KERNEL_PX, CLOSE_KERNEL_PX), np.uint8)
-
-            def _bridge_holes(mask):
-                # Convert float [0..1] → uint8 [0..255] for cv2 morphology, close,
-                # then return as float [0..1]. Inputs unchanged.
-                binary = (mask * 255.0).astype(np.uint8)
-                closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, _close_kernel)
-                return (closed.astype(np.float32) / 255.0)
+            #
+            # Option C 2026-05-09: this used to hard-threshold mask_logits > 0 and
+            # then run MORPH_CLOSE k=101 to bridge inter-dot confidence dips inside
+            # the silhouette. Trouble: hard threshold gave a binary edge with no
+            # soft band, MORPH_CLOSE(101) inflated and rounded silhouette geometry,
+            # net effect was the bumpy/blocky SAM matte. Replaced with the same
+            # saturation ramp the viewer uses — interior pins to 1.0, edges get a
+            # 2-4 px feather. If the user genuinely needs hole-bridging on a tough
+            # shot they raise FILL HOLES; the 101 px hardcoded close was nuking
+            # geometry on every shot to fix a problem only some shots have.
+            from corridorkey_sam_merge import logits_to_soft_mask as _ramp
 
             def _store_propagated(frame_idx, _obj_ids_returned, mask_logits, direction):
-                """Convert per-object logits to float masks and stash in masks_per_obj."""
+                """Convert per-object logits to soft float masks and stash in masks_per_obj."""
                 # mask_logits is shape [n_obj, 1, H, W]. _obj_ids_returned tells us
                 # which obj_id each row corresponds to (in active_obj_ids order).
                 for slot, oid in enumerate(_obj_ids_returned):
@@ -1274,11 +1268,15 @@ def run_sam2_video_propagation(fp, ss, cs, in_f, out_f, pos_pts, neg_pts, anchor
                     if direction == "backward" and frame_idx in masks_per_obj[oid]:
                         # Forward pass already filled this frame for this obj — keep it.
                         continue
-                    m = (mask_logits[slot] > 0.0).squeeze().cpu().numpy().astype(np.float32)
-                    if m.sum() < 100:
-                        masks_per_obj[oid][frame_idx] = m  # empty; resolved post-pass
+                    L = mask_logits[slot].squeeze().cpu().numpy()
+                    m = _ramp(L)
+                    # Empty-mask check still uses a >0.5 sum threshold so the
+                    # "actor not in frame" tail-empty resolver downstream
+                    # behaves the same way as on the binary path.
+                    if (m > 0.5).sum() < 100:
+                        masks_per_obj[oid][frame_idx] = np.zeros_like(m, dtype=np.float32)
                     else:
-                        masks_per_obj[oid][frame_idx] = _bridge_holes(m)
+                        masks_per_obj[oid][frame_idx] = m.astype(np.float32)
 
             status("SAM2: forward pass...")
             log(f"SAM2 video: forward pass (anchor={anchor_rel}, obj_ids={active_obj_ids} -> frame {dur-1})")
@@ -3293,8 +3291,13 @@ def on_process_range(ev):
                 # video-prop or static gate exists for this frame.
                 _sam_matte_v1 = None
                 if mt is not None and not bool(settings.get("sam2_bypass", False)):
+                    # Option C — feed CONTINUOUS soft gates into process_sam_matte.
+                    # binarize_sam_silhouette would collapse the 2-4 px soft band
+                    # the saturation ramp produces; the contour bumpiness from
+                    # 2026-05-09 came from binarising before the merge / matte.
+                    # union_binary_silhouettes works on soft input (np.maximum).
                     from corridorkey_sam_merge import (
-                        binarize_sam_silhouette, union_binary_silhouettes, process_sam_matte,
+                        union_binary_silhouettes, process_sam_matte,
                     )
                     _gates_for_sam = []
                     _obj_ids = []
@@ -3311,7 +3314,7 @@ def on_process_range(ev):
                                 continue
                             if _oid == 2 and bool(settings.get("mask2_bypass", False)):
                                 continue
-                            _gates_for_sam.append(binarize_sam_silhouette(_gm))
+                            _gates_for_sam.append(np.asarray(_gm, dtype=np.float32))
                             _obj_ids.append(_oid)
                     elif _braw_sam2_gate:
                         if isinstance(_braw_sam2_gate, dict):
@@ -3325,7 +3328,7 @@ def on_process_range(ev):
                                 continue
                             if _oid == 2 and bool(settings.get("mask2_bypass", False)):
                                 continue
-                            _gates_for_sam.append(binarize_sam_silhouette(_g))
+                            _gates_for_sam.append(np.asarray(_g, dtype=np.float32))
                             _obj_ids.append(_oid)
                     if _gates_for_sam:
                         _sam_union = union_binary_silhouettes(_gates_for_sam)
@@ -3551,8 +3554,14 @@ def on_process_range(ev):
                 # master clip; SAM matte ships as a separate alpha sidecar.
                 _sam_matte_v1 = None
                 if mt is not None and not bool(settings.get("sam2_bypass", False)):
+                    # Option C — feed CONTINUOUS soft gates straight through.
+                    # Pre-Option C this path called binarize_sam_silhouette
+                    # before the union and process_sam_matte; the binary edge
+                    # plus a downstream MORPH_OPEN was the bumpy contour root
+                    # cause Berto called out 2026-05-09. union_binary_silhouettes
+                    # is np.maximum and works on soft input directly.
                     from corridorkey_sam_merge import (
-                        binarize_sam_silhouette, union_binary_silhouettes, process_sam_matte,
+                        union_binary_silhouettes, process_sam_matte,
                     )
                     _gates_for_sam = []
                     _obj_ids = []
@@ -3569,7 +3578,7 @@ def on_process_range(ev):
                                 continue
                             if _oid == 2 and bool(settings.get("mask2_bypass", False)):
                                 continue
-                            _gates_for_sam.append(binarize_sam_silhouette(_gm))
+                            _gates_for_sam.append(np.asarray(_gm, dtype=np.float32))
                             _obj_ids.append(_oid)
                     else:
                         # Fallback path — static per-object gates loaded lazily on
@@ -3591,7 +3600,7 @@ def on_process_range(ev):
                                     continue
                                 if _oid == 2 and bool(settings.get("mask2_bypass", False)):
                                     continue
-                                _gates_for_sam.append(binarize_sam_silhouette(_g))
+                                _gates_for_sam.append(np.asarray(_g, dtype=np.float32))
                                 _obj_ids.append(_oid)
                     if _gates_for_sam:
                         _sam_union = union_binary_silhouettes(_gates_for_sam)

@@ -39,24 +39,67 @@ USE_CHROMA_GATED_MERGE = False
 DEBUG_ENABLED = False
 DEBUG_MODE = False
 
-# v1.0 always-on SAM matte baseline cleanup. Raw SAM 2 output has 1-2 px
-# speckle and jaggy contour edges (visible in 084512 test frame). These
-# baselines run inside process_sam_matte so every output path — Resolve
-# preview/render, AE/Premiere preview/render — gets the same cleanup
-# without each call site having to opt in.
-#
-# Sigma 0.75 (NOT the v2.2 2.5 that ate neck hair). Open kernel 3 px
-# kills isolated speckle without touching anything thicker than 1 px.
-SAM_BASELINE_OPEN_KERNEL_PX = 3
-SAM_BASELINE_SMOOTH_SIGMA = 0.75
+# Saturation ramp endpoints (logit space) — see logits_to_soft_mask below.
+# A 4-logit-wide soft band gives a 2-4 px feather at typical SAM 2 grad
+# magnitudes around the contour. Berto verified on 4K Kitchen Fight.
+SAM_SOFT_LOGIT_LO = -2.0
+SAM_SOFT_LOGIT_HI = 2.0
+
+# v1.0 always-on baseline smoothing of the soft SAM matte. Operates on
+# CONTINUOUS values now (the previous MORPH_OPEN k=3 was carving 3 px
+# polygonal facets out of the binary SAM silhouette — visible bumpiness
+# Berto called out 2026-05-09). Sigma 1.0 dissolves SAM 2's per-pixel
+# decoder jitter without touching the contour shape.
+SAM_BASELINE_SMOOTH_SIGMA = 1.0
 
 
 def binarize_sam_silhouette(sam: np.ndarray, threshold: float = SAM_BINARIZE_THRESHOLD) -> np.ndarray:
     # WHAT IT DOES: Threshold a continuous SAM mask to binary {0.0, 1.0} float32.
     # DEPENDS ON:   numpy. Caller pre-applies sigmoid if input is logit-space.
-    # AFFECTS:      Used by the viewer/renderer to convert per-object SAM gates
-    #               to binary before unioning across MASK 1 / MASK 2.
+    # AFFECTS:      Kept for legacy contracts (sam2_mask_obj{N}.png hard-mask
+    #               files the panel still expects). The v1.0 two-mask render
+    #               path no longer binarises before process_sam_matte —
+    #               continuous SAM matte flows end-to-end via the saturation
+    #               ramp. See logits_to_soft_mask for the entry point.
     return (np.asarray(sam, dtype=np.float32) >= float(threshold)).astype(np.float32)
+
+
+def logits_to_soft_mask(
+    logits: np.ndarray,
+    lo: float = SAM_SOFT_LOGIT_LO,
+    hi: float = SAM_SOFT_LOGIT_HI,
+) -> np.ndarray:
+    """Convert SAM 2 mask-decoder logits to a soft 0..1 mask via SATURATION RAMP.
+
+    Mapping:
+        logit >= hi   -> 1.0  (solid interior, kills decoder texture)
+        logit <= lo   -> 0.0  (solid background)
+        lo < L < hi   -> linear ramp (soft edge band, ~2-4 px feather)
+
+    Why a ramp instead of sigmoid: SAM 2's mask-decoder logits in confident
+    interior pixels sit in the +2..+6 range, not +20..+30. Sigmoid maps that
+    to 0.88..0.998 with subtle per-pixel variation that tracks image texture.
+    Multiplied through the alpha downstream, that variation prints as
+    horizontal banding and checker artifacts inside the body silhouette —
+    invisible at 1080p, very visible at 4K. The ramp pins interior to a
+    flat 1.0 and only soft-feathers within [lo, hi] across the contour.
+
+    Berto verified the checker artifact on 4K Kitchen Fight footage
+    2026-04-28; this is the same fix originally shipped in the AE viewer
+    and now the canonical soft-mask path for every SAM 2 call site.
+
+    Args:
+        logits: float array (any shape) of raw SAM 2 mask-decoder logits.
+        lo, hi: ramp endpoints in logit space (defaults -2..+2).
+
+    Returns:
+        float32 array of same shape, clipped to [0, 1].
+    """
+    L = np.asarray(logits, dtype=np.float32)
+    span = float(hi - lo)
+    if span <= 0:
+        return (L >= float(hi)).astype(np.float32)
+    return np.clip((L - float(lo)) / span, 0.0, 1.0)
 
 
 def union_binary_silhouettes(silhouettes: Iterable[np.ndarray]) -> Optional[np.ndarray]:
@@ -78,29 +121,33 @@ def process_sam_matte(
     softness_sigma: float = 0.0,
     fill_kernel_px: int = 0,
 ) -> np.ndarray:
-    """Apply the v1.0 simple SAM matte post-processing chain.
+    """Apply the v1.0 SAM matte post-processing chain on a CONTINUOUS soft mask.
+
+    Pre-Option C this function operated on a binary silhouette and applied a
+    MORPH_OPEN k=3 baseline, which carved 3 px polygonal facets out of the
+    contour. Bumpiness Berto called out 2026-05-09 was that artifact.
+
+    Option C: callers feed a soft post-ramp mask in [0, 1] (see
+    logits_to_soft_mask). The pipeline preserves softness — only the user-
+    controlled FILL HOLES and MARGIN stages binarise internally, and only
+    when the user opts in (defaults are no-op). The baseline is now a small
+    Gaussian on continuous values, which dissolves SAM 2 decoder jitter
+    without rebuilding the contour out of polygon stamps.
 
     Order of operations:
-      0. BASELINE despeckle (always on) — morphological open with a small
-         kernel kills 1-2 px isolated noise that SAM 2 produces around the
-         silhouette edge. Constant kernel SAM_BASELINE_OPEN_KERNEL_PX.
-      1. Fill holes — morphological close to seal small interior gaps.
-         Kernel size in pixels; 0 = no-op (user-controlled slider).
-      2. Margin — shrink (negative) or grow (positive) the silhouette. Pixels;
-         0 = no-op. Sub-pixel via lerp between adjacent integer kernel sizes.
-      3. BASELINE edge smoothing (always on) — light Gaussian sigma kills
-         jaggy SAM contours without dissolving fine detail. Constant
-         SAM_BASELINE_SMOOTH_SIGMA. Runs BEFORE the user-controlled softness
-         so the user can stack additional feathering on a clean base.
-      4. Softness — Gaussian blur of the matte for feathered edges. Sigma in
-         pixels; 0 = no-op (user-controlled slider).
+      1. BASELINE smoothing (always on) — Gaussian sigma SAM_BASELINE_SMOOTH_SIGMA
+         on continuous values. Smooths sub-pixel decoder jitter.
+      2. Fill holes — user-controlled MORPH_CLOSE on a 0.5-thresholded copy.
+         Pixels in [0, 1] flow through; only run when user sets fill_kernel_px>0.
+      3. Margin — user-controlled erode/dilate. Same opt-in semantics.
+      4. Softness — user-controlled Gaussian for additional edge feather.
 
     Args:
-        sam: (H, W) float32 mask in [0, 1] (or any range — clipped on output).
-             May be soft (post-sigmoid) or already-binary.
+        sam: (H, W) float32 soft mask in [0, 1]. Already post-ramp (or post-
+             sigmoid). Binary input still works but loses the soft-edge benefit.
         margin_px: -50..+50 typical. Negative erodes, positive dilates.
         softness_sigma: 0..30 typical. Gaussian sigma in pixels.
-        fill_kernel_px: 0..50 typical. Close kernel size in pixels.
+        fill_kernel_px: 0..50 typical. MORPH_CLOSE kernel; 0 = skip.
 
     Returns:
         (H, W) float32 mask in [0, 1].
@@ -109,15 +156,20 @@ def process_sam_matte(
 
     out = np.asarray(sam, dtype=np.float32)
 
-    # ── 0. BASELINE despeckle (always on, kills 1-2 px noise) ──
-    if SAM_BASELINE_OPEN_KERNEL_PX and SAM_BASELINE_OPEN_KERNEL_PX > 0:
-        k0 = max(3, int(SAM_BASELINE_OPEN_KERNEL_PX) | 1)
-        kernel0 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k0, k0))
-        binary0 = (out > 0.5).astype(np.uint8) * 255
-        opened = cv2.morphologyEx(binary0, cv2.MORPH_OPEN, kernel0)
-        out = opened.astype(np.float32) / 255.0
+    # ── 1. BASELINE smoothing on continuous values (always on) ──
+    if SAM_BASELINE_SMOOTH_SIGMA and SAM_BASELINE_SMOOTH_SIGMA > 0:
+        kbs = max(3, int(SAM_BASELINE_SMOOTH_SIGMA * 6) | 1)
+        out = cv2.GaussianBlur(
+            out, (kbs, kbs),
+            sigmaX=float(SAM_BASELINE_SMOOTH_SIGMA),
+            sigmaY=float(SAM_BASELINE_SMOOTH_SIGMA),
+        )
 
-    # ── 1. Fill holes (morphological close on the binarised gate) ──
+    # ── 2. Fill holes (user-controlled MORPH_CLOSE on a binarised copy) ──
+    # Only engages when the user dials FILL HOLES > 0. Default is 0, so the
+    # soft edge survives undisturbed. When engaged, the result becomes
+    # binary at the close stage and propagates that way through the rest
+    # of the pipeline — that's the user's choice.
     if fill_kernel_px and fill_kernel_px > 0:
         k = max(3, int(fill_kernel_px) | 1)  # round up to odd
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
@@ -125,7 +177,9 @@ def process_sam_matte(
         closed = cv2.morphologyEx(binary_u8, cv2.MORPH_CLOSE, kernel)
         out = closed.astype(np.float32) / 255.0
 
-    # ── 2. Margin (bidirectional: negative=erode, positive=dilate) ──
+    # ── 3. Margin (bidirectional: negative=erode, positive=dilate) ──
+    # Sub-pixel via lerp. Same opt-in semantics as fill — binarises internally
+    # only when engaged.
     margin_f = float(margin_px or 0.0)
     if margin_f != 0.0:
         m_abs = abs(margin_f)
@@ -151,16 +205,7 @@ def process_sam_matte(
         else:
             out = lo
 
-    # ── 3. BASELINE edge smoothing (always on, sigma 0.75) ──
-    if SAM_BASELINE_SMOOTH_SIGMA and SAM_BASELINE_SMOOTH_SIGMA > 0:
-        kbs = max(3, int(SAM_BASELINE_SMOOTH_SIGMA * 6) | 1)
-        out = cv2.GaussianBlur(
-            out, (kbs, kbs),
-            sigmaX=float(SAM_BASELINE_SMOOTH_SIGMA),
-            sigmaY=float(SAM_BASELINE_SMOOTH_SIGMA),
-        )
-
-    # ── 4. Softness (Gaussian, user-controlled) ──
+    # ── 4. User softness (Gaussian) ──
     sigma = float(softness_sigma or 0.0)
     if sigma > 0:
         k = max(3, int(sigma * 6) | 1)

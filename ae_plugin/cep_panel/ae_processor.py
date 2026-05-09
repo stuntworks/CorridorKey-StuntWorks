@@ -390,6 +390,10 @@ def cmd_batch(source_video, output_folder, settings,
                 _all_pts = list(sam_pos) + list(sam_neg)
                 _labels  = [1] * len(sam_pos) + [0] * len(sam_neg)
                 log.info(f"SAM2 video: anchor at range frame {sam_anchor_rel} (absolute {sam_anchor_abs})")
+                # Option C — saturation ramp (not sigmoid). Same canonical soft-
+                # mask path the viewer uses; sidecar matte is composit-ready in
+                # the host without re-binarising.
+                from corridorkey_sam_merge import logits_to_soft_mask as _ramp
                 with sam_torch.inference_mode():
                     _state = _video_predictor.init_state(
                         video_path=str(sam_tmp_dir),
@@ -406,15 +410,15 @@ def cmd_batch(source_video, output_folder, settings,
                     )
                     # Forward: anchor → last frame.
                     for _fi, _obj_ids, _mask_logits in _video_predictor.propagate_in_video(_state):
-                        _soft = sam_torch.sigmoid(_mask_logits[0]).squeeze().cpu().numpy().astype(np.float32)
-                        sam_video_masks[_fi] = np.clip(_soft, 0.0, 1.0)
+                        _L = _mask_logits[0].squeeze().cpu().numpy()
+                        sam_video_masks[_fi] = _ramp(_L)
                     # Backward: anchor → frame 0. Forward wins on overlap.
                     if sam_anchor_rel > 0:
                         for _fi, _obj_ids, _mask_logits in _video_predictor.propagate_in_video(_state, reverse=True):
                             if _fi in sam_video_masks:
                                 continue
-                            _soft = sam_torch.sigmoid(_mask_logits[0]).squeeze().cpu().numpy().astype(np.float32)
-                            sam_video_masks[_fi] = np.clip(_soft, 0.0, 1.0)
+                            _L = _mask_logits[0].squeeze().cpu().numpy()
+                            sam_video_masks[_fi] = _ramp(_L)
                 del _video_predictor
                 if sam_torch.cuda.is_available():
                     sam_torch.cuda.empty_cache()
@@ -435,7 +439,8 @@ def cmd_batch(source_video, output_folder, settings,
     if sam_dir is not None:
         sam_dir.mkdir(parents=True, exist_ok=True)
         # process_sam_matte lives in the engine root; it is on sys.path already.
-        from corridorkey_sam_merge import binarize_sam_silhouette, process_sam_matte
+        # Option C — feed soft mask straight in; no binarise step.
+        from corridorkey_sam_merge import process_sam_matte
 
     processed = 0
     failed = []
@@ -501,8 +506,10 @@ def cmd_batch(source_video, output_folder, settings,
                                 (alpha.shape[1], alpha.shape[0]),
                                 interpolation=cv2.INTER_LINEAR,
                             )
+                        # Option C — soft mask flows straight through; no
+                        # binarise step before process_sam_matte.
                         _sam_processed = process_sam_matte(
-                            binarize_sam_silhouette(_gate_soft),
+                            _gate_soft,
                             margin_px=sam_margin,
                             softness_sigma=sam_soften,
                             fill_kernel_px=sam_fill,
@@ -667,18 +674,21 @@ def cmd_batch_scrub(source_video, scrub_folder, settings,
                         labels=np.array(_labels, dtype=np.int32),
                         clear_old_points=True,
                     )
-                    # Forward: anchor → last frame.
+                    # Forward: anchor → last frame. Saturation ramp on logits
+                    # (Option C), same canonical soft-mask path as the viewer
+                    # and cmd_batch.
+                    from corridorkey_sam_merge import logits_to_soft_mask as _ramp
                     for _fi, _obj_ids, _mask_logits in _video_predictor.propagate_in_video(_state):
-                        _soft = sam_torch.sigmoid(_mask_logits[0]).squeeze().cpu().numpy().astype(np.float32)
-                        sam_video_masks[_fi] = np.clip(_soft, 0.0, 1.0)
+                        _L = _mask_logits[0].squeeze().cpu().numpy()
+                        sam_video_masks[_fi] = _ramp(_L)
                     # Backward: anchor → frame 0. Skip frames the forward pass
                     # already filled (forward wins on overlap, same as DaVinci).
                     if sam_anchor_rel > 0:
                         for _fi, _obj_ids, _mask_logits in _video_predictor.propagate_in_video(_state, reverse=True):
                             if _fi in sam_video_masks:
                                 continue
-                            _soft = sam_torch.sigmoid(_mask_logits[0]).squeeze().cpu().numpy().astype(np.float32)
-                            sam_video_masks[_fi] = np.clip(_soft, 0.0, 1.0)
+                            _L = _mask_logits[0].squeeze().cpu().numpy()
+                            sam_video_masks[_fi] = _ramp(_L)
                 del _video_predictor
                 if sam_torch.cuda.is_available():
                     sam_torch.cuda.empty_cache()

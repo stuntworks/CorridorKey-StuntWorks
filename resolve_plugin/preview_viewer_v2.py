@@ -569,12 +569,16 @@ def render_composite(cu, session: Session, params: dict):
                        if session.sam2_gates.get(oid) is not None]
     session.sam_matte_v1 = None  # set below when SAM is active; consumed by Phase B export and Phase C preview
     if session.alpha_raw is not None and _per_mask_pairs and not sam2_bypass:
+        # Option C — soft gates flow straight through. The previous binarise
+        # step collapsed the 2-4 px feather the saturation ramp produced and
+        # was the source of the bumpy contour Berto called out 2026-05-09.
+        # union_binary_silhouettes is np.maximum, soft-aware.
         from corridorkey_sam_merge import (
-            binarize_sam_silhouette, union_binary_silhouettes, process_sam_matte,
+            union_binary_silhouettes, process_sam_matte,
         )
         # Per-mask BYPASS: drop gates the user toggled off. Resize each
-        # surviving gate to alpha_raw shape before binarising — the engine
-        # may downscale internally so gate H,W can differ from alpha H,W.
+        # surviving gate to alpha_raw shape — the engine may downscale
+        # internally so gate H,W can differ from alpha H,W.
         _active_silhouettes = []
         for _oid, _gate in _per_mask_pairs:
             if _oid == 1 and mask1_bypass:
@@ -584,11 +588,9 @@ def render_composite(cu, session: Session, params: dict):
             if _gate.shape != session.alpha_raw.shape:
                 _gate = cv2.resize(_gate, (session.alpha_raw.shape[1], session.alpha_raw.shape[0]),
                                    interpolation=cv2.INTER_LINEAR)
-            _active_silhouettes.append(binarize_sam_silhouette(_gate))
+            _active_silhouettes.append(np.asarray(_gate, dtype=np.float32))
         if _active_silhouettes:
             _sam_union = union_binary_silhouettes(_active_silhouettes)
-            # Apply the v1.0 simple SAM controls: fill holes -> margin -> softness.
-            # MARGIN is bidirectional now (negative=erode, positive=dilate).
             session.sam_matte_v1 = process_sam_matte(
                 _sam_union,
                 margin_px=float(sam2_margin),
@@ -756,9 +758,11 @@ class PersistentWindow(QtWidgets.QWidget):
             # green but NN keyed transparent. SAM2-only control.
             "trim_chroma": 0,
             # FILL HOLES: morphological close kernel size (px). v1.0 spec.
-            # 0 = no-op. 5 default (kills typical SAM speckle without filling
-            # large gaps). 20-50 for larger interior fills. SAM2-only control.
-            "fill_holes": 5,
+            # 0 = no-op (default). User opts in only when a shot has actual
+            # interior holes — running close on every frame baked polygonal
+            # facets into the contour and was the bumpy-matte source 2026-05-09.
+            # 20-50 for larger interior fills. SAM2-only control.
+            "fill_holes": 0,
             # FG SOURCE: "nn" = model FG (default, original behavior)
             #            "source" = original plate inside the matte (yellow-shirt rescue)
             #            "blend" = 50/50 NN + source (built but not exposed in UI yet)
@@ -3091,26 +3095,25 @@ class PersistentWindow(QtWidgets.QWidget):
             model = build_sam2(cfg, ckpt, device=device)
             pred  = SAM2ImagePredictor(model)
             pred.set_image(frame_rgb)
-            # return_logits=True returns full-res raw logits (clamped to [-32, +32]
-            # by SAM2). Use masks[best_idx] — the full-res slot — not low_res_masks
-            # (256x256), because upscaling soft sigmoid values 15x bakes 256-grid
-            # banding into the matte.
-            masks, scores, _low_res = pred.predict(
+            # Option C — return_logits=True so we can run the saturation
+            # ramp ourselves. Default predict() binarises the masks at logit 0
+            # and we lose the 2-4 px soft-edge feather across the contour.
+            # Multiplying NN alpha by a hard 0/1 gate is what creates the
+            # "bumpy / polygonal" matte Berto saw 2026-05-09. The ramp pins
+            # confident interior to 1.0 (no decoder texture) and only soft-
+            # feathers within [-2, +2] logit at the silhouette edge.
+            masks, scores, logits = pred.predict(
                 point_coords=np.array(all_pts),
                 point_labels=np.array(labels),
                 multimask_output=True,
+                return_logits=True,
             )
             del pred, model
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             best_idx = int(np.argmax(scores))
-            # Standard SAM2 sigmoid output. The earlier saturation ramp
-            # (commit bcb376c) hard-clipped logits below -2 to zero, which
-            # erased subject regions separated by visual boundaries (e.g.
-            # an actor's butt across a stunt-rig strap). Sigmoid keeps those
-            # regions at low-but-nonzero alpha so they survive the multiply
-            # and can be recovered with HALO/MARGIN if needed.
-            best = masks[best_idx].astype(np.float32)
+            from corridorkey_sam_merge import logits_to_soft_mask
+            best = logits_to_soft_mask(logits[best_idx])
             # Backup the NN alpha if it exists and hasn't been backed up yet.
             # CLEAR restores this backup so the actress comes back without re-processing.
             alpha_path = self.session.session_dir / "alpha.png"
