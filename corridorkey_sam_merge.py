@@ -1,73 +1,57 @@
-# Last modified: 2026-05-08 | Change: v2.2 lower CK injection gate from 0.1 to 0.01. Restores hair tendril detail lost at 2K downsample. | Full history: git log
-"""v2.2 trimap + Closed-Form Matting (pymatting) + CK hair injection.
+# Last modified: 2026-05-09 | Change: v1.0 strip — remove v2.2 trimap+CFM merge. Add process_sam_matte for two-mask output mode. CK and SAM are independent now; the plugin no longer merges them.
+"""v1.0 two-mask SAM matte processing.
 
-REPLACES the v2.1 topology connectivity filter. v2.1 failed when CK had
-soft-alpha paths > threshold connecting body to walls / frame corners
-through green spill — the filter kept the entire connected blob (50%+
-of frame on the test clip).
+CK matte and SAM matte are independent in v1.0. The plugin no longer
+merges them — that responsibility belongs to the user inside the host
+(DaVinci Fusion / AE / Premiere) where mature compositor tools already
+exist.
 
-v2.2 abandons CK-driven topology and uses image-driven alpha matting:
+This module now exposes the simple post-processing the user controls
+via panel sliders before the SAM matte is exported:
 
-  1. Build a SAM-only trimap (CK NOT used in trimap):
-       fg_def      = erode(sam_filled, ~20px)   -> definite foreground
-       sam_dilated = dilate(sam_filled, ~80px)  -> outer boundary
-       trimap = 0.5 elsewhere; 1.0 in fg_def; 0.0 outside sam_dilated.
-  2. Downsample 2x.
-  3. Closed-Form Matting via pymatting on the downsampled image.
-  4. Upsample alpha 2x.
-  5. CK injection in the unknown band only: alpha = max(alpha, ck).
-     This recovers hair/fringe detail that CFM smooths over but CK
-     keyed correctly.
-  6. Hard clamp outside dilated SAM: alpha = 0 there.
+  process_sam_matte(sam, margin_px, softness_sigma, fill_kernel_px)
+      Order: fill holes → shrink/grow margin → soften.
+      Returns float32 [0..1] mask, ready for export or split-view display.
 
-The hard clamp is the safety rail. Walls / forklift / drape edges that
-sit outside the dilation buffer cannot survive, no matter what CK or
-CFM produced. The dilation radius is the spatial trust budget.
+The legacy dispatcher merge_ck_with_sam_active is kept as a passthrough
+returning the CK matte unchanged. Existing call sites still import it
+and get the CK-master-only behavior the v1.0 design wants. They'll be
+rewired to call process_sam_matte directly during Phase B/C.
 
-source_rgb is REQUIRED in v2.2 (was optional in v2.1). If None, raises.
+The v2.2 trimap + Closed-Form Matting + CK injection chain is gone.
+For the prior architecture (chromacity-aware merge, internal Gaussian
+smoothing, hard clamp outside dilated SAM, debug dumps), see git tag
+v2.2-experimental-2026-05-08.
 """
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Iterable, Optional
 
 import numpy as np
 
 
-# Threshold matches the existing 0.5 convention used by every viewer
-# binarisation site (post-sigmoid SAM output). Raise to make SAM more
-# conservative; lower to let more of SAM's confidence band contribute.
 SAM_BINARIZE_THRESHOLD = 0.5
 
-# Diagnostic toggle for the matte-branch snapshot. The merge-time debug
-# dump is gated by DEBUG_MODE below (separate flag so the matte snapshot
-# can be turned off independently). Both default True until validated.
-DEBUG_ENABLED = True
-DEBUG_DIR = Path(__file__).parent / ".chroma_debug"
-
-# Active merge mode toggle. True = v2.2 trimap + CFM (current).
-# False = Path B fallback (chroma-blind max(CK, SAM)). Call sites use the
-# single dispatcher merge_ck_with_sam_active so flipping this flag is a
-# one-deploy A/B without touching call sites. Path B kept on disk for
-# hot-revert; v2.1 connectivity logic is gone.
-USE_CHROMA_GATED_MERGE = True
-
-# v2.2 debug toggle. Separate from DEBUG_ENABLED so the merge dump can be
-# disabled for production renders independently of the matte snapshot.
-DEBUG_MODE = True   # set False for production renders
+# v1.0 two-mask mode: the merge dispatcher is a passthrough, the v2.2
+# chain is removed. These flags are kept for any downstream code that
+# still reads them; both are False so v2.2 paths never run.
+USE_CHROMA_GATED_MERGE = False
+DEBUG_ENABLED = False
+DEBUG_MODE = False
 
 
 def binarize_sam_silhouette(sam: np.ndarray, threshold: float = SAM_BINARIZE_THRESHOLD) -> np.ndarray:
     # WHAT IT DOES: Threshold a continuous SAM mask to binary {0.0, 1.0} float32.
     # DEPENDS ON:   numpy. Caller pre-applies sigmoid if input is logit-space.
-    # AFFECTS:      every merge — controls SAM silhouette edge sharpness.
+    # AFFECTS:      Used by the viewer/renderer to convert per-object SAM gates
+    #               to binary before unioning across MASK 1 / MASK 2.
     return (np.asarray(sam, dtype=np.float32) >= float(threshold)).astype(np.float32)
 
 
 def union_binary_silhouettes(silhouettes: Iterable[np.ndarray]) -> Optional[np.ndarray]:
     # WHAT IT DOES: OR-combine N already-binarised SAM silhouettes via per-pixel max.
     # DEPENDS ON:   all silhouettes share identical H x W shape. None entries dropped.
-    # AFFECTS:      multi-object renders (MASK 1 + MASK 2). Single-object: pass-through.
+    # AFFECTS:      Multi-object renders (MASK 1 + MASK 2). Single-object: pass-through.
     valid = [np.asarray(s, dtype=np.float32) for s in silhouettes if s is not None]
     if not valid:
         return None
@@ -77,278 +61,92 @@ def union_binary_silhouettes(silhouettes: Iterable[np.ndarray]) -> Optional[np.n
     return out.astype(np.float32, copy=False)
 
 
-def merge_ck_with_sam(ck_alpha: np.ndarray, sam_silhouette: Optional[np.ndarray]) -> np.ndarray:
-    # WHAT IT DOES: Path B fallback merge — final = max(CK, SAM_binary). Kept
-    #               on disk for hot-revert via USE_CHROMA_GATED_MERGE=False.
-    # DEPENDS ON:   ck_alpha and sam_silhouette must share identical H x W shape.
-    #               Both float32 in [0, 1]. sam should be ALREADY binary.
-    # AFFECTS:      only the fallback branch of merge_ck_with_sam_active. Not on
-    #               the active code path under normal operation.
-    ck = np.asarray(ck_alpha, dtype=np.float32)
-    if sam_silhouette is None:
-        return ck.copy()
-    sam = np.asarray(sam_silhouette, dtype=np.float32)
-    if ck.shape != sam.shape:
-        raise ValueError(f"shape mismatch: ck={ck.shape}, sam={sam.shape}")
-    difference = np.clip(sam - ck, 0.0, 1.0)
-    final = np.clip(ck + difference, 0.0, 1.0)
-    return final
-
-
-def _save_debug_dump_v22(
-    ck: np.ndarray,
+def process_sam_matte(
     sam: np.ndarray,
-    sam_filled: np.ndarray,
-    fg_def: np.ndarray,
-    sam_dilated: np.ndarray,
-    trimap: np.ndarray,
-    alpha_solved: np.ndarray,
-    final: np.ndarray,
-    scale: int,
-) -> None:
-    # WHAT IT DOES: Diagnostic dump for the v2.2 trimap + CFM merge. Writes the
-    #   per-stage masks + CFM output + final to DEBUG_DIR. Overwrites previous
-    #   dump; only the LAST merge call survives.
-    # DEPENDS ON:   cv2 (lazy), numpy, pathlib. DEBUG_DIR mkdir-on-write.
-    # AFFECTS:      writes 8 files to DEBUG_DIR; no return; no logic side effect.
-    import cv2 as _cv2
-    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+    margin_px: float = 0.0,
+    softness_sigma: float = 0.0,
+    fill_kernel_px: int = 0,
+) -> np.ndarray:
+    """Apply the v1.0 simple SAM matte post-processing chain.
 
-    ck_vis = np.clip(ck * 255.0, 0.0, 255.0).astype(np.uint8)
-    _cv2.imwrite(str(DEBUG_DIR / "debug_ck_alpha.png"), ck_vis)
+    Order of operations:
+      1. Fill holes — morphological close to kill SAM speckle and seal small
+         interior gaps. Kernel size in pixels; 0 = no-op.
+      2. Margin — shrink (negative) or grow (positive) the silhouette. Pixels;
+         0 = no-op. Sub-pixel via lerp between adjacent integer kernel sizes.
+      3. Softness — Gaussian blur of the matte for feathered edges. Sigma in
+         pixels; 0 = no-op.
 
-    sam_vis = (sam.astype(np.uint8)) * 255
-    _cv2.imwrite(str(DEBUG_DIR / "debug_sam_silhouette.png"), sam_vis)
+    Args:
+        sam: (H, W) float32 mask in [0, 1] (or any range — clipped on output).
+             May be soft (post-sigmoid) or already-binary.
+        margin_px: -50..+50 typical. Negative erodes, positive dilates.
+        softness_sigma: 0..30 typical. Gaussian sigma in pixels.
+        fill_kernel_px: 0..50 typical. Close kernel size in pixels.
 
-    sam_filled_vis = (sam_filled.astype(np.uint8)) * 255
-    _cv2.imwrite(str(DEBUG_DIR / "debug_sam_filled.png"), sam_filled_vis)
-
-    fg_def_vis = (fg_def.astype(np.uint8)) * 255
-    _cv2.imwrite(str(DEBUG_DIR / "debug_fg_def.png"), fg_def_vis)
-
-    sam_dilated_vis = (sam_dilated.astype(np.uint8)) * 255
-    _cv2.imwrite(str(DEBUG_DIR / "debug_sam_dilated.png"), sam_dilated_vis)
-
-    # trimap visualization: 0.0 -> 0, 0.5 -> 128, 1.0 -> 255.
-    trimap_vis = np.clip(trimap * 255.0, 0.0, 255.0).astype(np.uint8)
-    _cv2.imwrite(str(DEBUG_DIR / "debug_trimap.png"), trimap_vis)
-
-    alpha_solved_vis = np.clip(alpha_solved * 255.0, 0.0, 255.0).astype(np.uint8)
-    _cv2.imwrite(str(DEBUG_DIR / "debug_alpha_solved.png"), alpha_solved_vis)
-
-    final_vis = np.clip(final * 255.0, 0.0, 255.0).astype(np.uint8)
-    _cv2.imwrite(str(DEBUG_DIR / "debug_final.png"), final_vis)
-
-    H, W = ck.shape
-    n_pixels = float(ck.size)
-    unknown_band_pixels = int(((trimap > 0.4) & (trimap < 0.6)).sum())
-    fg_pixels = int((trimap >= 1.0).sum())
-    bg_pixels = int((trimap <= 0.0).sum())
-
-    # Feet-zone crops + floor-probe coords from sam_dilated bbox.
-    bbox_y, bbox_x = np.where(sam_dilated > 0.5)
-    floor_probes = []  # list of (name, y, x) appended to stats_lines below
-    if bbox_y.size > 0:
-        y_min, y_max = int(bbox_y.min()), int(bbox_y.max())
-        x_min, x_max = int(bbox_x.min()), int(bbox_x.max())
-        feet_y_start = int(y_min + 0.75 * (y_max - y_min))
-        feet_y_end   = min(H, y_max + 100)
-        feet_x_start = max(0, x_min - 200)
-        feet_x_end   = min(W, x_max + 200)
-
-        crop_final  = final [feet_y_start:feet_y_end, feet_x_start:feet_x_end]
-        crop_ck     = ck    [feet_y_start:feet_y_end, feet_x_start:feet_x_end]
-        crop_trimap = trimap[feet_y_start:feet_y_end, feet_x_start:feet_x_end]
-
-        _cv2.imwrite(str(DEBUG_DIR / "matte_debug_feet_final.png"),
-                     np.clip(crop_final * 255.0, 0.0, 255.0).astype(np.uint8))
-        _cv2.imwrite(str(DEBUG_DIR / "matte_debug_feet_ck.png"),
-                     np.clip(crop_ck * 255.0, 0.0, 255.0).astype(np.uint8))
-        _cv2.imwrite(str(DEBUG_DIR / "matte_debug_feet_trimap.png"),
-                     np.clip(crop_trimap * 255.0, 0.0, 255.0).astype(np.uint8))
-
-        # Hair-zone crops: top 25% of bbox + 100 px above + 200 px lateral.
-        hair_y_start = max(0, y_min - 100)
-        hair_y_end   = int(y_min + 0.25 * (y_max - y_min))
-        hair_x_start = max(0, x_min - 200)
-        hair_x_end   = min(W, x_max + 200)
-        crop_hair_final  = final [hair_y_start:hair_y_end, hair_x_start:hair_x_end]
-        crop_hair_ck     = ck    [hair_y_start:hair_y_end, hair_x_start:hair_x_end]
-        crop_hair_trimap = trimap[hair_y_start:hair_y_end, hair_x_start:hair_x_end]
-        _cv2.imwrite(str(DEBUG_DIR / "matte_debug_hair_final.png"),
-                     np.clip(crop_hair_final * 255.0, 0.0, 255.0).astype(np.uint8))
-        _cv2.imwrite(str(DEBUG_DIR / "matte_debug_hair_ck.png"),
-                     np.clip(crop_hair_ck * 255.0, 0.0, 255.0).astype(np.uint8))
-        _cv2.imwrite(str(DEBUG_DIR / "matte_debug_hair_trimap.png"),
-                     np.clip(crop_hair_trimap * 255.0, 0.0, 255.0).astype(np.uint8))
-
-        floor_probes = [
-            ("FLOOR_LEFT_OF_FEET ",  min(H - 1, max(0, feet_y_start + 50)),
-                                     min(W - 1, max(0, feet_x_start + 50))),
-            ("FLOOR_RIGHT_OF_FEET",  min(H - 1, max(0, feet_y_start + 50)),
-                                     min(W - 1, max(0, feet_x_end - 50))),
-            ("FLOOR_DIRECT_UNDER ",  min(H - 1, max(0, feet_y_end - 30)),
-                                     min(W - 1, max(0, (x_min + x_max) // 2))),
-            ("FLOOR_FAR_LEFT     ",  min(H - 1, max(0, feet_y_end - 30)),
-                                     min(W - 1, max(0, feet_x_start + 30))),
-            ("FLOOR_FAR_RIGHT    ",  min(H - 1, max(0, feet_y_end - 30)),
-                                     min(W - 1, max(0, feet_x_end - 30))),
-        ]
-
-    sample_topleft = (0, 0)
-    sample_body_ctr = (H // 2, W // 2)
-    sample_wall = (int(H * 0.10), int(W * 0.15))
-    sample_foot = (int(H * 0.90), int(W * 0.50))
-
-    def _fmt(name: str, y: int, x: int) -> str:
-        return (
-            f"PIXEL_{name}: ck={float(ck[y, x]):.4f} "
-            f"sam={int(sam[y, x])} "
-            f"trimap={float(trimap[y, x]):.2f} "
-            f"final={float(final[y, x]):.4f}  ({y}, {x})"
-        )
-
-    stats_lines = [
-        "=== v2.2 trimap + CFM debug dump ===",
-        f"SHAPE_CK: {ck.shape}",
-        f"DOWNSAMPLE_SCALE: {scale}x",
-        f"TRIMAP_FG_PIXELS: {fg_pixels}",
-        f"TRIMAP_BG_PIXELS: {bg_pixels}",
-        f"TRIMAP_UNKNOWN_PIXELS: {unknown_band_pixels}",
-        f"FRACTION_UNKNOWN: {unknown_band_pixels / n_pixels * 100.0:.4f}%",
-        f"ALPHA_SOLVED_RANGE: min={float(alpha_solved.min()):.4f} "
-        f"max={float(alpha_solved.max()):.4f} mean={float(alpha_solved.mean()):.4f}",
-        f"FINAL_RANGE: min={float(final.min()):.4f} "
-        f"max={float(final.max()):.4f} mean={float(final.mean()):.4f}",
-        f"SAM_DILATED_COVERAGE: {float(sam_dilated.sum()) / n_pixels * 100.0:.4f}%",
-        _fmt("TOPLEFT     ", *sample_topleft),
-        _fmt("BODY_CENTER ", *sample_body_ctr),
-        _fmt("WALL        ", *sample_wall),
-        _fmt("FOOT        ", *sample_foot),
-    ]
-    for _name, _y, _x in floor_probes:
-        stats_lines.append(_fmt(_name, _y, _x))
-    (DEBUG_DIR / "debug_stats.txt").write_text("\n".join(stats_lines) + "\n")
-
-
-def merge_ck_with_sam_chroma_gated(ck_alpha, sam_silhouette, source_rgb=None):
+    Returns:
+        (H, W) float32 mask in [0, 1].
     """
-    v2.2 trimap + Closed-Form Matting with CK hair injection.
-
-    source_rgb is REQUIRED in v2.2. If None, raise ValueError.
-    """
-    import numpy as np
     import cv2
-    from scipy.ndimage import binary_fill_holes
-    from pymatting import estimate_alpha_cf
 
-    if source_rgb is None:
-        raise ValueError("v2.2 requires source_rgb input")
+    out = np.asarray(sam, dtype=np.float32)
 
-    H, W = ck_alpha.shape
-    ck = np.clip(ck_alpha.astype(np.float32), 0.0, 1.0)
-    sam = (sam_silhouette > 0.5).astype(np.uint8)
-    rgb = np.clip(source_rgb.astype(np.float32) / 255.0, 0.0, 1.0) \
-          if source_rgb.dtype != np.float32 \
-          else np.clip(source_rgb, 0.0, 1.0)
+    # ── 1. Fill holes (morphological close on the binarised gate) ──
+    if fill_kernel_px and fill_kernel_px > 0:
+        k = max(3, int(fill_kernel_px) | 1)  # round up to odd
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        binary_u8 = (out > 0.5).astype(np.uint8) * 255
+        closed = cv2.morphologyEx(binary_u8, cv2.MORPH_CLOSE, kernel)
+        out = closed.astype(np.float32) / 255.0
 
-    # 1. Preprocess SAM
-    k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (40, 40))
-    sam_closed = cv2.morphologyEx(sam, cv2.MORPH_CLOSE, k_close)
-    sam_filled = binary_fill_holes(sam_closed).astype(np.uint8)
+    # ── 2. Margin (bidirectional: negative=erode, positive=dilate) ──
+    margin_f = float(margin_px or 0.0)
+    if margin_f != 0.0:
+        m_abs = abs(margin_f)
+        int_m = int(m_abs)
+        frac = m_abs - int_m
+        binary_u8 = (np.clip(out, 0, 1) * 255).astype(np.uint8)
+        op = cv2.dilate if margin_f > 0 else cv2.erode
 
-    # 2. Definite foreground (eroded SAM)
-    k_erode = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (41, 41))
-    fg_def = cv2.erode(sam_filled, k_erode, iterations=1)
+        if int_m > 0:
+            k_lo = int_m * 2 + 1
+            lo = op(binary_u8, cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (k_lo, k_lo)
+            )).astype(np.float32) / 255.0
+        else:
+            lo = out.copy()
 
-    # 3. Outer boundary (dilated SAM)
-    k_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (81, 81))
-    sam_dilated = cv2.dilate(sam_filled, k_dilate, iterations=1)
+        if frac > 0:
+            k_hi = (int_m + 1) * 2 + 1
+            hi = op(binary_u8, cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (k_hi, k_hi)
+            )).astype(np.float32) / 255.0
+            out = lo * (1.0 - frac) + hi * frac
+        else:
+            out = lo
 
-    # 4. Build trimap (SAM only, CK not used)
-    trimap = np.full((H, W), 0.5, dtype=np.float32)
-    trimap[fg_def > 0] = 1.0
-    trimap[sam_dilated == 0] = 0.0
+    # ── 3. Softness (Gaussian) ──
+    sigma = float(softness_sigma or 0.0)
+    if sigma > 0:
+        k = max(3, int(sigma * 6) | 1)
+        out = cv2.GaussianBlur(out, (k, k), sigmaX=sigma, sigmaY=sigma)
 
-    # 5. Downsample for CFM
-    scale = 2 if max(H, W) > 2500 else 1
-    if scale > 1:
-        h, w = H // scale, W // scale
-        trimap_small = cv2.resize(trimap, (w, h), cv2.INTER_NEAREST)
-        rgb_small = cv2.resize(rgb, (w, h), cv2.INTER_AREA)
-    else:
-        trimap_small = trimap
-        rgb_small = rgb
+    return np.clip(out, 0.0, 1.0)
 
-    # 6. Run CFM. pymatting's Numba kernels expect float64; cast immediately
-    # before the call so upstream stays float32 for memory.
-    alpha_small = estimate_alpha_cf(
-        rgb_small.astype(np.float64),
-        trimap_small.astype(np.float64),
-    )
 
-    # 7. Upsample
-    if scale > 1:
-        alpha = cv2.resize(alpha_small.astype(np.float32), (W, H), cv2.INTER_LINEAR)
-    else:
-        alpha = alpha_small.astype(np.float32)
-    alpha = np.clip(alpha, 0.0, 1.0)
+# ──────────────────────────────────────────────────────────────────────
+# Legacy passthrough shims
+# Kept so existing call sites still work during the Phase A→B→C migration.
+# In v1.0 two-mask mode no merge happens in the plugin — the dispatcher
+# returns the CK matte unchanged. Callers that want SAM post-processing
+# call process_sam_matte directly. After Phase B/C wires every call site,
+# these shims can be deleted.
+# ──────────────────────────────────────────────────────────────────────
 
-    # 8. CK hair injection in unknown band only
-    unknown_band = (trimap == 0.5)
-    # Only inject CK where CFM also found foreground signal.
-    # Prevents CK = 1.0 floor pixels from blowing up alpha where
-    # CFM correctly assigned them low alpha.
-    inject_zone = unknown_band & (alpha > 0.01)
-    alpha[inject_zone] = np.maximum(alpha[inject_zone], ck[inject_zone])
 
-    # Internal smoothing - soften hard transitions inside sam_dilated.
-    # The fg_def to unknown band transition and any CK-driven hard
-    # jumps (e.g., green tarp edges meeting floor within the unknown
-    # band) produce visible 1-2 pixel cliffs in the matte. We low-
-    # pass filter alpha only within sam_dilated to feather these
-    # transitions over ~8 pixels. Outside sam_dilated, alpha is
-    # left untouched (the boundary feather below will handle that).
-    INTERNAL_BLUR_KERNEL = 15      # odd
-    INTERNAL_BLUR_SIGMA  = 2.5     # ~8 px effective transition
-    alpha_smooth = cv2.GaussianBlur(
-        alpha, (INTERNAL_BLUR_KERNEL, INTERNAL_BLUR_KERNEL),
-        INTERNAL_BLUR_SIGMA
-    )
-    inside_band = sam_dilated > 0
-    alpha = np.where(inside_band, alpha_smooth, alpha)
-
-    # 9. Hard clamp outside dilated SAM
-    alpha[sam_dilated == 0] = 0.0
-
-    if DEBUG_MODE:
-        _save_debug_dump_v22(
-            ck=ck, sam=sam, sam_filled=sam_filled,
-            fg_def=fg_def, sam_dilated=sam_dilated,
-            trimap=trimap, alpha_solved=alpha_small,
-            final=alpha,
-            scale=scale,
-        )
-
-    return alpha.astype(np.float32)
-
-# Tuning guide (v2.2):
-# If foot halo within dilated band (CFM extends alpha into floor near foot):
-#   This is the dark-on-dark concern. Two levers:
-#   - Reduce dilation kernel from 161 toward 121 or 81 (tighter trust budget,
-#     hard-clamp kicks in sooner). Watch hair clipping.
-#   - The CK injection in the unknown band uses max(); CK can only INCREASE
-#     alpha, not decrease. Halos from CFM cannot be killed by CK.
-# If hair tendrils clipped beyond dilated SAM:
-#   Increase dilation kernel from 161 toward 181 or 201. Trust budget grows.
-#   Tradeoff: more room for CFM and CK to bleed into junk.
-# If butt notch returns (SAM under-clipping not absorbed by close):
-#   Increase close kernel from 40 toward 60 or 80.
-# If CFM runtime exceeds budget on a real shot:
-#   The downsample threshold is H > 3000. Lower it (e.g. H > 2000) to force
-#   downsample on smaller frames.
-# DO NOT use CK in the trimap.
-# DO NOT skip the hard clamp at the end.
+def merge_ck_with_sam(ck_alpha: np.ndarray, sam_silhouette: Optional[np.ndarray]) -> np.ndarray:
+    """v1.0 passthrough: returns CK unchanged. SAM is exported separately."""
+    return np.asarray(ck_alpha, dtype=np.float32).copy()
 
 
 def merge_ck_with_sam_active(
@@ -357,74 +155,15 @@ def merge_ck_with_sam_active(
     source_rgb: Optional[np.ndarray] = None,
     screen_type: str = "green",
 ) -> np.ndarray:
-    # WHAT IT DOES: Public dispatcher. Routes to the v2.2 trimap+CFM merge when
-    #   USE_CHROMA_GATED_MERGE is True, otherwise falls back to Path B (max).
-    #   Call sites use this single entry point so the A/B switch is a one-flag
-    #   flip with no call-site changes. screen_type kwarg accepted for backward
-    #   compatibility; v2.2 ignores it.
-    # DEPENDS ON:   USE_CHROMA_GATED_MERGE module flag, merge_ck_with_sam (Path B),
-    #               merge_ck_with_sam_chroma_gated (v2.2 trimap+CFM).
-    # AFFECTS:      every site that imports this dispatcher. Currently:
-    #               resolve renderer, resolve viewer, AE viewer (composite + matte).
-    if USE_CHROMA_GATED_MERGE:
-        print(
-            f"[merge] v2.2 trimap+CFM branch  USE_CHROMA_GATED_MERGE=True  "
-            f"source_rgb.shape={getattr(source_rgb, 'shape', None)}"
-        )
-        return merge_ck_with_sam_chroma_gated(
-            ck_alpha, sam_silhouette, source_rgb=source_rgb,
-        )
-    print("[merge] Path B fallback branch  (flag=False)")
-    return merge_ck_with_sam(ck_alpha, sam_silhouette)
+    """v1.0 passthrough dispatcher: returns CK unchanged.
+
+    Pre-v1.0 this was the v2.2 chroma-gated merge. v1.0 decouples CK and SAM —
+    plugin no longer merges them, the user composites in their host.
+    Existing imports keep working; the displayed/rendered alpha is just CK.
+    """
+    return np.asarray(ck_alpha, dtype=np.float32).copy()
 
 
 def write_matte_final_dump(alpha_final: np.ndarray, ops_applied) -> None:
-    # WHAT IT DOES: Snapshots the v2.2 debug PNGs (debug_*.png) under matte_-
-    #   prefixed names so they survive any subsequent composite-mode re-render
-    #   that would overwrite them, then saves the final post-processed alpha as
-    #   matte_debug_final_displayed.png + writes matte_debug_stats.txt with the
-    #   ordered list of ops applied to the merge output before display.
-    # DEPENDS ON:   cv2 (lazy), shutil, numpy, pathlib. DEBUG_DIR mkdir-on-write.
-    #               Assumes the caller's most recent merge_ck_with_sam_chroma_gated
-    #               call dumped to debug_*.png moments earlier.
-    # AFFECTS:      writes matte_-prefixed files to DEBUG_DIR; no return; no logic
-    #               side effect. No-op when DEBUG_ENABLED is False.
-    if not DEBUG_ENABLED:
-        return
-    import cv2 as _cv2
-    import shutil as _shutil
-    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
-    snapshot_pairs = [
-        ("debug_ck_alpha.png", "matte_debug_ck_alpha.png"),
-        ("debug_sam_silhouette.png", "matte_debug_sam_silhouette.png"),
-        ("debug_sam_filled.png", "matte_debug_sam_filled.png"),
-        ("debug_fg_def.png", "matte_debug_fg_def.png"),
-        ("debug_sam_dilated.png", "matte_debug_sam_dilated.png"),
-        ("debug_trimap.png", "matte_debug_trimap.png"),
-        ("debug_alpha_solved.png", "matte_debug_alpha_solved.png"),
-        ("debug_final.png", "matte_debug_final.png"),
-        ("debug_stats.txt", "matte_debug_merge_stats.txt"),
-    ]
-    for src_name, dst_name in snapshot_pairs:
-        src_p = DEBUG_DIR / src_name
-        dst_p = DEBUG_DIR / dst_name
-        try:
-            if src_p.exists():
-                _shutil.copy2(str(src_p), str(dst_p))
-        except Exception:
-            pass
-    a = np.asarray(alpha_final, dtype=np.float32)
-    final_vis = np.clip(a * 255.0, 0.0, 255.0).astype(np.uint8)
-    _cv2.imwrite(str(DEBUG_DIR / "matte_debug_final_displayed.png"), final_vis)
-    stats = (
-        "=== matte view final-displayed dump ===\n"
-        f"ops applied to merge_output before display: {list(ops_applied)}\n"
-        f"final alpha shape={a.shape}  "
-        f"mean={float(a.mean()):.4f}  "
-        f"min={float(a.min()):.4f}  "
-        f"max={float(a.max()):.4f}\n"
-        "Compare matte_debug_final.png vs matte_debug_final_displayed.png:\n"
-        "  - If different: a downstream op altered the merge output.\n"
-        "  - If identical: the merge inputs (matte_debug_ck_alpha + matte_debug_trimap + matte_debug_alpha_solved) explain the output.\n"
-    )
-    (DEBUG_DIR / "matte_debug_stats.txt").write_text(stats)
+    """v2.2 debug dump — no-op in v1.0."""
+    return

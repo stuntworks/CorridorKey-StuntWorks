@@ -357,30 +357,30 @@ def render_composite(cu, session: Session, params: dict):
     sam2_subtract = bool(params.get("sam2_subtract", False))
     sam2_bypass = bool(params.get("sam2_bypass", False))
     edge_guard_px = int(params.get("edge_guard_px", 20))
-    # PATH B (per Berto 2026-05-05): SAM gate binarised at 0.5 and OR-blended
-    # into CK alpha. CK preserved; SAM only contributes where CK is lower.
-    # final = clip(CK + clip(SAM_binary - CK, 0, 1), 0, 1).
-    # Mode flags (sam2_subtract / _weighted / _additive) and HALO / EDGE GUARD
-    # / TRIM SAM2 / FILL HOLES are NO-OPS under Path B — sliders remain wired
-    # but feed nothing. apply_sam2_gate_* in sam2_combine.py are now orphan
-    # dead code, kept on disk for hot-revert per Berto's instruction.
+    # v1.0 TWO-MASK MODE — CK is the displayed master, SAM is processed
+    # separately for export (Phase B) and side-by-side preview (Phase C).
+    # No merge happens here. SAM gate is run through the simple v1.0
+    # MARGIN / SOFTEN / FILL HOLES chain and stored on session for the
+    # renderer to write as a sidecar alpha PNG.
+    # Mode flags (sam2_subtract / _weighted / _additive) and HALO / EDGE
+    # GUARD / TRIM SAM2 are NO-OPS in v1.0. v2.2 chain lives in git tag
+    # v2.2-experimental-2026-05-08 for hot-revert.
+    session.sam_matte_v1 = None
     if session.alpha_nn is not None and session.sam2_gate_raw is not None and not sam2_bypass:
-        from corridorkey_sam_merge import binarize_sam_silhouette, merge_ck_with_sam_active
-        # source_rgb fed to the active dispatcher: chroma-gated merge needs the
-        # un-despilled source plate to compute on-green vs off-green pixel weights.
-        _src_rgb = session.original_rgb if session.original_rgb is not None else session.fg_rgb
+        from corridorkey_sam_merge import binarize_sam_silhouette, process_sam_matte
         _gate = session.sam2_gate_raw.copy()
         if _gate.shape != session.alpha_nn.shape:
             _gate = cv2.resize(_gate, (session.alpha_nn.shape[1], session.alpha_nn.shape[0]),
                                interpolation=cv2.INTER_LINEAR)
-        alpha = merge_ck_with_sam_active(session.alpha_nn, binarize_sam_silhouette(_gate),
-                                         source_rgb=_src_rgb)
-    else:
-        alpha = session.alpha.copy()
-    if sam2_margin > 0:
-        alpha = _dilate_mask(alpha, sam2_margin)
-    if sam2_soften > 0:
-        alpha = _soften_mask(alpha, sam2_soften)
+        session.sam_matte_v1 = process_sam_matte(
+            binarize_sam_silhouette(_gate),
+            margin_px=float(sam2_margin),
+            softness_sigma=float(sam2_soften),
+            fill_kernel_px=int(fill_holes),
+        )
+    # Display alpha = CK alone (untouched master). SAM matte ships as a
+    # separate alpha clip via the renderer when the user opts in.
+    alpha = session.alpha.copy()
     if choke_px > 0:
         int_choke = int(choke_px)
         frac = choke_px - int_choke
@@ -500,11 +500,9 @@ class PersistentWindow(QtWidgets.QWidget):
             # combine — kills "holes" at silhouette edges where SAM2 claims
             # green but NN keyed transparent. SAM2-only control.
             "trim_chroma": 0,
-            # FILL HOLES: color-aware interior alpha-zero fill. 0 = off
-            # (bit-identical). >0 fills alpha=0 holes inside the SAM2 gate at
-            # non-screen-color pixels — rescues NN dropouts on yellow shirts,
-            # skin, red. SAM2-only control.
-            "fill_holes": 0,
+            # FILL HOLES: morphological close kernel size (px). v1.0 spec.
+            # 0 = no-op. 5 default. SAM2-only control.
+            "fill_holes": 5,
             "choke": 0,
             # FG SOURCE: "nn" = model FG (default, original behavior)
             #            "source" = original plate inside the matte (yellow-shirt rescue)
@@ -973,10 +971,10 @@ class PersistentWindow(QtWidgets.QWidget):
         self.choke_value_label.setMinimumWidth(42)
         grid.addWidget(self.choke_value_label, 2, 2)
 
-        # --- SAM2 margin: expand mask boundary outward (px) ---
+        # --- SAM2 MARGIN: bidirectional shrink/grow (-50..+50 px). v1.0 spec. ---
         grid.addWidget(_label("MARGIN"), 3, 0)
         self.sam2_margin_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.sam2_margin_slider.setRange(0, 80)
+        self.sam2_margin_slider.setRange(-50, 50)
         self.sam2_margin_slider.setValue(int(self._params["sam2_margin"]))
         self.sam2_margin_slider.valueChanged.connect(self._on_sam2_margin_changed)
         grid.addWidget(self.sam2_margin_slider, 3, 1)
@@ -984,10 +982,10 @@ class PersistentWindow(QtWidgets.QWidget):
         self.sam2_margin_value_label.setMinimumWidth(42)
         grid.addWidget(self.sam2_margin_value_label, 3, 2)
 
-        # --- SAM2 soften: feather mask edges with Gaussian blur (px) ---
+        # --- SAM2 SOFTEN: Gaussian sigma 0..30 px. v1.0 spec. ---
         grid.addWidget(_label("SOFTEN"), 4, 0)
         self.sam2_soften_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.sam2_soften_slider.setRange(0, 80)
+        self.sam2_soften_slider.setRange(0, 30)
         self.sam2_soften_slider.setValue(int(self._params["sam2_soften"]))
         self.sam2_soften_slider.valueChanged.connect(self._on_sam2_soften_changed)
         grid.addWidget(self.sam2_soften_slider, 4, 1)
@@ -1030,23 +1028,20 @@ class PersistentWindow(QtWidgets.QWidget):
         # TRIM SAM2 widget removed from UI 2026-05-01 (Berto declared useless).
         # Underlying flow + helper kept; param defaults to 0.
 
-        # --- FILL HOLES: color-aware interior alpha-zero fill (slider 0-100 integer). ---
-        # SAM2-only. Fills alpha=0 holes INSIDE the SAM2 gate at pixels whose
-        # source RGB is NOT screen-colored — rescues NN dropouts on yellow
-        # shirts / skin / red while leaving correctly-killed green pixels alone.
-        # 0 = bit-identical. Higher = more lenient (more pixels qualify as
-        # "non-screen"). Mirrors Resolve viewer's FILL HOLES slider.
-        _FILL_TOOLTIP = ("FILL HOLES — fills NN alpha=0 dropouts inside SAM2 mask, but only for non-screen-color pixels.\n"
-                         "0 = off (bit-identical). 30-60 typical. Higher = more aggressive.")
+        # --- FILL HOLES: morphological close kernel (slider 0..50). v1.0 spec. ---
+        # SAM2-only. Fills small interior holes inside the SAM2 mask via
+        # cv2.MORPH_CLOSE. 0 = no-op. Mirrors Resolve viewer.
+        _FILL_TOOLTIP = ("FILL HOLES — close kernel size in pixels.\n"
+                         "Fills small interior holes inside the SAM2 mask.\n"
+                         "0 = off. 5 default. 20-50 for larger gaps.")
         self.fill_holes_label_widget = _label("FILL HOLES")
         self.fill_holes_label_widget.setToolTip(_FILL_TOOLTIP)
         grid.addWidget(self.fill_holes_label_widget, 7, 0)
         self.fill_holes_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.fill_holes_slider.setRange(0, 100)
+        self.fill_holes_slider.setRange(0, 50)
         self.fill_holes_slider.setValue(int(self._params["fill_holes"]))
         self.fill_holes_slider.valueChanged.connect(self._on_fill_holes_changed)
         self.fill_holes_slider.setToolTip(_FILL_TOOLTIP)
-        grid.addWidget(self.fill_holes_slider, 7, 1)
         self.fill_holes_value_label = _label(f"{int(self._params['fill_holes'])}", "#0ff")
         self.fill_holes_value_label.setMinimumWidth(42)
         self.fill_holes_value_label.setToolTip(_FILL_TOOLTIP)
