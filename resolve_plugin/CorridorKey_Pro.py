@@ -36,6 +36,12 @@ if sys.stderr is None: sys.stderr = io.StringIO()
 # breaks: if removed, SAM2 init_state throws SystemError on first BRAW range run.
 import os as _os
 _os.environ["TQDM_DISABLE"] = "True"
+# v1.0 — enable OpenCV's OpenEXR codec so the EXR 32-bit output option works.
+# OpenCV ships EXR disabled by default since v4.5 (CVE-2017-5110/5111 family).
+# Plugin runs only the user's local PNG/TIFF/EXR files in this venv — no
+# untrusted EXR ingestion path — so the disable-by-default isn't relevant
+# here. Must be set BEFORE cv2 imports.
+_os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 try:
     from functools import partialmethod
     from tqdm import tqdm as _tqdm_cls
@@ -284,6 +290,13 @@ winLayout = ui.VGroup({"Spacing": 4}, [
         ui.Label({"Text": "Export:", "Weight": 0}),
         ui.ComboBox({"ID": "ExportFormat", "Weight": 2, "StyleSheet": "QComboBox { background-color: #1a1a1a; border: 1px solid #333; border-radius: 3px; padding: 4px 8px; color: #ccc; } QComboBox:hover { border-color: #0dcaf0; background-color: #222; } QComboBox::drop-down { border-left: 1px solid #333; width: 24px; } QComboBox::down-arrow { border-top: 5px solid #0dcaf0; border-left: 4px solid transparent; border-right: 4px solid transparent; width: 0; height: 0; }"}),
     ]),
+    # v1.0 — output codec / bit depth picker. PNG 8-bit default for editor
+    # workflows. PNG 16-bit eliminates banding on subtle gradients. TIFF 16-bit
+    # is universal lossless. EXR 32-bit is the VFX float standard.
+    ui.HGroup({"Weight": 0, "Spacing": 5}, [
+        ui.Label({"Text": "Codec:", "Weight": 0}),
+        ui.ComboBox({"ID": "OutputCodec", "Weight": 2, "StyleSheet": "QComboBox { background-color: #1a1a1a; border: 1px solid #333; border-radius: 3px; padding: 4px 8px; color: #ccc; } QComboBox:hover { border-color: #0dcaf0; background-color: #222; } QComboBox::drop-down { border-left: 1px solid #333; width: 24px; } QComboBox::down-arrow { border-top: 5px solid #0dcaf0; border-left: 4px solid transparent; border-right: 4px solid transparent; width: 0; height: 0; }"}),
+    ]),
     ui.HGroup({"Weight": 0, "Spacing": 5}, [
         ui.Label({"Text": "Output:", "Weight": 0}),
         ui.ComboBox({"ID": "OutputMode", "Weight": 2, "StyleSheet": "QComboBox { background-color: #1a1a1a; border: 1px solid #333; border-radius: 3px; padding: 4px 8px; color: #ccc; } QComboBox:hover { border-color: #0dcaf0; background-color: #222; } QComboBox::drop-down { border-left: 1px solid #333; width: 24px; } QComboBox::down-arrow { border-top: 5px solid #0dcaf0; border-left: 4px solid transparent; border-right: 4px solid transparent; width: 0; height: 0; }"}),
@@ -416,6 +429,13 @@ items["ScreenType"].AddItem("Blue Screen")
 items["ExportFormat"].AddItem("RGBA (Full)")
 items["ExportFormat"].AddItem("Alpha Only")
 items["ExportFormat"].AddItem("Foreground Only")
+# v1.0 codec dropdown — PNG 8-bit default; user upgrades to 16-bit / EXR for
+# lossless / VFX workflows. EXR support via OPENCV_IO_ENABLE_OPENEXR (set at
+# the top of this module).
+items["OutputCodec"].AddItem("PNG 8-bit (default)")
+items["OutputCodec"].AddItem("PNG 16-bit (lossless)")
+items["OutputCodec"].AddItem("TIFF 16-bit (lossless)")
+items["OutputCodec"].AddItem("EXR 32-bit (VFX float)")
 items["OutputMode"].AddItem("Track 2 (Above Source)")
 items["OutputMode"].AddItem("MediaPool Only")
 items["OutputMode"].AddItem("Fusion Comp")
@@ -457,6 +477,9 @@ def get_settings():
         "despeckle_enabled": True,  # viewer-owned; overridden by _merge_live_params — default ON matches viewer checkbox default
         "despeckle_size": 400,      # viewer-owned; overridden by _merge_live_params
         "export_format": items["ExportFormat"].CurrentIndex,
+        # v1.0 codec selector: 0=PNG8 / 1=PNG16 / 2=TIFF16 / 3=EXR32. Default
+        # PNG8 keeps current renders byte-identical for users who don't change it.
+        "output_codec": items["OutputCodec"].CurrentIndex,
         "output_mode": items["OutputMode"].CurrentIndex,
         # margin/soften sliders moved to viewer; defaults of 0 are overridden by
         # _merge_live_params() which pulls the actual values from live_params.json
@@ -2096,15 +2119,73 @@ def show_preview_window(orig_bgr, keyed_rgb, alpha):
 #   0 = RGBA (foreground + alpha), 1 = Alpha only (grayscale matte), 2 = Foreground only (no alpha)
 # DEPENDS-ON: OpenCV, numpy
 # ISOLATED: pure file write, no side effects beyond disk
-def save_output(fg, matte, path, fmt):
+# v1.0 codec map: 0=PNG8 1=PNG16 2=TIFF16 3=EXR32. Returns the file extension
+# the codec writes. Used by the renderer to decide both the imwrite call and
+# the destination filename so MediaPool finds the right sequence on import.
+def _codec_extension(codec):
+    return {0: ".png", 1: ".png", 2: ".tiff", 3: ".exr"}.get(int(codec or 0), ".png")
+
+
+def save_output(fg, matte, path, fmt, codec=0):
+    """Write the keyed output for ONE frame.
+
+    fmt    — structure: 0 = RGBA keyed (default), 1 = alpha-only, 2 = composite (no alpha).
+    codec  — bit depth + container: 0 PNG 8-bit, 1 PNG 16-bit, 2 TIFF 16-bit, 3 EXR 32-bit.
+    path   — destination path. The caller picks the extension via _codec_extension.
+    """
     import cv2, numpy as np
     m = matte[:, :, 0] if len(matte.shape) == 3 else matte
-    if fmt == 0:
-        fb = cv2.cvtColor((fg * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
-        au = (m * 255).astype(np.uint8)
-        cv2.imwrite(str(path), cv2.merge([fb[:,:,0], fb[:,:,1], fb[:,:,2], au]))
-    elif fmt == 1: cv2.imwrite(str(path), (m * 255).astype(np.uint8))
-    elif fmt == 2: cv2.imwrite(str(path), cv2.cvtColor((fg * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
+    m = np.clip(m, 0.0, 1.0).astype(np.float32)
+    fg_clip = np.clip(fg, 0.0, 1.0).astype(np.float32) if fg is not None else None
+    codec = int(codec or 0)
+
+    if codec == 3:
+        # EXR: float32 throughout. RGBA mode merges 4 channels; matte-only writes
+        # single channel; composite writes RGB. OpenCV's EXR writer expects BGR
+        # (or BGRA for 4-channel) float32.
+        if fmt == 0 and fg_clip is not None:
+            fb = cv2.cvtColor(fg_clip, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(str(path), cv2.merge([fb[:, :, 0], fb[:, :, 1], fb[:, :, 2], m]))
+        elif fmt == 1:
+            cv2.imwrite(str(path), m)
+        else:
+            if fg_clip is not None:
+                cv2.imwrite(str(path), cv2.cvtColor(fg_clip, cv2.COLOR_RGB2BGR))
+        return
+
+    # PNG / TIFF — uint8 (codec 0) or uint16 (codec 1, 2). Same channel logic.
+    if codec == 0:
+        au = (m * 255.0).astype(np.uint8)
+        fg_int = (fg_clip * 255.0).astype(np.uint8) if fg_clip is not None else None
+    else:
+        au = (m * 65535.0).astype(np.uint16)
+        fg_int = (fg_clip * 65535.0).astype(np.uint16) if fg_clip is not None else None
+
+    if fmt == 0 and fg_int is not None:
+        fb = cv2.cvtColor(fg_int, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(str(path), cv2.merge([fb[:, :, 0], fb[:, :, 1], fb[:, :, 2], au]))
+    elif fmt == 1:
+        cv2.imwrite(str(path), au)
+    elif fmt == 2 and fg_int is not None:
+        cv2.imwrite(str(path), cv2.cvtColor(fg_int, cv2.COLOR_RGB2BGR))
+
+
+def save_alpha_only(matte, path, codec=0):
+    """v1.0 SAM matte sidecar — writes alpha-only mask in the user-selected codec.
+
+    Matches save_output's codec semantics so the SAM sidecar always matches the
+    keyed clip's bit depth / container.
+    """
+    import cv2, numpy as np
+    m = matte[:, :, 0] if len(matte.shape) == 3 else matte
+    m = np.clip(m, 0.0, 1.0).astype(np.float32)
+    codec = int(codec or 0)
+    if codec == 3:
+        cv2.imwrite(str(path), m)
+    elif codec == 0:
+        cv2.imwrite(str(path), (m * 255.0).astype(np.uint8))
+    else:
+        cv2.imwrite(str(path), (m * 65535.0).astype(np.uint16))
 
 # WHAT IT DOES: Re-runs the neural keyer on the already-loaded frame using current slider values.
 #   Used by Live Preview mode — avoids re-reading video from disk on every slider change.
@@ -2318,7 +2399,7 @@ def process_current_frame(preview_only=False):
         cn = Path(fp).stem
         od = Path(items["OutputPath"].Text) / f"CK_{cn}"
         od.mkdir(parents=True, exist_ok=True)
-        op = od / f"CK_{cn}_{cf:06d}.png"
+        op = od / f"CK_{cn}_{cf:06d}{_codec_extension(settings.get('output_codec', 0))}"
         fg, mt = res.get("fg"), res.get("alpha")
         # Apply despill manually — NN ran with despill_strength=0 so result["fg"] is raw.
         # Viewer applies its own despill live; render path must match it here.
@@ -2343,7 +2424,7 @@ def process_current_frame(preview_only=False):
             # Use a local copy so the unchanged mt below reaches show_preview_window
             # untouched — the viewer applies despeckle live on its own slider.
             mt_for_save = _apply_despeckle_to_alpha(mt, settings)
-            save_output(fg, mt_for_save, op, settings["export_format"])
+            save_output(fg, mt_for_save, op, settings["export_format"], codec=settings.get("output_codec", 0))
             log(f"Saved: {op.name}")
         if len(mt.shape) == 3: mt = mt[:, :, 0]
         last_preview_data["original"], last_preview_data["keyed"], last_preview_data["alpha"] = frame.copy(), (fg * 255).astype(np.uint8), mt.copy()
@@ -3242,16 +3323,16 @@ def on_process_range(ev):
                 # Despeckle for the rendered output (parity with viewer's render_composite).
                 mt = _apply_despeckle_to_alpha(mt, settings)
                 if fg is not None and mt is not None:
-                    op = od / f"CK_{cn}_{pr:06d}.png"
-                    save_output(fg, mt, op, settings["export_format"])
+                    _ext = _codec_extension(settings.get("output_codec", 0))
+                    op = od / f"CK_{cn}_{pr:06d}{_ext}"
+                    save_output(fg, mt, op, settings["export_format"], codec=settings.get("output_codec", 0))
                     ofs.append(str(op))
-                    # v1.0 SAM matte sidecar — saved as alpha-only PNG when SAM
-                    # is active for this frame. Imported by _do_import on the
-                    # next-higher track than the keyed clip.
+                    # v1.0 SAM matte sidecar — alpha-only file in the user's
+                    # selected codec. Imported by _do_import on the next-higher
+                    # track than the keyed clip.
                     if _sam_matte_v1 is not None:
-                        sam_op = od / f"SAM_{cn}_{pr:06d}.png"
-                        _sam_u8 = (np.clip(_sam_matte_v1, 0, 1) * 255).astype(np.uint8)
-                        cv2.imwrite(str(sam_op), _sam_u8)
+                        sam_op = od / f"SAM_{cn}_{pr:06d}{_ext}"
+                        save_alpha_only(_sam_matte_v1, sam_op, codec=settings.get("output_codec", 0))
                         sam_ofs.append(str(sam_op))
                 del frame  # Release this frame's numpy array before the next decode
                 pr += 1
@@ -3508,29 +3589,56 @@ def on_process_range(ev):
                 # Despeckle for the rendered output (parity with viewer's render_composite).
                 mt = _apply_despeckle_to_alpha(mt, settings)
                 if fg is not None and mt is not None:
-                    op = od / f"CK_{cn}_{pr:06d}.png"
-                    # Encode PNG to bytes IN MEMORY — no file I/O, no Defender block.
+                    _codec = int(settings.get("output_codec", 0))
+                    _ext = _codec_extension(_codec)
+                    op = od / f"CK_{cn}_{pr:06d}{_ext}"
+                    # Encode IN MEMORY — no file I/O on the worker thread, no
+                    # Defender block. Codec selection picks bit depth + format:
+                    #   0 PNG8, 1 PNG16, 2 TIFF16, 3 EXR32 (float).
                     _fmt = settings["export_format"]
                     _m = mt[:, :, 0] if len(mt.shape) == 3 else mt
-                    if _fmt == 0:
-                        _fb = cv2.cvtColor((fg * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
-                        _au = (_m * 255).astype(np.uint8)
-                        _img = cv2.merge([_fb[:,:,0], _fb[:,:,1], _fb[:,:,2], _au])
-                    elif _fmt == 1:
-                        _img = (_m * 255).astype(np.uint8)
+                    _m = np.clip(_m, 0.0, 1.0).astype(np.float32)
+                    _fg_clip = np.clip(fg, 0.0, 1.0).astype(np.float32)
+                    if _codec == 3:
+                        # EXR float32. RGBA = BGR + alpha float; matte-only single channel.
+                        if _fmt == 0:
+                            _fb = cv2.cvtColor(_fg_clip, cv2.COLOR_RGB2BGR)
+                            _img = cv2.merge([_fb[:,:,0], _fb[:,:,1], _fb[:,:,2], _m])
+                        elif _fmt == 1:
+                            _img = _m
+                        else:
+                            _img = cv2.cvtColor(_fg_clip, cv2.COLOR_RGB2BGR)
                     else:
-                        _img = cv2.cvtColor((fg * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
-                    _ret, _buf = cv2.imencode('.png', _img)
+                        # uint8 (codec 0) or uint16 (codec 1, 2)
+                        if _codec == 0:
+                            _au = (_m * 255.0).astype(np.uint8)
+                            _fg_int = (_fg_clip * 255.0).astype(np.uint8)
+                        else:
+                            _au = (_m * 65535.0).astype(np.uint16)
+                            _fg_int = (_fg_clip * 65535.0).astype(np.uint16)
+                        if _fmt == 0:
+                            _fb = cv2.cvtColor(_fg_int, cv2.COLOR_RGB2BGR)
+                            _img = cv2.merge([_fb[:,:,0], _fb[:,:,1], _fb[:,:,2], _au])
+                        elif _fmt == 1:
+                            _img = _au
+                        else:
+                            _img = cv2.cvtColor(_fg_int, cv2.COLOR_RGB2BGR)
+                    _ret, _buf = cv2.imencode(_ext, _img)
                     if _ret:
                         _save_queue.put(("save", str(op), _buf.tobytes()))
                         ofs.append(str(op))
-                    # v1.0 SAM matte sidecar — alpha-only PNG saved alongside
-                    # the keyed clip when SAM is active. Imported by _do_import
-                    # on the next-higher track than the keyed clip.
+                    # v1.0 SAM matte sidecar — alpha-only file in the user's
+                    # selected codec. Imported by _do_import on output_track + 1.
                     if _sam_matte_v1 is not None:
-                        sam_op = od / f"SAM_{cn}_{pr:06d}.png"
-                        _sam_u8 = (np.clip(_sam_matte_v1, 0, 1) * 255).astype(np.uint8)
-                        _ret_s, _buf_s = cv2.imencode('.png', _sam_u8)
+                        sam_op = od / f"SAM_{cn}_{pr:06d}{_ext}"
+                        _sam = np.clip(_sam_matte_v1, 0.0, 1.0).astype(np.float32)
+                        if _codec == 3:
+                            _sam_img = _sam
+                        elif _codec == 0:
+                            _sam_img = (_sam * 255.0).astype(np.uint8)
+                        else:
+                            _sam_img = (_sam * 65535.0).astype(np.uint16)
+                        _ret_s, _buf_s = cv2.imencode(_ext, _sam_img)
                         if _ret_s:
                             _save_queue.put(("save", str(sam_op), _buf_s.tobytes()))
                             sam_ofs.append(str(sam_op))

@@ -84,6 +84,19 @@ Real stunt/action greenscreen clips for testing are attached to the [v0.7.0 rele
 | **GPU** | NVIDIA with CUDA, 8GB+ VRAM recommended |
 | **Editor** | Resolve Studio 18+, After Effects 2020+, or Premiere Pro 2020+ |
 
+### Output Codec — pick your bit depth
+
+Resolve plugin v1.0 ships a codec dropdown next to the export-format selector:
+
+| Codec | What it's for |
+|---|---|
+| **PNG 8-bit** (default) | Editor workflows. Universal compatibility, smallest files. Right for 99% of users. |
+| **PNG 16-bit** | Lossless. Eliminates banding on subtle gradients. ~2× the file size of 8-bit. |
+| **TIFF 16-bit** | Lossless universal — every VFX tool reads it. ~2× file size. |
+| **EXR 32-bit** | VFX float standard. Used by Nuke / Houdini pipelines. Largest files, perfect precision. |
+
+When you switch codec, both the keyed clip AND the SAM matte sidecar (when SAM 2 is active) save in that format. AE and Premiere v1.0 stay on PNG 8-bit; codec selection ships for AE/Premiere in v1.1.
+
 ### Hardware sizing — what to expect
 
 | GPU VRAM | What works | What tends to fall over |
