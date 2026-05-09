@@ -39,6 +39,17 @@ USE_CHROMA_GATED_MERGE = False
 DEBUG_ENABLED = False
 DEBUG_MODE = False
 
+# v1.0 always-on SAM matte baseline cleanup. Raw SAM 2 output has 1-2 px
+# speckle and jaggy contour edges (visible in 084512 test frame). These
+# baselines run inside process_sam_matte so every output path — Resolve
+# preview/render, AE/Premiere preview/render — gets the same cleanup
+# without each call site having to opt in.
+#
+# Sigma 0.75 (NOT the v2.2 2.5 that ate neck hair). Open kernel 3 px
+# kills isolated speckle without touching anything thicker than 1 px.
+SAM_BASELINE_OPEN_KERNEL_PX = 3
+SAM_BASELINE_SMOOTH_SIGMA = 0.75
+
 
 def binarize_sam_silhouette(sam: np.ndarray, threshold: float = SAM_BINARIZE_THRESHOLD) -> np.ndarray:
     # WHAT IT DOES: Threshold a continuous SAM mask to binary {0.0, 1.0} float32.
@@ -70,12 +81,19 @@ def process_sam_matte(
     """Apply the v1.0 simple SAM matte post-processing chain.
 
     Order of operations:
-      1. Fill holes — morphological close to kill SAM speckle and seal small
-         interior gaps. Kernel size in pixels; 0 = no-op.
+      0. BASELINE despeckle (always on) — morphological open with a small
+         kernel kills 1-2 px isolated noise that SAM 2 produces around the
+         silhouette edge. Constant kernel SAM_BASELINE_OPEN_KERNEL_PX.
+      1. Fill holes — morphological close to seal small interior gaps.
+         Kernel size in pixels; 0 = no-op (user-controlled slider).
       2. Margin — shrink (negative) or grow (positive) the silhouette. Pixels;
          0 = no-op. Sub-pixel via lerp between adjacent integer kernel sizes.
-      3. Softness — Gaussian blur of the matte for feathered edges. Sigma in
-         pixels; 0 = no-op.
+      3. BASELINE edge smoothing (always on) — light Gaussian sigma kills
+         jaggy SAM contours without dissolving fine detail. Constant
+         SAM_BASELINE_SMOOTH_SIGMA. Runs BEFORE the user-controlled softness
+         so the user can stack additional feathering on a clean base.
+      4. Softness — Gaussian blur of the matte for feathered edges. Sigma in
+         pixels; 0 = no-op (user-controlled slider).
 
     Args:
         sam: (H, W) float32 mask in [0, 1] (or any range — clipped on output).
@@ -90,6 +108,14 @@ def process_sam_matte(
     import cv2
 
     out = np.asarray(sam, dtype=np.float32)
+
+    # ── 0. BASELINE despeckle (always on, kills 1-2 px noise) ──
+    if SAM_BASELINE_OPEN_KERNEL_PX and SAM_BASELINE_OPEN_KERNEL_PX > 0:
+        k0 = max(3, int(SAM_BASELINE_OPEN_KERNEL_PX) | 1)
+        kernel0 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k0, k0))
+        binary0 = (out > 0.5).astype(np.uint8) * 255
+        opened = cv2.morphologyEx(binary0, cv2.MORPH_OPEN, kernel0)
+        out = opened.astype(np.float32) / 255.0
 
     # ── 1. Fill holes (morphological close on the binarised gate) ──
     if fill_kernel_px and fill_kernel_px > 0:
@@ -125,7 +151,16 @@ def process_sam_matte(
         else:
             out = lo
 
-    # ── 3. Softness (Gaussian) ──
+    # ── 3. BASELINE edge smoothing (always on, sigma 0.75) ──
+    if SAM_BASELINE_SMOOTH_SIGMA and SAM_BASELINE_SMOOTH_SIGMA > 0:
+        kbs = max(3, int(SAM_BASELINE_SMOOTH_SIGMA * 6) | 1)
+        out = cv2.GaussianBlur(
+            out, (kbs, kbs),
+            sigmaX=float(SAM_BASELINE_SMOOTH_SIGMA),
+            sigmaY=float(SAM_BASELINE_SMOOTH_SIGMA),
+        )
+
+    # ── 4. Softness (Gaussian, user-controlled) ──
     sigma = float(softness_sigma or 0.0)
     if sigma > 0:
         k = max(3, int(sigma * 6) | 1)
