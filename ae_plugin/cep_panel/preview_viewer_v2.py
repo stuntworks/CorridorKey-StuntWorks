@@ -671,11 +671,17 @@ class PersistentWindow(QtWidgets.QWidget):
         mode_row.addStretch(1)
         # Each mode gets its own color — muted so it doesn't
         # compete with the footage, bright enough to read.
+        # v1.0 dual-mask: replaced single "Matte" pill with four discrete
+        # views (CK Matte / SAM Matte / Combined / Split). Mirrors the
+        # Resolve viewer so AE users get the same UX.
         self._mode_colors = {
-            "Original": ("#3a5a6a", "#7ab"),    # slate blue (neutral/source)
-            "Composite": ("#1a4a2a", "#5b5"),    # muted green (result)
-            "Foreground": ("#1a3a5a", "#5af"),   # steel blue (extracted)
-            "Matte": ("#4a3a1a", "#da5"),         # amber (technical)
+            "Original":   ("#3a5a6a", "#7ab"),  # slate blue (neutral/source)
+            "Composite":  ("#1a4a2a", "#5b5"),  # muted green (result)
+            "Foreground": ("#1a3a5a", "#5af"),  # steel blue (extracted)
+            "CK Matte":   ("#4a3a1a", "#da5"),  # amber (CK matte alone)
+            "SAM Matte":  ("#1a3a4a", "#0cd"),  # cyan (SAM matte alone)
+            "Combined":   ("#3a1a4a", "#c5f"),  # purple (CK x SAM preview)
+            "Split":      ("#3a2a1a", "#a85"),  # bronze (CK | SAM side-by-side)
         }
         self.mode_buttons = {}
         for mode, (bg, fg) in self._mode_colors.items():
@@ -687,12 +693,17 @@ class PersistentWindow(QtWidgets.QWidget):
             btn.clicked.connect(lambda _=False, m=mode: self._set_view_mode(m))
             mode_row.addWidget(btn)
             self.mode_buttons[mode] = btn
-        # Split toggle
-        self._split_btn = QtWidgets.QPushButton("Split")
+        # Source toggle (legacy two-pane mode) — renamed from "Split" so it
+        # doesn't collide with the new SPLIT view mode above.
+        self._split_btn = QtWidgets.QPushButton("Source")
         self._split_btn.setCheckable(True)
         self._split_btn.setStyleSheet(
             "background-color: #111; color: #667; padding: 6px 12px; "
             "border: 1px solid #2a2a2a; border-radius: 12px; font-size: 12px;"
+        )
+        self._split_btn.setToolTip(
+            "Show the input frame in a second pane next to the current view. "
+            "Useful for A/B comparison."
         )
         self._split_btn.clicked.connect(self._toggle_split)
         mode_row.addWidget(self._split_btn)
@@ -1626,8 +1637,10 @@ class PersistentWindow(QtWidgets.QWidget):
                         fg_rgb, green_limit_mode="average", strength=despill_strength
                     )
                 img = np.clip(fg_rgb * 255.0, 0, 255).astype(np.uint8)
-            else:  # Matte
-                # Apply despeckle (matte is what it edits) and show as grayscale RGB
+            elif self._view_mode in ("CK Matte", "SAM Matte", "Combined", "Split"):
+                # v1.0 dual-mask matte branch. Compute the post-processed CK
+                # alpha once, then dispatch to whichever of the four matte
+                # views is selected.
                 params_for_matte = dict(self._params)
                 _m = int(params_for_matte.get("sam2_margin", 0))
                 _s = int(params_for_matte.get("sam2_soften", 0))
@@ -1672,27 +1685,55 @@ class PersistentWindow(QtWidgets.QWidget):
                     alpha = self.cu.clean_matte_opencv(
                         alpha, area_threshold=int(params_for_matte.get("despeckleSize", 400))
                     )
-                # v1.0 SIDE-BY-SIDE — when SAM is active, render CK matte on the
-                # LEFT and the processed SAM matte on the RIGHT in one image.
-                # The user composites them in AE / Roto+ / Mocha — the split
-                # makes both mattes visible at once for sanity-check before render.
+                # v1.0 dual-mask dispatch. session.sam_matte_v1 is the SAM
+                # matte AFTER process_sam_matte (always-on baseline cleanup +
+                # user FILL HOLES / MARGIN / SOFTEN). When SAM is bypassed or
+                # absent, SAM-dependent views fall back to CK so the pane is
+                # never blank.
                 _sam_v1 = getattr(self.session, "sam_matte_v1", None)
-                if _sam_v1 is not None and not _bypass:
-                    _ck_rgb = alpha_to_rgb_u8(alpha)
-                    _sam_rgb = alpha_to_rgb_u8(np.asarray(_sam_v1, dtype=np.float32))
-                    if _sam_rgb.shape != _ck_rgb.shape:
-                        _sam_rgb = cv2.resize(
-                            _sam_rgb, (_ck_rgb.shape[1], _ck_rgb.shape[0]),
-                            interpolation=cv2.INTER_NEAREST,
-                        )
-                    _sep = np.full((_ck_rgb.shape[0], 4, 3), 60, dtype=np.uint8)
-                    _sep[:, :] = (60, 90, 100)
-                    img = np.concatenate([_ck_rgb, _sep, _sam_rgb], axis=1)
-                else:
+                _sam_active = _sam_v1 is not None and not _bypass
+                _sam_arr = np.asarray(_sam_v1, dtype=np.float32) if _sam_active else None
+                if _sam_active and _sam_arr.shape != alpha.shape:
+                    _sam_arr = cv2.resize(
+                        _sam_arr, (alpha.shape[1], alpha.shape[0]),
+                        interpolation=cv2.INTER_LINEAR,
+                    )
+
+                if self._view_mode == "CK Matte":
                     img = alpha_to_rgb_u8(alpha)
+                elif self._view_mode == "SAM Matte":
+                    img = alpha_to_rgb_u8(_sam_arr if _sam_active else alpha)
+                elif self._view_mode == "Combined":
+                    if _sam_active:
+                        _combo = np.clip(alpha * _sam_arr, 0.0, 1.0)
+                        img = alpha_to_rgb_u8(_combo)
+                    else:
+                        img = alpha_to_rgb_u8(alpha)
+                else:  # Split
+                    if _sam_active:
+                        _ck_rgb = alpha_to_rgb_u8(alpha)
+                        _sam_rgb = alpha_to_rgb_u8(_sam_arr)
+                        _sep = np.full((_ck_rgb.shape[0], 4, 3), 60, dtype=np.uint8)
+                        _sep[:, :] = (60, 90, 100)
+                        img = np.concatenate([_ck_rgb, _sep, _sam_rgb], axis=1)
+                    else:
+                        img = alpha_to_rgb_u8(alpha)
+            else:
+                # Unknown mode — fall back to Composite so the viewer never
+                # paints a blank pane.
+                img = render_composite(self.cu, self.session, self._params)
 
             # SHOW SAM2 viewer-only overlay (cyan outline of SAM2 silhouette).
-            if bool(self._params.get("show_sam2", False)) and self.session is not None \
+            # Suppressed in any matte view — drawing the outline on a multi-
+            # panel matte image stretches the gate horizontally and lands the
+            # outline in the gutter (the "weird outline" Berto called out
+            # 2026-05-09). The Combined / Split views already display SAM
+            # data, so the overlay would be redundant on top of those too.
+            _is_matte_view = self._view_mode in (
+                "CK Matte", "SAM Matte", "Combined", "Split"
+            )
+            if (not _is_matte_view) and bool(self._params.get("show_sam2", False)) \
+                    and self.session is not None \
                     and self.session.sam2_gate_raw is not None and img is not None:
                 try:
                     _g = self.session.sam2_gate_raw
@@ -1718,15 +1759,26 @@ class PersistentWindow(QtWidgets.QWidget):
             # same, the display layer is broken. This is the first data point any
             # debugger reaches for when "nothing seems to be happening."
             mean_r, mean_g, mean_b = img.reshape(-1, 3).mean(axis=0)
-            # v1.0 — Matte view + SAM active: replace the diagnostic readout with
-            # the user-facing hint about combining the two mattes in AE.
-            if (self._view_mode == "Matte"
-                    and getattr(self.session, "sam_matte_v1", None) is not None):
-                self.status.setText(
-                    "  CK MATTE (left)  ▸  SAM MATTE (right)  |  "
-                    "Combine in AE: drop both mattes onto your comp, use a Track Matte "
-                    "or Roto Brush blend between them."
-                )
+            # Per-mode status text. Matte views get a short user-facing hint
+            # rather than the diagnostic readout.
+            _sam_present = getattr(self.session, "sam_matte_v1", None) is not None
+            if self._view_mode == "CK Matte":
+                self.status.setText("  CK matte (full size)  |  Output: this matte goes to your CK keyed clip.")
+            elif self._view_mode == "SAM Matte":
+                if _sam_present:
+                    self.status.setText("  SAM matte (full size)  |  Output: ships as a sidecar layer in your comp / sequence.")
+                else:
+                    self.status.setText("  SAM matte (full size)  |  No SAM points active — showing CK matte as fallback.")
+            elif self._view_mode == "Combined":
+                if _sam_present:
+                    self.status.setText("  Combined preview (CK x SAM)  |  Reference look only — output is still two separate mattes.")
+                else:
+                    self.status.setText("  Combined preview  |  No SAM points active — showing CK matte as fallback.")
+            elif self._view_mode == "Split":
+                if _sam_present:
+                    self.status.setText("  CK MATTE (left)  /  SAM MATTE (right)  |  Combine in AE: track matte or Roto+ blend.")
+                else:
+                    self.status.setText("  CK matte  |  No SAM points active — Split view collapses to CK matte alone.")
             else:
                 self.status.setText(
                     f"Mode: {self._view_mode}  |  despill={self._params['despill']:.2f}  "
