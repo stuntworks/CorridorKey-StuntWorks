@@ -2692,7 +2692,25 @@ class PersistentWindow(QtWidgets.QWidget):
                     write_matte_final_dump(alpha, _matte_ops_applied)
                 except Exception as _matte_dump_e:
                     print(f"[matte branch] dump failed: {_matte_dump_e}")
-                img = alpha_to_rgb_u8(alpha)
+                # v1.0 SIDE-BY-SIDE — when SAM is active, render CK matte on the
+                # LEFT and the processed SAM matte on the RIGHT in one image.
+                # The user composites them in Fusion / Roto+ — the split makes
+                # both mattes visible at once for sanity-checking before render.
+                _sam_v1 = getattr(self.session, "sam_matte_v1", None)
+                if _sam_v1 is not None and not matte_bypass:
+                    _ck_rgb = alpha_to_rgb_u8(alpha)
+                    _sam_rgb = alpha_to_rgb_u8(np.asarray(_sam_v1, dtype=np.float32))
+                    if _sam_rgb.shape != _ck_rgb.shape:
+                        _sam_rgb = cv2.resize(
+                            _sam_rgb, (_ck_rgb.shape[1], _ck_rgb.shape[0]),
+                            interpolation=cv2.INTER_NEAREST,
+                        )
+                    _h_split = _ck_rgb.shape[0]
+                    _sep = np.full((_h_split, 4, 3), 60, dtype=np.uint8)
+                    _sep[:, :] = (60, 90, 100)  # subtle cyan gutter between mattes
+                    img = np.concatenate([_ck_rgb, _sep, _sam_rgb], axis=1)
+                else:
+                    img = alpha_to_rgb_u8(alpha)
 
             # SHOW SAM2: viewer-only overlay. Draws cyan outline of SAM2's
             # silhouette on top of whatever view is shown. Does not affect
@@ -2728,13 +2746,23 @@ class PersistentWindow(QtWidgets.QWidget):
             # same, the display layer is broken. This is the first data point any
             # debugger reaches for when "nothing seems to be happening."
             mean_r, mean_g, mean_b = img.reshape(-1, 3).mean(axis=0)
-            self.status.setText(
-                f"Mode: {self._view_mode}  |  despill={self._params['despill']:.2f}  "
-                f"despeckle={'on' if self._params['despeckle'] else 'off'}"
-                f"@{self._params['despeckleSize']}  bg={self._params['background']}  "
-                f"|  meanRGB=({mean_r:.1f},{mean_g:.1f},{mean_b:.1f})  "
-                f"|  render {dt_ms:.0f} ms"
-            )
+            # v1.0 — Matte view + SAM active: replace the diagnostic readout with
+            # the user-facing hint about combining the two mattes in Fusion.
+            if (self._view_mode == "Matte"
+                    and getattr(self.session, "sam_matte_v1", None) is not None):
+                self.status.setText(
+                    "  CK MATTE (left)  ▸  SAM MATTE (right)  |  "
+                    "Combine in Resolve: drop both mattes into Fusion, use Roto+ "
+                    "for a blend mask between them."
+                )
+            else:
+                self.status.setText(
+                    f"Mode: {self._view_mode}  |  despill={self._params['despill']:.2f}  "
+                    f"despeckle={'on' if self._params['despeckle'] else 'off'}"
+                    f"@{self._params['despeckleSize']}  bg={self._params['background']}  "
+                    f"|  meanRGB=({mean_r:.1f},{mean_g:.1f},{mean_b:.1f})  "
+                    f"|  render {dt_ms:.0f} ms"
+                )
         except Exception as e:
             self.status.setText(f"Render error: {e}")
         finally:

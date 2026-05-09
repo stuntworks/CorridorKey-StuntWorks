@@ -1672,7 +1672,24 @@ class PersistentWindow(QtWidgets.QWidget):
                     alpha = self.cu.clean_matte_opencv(
                         alpha, area_threshold=int(params_for_matte.get("despeckleSize", 400))
                     )
-                img = alpha_to_rgb_u8(alpha)
+                # v1.0 SIDE-BY-SIDE — when SAM is active, render CK matte on the
+                # LEFT and the processed SAM matte on the RIGHT in one image.
+                # The user composites them in AE / Roto+ / Mocha — the split
+                # makes both mattes visible at once for sanity-check before render.
+                _sam_v1 = getattr(self.session, "sam_matte_v1", None)
+                if _sam_v1 is not None and not _bypass:
+                    _ck_rgb = alpha_to_rgb_u8(alpha)
+                    _sam_rgb = alpha_to_rgb_u8(np.asarray(_sam_v1, dtype=np.float32))
+                    if _sam_rgb.shape != _ck_rgb.shape:
+                        _sam_rgb = cv2.resize(
+                            _sam_rgb, (_ck_rgb.shape[1], _ck_rgb.shape[0]),
+                            interpolation=cv2.INTER_NEAREST,
+                        )
+                    _sep = np.full((_ck_rgb.shape[0], 4, 3), 60, dtype=np.uint8)
+                    _sep[:, :] = (60, 90, 100)
+                    img = np.concatenate([_ck_rgb, _sep, _sam_rgb], axis=1)
+                else:
+                    img = alpha_to_rgb_u8(alpha)
 
             # SHOW SAM2 viewer-only overlay (cyan outline of SAM2 silhouette).
             if bool(self._params.get("show_sam2", False)) and self.session is not None \
@@ -1701,13 +1718,23 @@ class PersistentWindow(QtWidgets.QWidget):
             # same, the display layer is broken. This is the first data point any
             # debugger reaches for when "nothing seems to be happening."
             mean_r, mean_g, mean_b = img.reshape(-1, 3).mean(axis=0)
-            self.status.setText(
-                f"Mode: {self._view_mode}  |  despill={self._params['despill']:.2f}  "
-                f"despeckle={'on' if self._params['despeckle'] else 'off'}"
-                f"@{self._params['despeckleSize']}  bg={self._params['background']}  "
-                f"|  meanRGB=({mean_r:.1f},{mean_g:.1f},{mean_b:.1f})  "
-                f"|  render {dt_ms:.0f} ms"
-            )
+            # v1.0 — Matte view + SAM active: replace the diagnostic readout with
+            # the user-facing hint about combining the two mattes in AE.
+            if (self._view_mode == "Matte"
+                    and getattr(self.session, "sam_matte_v1", None) is not None):
+                self.status.setText(
+                    "  CK MATTE (left)  ▸  SAM MATTE (right)  |  "
+                    "Combine in AE: drop both mattes onto your comp, use a Track Matte "
+                    "or Roto Brush blend between them."
+                )
+            else:
+                self.status.setText(
+                    f"Mode: {self._view_mode}  |  despill={self._params['despill']:.2f}  "
+                    f"despeckle={'on' if self._params['despeckle'] else 'off'}"
+                    f"@{self._params['despeckleSize']}  bg={self._params['background']}  "
+                    f"|  meanRGB=({mean_r:.1f},{mean_g:.1f},{mean_b:.1f})  "
+                    f"|  render {dt_ms:.0f} ms"
+                )
         except Exception as e:
             self.status.setText(f"Render error: {e}")
         finally:
