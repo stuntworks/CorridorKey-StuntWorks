@@ -1993,7 +1993,12 @@ class PersistentWindow(QtWidgets.QWidget):
             # Option C — return_logits=True so we can run our own saturation
             # ramp. Default predict() binarises masks at logit 0 and we lose
             # the 2-4 px soft edge band that makes the matte composit-able.
-            masks, scores, logits = pred.predict(
+            # SAM 2 returns (masks_np, iou_predictions_np, low_res_masks_np).
+            # With return_logits=True, masks_np is the HIGH-RES float logits at
+            # orig_hw (padded square shape here). The third return is fixed
+            # 256x256 low-res — using it was the actual source of the wave
+            # Berto saw (it was bilinearly upsampled on display).
+            masks_hi, scores, _low_res = pred.predict(
                 point_coords=np.array(adjusted_pts),
                 point_labels=np.array(labels),
                 multimask_output=True,
@@ -2003,9 +2008,9 @@ class PersistentWindow(QtWidgets.QWidget):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             best_idx = int(np.argmax(scores))
-            # logits[best_idx] is at padded square shape — apply the soft-mask
-            # ramp first, then crop the square back to source frame shape.
-            _soft_padded = logits_to_soft_mask(logits[best_idx])
+            # masks_hi[best_idx] is at padded square shape — apply the soft-
+            # mask ramp first, then crop the square back to source frame shape.
+            _soft_padded = logits_to_soft_mask(masks_hi[best_idx])
             best = unpad_from_square(_soft_padded, _pad_box)
             # Save soft gate as uint16 PNG so the 0..1 precision survives the
             # save/load roundtrip (uint8 would quantize to 256 levels and undo

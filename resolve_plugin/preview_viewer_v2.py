@@ -3111,7 +3111,14 @@ class PersistentWindow(QtWidgets.QWidget):
             # Option C — return_logits=True so we can run the saturation
             # ramp ourselves. Default predict() binarises the masks at logit 0
             # and we lose the 2-4 px soft-edge feather across the contour.
-            masks, scores, logits = pred.predict(
+            # SAM 2 returns (masks_np, iou_predictions_np, low_res_masks_np).
+            # With return_logits=True, masks_np is the HIGH-RES float logits
+            # postprocessed to orig_hw (here = padded square shape). The third
+            # return is a fixed 256x256 low-res. Pre-Phase-0 the code used the
+            # 256x256 path and bilinearly upsampled it on display — that was
+            # the actual source of the wave Berto saw. Phase 0 uses the
+            # high-res output directly.
+            masks_hi, scores, _low_res = pred.predict(
                 point_coords=np.array(adjusted_pts),
                 point_labels=np.array(labels),
                 multimask_output=True,
@@ -3121,9 +3128,9 @@ class PersistentWindow(QtWidgets.QWidget):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             best_idx = int(np.argmax(scores))
-            # logits[best_idx] is at padded square shape — apply the soft-mask
-            # ramp first, then crop the square back to source frame shape.
-            _soft_padded = logits_to_soft_mask(logits[best_idx])
+            # masks_hi[best_idx] is at padded square shape — apply the soft-
+            # mask ramp first, then crop the square back to source frame shape.
+            _soft_padded = logits_to_soft_mask(masks_hi[best_idx])
             best = unpad_from_square(_soft_padded, _pad_box)
             # Backup the NN alpha if it exists and hasn't been backed up yet.
             # CLEAR restores this backup so the actress comes back without re-processing.
