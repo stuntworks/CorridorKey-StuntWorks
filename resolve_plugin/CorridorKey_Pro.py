@@ -2688,8 +2688,21 @@ def _key_one_scrub_frame():
             _mt_raw2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
             _al_raw16 = (_mt_raw2d * 65535).clip(0, 65535).astype(_np.uint16)
             _cv2.imwrite(str(out_dir / "alpha_raw.png"), _al_raw16)
+            # Multi-object v0.8: _s2_masks[frame_idx] can be dict[obj_id, mask],
+            # list/tuple of masks, or a bare ndarray. The diagnostic dump below
+            # collapses to a single soft mask via per-pixel max (union) — same
+            # shape the legacy viewer reads back from sam2_gate_raw.png.
             _s2_raw = _s2_masks[frame_idx]
-            _s2_raw8 = (_s2_raw * 255).clip(0, 255).astype(_np.uint8)
+            if isinstance(_s2_raw, dict):
+                _s2_arrs = [_np.asarray(m, dtype=_np.float32) for m in _s2_raw.values()]
+            elif isinstance(_s2_raw, (list, tuple)):
+                _s2_arrs = [_np.asarray(m, dtype=_np.float32) for m in _s2_raw]
+            else:
+                _s2_arrs = [_np.asarray(_s2_raw, dtype=_np.float32)]
+            _s2_union = _s2_arrs[0]
+            for _a in _s2_arrs[1:]:
+                _s2_union = _np.maximum(_s2_union, _a)
+            _s2_raw8 = (_s2_union * 255).clip(0, 255).astype(_np.uint8)
             _cv2.imwrite(str(out_dir / "sam2_gate_raw.png"), _s2_raw8)
             # Multi-object v0.8 — _s2_masks[frame_idx] is dict[obj_id, mask]
             # (or list-of-masks from older code, or a bare mask in legacy).
