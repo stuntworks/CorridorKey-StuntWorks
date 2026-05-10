@@ -2645,7 +2645,8 @@ class PersistentWindow(QtWidgets.QWidget):
                         and _matte_pairs
                         and not matte_bypass):
                     from corridorkey_sam_merge import (
-                        binarize_sam_silhouette, union_binary_silhouettes, merge_ck_with_sam_active,
+                        binarize_sam_silhouette, union_binary_silhouettes,
+                        merge_ck_with_sam_active, process_sam_matte,
                     )
                     _src_rgb_m = (self.session.original_rgb
                                   if self.session.original_rgb is not None
@@ -2666,11 +2667,27 @@ class PersistentWindow(QtWidgets.QWidget):
                         _active_silhouettes_m.append(binarize_sam_silhouette(_gate_m))
                     if not _active_silhouettes_m:
                         alpha = self.session.alpha.copy()
+                        # SAM matte must be recomputed per render — the matte
+                        # branch is its own code path and never calls
+                        # render_composite, so the cached session.sam_matte_v1
+                        # was stuck at whatever the last Composite-view render
+                        # produced. Caused the "SAM frozen on anchor frame
+                        # while CK animates" symptom Berto called out
+                        # 2026-05-10 during scrub.
+                        self.session.sam_matte_v1 = None
                     else:
                         _sam_union_m = union_binary_silhouettes(_active_silhouettes_m)
                         alpha = merge_ck_with_sam_active(
                             self.session.alpha_raw, _sam_union_m,
                             source_rgb=_src_rgb_m,
+                        )
+                        # Recompute SAM matte from this render's per-frame
+                        # gates — same call render_composite makes at line 594.
+                        self.session.sam_matte_v1 = process_sam_matte(
+                            _sam_union_m,
+                            margin_px=matte_margin,
+                            softness_sigma=matte_soften,
+                            fill_kernel_px=matte_fill,
                         )
                     if matte_margin > 0:
                         alpha = _dilate_mask(alpha, matte_margin)
@@ -2682,6 +2699,7 @@ class PersistentWindow(QtWidgets.QWidget):
                     # SAM2 inactive — Matte view shows the raw NN alpha;
                     # matte_margin/soften are SAM2-only globals and don't apply.
                     alpha = self.session.alpha.copy()
+                    self.session.sam_matte_v1 = None
                 # CHOKE: same erode as render_composite (line 647). Was missing
                 # from this branch — Matte view's slider showed no effect.
                 _matte_choke_px = float(params_for_matte.get("choke", 0))
