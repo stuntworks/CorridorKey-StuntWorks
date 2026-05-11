@@ -2161,6 +2161,41 @@ def _codec_extension(codec):
     return {0: ".png", 1: ".png", 2: ".tiff", 3: ".exr"}.get(int(codec or 0), ".png")
 
 
+def _srgb_png_info():
+    """Build a PngInfo with sRGB + gAMA + cHRM chunks so color-managed apps
+    (DaVinci Resolve in ACES, YRGB CM, or any other mode) auto-apply the
+    correct inverse transform when reading the PNG.
+
+    Untagged PNGs default to "scene-referred ACEScc" interpretation under
+    ACES projects, which lifts midtones across the entire frame (the
+    "whole frame brighter" bug Berto reported 2026-05-11). Tagging the
+    PNG as sRGB is the universal fix — works for ACES, YRGB, YRGB Color
+    Managed, and every other color-managed mode without requiring the
+    user to right-click anything.
+
+    Chunks written:
+      sRGB — 1 byte rendering intent (0=Perceptual, the standard default).
+      gAMA — gamma 1/2.2 (45455 * 100000) — fallback for apps that don't
+             honor sRGB chunk.
+      cHRM — sRGB chromaticity primaries — completes the sRGB standard
+             triple; some color-managed apps require all three to trust
+             the tag.
+    """
+    from PIL.PngImagePlugin import PngInfo
+    pnginfo = PngInfo()
+    pnginfo.add(b'sRGB', bytes([0]))  # 0 = Perceptual rendering intent
+    pnginfo.add(b'gAMA', (45455).to_bytes(4, 'big'))
+    def _u32(v): return v.to_bytes(4, 'big')
+    chrm = b''.join(_u32(v) for v in (
+        31270, 32900,  # white point (D65)
+        64000, 33000,  # red primary
+        30000, 60000,  # green primary
+        15000,  6000,  # blue primary
+    ))
+    pnginfo.add(b'cHRM', chrm)
+    return pnginfo
+
+
 def save_output(fg, matte, path, fmt, codec=0):
     """Write the keyed output for ONE frame.
 
@@ -2177,7 +2212,9 @@ def save_output(fg, matte, path, fmt, codec=0):
     if codec == 3:
         # EXR: float32 throughout. RGBA mode merges 4 channels; matte-only writes
         # single channel; composite writes RGB. OpenCV's EXR writer expects BGR
-        # (or BGRA for 4-channel) float32.
+        # (or BGRA for 4-channel) float32. EXR is linear scene-referred — no
+        # sRGB tag (would be wrong). Color-managed apps already know EXR is
+        # linear by convention.
         if fmt == 0 and fg_clip is not None:
             fb = cv2.cvtColor(fg_clip, cv2.COLOR_RGB2BGR)
             cv2.imwrite(str(path), cv2.merge([fb[:, :, 0], fb[:, :, 1], fb[:, :, 2], m]))
@@ -2196,6 +2233,35 @@ def save_output(fg, matte, path, fmt, codec=0):
         au = (m * 65535.0).astype(np.uint16)
         fg_int = (fg_clip * 65535.0).astype(np.uint16) if fg_clip is not None else None
 
+    # PNG 8-bit output (codec 0): write via PIL so we can embed sRGB
+    # colorspace metadata. Resolve under ACES then auto-applies the correct
+    # inverse transform instead of treating the file as ACEScc and lifting
+    # midtones across the entire frame. Universal — works for any DaVinci
+    # color mode without user intervention.
+    if codec == 0:
+        try:
+            from PIL import Image
+            pnginfo = _srgb_png_info()
+            if fmt == 0 and fg_int is not None:
+                # RGBA: PIL takes (H,W,4) uint8 directly. fg_int is RGB; no
+                # cvtColor needed for PIL (it expects RGB, not BGR).
+                rgba = np.dstack([fg_int, au])
+                Image.fromarray(rgba, mode="RGBA").save(str(path), "PNG", pnginfo=pnginfo)
+            elif fmt == 1:
+                Image.fromarray(au, mode="L").save(str(path), "PNG", pnginfo=pnginfo)
+            elif fmt == 2 and fg_int is not None:
+                Image.fromarray(fg_int, mode="RGB").save(str(path), "PNG", pnginfo=pnginfo)
+            return
+        except Exception as _pil_err:
+            # PIL not available or write failed — fall through to cv2 (untagged).
+            print(f"[save_output] PIL PNG-write failed, falling back to cv2: {_pil_err}")
+
+    # CLEANUP CANDIDATES — NOT APPLIED 2026-05-11:
+    #   - codec 1 (PNG 16-bit): PIL doesn't have a native 16-bit RGBA mode;
+    #     fixing requires manual PNG chunk injection. Same brightness bug
+    #     applies to 16-bit PNG.
+    #   - codec 2 (TIFF): TIFF supports embedded ICC profiles via different
+    #     mechanism (libtiff TIFFTAG_ICCPROFILE). Same brightness bug.
     if fmt == 0 and fg_int is not None:
         fb = cv2.cvtColor(fg_int, cv2.COLOR_RGB2BGR)
         cv2.imwrite(str(path), cv2.merge([fb[:, :, 0], fb[:, :, 1], fb[:, :, 2], au]))
