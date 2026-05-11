@@ -3147,8 +3147,15 @@ def on_process_range(ev):
         _kind = "HEVC" if _is_hevc_clip else "BRAW"
         log(f"{_kind} detected — exporting source frames {src_start}-{src_end} to TIFF sequence...")
         status(f"Exporting {_kind} range ({dur} frames) — please wait...")
+        # Pass the CLIP (timeline item), not the MediaPoolItem. The wrapper
+        # expects to call .GetMediaPoolItem() on its arg to extract the media.
+        # mpi here was already extracted via clip.GetMediaPoolItem() above
+        # (line ~3126), so passing it instead silently broke the fast BRAW
+        # exe path on every PROCESS RANGE since 2026-04-29 (commit 241aaa44)
+        # — fell back to slow Resolve seek+still for ~12 days. Berto noticed
+        # 2026-05-11.
         braw_frames_dir = _export_braw_range_to_frames(
-            mpi, src_start, src_end, timeline, in_f, fps,
+            clip, src_start, src_end, timeline, in_f, fps,
             skip_braw_exe=_is_hevc_clip,
         )
         if braw_frames_dir is None:
