@@ -1331,14 +1331,26 @@ def run_sam2_video_propagation(fp, ss, cs, in_f, out_f, pos_pts, neg_pts, anchor
 
             # Per-object post-pass: resolve interior empties (mid-range
             # tracking collapse → ones-mask, NN-only fallback) vs tail
-            # empties (actor not in frame → leave empty so call site's
-            # alpha*gate correctly zeroes the non-green set). Run the
-            # same logic per-object so MASK 1's collapse doesn't get filled
-            # by MASK 2's healthy frames and vice-versa.
+            # empties (actor not in frame → hold the nearest substantial
+            # mask so junk SAM was killing stays killed when the subject
+            # leaves frame). Run the same logic per-object so MASK 1's
+            # collapse doesn't get filled by MASK 2's healthy frames and
+            # vice-versa.
+            #
+            # Tail-empty handling — Berto 2026-05-11: previously the tail
+            # was left empty, so empty SAM × CK = CK alone on the last
+            # frames, which let all the junk SAM was killing (foot mat,
+            # crate edges, markers) come back. Holding the last substantial
+            # mask forward keeps the junk killed since junk positions are
+            # fixed in the frame. Note: in Combined (CK × SAM) output mode
+            # everything outside the held mask is transparent. Shots that
+            # need to preserve non-actor pixels on tail frames (mirror /
+            # partial-green-screen cases) should use the CK-only output
+            # mode instead.
             for oid, m_dict in masks_per_obj.items():
                 sorted_keys = sorted(m_dict.keys())
                 collapsed_count = 0
-                tail_empty_count = 0
+                tail_held_count = 0
                 if sorted_keys:
                     first_substantial = next(
                         (f for f in sorted_keys if m_dict[f].sum() >= 100), None)
@@ -1351,10 +1363,14 @@ def run_sam2_video_propagation(fp, ss, cs, in_f, out_f, pos_pts, neg_pts, anchor
                             if first_substantial <= f <= last_substantial:
                                 m_dict[f] = np.ones_like(m_dict[f])
                                 collapsed_count += 1
-                            else:
-                                tail_empty_count += 1
+                            elif f > last_substantial:
+                                m_dict[f] = m_dict[last_substantial].copy()
+                                tail_held_count += 1
+                            else:  # f < first_substantial (head empty)
+                                m_dict[f] = m_dict[first_substantial].copy()
+                                tail_held_count += 1
                 log(f"SAM2 obj{oid} post-pass: {collapsed_count} interior empties -> NN fallback, "
-                    f"{tail_empty_count} tail empties left empty.")
+                    f"{tail_held_count} tail empties held to nearest substantial mask.")
 
             # reset_state releases SAM2's internal CUDA buffers before we drop
             # the predictor — prevents the GPU memory leak on Windows (issue #258).
