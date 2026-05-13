@@ -375,3 +375,48 @@ def merge_ck_with_sam_active(
 def write_matte_final_dump(alpha_final: np.ndarray, ops_applied) -> None:
     """v2.2 debug dump — no-op in v1.0."""
     return
+
+
+# Chroma-aware BG-cleanup pass, restored from the e4ed333 (2026-05-06) known-good
+# matte behavior. The post-5/7 architecture rip removed the BG kill mask Berto
+# was relying on — CK matte now leaves partial-alpha bleed across dim/poorly-lit
+# green areas (forklift, floor mats, shadowed BG tarp), which composites as a
+# lifted blue cast on the timeline.
+#
+# This re-applies the BG cleanup as a pure post-process on the CK matte. SAFE:
+# only zeros pixels where ALPHA IS ALREADY WEAK (< alpha_threshold) AND the
+# source plate is clearly on-screen-color (chroma >= chroma_threshold). The
+# subject body (alpha ~1) is preserved even if green spill is present on hair
+# or skin — body never gets cut.
+def apply_chroma_kill_to_matte(
+    matte: np.ndarray,
+    source_rgb: np.ndarray,
+    screen_type: str = "green",
+    chroma_threshold: float = 0.05,
+    alpha_threshold: float = 0.5,
+) -> np.ndarray:
+    """Zero matte pixels in BG green areas with weak alpha. Body preserved.
+
+    matte: float [0,1], shape (H,W) or (H,W,1) — CK alpha output.
+    source_rgb: float [0,1], shape (H,W,3) — source plate fed into the engine.
+    screen_type: "green" or "blue" — picks which chroma channel dominates.
+    chroma_threshold: minimum (G - max(R,B)) for a pixel to count as on-screen.
+                     0.05 catches teal-leaning + dim screens; raise for purer green.
+    alpha_threshold: only kill matte below this. Body (~1) protected; bleed (<0.5) killed.
+    """
+    src = np.asarray(source_rgb, dtype=np.float32)
+    mt = np.asarray(matte, dtype=np.float32)
+    if screen_type == "blue":
+        chroma = src[..., 2] - np.maximum(src[..., 0], src[..., 1])
+    else:
+        chroma = src[..., 1] - np.maximum(src[..., 0], src[..., 2])
+    mt_2d = mt[..., 0] if mt.ndim == 3 else mt
+    if mt_2d.shape != chroma.shape:
+        return mt
+    is_screen = chroma >= float(chroma_threshold)
+    weak_alpha = mt_2d < float(alpha_threshold)
+    kill_zone = is_screen & weak_alpha
+    result = np.where(kill_zone, 0.0, mt_2d).astype(np.float32)
+    if mt.ndim == 3:
+        return result[..., np.newaxis]
+    return result

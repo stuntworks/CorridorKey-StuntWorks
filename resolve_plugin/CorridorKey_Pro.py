@@ -187,6 +187,14 @@ _proxy_mode_saved = None   # proxy mode value before we enabled it — restored 
 # DEPENDS-ON: atexit (stdlib) — Python calls this on ANY exit (normal or signal).
 # AFFECTS: Terminates _viewer_proc, clears cached_processor, frees CUDA memory.
 import atexit
+# Hoisted: in-thread `from corridorkey_sam_merge import ...` can deadlock
+# Fusion's import hook on daemon threads, hanging PROCESS RANGE silently.
+from corridorkey_sam_merge import (
+    apply_chroma_kill_to_matte,
+    union_binary_silhouettes,
+    process_sam_matte,
+    logits_to_soft_mask,
+)
 def _cleanup_on_exit():
     # WHAT IT DOES: Kills the viewer subprocess on Resolve exit and WAITS for it to die.
     #   Without wait(), kill() fires the signal but returns immediately — the viewer
@@ -464,6 +472,14 @@ except Exception: pass
 # AFFECTS: Log TextEdit widget, _ck_debug_log file
 _ck_debug_log = Path(tempfile.gettempdir()) / "corridorkey_debug.txt"
 def log(msg):
+    # Cross-thread Fusion widget mutation deadlocks on the UI mutex after the
+    # first call. Worker threads must route through _ui_queue, drained by
+    # on_poll_timer on the main thread. File I/O also skipped — Defender can
+    # block thread file opens (see _tlog comment in _run).
+    if threading.get_ident() != _main_thread_id:
+        try: _ui_queue.put(("log", msg))
+        except Exception: pass
+        return
     try: print(msg)  # sys.stdout is None in Resolve background threads — must guard
     except Exception: pass
     try: items["Log"].PlainText = (items["Log"].PlainText or "") + msg + "\n"
@@ -474,6 +490,10 @@ def log(msg):
 
 # WHAT IT DOES: Updates the cyan status label at the center of the panel
 def status(msg):
+    if threading.get_ident() != _main_thread_id:
+        try: _ui_queue.put(("status", msg))
+        except Exception: pass
+        return
     try: items["Status"].Text = msg
     except Exception: pass
 
@@ -520,7 +540,7 @@ def get_settings():
         # (use the original plate inside the matte — Mocha-style; rescues warm
         # wardrobe like yellow shirts that the NN paints pink) | "blend" (50/50).
         # Viewer-owned; overridden by _merge_live_params.
-        "fg_source": "nn",
+        "fg_source": "source",
         # SAM2 ADDITIVE: when True, switches the NN+SAM2 combine math from
         # multiplicative (alpha = NN x SAM2_gate, default) to additive
         # (alpha = max(NN, SAM2_gate * non_screen)). Preserves NN's correct
@@ -1167,7 +1187,7 @@ def run_sam2_video_propagation(fp, ss, cs, in_f, out_f, pos_pts, neg_pts, anchor
     # predictor (live-preview click-to-mask) keeps Phase 0a padding because
     # that's a separate code path in preview_viewer_v2.py and works fine.
     # The saturation ramp is still applied via logits_to_soft_mask below.
-    from corridorkey_sam_merge import logits_to_soft_mask as _ramp
+    _ramp = logits_to_soft_mask
     try:
         # --- Export frames ---
         log(f"SAM2 video: exporting {dur} frames to {tmp_dir} ...")
@@ -1182,7 +1202,11 @@ def run_sam2_video_propagation(fp, ss, cs, in_f, out_f, pos_pts, neg_pts, anchor
             log(f"SAM2 video: {len(_tif_files)} TIFF frames from {Path(fp).name}")
         else:
             log(f"SAM2 video: opening {os.path.basename(fp)}")
-            _cap = cv2.VideoCapture(fp)
+            # CAP_FFMPEG: Windows MSMF (default) backend deadlocks when opened
+            # from a daemon thread — IMFSourceReader needs an STA COM apartment
+            # that Resolve's embedded Python doesn't init for worker threads.
+            # FFMPEG backend has no COM dependency.
+            _cap = cv2.VideoCapture(fp, cv2.CAP_FFMPEG)
             if not _cap.isOpened():
                 log("SAM2 video: cannot open video"); return {}
         for i in range(dur):
@@ -2231,35 +2255,12 @@ def save_output(fg, matte, path, fmt, codec=0):
         au = (m * 65535.0).astype(np.uint16)
         fg_int = (fg_clip * 65535.0).astype(np.uint16) if fg_clip is not None else None
 
-    # PNG 8-bit output (codec 0): write via PIL so we can embed sRGB
-    # colorspace metadata. Resolve under ACES then auto-applies the correct
-    # inverse transform instead of treating the file as ACEScc and lifting
-    # midtones across the entire frame. Universal — works for any DaVinci
-    # color mode without user intervention.
-    if codec == 0:
-        try:
-            from PIL import Image
-            pnginfo = _srgb_png_info()
-            if fmt == 0 and fg_int is not None:
-                # RGBA: PIL takes (H,W,4) uint8 directly. fg_int is RGB; no
-                # cvtColor needed for PIL (it expects RGB, not BGR).
-                rgba = np.dstack([fg_int, au])
-                Image.fromarray(rgba, mode="RGBA").save(str(path), "PNG", pnginfo=pnginfo)
-            elif fmt == 1:
-                Image.fromarray(au, mode="L").save(str(path), "PNG", pnginfo=pnginfo)
-            elif fmt == 2 and fg_int is not None:
-                Image.fromarray(fg_int, mode="RGB").save(str(path), "PNG", pnginfo=pnginfo)
-            return
-        except Exception as _pil_err:
-            # PIL not available or write failed — fall through to cv2 (untagged).
-            print(f"[save_output] PIL PNG-write failed, falling back to cv2: {_pil_err}")
-
-    # CLEANUP CANDIDATES — NOT APPLIED 2026-05-11:
-    #   - codec 1 (PNG 16-bit): PIL doesn't have a native 16-bit RGBA mode;
-    #     fixing requires manual PNG chunk injection. Same brightness bug
-    #     applies to 16-bit PNG.
-    #   - codec 2 (TIFF): TIFF supports embedded ICC profiles via different
-    #     mechanism (libtiff TIFFTAG_ICCPROFILE). Same brightness bug.
+    # Untagged write — bytes go to disk verbatim, no color metadata chunks.
+    # Resolve interprets the PNG using its timeline color science (Rec.709
+    # Gamma 2.4 for davinciYRGB legacy, ACEScct for ACES, etc.). The PIL
+    # sRGB-tagged path (7c641cf) caused a 2.2→2.4 re-encode midtone lift on
+    # legacy Rec.709 Gamma 2.4 timelines. Proper color-science-aware tagging
+    # is a future enhancement.
     if fmt == 0 and fg_int is not None:
         fb = cv2.cvtColor(fg_int, cv2.COLOR_RGB2BGR)
         cv2.imwrite(str(path), cv2.merge([fb[:, :, 0], fb[:, :, 1], fb[:, :, 2], au]))
@@ -2285,6 +2286,45 @@ def save_alpha_only(matte, path, codec=0):
         cv2.imwrite(str(path), (m * 255.0).astype(np.uint8))
     else:
         cv2.imwrite(str(path), (m * 65535.0).astype(np.uint16))
+
+
+# Tell Resolve not to apply any IDT to imported CK renders. Without this, on
+# ACES projects Resolve defaults to applying sRGB→working-space conversion to
+# untagged PNGs, which doesn't match the source clip's IDT and produces a
+# ~8% midtone lift on the timeline. "Bypass" tells Resolve to leave the PNG
+# pixels alone — CK pixels in, CK pixels out, no transform.
+def _bypass_idt_on_imports(items):
+    if not items:
+        return
+    # Try a matrix of (key, value) candidates. SetClipProperty returns True on
+    # success / False on bad key+value combo. We stop at the first pair that
+    # sticks for each clip. Order matters — Rec.709 IDT on a Rec.709-encoded
+    # PNG matches what Resolve auto-applies to a ProRes/H.264 source, so the
+    # imported clip lands in ACES the same way the source clip would. The
+    # Bypass / No Input Transform options are fallbacks for legacy modes.
+    candidates = [
+        ("ACES Input Transform", "Rec.709"),
+        ("ACES Input Transform", "Rec709"),
+        ("Input Color Space", "Rec.709"),
+        ("Input Color Space", "Rec.709 (Scene)"),
+        ("ACES Input Transform", "Bypass"),
+        ("ACES Input Transform", "No Input Transform"),
+        ("Input Color Space", "Bypass"),
+        ("Input Color Space", "No Input Transform"),
+    ]
+    for _mpi in items:
+        _last_log = None
+        for _key, _val in candidates:
+            try:
+                if _mpi.SetClipProperty(_key, _val):
+                    _last_log = f"{_key}={_val}"
+                    break
+            except Exception:
+                pass
+        if _last_log:
+            try: log(f"  CK import: SetClipProperty {_last_log}")
+            except Exception: pass
+
 
 # WHAT IT DOES: Re-runs the neural keyer on the already-loaded frame using current slider values.
 #   Used by Live Preview mode — avoids re-reading video from disk on every slider change.
@@ -2327,6 +2367,11 @@ def reprocess_with_cached():
         log(f"Settings: despeckle_enabled={ps.despeckle_enabled} despeckle_size={ps.despeckle_size} despill={ps.despill_strength} refiner={ps.refiner_strength} fg_source={ps.fg_source}")
         res = proc.process_frame(fr, ah, ps)
         fg, mt = res.get("fg"), res.get("alpha")
+        if mt is not None:
+            try:
+                from corridorkey_sam_merge import apply_chroma_kill_to_matte
+                mt = apply_chroma_kill_to_matte(mt, fr, settings.get("screen_type", "green"))
+            except Exception as _ckm_e: log(f"chroma kill failed (non-fatal): {_ckm_e}")
         if fg is not None:
             try: log(f"FG stats — dtype:{fg.dtype} min:{float(fg.min()):.4f} max:{float(fg.max()):.4f} mean R:{float(fg[..., 0].mean()):.4f} G:{float(fg[..., 1].mean()):.4f} B:{float(fg[..., 2].mean()):.4f}")
             except Exception as _e: log(f"FG stat error: {_e}")
@@ -2529,6 +2574,7 @@ def process_current_frame(preview_only=False):
         media_pool.SetCurrentFolder(ckb)
         imp = media_pool.ImportMedia([str(op)])
         if not imp: status("Import failed"); return
+        _bypass_idt_on_imports(imp)
         if settings["output_mode"] in [0, 2]:
             # v1.0 two-mask placement — find highest-used video track so we
             # never overwrite a previous-run output. Source clip's track itself
@@ -3406,6 +3452,11 @@ def on_process_range(ev):
                 fg, mt = res.get("fg"), res.get("alpha")
                 if _despill_str > 0 and fg is not None:
                     fg = _cu.despill_opencv(fg, green_limit_mode="average", strength=_despill_str)
+                if mt is not None:
+                    try:
+                        from corridorkey_sam_merge import apply_chroma_kill_to_matte
+                        mt = apply_chroma_kill_to_matte(mt, fr, settings.get("screen_type", "green"))
+                    except Exception as _ckm_e: log(f"chroma kill failed (non-fatal): {_ckm_e}")
                 # v1.0 TWO-MASK MODE — CK matte unchanged, SAM matte saved as
                 # a separate alpha-only sidecar PNG. The user composites the
                 # two in their host (Fusion / AE) using the matte they need.
@@ -3579,6 +3630,17 @@ def on_process_range(ev):
             _range_running = False
             return
 
+        # Worker thread inherits no CUDA context — first CUDA op silently
+        # deadlocks on Windows + Blackwell (RTX 5090) without explicit init.
+        _torch_init = sys.modules.get("torch")
+        if _torch_init is not None:
+            try:
+                _torch_init.cuda.set_device(0)
+                _torch_init.cuda.init()
+                _tlog("CUDA context init: device 0")
+            except Exception as _ce:
+                _tlog(f"CUDA init failed (non-fatal): {_ce}")
+
         ofs = []
         sam_ofs = []  # v1.0 two-mask: SAM matte sidecar PNGs
         pr = 0
@@ -3638,7 +3700,8 @@ def on_process_range(ev):
                 _tlog(f"BRAW frames: {len(braw_tif_files)} TIFF files")
                 _src_fps = fps
             else:
-                cap = cv2.VideoCapture(fp)
+                # CAP_FFMPEG: MSMF deadlocks from daemon thread (see line 1209).
+                cap = cv2.VideoCapture(fp, cv2.CAP_FFMPEG)
                 if not cap.isOpened():
                     _tstatus("Cannot open video"); return
                 _src_fps = cap.get(cv2.CAP_PROP_FPS) or fps
@@ -3686,6 +3749,10 @@ def on_process_range(ev):
                 fg, mt = res.get("fg"), res.get("alpha")
                 if _despill_str > 0 and fg is not None:
                     fg = _cu.despill_opencv(fg, green_limit_mode="average", strength=_despill_str)
+                if mt is not None:
+                    try:
+                        mt = apply_chroma_kill_to_matte(mt, fr, settings.get("screen_type", "green"))
+                    except Exception as _ckm_e: log(f"chroma kill failed (non-fatal): {_ckm_e}")
                 # v1.0 TWO-MASK MODE — CK matte (mt) is unchanged; SAM matte
                 # is computed separately for sidecar export. Same per-mask
                 # gather as before, but with bidirectional MARGIN + simple
@@ -3699,9 +3766,6 @@ def on_process_range(ev):
                     # plus a downstream MORPH_OPEN was the bumpy contour root
                     # cause Berto called out 2026-05-09. union_binary_silhouettes
                     # is np.maximum and works on soft input directly.
-                    from corridorkey_sam_merge import (
-                        union_binary_silhouettes, process_sam_matte,
-                    )
                     _gates_for_sam = []
                     _obj_ids = []
                     if sam2_video_masks and range_idx in sam2_video_masks:
@@ -4134,12 +4198,14 @@ def _do_import(task):
             status("CK import failed — check MediaPool bin"); return
         if imp:
             log(f"Imported {len(imp)} items to MediaPool")
+            _bypass_idt_on_imports(imp)
         # v1.0: also import the SAM matte sidecar sequence when present.
         sam_imp = None
         if sam_ofs:
             sam_imp = media_pool.ImportMedia(sam_ofs)
             if sam_imp:
                 log(f"Imported {len(sam_imp)} SAM matte items to MediaPool")
+                _bypass_idt_on_imports(sam_imp)
             else:
                 log("SAM matte import returned nothing")
         if settings["output_mode"] in [0, 2]:
