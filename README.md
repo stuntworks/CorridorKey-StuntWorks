@@ -190,11 +190,7 @@ Editing this plugin? Read these first, in order:
    batch frame math, read this. Same alignment was broken and re-fixed four
    times in three days; the doc exists so it stops happening. Includes a
    mandatory pre-commit smoke test.
-2. **[CLAUDE.md](./CLAUDE.md)** — entry point for AI coding assistants working
-   on this repo.
-3. **[INSTALL.md](./INSTALL.md)** — full install walkthrough for end users.
-4. **[CODE_REVIEW_2026-04-14.md](./CODE_REVIEW_2026-04-14.md)** — latest
-   security + quality audit (all Critical and High items are addressed).
+2. **[INSTALL.md](./INSTALL.md)** — full install walkthrough for end users.
 
 Rebuild the engine venv: `setup.bat` (Windows) or `./setup.sh` (macOS / Linux).
 
