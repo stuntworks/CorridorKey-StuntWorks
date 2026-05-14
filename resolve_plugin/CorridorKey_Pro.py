@@ -2616,21 +2616,37 @@ def process_current_frame(preview_only=False):
             _content_single = int(settings.get("output_content", 0))
             if _content_single == 0:
                 try:
-                    # 1d648e5 recipe (2026-05-03 ship): alpha * dilate(SAM, margin) +
-                    # Gaussian feather. This is the actual "perfect blend" — NOT the
-                    # 9093bb8 trimap+CFM detour which destroyed hair. See memory
-                    # [[corridorkey_subtract_is_simple_multiply]]: "Stop chasing.
-                    # Ship the multiply." Default buffer_px=20, feather_px=4.
-                    from sam2_combine import apply_sam2_gate_subtract
-                    _sam_raw_single = _load_raw_sam_silhouette(mt_for_save.shape, settings)
-                    if _sam_raw_single is not None:
-                        _ck_2d_single = mt_for_save[:, :, 0] if len(mt_for_save.shape) == 3 else mt_for_save
-                        mt_for_save = apply_sam2_gate_subtract(
-                            _ck_2d_single, _sam_raw_single,
-                            buffer_px=int(settings.get("sam2_margin", 20) or 20),
-                            feather_px=4,
-                        )
-                        log(f"Combined export: 1d648e5 simple-multiply applied (margin={int(settings.get('sam2_margin', 20) or 20)})")
+                    # 1d648e5 PROPER recipe: route through _panel_dispatch_sam2_combine
+                    # so per-mask dilate_into kicks in. MASK 1 (body) extends ONLY into
+                    # low-alpha pixels (hair, green-screen), MASK 2 (feet) extends ONLY
+                    # into high-alpha pixels (floor). Chroma-aware extension is THE
+                    # mechanism that preserves hair without pulling in floor halos.
+                    # Direct apply_sam2_gate_subtract call misses this — that's why
+                    # my earlier 1d648e5-recipe attempt still lost hair detail.
+                    _ck_2d_single = mt_for_save[:, :, 0] if len(mt_for_save.shape) == 3 else mt_for_save
+                    _per_obj_gates = _load_per_object_sam2_gates(_ck_2d_single.shape, settings)
+                    if _per_obj_gates:
+                        if isinstance(_per_obj_gates, dict):
+                            _frame_obj_ids = list(_per_obj_gates.keys())
+                            _gates_list = list(_per_obj_gates.values())
+                        else:
+                            _frame_obj_ids = list(range(1, len(_per_obj_gates) + 1))
+                            _gates_list = list(_per_obj_gates)
+                        # Pre-process each gate (margin/soften from sliders) and
+                        # resize to ck shape — mirrors the scrub path at line 2914.
+                        _processed = []
+                        for _gm in _gates_list:
+                            _gx = _dilate_sam2_mask(_gm, margin=settings.get("sam2_margin", SAM2_MATTE_MARGIN))
+                            _gx = _soften_sam2_mask(_gx, soften=settings.get("sam2_soften", 0))
+                            if _gx.shape != _ck_2d_single.shape:
+                                _gx = cv2.resize(_gx, (_ck_2d_single.shape[1], _ck_2d_single.shape[0]),
+                                                 interpolation=cv2.INTER_LINEAR)
+                            _processed.append(_gx)
+                        if _processed:
+                            mt_for_save = _panel_dispatch_sam2_combine(
+                                _ck_2d_single, _processed, fr, settings, obj_ids=_frame_obj_ids,
+                            )
+                            log(f"Combined export: 1d648e5 per-mask dispatch ({len(_processed)} mask(s), obj_ids={_frame_obj_ids})")
                     else:
                         log("OutputContent=Combined but SAM PNGs missing — exporting CK alone")
                 except Exception as _merge_e:
