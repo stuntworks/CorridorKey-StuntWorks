@@ -3787,6 +3787,16 @@ def on_process_range(ev):
             # For normal files: seek with VideoCapture as before.
             cap = None
             braw_tif_files = []
+            # 2026-05-14 hang diagnostic — write tag to a temp file BEFORE _ui_queue,
+            # so we can see exactly where _run stops even if PollTimer never drains.
+            def _probe(tag):
+                try:
+                    import tempfile as _tf, os as _os, time as _tm
+                    _pp = _os.path.join(_tf.gettempdir(), "ck_run_probe.txt")
+                    with open(_pp, "a", encoding="utf-8") as _pf:
+                        _pf.write(f"{_tm.time():.3f}  {tag}\n")
+                except Exception: pass
+            _probe("AFTER_SAM2_PROP")
             if braw_frames_dir:
                 # Use list pre-computed on main thread — avoids thread glob which triggers Defender directory scan.
                 braw_tif_files = _braw_tif_files_precomputed
@@ -3794,10 +3804,16 @@ def on_process_range(ev):
                 _src_fps = fps
             else:
                 # CAP_FFMPEG: MSMF deadlocks from daemon thread (see line 1209).
+                _probe("BEFORE_VIDEOCAPTURE")
                 cap = cv2.VideoCapture(fp, cv2.CAP_FFMPEG)
+                _probe("AFTER_VIDEOCAPTURE")
                 if not cap.isOpened():
+                    _probe("CAP_NOT_OPENED")
                     _tstatus("Cannot open video"); return
+                _probe("BEFORE_FPS")
                 _src_fps = cap.get(cv2.CAP_PROP_FPS) or fps
+                _probe("AFTER_FPS")
+            _probe("BEFORE_FRAME_LOOP")
             for tf in range(in_f, out_f):
                 if processing_cancelled:
                     _tlog(f"Cancelled at frame {pr}/{dur}")
