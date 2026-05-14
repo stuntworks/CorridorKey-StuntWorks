@@ -2616,26 +2616,18 @@ def process_current_frame(preview_only=False):
             _content_single = int(settings.get("output_content", 0))
             if _content_single == 0:
                 try:
-                    from corridorkey_sam_merge import (
-                        union_binary_silhouettes, process_sam_matte,
-                    )
+                    from corridorkey_sam_merge import merge_ck_with_sam_chroma_gated
                     _sam_raw_single = _load_raw_sam_silhouette(mt_for_save.shape, settings)
                     if _sam_raw_single is not None:
                         _ck_2d_single = mt_for_save[:, :, 0] if len(mt_for_save.shape) == 3 else mt_for_save
-                        # process_sam_matte: margin dilation, soften, fill_holes
-                        # (panel sliders). Identical to viewer's Combined-tab math.
-                        _sam_processed = process_sam_matte(
-                            _sam_raw_single,
-                            margin_px=float(settings.get("sam2_margin", 0)),
-                            softness_sigma=float(settings.get("sam2_soften", 0)),
-                            fill_kernel_px=int(settings.get("fill_holes", 0)),
+                        # 9093bb8 verbatim recipe: trimap + Closed-Form Matting
+                        # via pymatting, CK injected in unknown band only, hard
+                        # clamp outside dilated SAM. The "perfect blend" Berto
+                        # remembers from 3 weeks ago.
+                        mt_for_save = merge_ck_with_sam_chroma_gated(
+                            _ck_2d_single, _sam_raw_single, source_rgb=fr,
                         )
-                        _sam_arr = np.asarray(_sam_processed, dtype=np.float32)
-                        if _sam_arr.shape != _ck_2d_single.shape:
-                            _sam_arr = cv2.resize(_sam_arr, (_ck_2d_single.shape[1], _ck_2d_single.shape[0]),
-                                                  interpolation=cv2.INTER_LINEAR)
-                        mt_for_save = np.clip(_ck_2d_single * _sam_arr, 0.0, 1.0).astype(np.float32)
-                        log("Combined export: CK x dilated SAM (viewer-parity multiply)")
+                        log("Combined export: 9093bb8 trimap+CFM merge applied")
                     else:
                         log("OutputContent=Combined but SAM PNGs missing — exporting CK alone")
                 except Exception as _merge_e:
@@ -3554,6 +3546,7 @@ def on_process_range(ev):
                 # CK matte = mt unchanged below. SAM matte built here when a
                 # video-prop or static gate exists for this frame.
                 _sam_matte_v1 = None
+                _sam_union = None  # raw binary union, fed to 9093bb8 merge below
                 if mt is not None and not bool(settings.get("sam2_bypass", False)):
                     # Option C — feed CONTINUOUS soft gates into process_sam_matte.
                     # binarize_sam_silhouette would collapse the 2-4 px soft band
@@ -3619,22 +3612,23 @@ def on_process_range(ev):
                     _write_sam = _content in (1, 3) and _sam_matte_v1 is not None  # both / SAM-only
                     _write_combined = _content == 0
                     if _write_combined:
-                        # 2026-05-14: viewer-parity simple multiply. CK alpha
-                        # multiplied by process_sam_matte(SAM_union) which is
-                        # margin-dilated, softened, hole-filled SAM. Preserves
-                        # CK's fine hair detail inside the dilated SAM region
-                        # and zeros it outside (kills floor/walls). Replaces
-                        # the v2.2 trimap+CFM merge which destroyed hair
-                        # detail by replacing CK with CFM's smoothed solve.
-                        # Math matches preview_viewer_v2.py:2751 (Combined tab).
+                        # 9093bb8 verbatim recipe in BRAW sync path: trimap +
+                        # CFM via pymatting, CK injected in unknown band only,
+                        # hard clamp outside dilated SAM. _sam_union is the
+                        # raw binary union (no margin/soften/fill applied),
+                        # initialised to None at top of per-frame block so
+                        # this stays safe when SAM is inactive / bypassed.
                         _mt_2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
-                        _mt_for_save = mt
-                        if _sam_matte_v1 is not None:
-                            _sam_for_merge = np.asarray(_sam_matte_v1, dtype=np.float32)
-                            if _sam_for_merge.shape != _mt_2d.shape:
-                                _sam_for_merge = cv2.resize(_sam_for_merge, (_mt_2d.shape[1], _mt_2d.shape[0]),
-                                                            interpolation=cv2.INTER_LINEAR)
-                            _mt_for_save = np.clip(_mt_2d * _sam_for_merge, 0.0, 1.0).astype(np.float32)
+                        _mt_for_save = _mt_2d
+                        if _sam_union is not None:
+                            try:
+                                from corridorkey_sam_merge import merge_ck_with_sam_chroma_gated
+                                _mt_for_save = merge_ck_with_sam_chroma_gated(
+                                    _mt_2d, _sam_union, source_rgb=fr,
+                                )
+                            except Exception as _mge:
+                                log(f"BRAW Combined merge failed (CK alone): {_mge}")
+                                _mt_for_save = _mt_2d
                         op = od / f"CK_{cn}_{pr:06d}{_ext}"
                         save_output(fg, _mt_for_save, op, settings["export_format"], codec=settings.get("output_codec", 0))
                         ofs.append(str(op))
@@ -3856,6 +3850,7 @@ def on_process_range(ev):
                 # FILL HOLES via process_sam_matte. CK keying output is the
                 # master clip; SAM matte ships as a separate alpha sidecar.
                 _sam_matte_v1 = None
+                _sam_union = None  # raw binary union for 9093bb8 chroma-gated merge
                 if mt is not None and not bool(settings.get("sam2_bypass", False)):
                     # Option C — feed CONTINUOUS soft gates straight through.
                     # Pre-Option C this path called binarize_sam_silhouette
@@ -3939,12 +3934,19 @@ def on_process_range(ev):
                     # and zeros it outside (kills floor/walls). Math matches
                     # preview_viewer_v2.py:2751 (viewer's Combined tab).
                     if _write_combined:
-                        if _sam_matte_v1 is not None:
-                            _sam_for_merge = np.asarray(_sam_matte_v1, dtype=np.float32)
-                            if _sam_for_merge.shape != _m.shape:
-                                _sam_for_merge = cv2.resize(_sam_for_merge, (_m.shape[1], _m.shape[0]),
-                                                            interpolation=cv2.INTER_LINEAR)
-                            _m_combined = np.clip(_m * _sam_for_merge, 0.0, 1.0).astype(np.float32)
+                        # 9093bb8 verbatim recipe in non-BRAW PROCESS RANGE
+                        # main-thread loop: trimap + CFM via pymatting, CK
+                        # injected in unknown band only, hard clamp outside
+                        # dilated SAM. _sam_union is the raw binary union.
+                        if _sam_union is not None:
+                            try:
+                                from corridorkey_sam_merge import merge_ck_with_sam_chroma_gated
+                                _m_combined = merge_ck_with_sam_chroma_gated(
+                                    _m, _sam_union, source_rgb=fr,
+                                )
+                            except Exception as _mge:
+                                _tlog(f"Combined merge failed at frame {pr} (CK alone): {_mge}")
+                                _m_combined = _m
                         else:
                             _m_combined = _m
                         _m_active = _m_combined

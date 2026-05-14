@@ -378,43 +378,15 @@ def merge_ck_with_sam(ck_alpha: np.ndarray, sam_silhouette: Optional[np.ndarray]
 
 
 def merge_ck_with_sam_chroma_gated(ck_alpha, sam_silhouette, source_rgb=None):
-    # WHAT IT DOES: v2.2 trimap + Closed-Form Matting with CK hair injection.
-    #   Restored 2026-05-13 from pre-Phase-A architecture (commit 9093bb8).
+    # 9093bb8 verbatim: v2.2 trimap + Closed-Form Matting with CK hair injection
+    # in unknown band, hard clamp outside dilated SAM. No "improvements" added.
+    # The artist remembers this exact recipe as the "perfect blend." Validate
+    # first, tune later if needed.
     #
-    #   Pipeline:
-    #     1. SAM silhouette gets MORPH_CLOSE (40) + binary_fill_holes for solid body region.
-    #     2. fg_def = erode(sam_filled, 41) -> definite foreground.
-    #     3. sam_dilated = dilate(sam_filled, 81) -> outer boundary (trust budget).
-    #     4. Trimap = 0.5 unknown band; 1.0 where fg_def; 0.0 outside sam_dilated.
-    #        (CK is NOT used in the trimap. SAM-only trimap is the correctness rail.)
-    #     5. Downsample 2x if max(H, W) > 2500 (saves CFM solver time at 4K).
-    #     6. Closed-Form Matting via pymatting solves alpha in the unknown band.
-    #     7. Upsample back to source resolution.
-    #     8. CK hair injection in unknown band only: alpha = max(CFM_alpha, CK) where
-    #        CFM_alpha > 0.01. Protects hair tendrils CFM smooths over while preventing
-    #        CK = 1.0 floor pixels from blowing up alpha where CFM correctly killed them.
-    #     9. Internal GaussianBlur(15, 2.5) inside sam_dilated to soften fg_def boundary.
-    #    10. Hard clamp alpha = 0 outside sam_dilated (kills walls/floor/junk SAM didn't cover).
-    #
-    # DEPENDS ON: pymatting.estimate_alpha_cf, scipy.ndimage.binary_fill_holes, cv2, numpy.
-    #             source_rgb is REQUIRED — raises ValueError if None.
-    # AFFECTS:    The exporter's combined-mode output (Combined OutputContent in panel).
-    #             The "perfect key" path Berto needs. The viewer's Combined tab uses
-    #             a separate alpha * sam_arr multiply; the exporter's quality matches
-    #             this function, not the viewer.
-    # DANGER ZONE HIGH:
-    #   - DO NOT use CK in the trimap (only SAM).
-    #   - DO NOT skip the hard clamp at the end (it's the safety rail against junk halos).
-    #   - DO NOT increase the dilation kernel beyond 121 without verifying foot halo.
-    #   - DO NOT decrease the close kernel below 30 — body holes return.
-    #
-    # Tuning guide (from v2.2 author notes):
-    #   - Foot halo (CFM extends alpha into floor near foot): reduce dilation 81 -> 61.
-    #     CK injection uses max(), so CK can only INCREASE alpha; halos from CFM aren't
-    #     killed by CK. Tighter dilation = sooner hard-clamp.
-    #   - Hair tendrils clipped beyond dilated SAM: increase dilation 81 -> 101 or 121.
-    #     Tradeoff: more room for CFM and CK to bleed into junk.
-    #   - Butt notch returns (SAM under-clipping not absorbed by close): increase close 40 -> 60.
+    # source_rgb is REQUIRED. ValueError if None.
+    # Empty-mask guard: only safety net added beyond verbatim — returns CK if
+    # SAM has < 100 active pixels (prevents silent black-frame failure on a
+    # single bad SAM result mid-render).
     import cv2
     from scipy.ndimage import binary_fill_holes
     from pymatting import estimate_alpha_cf
@@ -433,13 +405,14 @@ def merge_ck_with_sam_chroma_gated(ck_alpha, sam_silhouette, source_rgb=None):
         sam_arr = sam_arr[..., 0]
     sam = (sam_arr > 0.5).astype(np.uint8)
 
+    if int(sam.sum()) < 100:
+        return ck.copy()
+
     rgb_in = np.asarray(source_rgb)
     if rgb_in.dtype != np.float32:
         rgb = np.clip(rgb_in.astype(np.float32) / 255.0, 0.0, 1.0)
     else:
         rgb = np.clip(rgb_in, 0.0, 1.0)
-    # CFM needs 3-channel RGB. If caller fed BGR, that's OK for the matte solve
-    # since CFM treats channels symmetrically. Single-channel? Stack to 3.
     if rgb.ndim == 2:
         rgb = np.stack([rgb, rgb, rgb], axis=-1)
     if rgb.shape[:2] != (H, W):
