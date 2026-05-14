@@ -2603,23 +2603,43 @@ def process_current_frame(preview_only=False):
             # Use a local copy so the unchanged mt below reaches show_preview_window
             # untouched — the viewer applies despeckle live on its own slider.
             mt_for_save = _apply_despeckle_to_alpha(mt, settings)
-            # OutputContent gate: v2.2 chroma-gated merge runs ONLY when the user
-            # selected Combined mode. Berto's rule (2026-05-14): SAM combination is
-            # opt-in via dropdown, never automatic. The artist owns that decision.
+            # OutputContent gate: SAM combine runs ONLY when the user selected
+            # Combined mode. Berto's rule (2026-05-14): SAM combination is opt-in
+            # via dropdown, never automatic. The artist owns that decision.
+            #
+            # 2026-05-14 architecture: simple multiply CK * process_sam_matte(SAM)
+            # at viewer-parity (preview_viewer_v2.py:2751). Generously-dilated SAM
+            # via margin slider lets CK's hair tendrils and soft edges survive
+            # INSIDE the dilation; CK pixels outside the dilated SAM go to zero
+            # (kills floor/walls). Replaces the v2.2 trimap+CFM merge which
+            # REPLACED CK with a smoothed CFM solution and destroyed hair detail.
             _content_single = int(settings.get("output_content", 0))
             if _content_single == 0:
                 try:
+                    from corridorkey_sam_merge import (
+                        union_binary_silhouettes, process_sam_matte,
+                    )
                     _sam_raw_single = _load_raw_sam_silhouette(mt_for_save.shape, settings)
                     if _sam_raw_single is not None:
-                        from corridorkey_sam_merge import merge_ck_with_sam_active
                         _ck_2d_single = mt_for_save[:, :, 0] if len(mt_for_save.shape) == 3 else mt_for_save
-                        _merged_single = merge_ck_with_sam_active(_ck_2d_single, _sam_raw_single, source_rgb=fr)
-                        mt_for_save = np.clip(_merged_single.astype(np.float32), 0.0, 1.0)
-                        log("v2.2 merge applied to single-frame export (OutputContent=Combined)")
+                        # process_sam_matte: margin dilation, soften, fill_holes
+                        # (panel sliders). Identical to viewer's Combined-tab math.
+                        _sam_processed = process_sam_matte(
+                            _sam_raw_single,
+                            margin_px=float(settings.get("sam2_margin", 0)),
+                            softness_sigma=float(settings.get("sam2_soften", 0)),
+                            fill_kernel_px=int(settings.get("fill_holes", 0)),
+                        )
+                        _sam_arr = np.asarray(_sam_processed, dtype=np.float32)
+                        if _sam_arr.shape != _ck_2d_single.shape:
+                            _sam_arr = cv2.resize(_sam_arr, (_ck_2d_single.shape[1], _ck_2d_single.shape[0]),
+                                                  interpolation=cv2.INTER_LINEAR)
+                        mt_for_save = np.clip(_ck_2d_single * _sam_arr, 0.0, 1.0).astype(np.float32)
+                        log("Combined export: CK x dilated SAM (viewer-parity multiply)")
                     else:
                         log("OutputContent=Combined but SAM PNGs missing — exporting CK alone")
                 except Exception as _merge_e:
-                    log(f"v2.2 merge failed (non-fatal, exporting CK alone): {_merge_e}")
+                    log(f"Combined merge failed (non-fatal, exporting CK alone): {_merge_e}")
             save_output(fg, mt_for_save, op, settings["export_format"], codec=settings.get("output_codec", 0))
             log(f"Saved: {op.name}")
         if len(mt.shape) == 3: mt = mt[:, :, 0]
@@ -3520,7 +3540,12 @@ def on_process_range(ev):
                     fg = _cu.despill_opencv(fg, green_limit_mode="average", strength=_despill_str)
                 if mt is not None:
                     try:
-                        from corridorkey_sam_merge import apply_chroma_kill_to_matte
+                        # apply_chroma_kill_to_matte is imported at module level (line 193).
+                        # Inline 'from X import Y' inside on_process_range used to bind Y as
+                        # a LOCAL of on_process_range; the nested _run() then saw Y as a
+                        # closure variable that was unbound when BRAW sync didn't execute
+                        # the import (non-BRAW renders produced 21x "cannot access free
+                        # variable" errors per range). Use the module-level binding only.
                         mt = apply_chroma_kill_to_matte(mt, fr, settings.get("screen_type", "green"))
                     except Exception as _ckm_e: log(f"chroma kill failed (non-fatal): {_ckm_e}")
                 # v1.0 TWO-MASK MODE — CK matte unchanged, SAM matte saved as
@@ -3594,25 +3619,22 @@ def on_process_range(ev):
                     _write_sam = _content in (1, 3) and _sam_matte_v1 is not None  # both / SAM-only
                     _write_combined = _content == 0
                     if _write_combined:
-                        # 2026-05-13: v2.2 chroma-gated merge replaces the
-                        # naive multiply on the BRAW sync path too. trimap +
-                        # CFM + CK hair injection preserves hair detail that
-                        # the naive alpha * sam_arr clamped to zero. Falls
-                        # back to CK alone if pymatting fails or SAM is absent.
+                        # 2026-05-14: viewer-parity simple multiply. CK alpha
+                        # multiplied by process_sam_matte(SAM_union) which is
+                        # margin-dilated, softened, hole-filled SAM. Preserves
+                        # CK's fine hair detail inside the dilated SAM region
+                        # and zeros it outside (kills floor/walls). Replaces
+                        # the v2.2 trimap+CFM merge which destroyed hair
+                        # detail by replacing CK with CFM's smoothed solve.
+                        # Math matches preview_viewer_v2.py:2751 (Combined tab).
                         _mt_2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
                         _mt_for_save = mt
                         if _sam_matte_v1 is not None:
-                            try:
-                                from corridorkey_sam_merge import merge_ck_with_sam_active
-                                _sam_for_merge = np.asarray(_sam_matte_v1, dtype=np.float32)
-                                if _sam_for_merge.shape != _mt_2d.shape:
-                                    _sam_for_merge = cv2.resize(_sam_for_merge, (_mt_2d.shape[1], _mt_2d.shape[0]),
-                                                                interpolation=cv2.INTER_LINEAR)
-                                _mt_for_save = merge_ck_with_sam_active(_mt_2d, _sam_for_merge, source_rgb=fr)
-                                _mt_for_save = np.clip(_mt_for_save.astype(np.float32), 0.0, 1.0)
-                            except Exception as _mge:
-                                log(f"v2.2 merge failed at frame {pr} (BRAW sync, CK alone): {_mge}")
-                                _mt_for_save = _mt_2d
+                            _sam_for_merge = np.asarray(_sam_matte_v1, dtype=np.float32)
+                            if _sam_for_merge.shape != _mt_2d.shape:
+                                _sam_for_merge = cv2.resize(_sam_for_merge, (_mt_2d.shape[1], _mt_2d.shape[0]),
+                                                            interpolation=cv2.INTER_LINEAR)
+                            _mt_for_save = np.clip(_mt_2d * _sam_for_merge, 0.0, 1.0).astype(np.float32)
                         op = od / f"CK_{cn}_{pr:06d}{_ext}"
                         save_output(fg, _mt_for_save, op, settings["export_format"], codec=settings.get("output_codec", 0))
                         ofs.append(str(op))
@@ -3910,24 +3932,19 @@ def on_process_range(ev):
                     _m = np.clip(_m, 0.0, 1.0).astype(np.float32)
                     _fg_clip = np.clip(fg, 0.0, 1.0).astype(np.float32)
                     # Pre-compute combined alpha for the Combined-output branch.
-                    # 2026-05-13: v2.2 chroma-gated merge replaces the naive
-                    # alpha * sam_arr multiply. The merge runs trimap + CFM
-                    # + CK hair injection internally and is the "delicate
-                    # operation" Berto needs to preserve hair detail. Falls
-                    # back to CK alone if pymatting fails for any reason.
+                    # 2026-05-14: viewer-parity simple multiply. CK alpha
+                    # multiplied by process_sam_matte(SAM_union) which is
+                    # margin-dilated, softened, hole-filled SAM. Preserves
+                    # CK's fine hair detail inside the dilated SAM region
+                    # and zeros it outside (kills floor/walls). Math matches
+                    # preview_viewer_v2.py:2751 (viewer's Combined tab).
                     if _write_combined:
                         if _sam_matte_v1 is not None:
-                            try:
-                                from corridorkey_sam_merge import merge_ck_with_sam_active
-                                _sam_for_merge = np.asarray(_sam_matte_v1, dtype=np.float32)
-                                if _sam_for_merge.shape != _m.shape:
-                                    _sam_for_merge = cv2.resize(_sam_for_merge, (_m.shape[1], _m.shape[0]),
-                                                                interpolation=cv2.INTER_LINEAR)
-                                _m_combined = merge_ck_with_sam_active(_m, _sam_for_merge, source_rgb=fr)
-                                _m_combined = np.clip(_m_combined.astype(np.float32), 0.0, 1.0)
-                            except Exception as _mge:
-                                _tlog(f"v2.2 merge failed at frame {pr} (CK alone): {_mge}")
-                                _m_combined = _m
+                            _sam_for_merge = np.asarray(_sam_matte_v1, dtype=np.float32)
+                            if _sam_for_merge.shape != _m.shape:
+                                _sam_for_merge = cv2.resize(_sam_for_merge, (_m.shape[1], _m.shape[0]),
+                                                            interpolation=cv2.INTER_LINEAR)
+                            _m_combined = np.clip(_m * _sam_for_merge, 0.0, 1.0).astype(np.float32)
                         else:
                             _m_combined = _m
                         _m_active = _m_combined
