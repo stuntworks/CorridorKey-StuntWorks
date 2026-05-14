@@ -2616,18 +2616,21 @@ def process_current_frame(preview_only=False):
             _content_single = int(settings.get("output_content", 0))
             if _content_single == 0:
                 try:
-                    from corridorkey_sam_merge import merge_ck_with_sam_chroma_gated
+                    # 1d648e5 recipe (2026-05-03 ship): alpha * dilate(SAM, margin) +
+                    # Gaussian feather. This is the actual "perfect blend" — NOT the
+                    # 9093bb8 trimap+CFM detour which destroyed hair. See memory
+                    # [[corridorkey_subtract_is_simple_multiply]]: "Stop chasing.
+                    # Ship the multiply." Default buffer_px=20, feather_px=4.
+                    from sam2_combine import apply_sam2_gate_subtract
                     _sam_raw_single = _load_raw_sam_silhouette(mt_for_save.shape, settings)
                     if _sam_raw_single is not None:
                         _ck_2d_single = mt_for_save[:, :, 0] if len(mt_for_save.shape) == 3 else mt_for_save
-                        # 9093bb8 verbatim recipe: trimap + Closed-Form Matting
-                        # via pymatting, CK injected in unknown band only, hard
-                        # clamp outside dilated SAM. The "perfect blend" Berto
-                        # remembers from 3 weeks ago.
-                        mt_for_save = merge_ck_with_sam_chroma_gated(
-                            _ck_2d_single, _sam_raw_single, source_rgb=fr,
+                        mt_for_save = apply_sam2_gate_subtract(
+                            _ck_2d_single, _sam_raw_single,
+                            buffer_px=int(settings.get("sam2_margin", 20) or 20),
+                            feather_px=4,
                         )
-                        log("Combined export: 9093bb8 trimap+CFM merge applied")
+                        log(f"Combined export: 1d648e5 simple-multiply applied (margin={int(settings.get('sam2_margin', 20) or 20)})")
                     else:
                         log("OutputContent=Combined but SAM PNGs missing — exporting CK alone")
                 except Exception as _merge_e:
@@ -3612,19 +3615,18 @@ def on_process_range(ev):
                     _write_sam = _content in (1, 3) and _sam_matte_v1 is not None  # both / SAM-only
                     _write_combined = _content == 0
                     if _write_combined:
-                        # 9093bb8 verbatim recipe in BRAW sync path: trimap +
-                        # CFM via pymatting, CK injected in unknown band only,
-                        # hard clamp outside dilated SAM. _sam_union is the
-                        # raw binary union (no margin/soften/fill applied),
-                        # initialised to None at top of per-frame block so
-                        # this stays safe when SAM is inactive / bypassed.
+                        # 1d648e5 recipe (the actual perfect blend, NOT 9093bb8
+                        # CFM): alpha * dilate(SAM, margin) + Gaussian feather.
+                        # Memory [[corridorkey_subtract_is_simple_multiply]].
                         _mt_2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
                         _mt_for_save = _mt_2d
                         if _sam_union is not None:
                             try:
-                                from corridorkey_sam_merge import merge_ck_with_sam_chroma_gated
-                                _mt_for_save = merge_ck_with_sam_chroma_gated(
-                                    _mt_2d, _sam_union, source_rgb=fr,
+                                from sam2_combine import apply_sam2_gate_subtract
+                                _mt_for_save = apply_sam2_gate_subtract(
+                                    _mt_2d, _sam_union,
+                                    buffer_px=int(settings.get("sam2_margin", 20) or 20),
+                                    feather_px=4,
                                 )
                             except Exception as _mge:
                                 log(f"BRAW Combined merge failed (CK alone): {_mge}")
@@ -3934,15 +3936,16 @@ def on_process_range(ev):
                     # and zeros it outside (kills floor/walls). Math matches
                     # preview_viewer_v2.py:2751 (viewer's Combined tab).
                     if _write_combined:
-                        # 9093bb8 verbatim recipe in non-BRAW PROCESS RANGE
-                        # main-thread loop: trimap + CFM via pymatting, CK
-                        # injected in unknown band only, hard clamp outside
-                        # dilated SAM. _sam_union is the raw binary union.
+                        # 1d648e5 recipe in non-BRAW PROCESS RANGE main-thread loop:
+                        # alpha * dilate(SAM, margin) + Gaussian feather. The actual
+                        # perfect blend (NOT the 9093bb8 CFM detour).
                         if _sam_union is not None:
                             try:
-                                from corridorkey_sam_merge import merge_ck_with_sam_chroma_gated
-                                _m_combined = merge_ck_with_sam_chroma_gated(
-                                    _m, _sam_union, source_rgb=fr,
+                                from sam2_combine import apply_sam2_gate_subtract
+                                _m_combined = apply_sam2_gate_subtract(
+                                    _m, _sam_union,
+                                    buffer_px=int(settings.get("sam2_margin", 20) or 20),
+                                    feather_px=4,
                                 )
                             except Exception as _mge:
                                 _tlog(f"Combined merge failed at frame {pr} (CK alone): {_mge}")
