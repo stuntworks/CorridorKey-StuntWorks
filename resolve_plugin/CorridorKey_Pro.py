@@ -3595,16 +3595,25 @@ def on_process_range(ev):
                     _write_sam = _content in (1, 3) and _sam_matte_v1 is not None  # both / SAM-only
                     _write_combined = _content == 0
                     if _write_combined:
-                        # CK alpha multiplied by SAM gate. Falls back to CK alone
-                        # when SAM matte is absent (e.g. user didn't drop dots).
+                        # 2026-05-13: v2.2 chroma-gated merge replaces the
+                        # naive multiply on the BRAW sync path too. trimap +
+                        # CFM + CK hair injection preserves hair detail that
+                        # the naive alpha * sam_arr clamped to zero. Falls
+                        # back to CK alone if pymatting fails or SAM is absent.
+                        _mt_2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
                         _mt_for_save = mt
                         if _sam_matte_v1 is not None:
-                            _sam_arr = np.asarray(_sam_matte_v1, dtype=np.float32)
-                            _mt_2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
-                            if _sam_arr.shape != _mt_2d.shape:
-                                _sam_arr = cv2.resize(_sam_arr, (_mt_2d.shape[1], _mt_2d.shape[0]),
-                                                      interpolation=cv2.INTER_LINEAR)
-                            _mt_for_save = np.clip(_mt_2d * _sam_arr, 0.0, 1.0)
+                            try:
+                                from corridorkey_sam_merge import merge_ck_with_sam_active
+                                _sam_for_merge = np.asarray(_sam_matte_v1, dtype=np.float32)
+                                if _sam_for_merge.shape != _mt_2d.shape:
+                                    _sam_for_merge = cv2.resize(_sam_for_merge, (_mt_2d.shape[1], _mt_2d.shape[0]),
+                                                                interpolation=cv2.INTER_LINEAR)
+                                _mt_for_save = merge_ck_with_sam_active(_mt_2d, _sam_for_merge, source_rgb=fr)
+                                _mt_for_save = np.clip(_mt_for_save.astype(np.float32), 0.0, 1.0)
+                            except Exception as _mge:
+                                log(f"v2.2 merge failed at frame {pr} (BRAW sync, CK alone): {_mge}")
+                                _mt_for_save = _mt_2d
                         op = od / f"CK_{cn}_{pr:06d}{_ext}"
                         save_output(fg, _mt_for_save, op, settings["export_format"], codec=settings.get("output_codec", 0))
                         ofs.append(str(op))
@@ -3902,14 +3911,26 @@ def on_process_range(ev):
                     _m = np.clip(_m, 0.0, 1.0).astype(np.float32)
                     _fg_clip = np.clip(fg, 0.0, 1.0).astype(np.float32)
                     # Pre-compute combined alpha for the Combined-output branch.
+                    # 2026-05-13: v2.2 chroma-gated merge replaces the naive
+                    # alpha * sam_arr multiply. The merge runs trimap + CFM
+                    # + CK hair injection internally and is the "delicate
+                    # operation" Berto needs to preserve hair detail. Falls
+                    # back to CK alone if pymatting fails for any reason.
                     if _write_combined:
-                        _m_combined = _m
                         if _sam_matte_v1 is not None:
-                            _sam_arr = np.asarray(_sam_matte_v1, dtype=np.float32)
-                            if _sam_arr.shape != _m.shape:
-                                _sam_arr = cv2.resize(_sam_arr, (_m.shape[1], _m.shape[0]),
-                                                      interpolation=cv2.INTER_LINEAR)
-                            _m_combined = np.clip(_m * _sam_arr, 0.0, 1.0)
+                            try:
+                                from corridorkey_sam_merge import merge_ck_with_sam_active
+                                _sam_for_merge = np.asarray(_sam_matte_v1, dtype=np.float32)
+                                if _sam_for_merge.shape != _m.shape:
+                                    _sam_for_merge = cv2.resize(_sam_for_merge, (_m.shape[1], _m.shape[0]),
+                                                                interpolation=cv2.INTER_LINEAR)
+                                _m_combined = merge_ck_with_sam_active(_m, _sam_for_merge, source_rgb=fr)
+                                _m_combined = np.clip(_m_combined.astype(np.float32), 0.0, 1.0)
+                            except Exception as _mge:
+                                _tlog(f"v2.2 merge failed at frame {pr} (CK alone): {_mge}")
+                                _m_combined = _m
+                        else:
+                            _m_combined = _m
                         _m_active = _m_combined
                     else:
                         _m_active = _m
@@ -3965,6 +3986,19 @@ def on_process_range(ev):
                     _tstatus(f"{pr}/{dur} ({fpsr:.1f}fps, {rem:.0f}s left)")
                     _tprogress(pr, dur)
                     if pr % 10 == 0: _tlog(f"{pr}/{dur}")
+                    # Path B sync mode: drain _ui_queue + _save_queue via the
+                    # main-thread PollTimer, and let Qt process the Cancel
+                    # button click. Without this the UI freezes for the whole
+                    # range render and CANCEL never fires.
+                    try:
+                        from PyQt5.QtWidgets import QApplication as _QApp
+                        _QApp.processEvents()
+                    except Exception:
+                        try:
+                            from PySide2.QtWidgets import QApplication as _QApp
+                            _QApp.processEvents()
+                        except Exception:
+                            pass
             if cap:
                 cap.release()
 
@@ -4001,9 +4035,16 @@ def on_process_range(ev):
                 if _torch_mod is not None:
                     _torch_mod.cuda.empty_cache()
             except Exception: pass
-    _t = threading.Thread(target=_run, daemon=True)
-    _t.start()
-    log(f"Range thread launched (alive={_t.is_alive()})")
+    # Path B (2026-05-13): kill the worker thread, run _run on the main thread.
+    # Worker thread died silently before line 3633 across 16 hours of debug
+    # (5 deployed thread-safety fixes did not crack it). Cause unknown; likely
+    # a Fusion embedded-Python quirk with daemon-thread bootstrap. The BRAW
+    # sync path right above this function has been proven to work synchronously.
+    # UI freezes during the run; cancel button still works between frames via
+    # QApplication.processEvents() inside the loop. Apr 20 handoff doc:
+    # "PROCESS RANGE runs synchronously on the main thread. UI freezes
+    #  during processing. That is expected and correct."
+    _run()
 
 # WHAT IT DOES: Sets the cancel flag so the range processing loop stops on next iteration
 def on_cancel(ev):
