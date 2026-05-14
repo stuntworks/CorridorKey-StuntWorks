@@ -452,11 +452,16 @@ items["OutputCodec"].AddItem("PNG 8-bit (default)")
 items["OutputCodec"].AddItem("PNG 16-bit (lossless)")
 items["OutputCodec"].AddItem("TIFF 16-bit (lossless)")
 items["OutputCodec"].AddItem("EXR 32-bit (VFX float)")
-# OutputContent: which file(s) to write. Default 0 = Combined.
+# OutputContent: which file(s) to write. 2026-05-14: default flipped to
+# "CK only" so SAM2 is never combined automatically. SAM combination is
+# the artist's explicit choice (Berto's rule). Item order kept the same so
+# Combined sits at the top of the dropdown for users who want it.
 items["OutputContent"].AddItem("Combined (CK x SAM)")
 items["OutputContent"].AddItem("Both (CK + SAM sidecar)")
 items["OutputContent"].AddItem("CK only")
 items["OutputContent"].AddItem("SAM matte only")
+try: items["OutputContent"].CurrentIndex = 2  # default to "CK only"
+except Exception: pass
 items["OutputMode"].AddItem("Track 2 (Above Source)")
 items["OutputMode"].AddItem("MediaPool Only")
 items["OutputMode"].AddItem("Fusion Comp")
