@@ -32,10 +32,13 @@ import numpy as np
 
 SAM_BINARIZE_THRESHOLD = 0.5
 
-# v1.0 two-mask mode: the merge dispatcher is a passthrough, the v2.2
-# chain is removed. These flags are kept for any downstream code that
-# still reads them; both are False so v2.2 paths never run.
-USE_CHROMA_GATED_MERGE = False
+# 2026-05-13: v2.2 chroma-gated merge restored for combined CK+SAM2 export.
+# When True (default), merge_ck_with_sam_active routes to the trimap+CFM path
+# in merge_ck_with_sam_chroma_gated (CK injected post-solve in unknown band,
+# hard clamp outside dilated SAM). When False, falls back to Path B
+# (max-style) merge_ck_with_sam. Live-preview (reprocess_with_cached) stays
+# CK-only regardless: this flag only controls the export-time merge.
+USE_CHROMA_GATED_MERGE = True
 DEBUG_ENABLED = False
 DEBUG_MODE = False
 
@@ -353,8 +356,157 @@ def process_sam_matte(
 
 
 def merge_ck_with_sam(ck_alpha: np.ndarray, sam_silhouette: Optional[np.ndarray]) -> np.ndarray:
-    """v1.0 passthrough: returns CK unchanged. SAM is exported separately."""
-    return np.asarray(ck_alpha, dtype=np.float32).copy()
+    # WHAT IT DOES: Path B fallback merge. final = max(CK, SAM_binary) via
+    #               clip-add. Returns CK alone if SAM is None or shape-mismatched
+    #               (safe fallback for callers without a usable SAM silhouette).
+    # DEPENDS ON:   ck_alpha shape == sam_silhouette shape when both present.
+    #               numpy. No CFM, no chroma reasoning.
+    # AFFECTS:      Only the fallback branch of merge_ck_with_sam_active when
+    #               USE_CHROMA_GATED_MERGE is False or source_rgb is missing.
+    ck = np.asarray(ck_alpha, dtype=np.float32)
+    if ck.ndim == 3:
+        ck = ck[..., 0]
+    if sam_silhouette is None:
+        return ck.copy()
+    sam = np.asarray(sam_silhouette, dtype=np.float32)
+    if sam.ndim == 3:
+        sam = sam[..., 0]
+    if ck.shape != sam.shape:
+        return ck.copy()
+    difference = np.clip(sam - ck, 0.0, 1.0)
+    return np.clip(ck + difference, 0.0, 1.0).astype(np.float32)
+
+
+def merge_ck_with_sam_chroma_gated(ck_alpha, sam_silhouette, source_rgb=None):
+    # WHAT IT DOES: v2.2 trimap + Closed-Form Matting with CK hair injection.
+    #   Restored 2026-05-13 from pre-Phase-A architecture (commit 9093bb8).
+    #
+    #   Pipeline:
+    #     1. SAM silhouette gets MORPH_CLOSE (40) + binary_fill_holes for solid body region.
+    #     2. fg_def = erode(sam_filled, 41) -> definite foreground.
+    #     3. sam_dilated = dilate(sam_filled, 81) -> outer boundary (trust budget).
+    #     4. Trimap = 0.5 unknown band; 1.0 where fg_def; 0.0 outside sam_dilated.
+    #        (CK is NOT used in the trimap. SAM-only trimap is the correctness rail.)
+    #     5. Downsample 2x if max(H, W) > 2500 (saves CFM solver time at 4K).
+    #     6. Closed-Form Matting via pymatting solves alpha in the unknown band.
+    #     7. Upsample back to source resolution.
+    #     8. CK hair injection in unknown band only: alpha = max(CFM_alpha, CK) where
+    #        CFM_alpha > 0.01. Protects hair tendrils CFM smooths over while preventing
+    #        CK = 1.0 floor pixels from blowing up alpha where CFM correctly killed them.
+    #     9. Internal GaussianBlur(15, 2.5) inside sam_dilated to soften fg_def boundary.
+    #    10. Hard clamp alpha = 0 outside sam_dilated (kills walls/floor/junk SAM didn't cover).
+    #
+    # DEPENDS ON: pymatting.estimate_alpha_cf, scipy.ndimage.binary_fill_holes, cv2, numpy.
+    #             source_rgb is REQUIRED — raises ValueError if None.
+    # AFFECTS:    The exporter's combined-mode output (Combined OutputContent in panel).
+    #             The "perfect key" path Berto needs. The viewer's Combined tab uses
+    #             a separate alpha * sam_arr multiply; the exporter's quality matches
+    #             this function, not the viewer.
+    # DANGER ZONE HIGH:
+    #   - DO NOT use CK in the trimap (only SAM).
+    #   - DO NOT skip the hard clamp at the end (it's the safety rail against junk halos).
+    #   - DO NOT increase the dilation kernel beyond 121 without verifying foot halo.
+    #   - DO NOT decrease the close kernel below 30 — body holes return.
+    #
+    # Tuning guide (from v2.2 author notes):
+    #   - Foot halo (CFM extends alpha into floor near foot): reduce dilation 81 -> 61.
+    #     CK injection uses max(), so CK can only INCREASE alpha; halos from CFM aren't
+    #     killed by CK. Tighter dilation = sooner hard-clamp.
+    #   - Hair tendrils clipped beyond dilated SAM: increase dilation 81 -> 101 or 121.
+    #     Tradeoff: more room for CFM and CK to bleed into junk.
+    #   - Butt notch returns (SAM under-clipping not absorbed by close): increase close 40 -> 60.
+    import cv2
+    from scipy.ndimage import binary_fill_holes
+    from pymatting import estimate_alpha_cf
+
+    if source_rgb is None:
+        raise ValueError("v2.2 chroma-gated merge requires source_rgb")
+
+    ck_arr = np.asarray(ck_alpha, dtype=np.float32)
+    if ck_arr.ndim == 3:
+        ck_arr = ck_arr[..., 0]
+    H, W = ck_arr.shape
+    ck = np.clip(ck_arr, 0.0, 1.0)
+
+    sam_arr = np.asarray(sam_silhouette)
+    if sam_arr.ndim == 3:
+        sam_arr = sam_arr[..., 0]
+    sam = (sam_arr > 0.5).astype(np.uint8)
+
+    rgb_in = np.asarray(source_rgb)
+    if rgb_in.dtype != np.float32:
+        rgb = np.clip(rgb_in.astype(np.float32) / 255.0, 0.0, 1.0)
+    else:
+        rgb = np.clip(rgb_in, 0.0, 1.0)
+    # CFM needs 3-channel RGB. If caller fed BGR, that's OK for the matte solve
+    # since CFM treats channels symmetrically. Single-channel? Stack to 3.
+    if rgb.ndim == 2:
+        rgb = np.stack([rgb, rgb, rgb], axis=-1)
+    if rgb.shape[:2] != (H, W):
+        rgb = cv2.resize(rgb, (W, H), interpolation=cv2.INTER_AREA)
+
+    # 1. Preprocess SAM: morphological close + hole fill -> solid body region.
+    k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (40, 40))
+    sam_closed = cv2.morphologyEx(sam, cv2.MORPH_CLOSE, k_close)
+    sam_filled = binary_fill_holes(sam_closed).astype(np.uint8)
+
+    # 2. Definite foreground (eroded SAM).
+    k_erode = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (41, 41))
+    fg_def = cv2.erode(sam_filled, k_erode, iterations=1)
+
+    # 3. Outer boundary (dilated SAM).
+    k_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (81, 81))
+    sam_dilated = cv2.dilate(sam_filled, k_dilate, iterations=1)
+
+    # 4. Trimap. SAM only, CK not used.
+    trimap = np.full((H, W), 0.5, dtype=np.float32)
+    trimap[fg_def > 0] = 1.0
+    trimap[sam_dilated == 0] = 0.0
+
+    # 5. Downsample for CFM speed at 4K (CFM is O(N^1.5) on pixels).
+    scale = 2 if max(H, W) > 2500 else 1
+    if scale > 1:
+        h, w = H // scale, W // scale
+        trimap_small = cv2.resize(trimap, (w, h), interpolation=cv2.INTER_NEAREST)
+        rgb_small = cv2.resize(rgb, (w, h), interpolation=cv2.INTER_AREA)
+    else:
+        trimap_small = trimap
+        rgb_small = rgb
+
+    # 6. Closed-Form Matting. pymatting Numba kernels expect float64.
+    alpha_small = estimate_alpha_cf(
+        rgb_small.astype(np.float64),
+        trimap_small.astype(np.float64),
+    )
+
+    # 7. Upsample alpha back to source resolution.
+    if scale > 1:
+        alpha = cv2.resize(alpha_small.astype(np.float32), (W, H), interpolation=cv2.INTER_LINEAR)
+    else:
+        alpha = alpha_small.astype(np.float32)
+    alpha = np.clip(alpha, 0.0, 1.0)
+
+    # 8. CK hair injection in unknown band only. Protects hair tendrils CFM smooths
+    # over. Gated on CFM > 0.01 so CK = 1.0 floor pixels don't blow up alpha where
+    # CFM correctly assigned near-zero alpha.
+    unknown_band = (trimap == 0.5)
+    inject_zone = unknown_band & (alpha > 0.01)
+    alpha[inject_zone] = np.maximum(alpha[inject_zone], ck[inject_zone])
+
+    # 9. Internal smoothing inside dilated SAM. Feathers fg_def -> unknown transitions
+    # over ~8 px to kill the 1-2 pixel cliffs that show as visible matte edges.
+    INTERNAL_BLUR_KERNEL = 15
+    INTERNAL_BLUR_SIGMA = 2.5
+    alpha_smooth = cv2.GaussianBlur(
+        alpha, (INTERNAL_BLUR_KERNEL, INTERNAL_BLUR_KERNEL), INTERNAL_BLUR_SIGMA
+    )
+    inside_band = sam_dilated > 0
+    alpha = np.where(inside_band, alpha_smooth, alpha)
+
+    # 10. Hard clamp outside dilated SAM. Safety rail.
+    alpha[sam_dilated == 0] = 0.0
+
+    return alpha.astype(np.float32)
 
 
 def merge_ck_with_sam_active(
@@ -363,13 +515,28 @@ def merge_ck_with_sam_active(
     source_rgb: Optional[np.ndarray] = None,
     screen_type: str = "green",
 ) -> np.ndarray:
-    """v1.0 passthrough dispatcher: returns CK unchanged.
-
-    Pre-v1.0 this was the v2.2 chroma-gated merge. v1.0 decouples CK and SAM —
-    plugin no longer merges them, the user composites in their host.
-    Existing imports keep working; the displayed/rendered alpha is just CK.
-    """
-    return np.asarray(ck_alpha, dtype=np.float32).copy()
+    # WHAT IT DOES: Dispatcher for the active merge mode. Routes to v2.2
+    #   chroma-gated merge when USE_CHROMA_GATED_MERGE is True (default after
+    #   2026-05-13 restoration). Falls back to Path B (max-style) when the
+    #   flag is False, when sam_silhouette is None, or when source_rgb is
+    #   missing. Single entry point so call sites are agnostic to which
+    #   merge is in effect.
+    # DEPENDS ON: USE_CHROMA_GATED_MERGE flag, merge_ck_with_sam_chroma_gated,
+    #             merge_ck_with_sam (fallback).
+    # AFFECTS: every exporter call site (process_current_frame Combined branch,
+    #          on_process_range Combined branch, AE/Fusion plugin call sites).
+    #          screen_type kwarg accepted for backward compatibility; v2.2
+    #          chroma-gated ignores it (uses RGB matting, not chroma keying).
+    if not USE_CHROMA_GATED_MERGE:
+        return merge_ck_with_sam(ck_alpha, sam_silhouette)
+    if sam_silhouette is None or source_rgb is None:
+        return merge_ck_with_sam(ck_alpha, sam_silhouette)
+    try:
+        return merge_ck_with_sam_chroma_gated(ck_alpha, sam_silhouette, source_rgb=source_rgb)
+    except Exception:
+        # Safety net: never let a CFM solver hiccup crash the renderer.
+        # Fall back to Path B which always returns a usable alpha.
+        return merge_ck_with_sam(ck_alpha, sam_silhouette)
 
 
 def write_matte_final_dump(alpha_final: np.ndarray, ops_applied) -> None:

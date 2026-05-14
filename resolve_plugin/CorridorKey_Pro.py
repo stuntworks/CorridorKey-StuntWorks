@@ -1107,6 +1107,47 @@ def _load_sam2_output_gate(frame_shape, settings):
         f"coverage {mask.mean():.3f} ({int(mask.sum())} px foreground)")
     return mask
 
+
+def _load_raw_sam_silhouette(frame_shape, settings):
+    """Load the RAW binary SAM silhouette (union of per-object PNGs) without
+    dilation or soften. Returns float32 mask in {0.0, 1.0} or None when SAM
+    is inactive / PNGs missing.
+
+    Distinct from _load_sam2_output_gate above which applies dilate+soften
+    before returning. The v2.2 chroma-gated merge in corridorkey_sam_merge.py
+    needs the raw silhouette because it builds its own trimap and runs its
+    own dilation (81-pixel ellipse) internally.
+    """
+    import numpy as np, cv2
+    if settings.get("alpha_method") != 1:
+        return None
+    h, w = frame_shape[:2]
+    candidates = [
+        SESSION_DIR / "sam2_mask_obj1.png",
+        SESSION_DIR / "sam2_mask_obj2.png",
+    ]
+    legacy = SESSION_DIR / "sam2_mask.png"
+    if not any(p.exists() for p in candidates) and legacy.exists():
+        candidates = [legacy]
+    found = []
+    for p in candidates:
+        if not p.exists():
+            continue
+        raw = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+        if raw is None:
+            continue
+        _, raw = cv2.threshold(raw, 127, 255, cv2.THRESH_BINARY)
+        if raw.shape != (h, w):
+            raw = cv2.resize(raw, (w, h), interpolation=cv2.INTER_NEAREST)
+        found.append(raw.astype(np.float32) / 255.0)
+    if not found:
+        return None
+    mask = found[0]
+    for m in found[1:]:
+        mask = np.maximum(mask, m)
+    return mask
+
+
 # WHAT IT DOES: Runs SAM2 (Segment Anything Model 2) to generate a mask from user click points.
 #   Loads the SAM2 model, feeds it the frame + positive/negative points, returns the best mask.
 # DEPENDS-ON: SAM2 weights at <CK_ROOT>/sam2_weights/sam2.1_hiera_small.pt, CUDA GPU
@@ -2540,8 +2581,34 @@ def process_current_frame(preview_only=False):
         if fg is not None:
             try: log(f"FG stats — dtype:{fg.dtype} min:{float(fg.min()):.4f} max:{float(fg.max()):.4f} mean R:{float(fg[..., 0].mean()):.4f} G:{float(fg[..., 1].mean()):.4f} B:{float(fg[..., 2].mean()):.4f}")
             except Exception as _e: log(f"FG stat error: {_e}")
-        # SAM2 gate intentionally NOT applied here — single frame preview shows
-        # clean chroma key only. SAM2 gate is applied only in PROCESS RANGE.
+        # Last modified: 2026-05-13 | Change: v2.2 chroma-gated merge wired into single-frame export
+        # WHAT IT DOES: When SAM dots are placed (alpha_method=1 and SAM PNGs in session dir),
+        #               merges CK alpha with the raw SAM silhouette via trimap + Closed-Form
+        #               Matting in corridorkey_sam_merge.merge_ck_with_sam_active. CK is injected
+        #               post-CFM only in the unknown band so hair tendrils CFM smooths over are
+        #               preserved. Hard clamp outside dilated SAM kills walls/floor/junk.
+        # DEPENDS-ON: corridorkey_sam_merge.merge_ck_with_sam_active (with USE_CHROMA_GATED_MERGE=True),
+        #             pymatting, scipy.ndimage, _load_raw_sam_silhouette helper (line ~1110).
+        # AFFECTS: only the exported PNG/TIFF/EXR file. Live preview (reprocess_with_cached) is
+        #          intentionally left CK-only so the artist can spot missing hair, evaluate SAM
+        #          placement, and see CK's soft edges before SAM clamps them. Switch to the
+        #          viewer's Combined or Split tabs to preview the merged result.
+        # DANGER ZONE: parallel logic must exist in on_process_range Combined branch (Path B work).
+        #              If you change the merge math here, update on_process_range too.
+        if mt is not None:
+            try:
+                _sam_raw = _load_raw_sam_silhouette(mt.shape, settings)
+                if _sam_raw is not None:
+                    from corridorkey_sam_merge import merge_ck_with_sam_active
+                    _ck_2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
+                    _ck_mean_before = float(_ck_2d.mean())
+                    _merged = merge_ck_with_sam_active(_ck_2d, _sam_raw, source_rgb=fr)
+                    mt = _merged.astype(np.float32)
+                    log(f"v2.2 merge applied: alpha mean {_ck_mean_before:.3f} -> {float(mt.mean()):.3f}")
+                else:
+                    log("SAM2 inactive or PNGs missing: CK matte exported unchanged")
+            except Exception as _merge_e:
+                log(f"v2.2 merge failed (non-fatal, exporting CK alone): {_merge_e}")
         choke_px = int(settings.get("choke", 0))
         if choke_px > 0 and mt is not None:
             k = choke_px * 2 + 1
