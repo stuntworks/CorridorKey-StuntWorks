@@ -2581,34 +2581,11 @@ def process_current_frame(preview_only=False):
         if fg is not None:
             try: log(f"FG stats — dtype:{fg.dtype} min:{float(fg.min()):.4f} max:{float(fg.max()):.4f} mean R:{float(fg[..., 0].mean()):.4f} G:{float(fg[..., 1].mean()):.4f} B:{float(fg[..., 2].mean()):.4f}")
             except Exception as _e: log(f"FG stat error: {_e}")
-        # Last modified: 2026-05-13 | Change: v2.2 chroma-gated merge wired into single-frame export
-        # WHAT IT DOES: When SAM dots are placed (alpha_method=1 and SAM PNGs in session dir),
-        #               merges CK alpha with the raw SAM silhouette via trimap + Closed-Form
-        #               Matting in corridorkey_sam_merge.merge_ck_with_sam_active. CK is injected
-        #               post-CFM only in the unknown band so hair tendrils CFM smooths over are
-        #               preserved. Hard clamp outside dilated SAM kills walls/floor/junk.
-        # DEPENDS-ON: corridorkey_sam_merge.merge_ck_with_sam_active (with USE_CHROMA_GATED_MERGE=True),
-        #             pymatting, scipy.ndimage, _load_raw_sam_silhouette helper (line ~1110).
-        # AFFECTS: only the exported PNG/TIFF/EXR file. Live preview (reprocess_with_cached) is
-        #          intentionally left CK-only so the artist can spot missing hair, evaluate SAM
-        #          placement, and see CK's soft edges before SAM clamps them. Switch to the
-        #          viewer's Combined or Split tabs to preview the merged result.
-        # DANGER ZONE: parallel logic must exist in on_process_range Combined branch (Path B work).
-        #              If you change the merge math here, update on_process_range too.
-        if mt is not None:
-            try:
-                _sam_raw = _load_raw_sam_silhouette(mt.shape, settings)
-                if _sam_raw is not None:
-                    from corridorkey_sam_merge import merge_ck_with_sam_active
-                    _ck_2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
-                    _ck_mean_before = float(_ck_2d.mean())
-                    _merged = merge_ck_with_sam_active(_ck_2d, _sam_raw, source_rgb=fr)
-                    mt = _merged.astype(np.float32)
-                    log(f"v2.2 merge applied: alpha mean {_ck_mean_before:.3f} -> {float(mt.mean()):.3f}")
-                else:
-                    log("SAM2 inactive or PNGs missing: CK matte exported unchanged")
-            except Exception as _merge_e:
-                log(f"v2.2 merge failed (non-fatal, exporting CK alone): {_merge_e}")
+        # 2026-05-14 fix: SAM merge is the user's choice via OutputContent dropdown.
+        # mt stays CK-alone through choke, despeckle, and the preview push so the
+        # artist sees the raw CK matte. The v2.2 chroma-gated merge runs only at
+        # save time, only when output_content == 0 (Combined mode). All other
+        # modes (Both, CK only, SAM only) export CK alone from this code path.
         choke_px = int(settings.get("choke", 0))
         if choke_px > 0 and mt is not None:
             k = choke_px * 2 + 1
@@ -2621,6 +2598,23 @@ def process_current_frame(preview_only=False):
             # Use a local copy so the unchanged mt below reaches show_preview_window
             # untouched — the viewer applies despeckle live on its own slider.
             mt_for_save = _apply_despeckle_to_alpha(mt, settings)
+            # OutputContent gate: v2.2 chroma-gated merge runs ONLY when the user
+            # selected Combined mode. Berto's rule (2026-05-14): SAM combination is
+            # opt-in via dropdown, never automatic. The artist owns that decision.
+            _content_single = int(settings.get("output_content", 0))
+            if _content_single == 0:
+                try:
+                    _sam_raw_single = _load_raw_sam_silhouette(mt_for_save.shape, settings)
+                    if _sam_raw_single is not None:
+                        from corridorkey_sam_merge import merge_ck_with_sam_active
+                        _ck_2d_single = mt_for_save[:, :, 0] if len(mt_for_save.shape) == 3 else mt_for_save
+                        _merged_single = merge_ck_with_sam_active(_ck_2d_single, _sam_raw_single, source_rgb=fr)
+                        mt_for_save = np.clip(_merged_single.astype(np.float32), 0.0, 1.0)
+                        log("v2.2 merge applied to single-frame export (OutputContent=Combined)")
+                    else:
+                        log("OutputContent=Combined but SAM PNGs missing — exporting CK alone")
+                except Exception as _merge_e:
+                    log(f"v2.2 merge failed (non-fatal, exporting CK alone): {_merge_e}")
             save_output(fg, mt_for_save, op, settings["export_format"], codec=settings.get("output_codec", 0))
             log(f"Saved: {op.name}")
         if len(mt.shape) == 3: mt = mt[:, :, 0]
