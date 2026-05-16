@@ -48,16 +48,19 @@ DEBUG_MODE = False
 # Off-green pixels => SAM_binary rules (hard kill of floor/wire/walls).
 # Trimap+CFM architecture from 9093bb8 is archived as _v22_trimap_cfm_archived
 # below for hot-revert if this regresses.
-CHROMA_GATE_THRESHOLD = 0.20
-# 2026-05-16: bumped 0.01 → 0.20 after diagnostic showed 96% weight=1 coverage on
-# Berto's BRAW (G channel mean 0.39). The 0.01 was for dim greens; this clip has
-# a bright screen with mild spill onto the body, so threshold must be high enough
-# to exclude spill (~0.19) and low enough to catch hair edges (~0.25–0.30).
-CHROMA_GATE_DILATE_PX = 0
-# 2026-05-16: 50 → 0. cv2.dilate expands in ALL directions and dragged the
-# on-green region into adjacent off-green junk (carpet, lift, walls), giving
-# them CK-rule when they should have been SAM-rule.
-CHROMA_GATE_SOFT_BAND = 0.0
+CHROMA_GATE_THRESHOLD = 0.20  # UNUSED in confidence-based merge; kept for hot-revert
+CHROMA_GATE_DILATE_PX = 0     # UNUSED in confidence-based merge; kept for hot-revert
+CHROMA_GATE_SOFT_BAND = 0.0   # UNUSED in confidence-based merge; kept for hot-revert
+
+# CK-confidence-based routing — evolved version from 0ffc24b1 (2026-05-07).
+# Soft zone gated by dilated SAM buffer so CK partial alpha far from body
+# (wire echoes, structure edges) get killed. CK_SOFT_HI lowered to 0.7
+# (from 0.95) so "almost confident" CK pixels also route through SAM gate.
+# NO Gaussian blur anywhere — cv2.dilate binary only — see
+# [[feedback-ck-no-gaussian-on-sam-mask]].
+CK_SOFT_LO = 0.05
+CK_SOFT_HI = 0.7
+SOFT_ZONE_SAM_BUFFER_PX = 40
 
 # Saturation ramp endpoints (logit space) — see logits_to_soft_mask below.
 # A 4-logit-wide soft band gives a 2-4 px feather at typical SAM 2 grad
@@ -463,61 +466,57 @@ def merge_ck_with_sam_chroma_gated(
         ck = ck[..., 0]
     if sam_silhouette is None:
         return ck.copy()
-    sam = binarize_sam_silhouette(sam_silhouette)
+    sam = (np.asarray(sam_silhouette, dtype=np.float32) > 0.5).astype(np.float32)
     if sam.ndim == 3:
         sam = sam[..., 0]
     if ck.shape != sam.shape:
         return ck.copy()
 
-    rgb_in = np.asarray(source_rgb)
-    if rgb_in.dtype != np.float32:
-        rgb = np.clip(rgb_in.astype(np.float32) / 255.0, 0.0, 1.0)
-    else:
-        rgb = np.clip(rgb_in, 0.0, 1.0)
-    if rgb.ndim == 2:
-        rgb = np.stack([rgb, rgb, rgb], axis=-1)
-    if rgb.shape[:2] != ck.shape:
-        import cv2 as _cv2
-        rgb = _cv2.resize(rgb, (ck.shape[1], ck.shape[0]), interpolation=_cv2.INTER_AREA)
+    # Fill SAM2 segmentation holes (small interior gaps from imperfect masks).
+    try:
+        from scipy.ndimage import binary_fill_holes
+        sam = binary_fill_holes((sam > 0.5).astype(np.uint8)).astype(np.float32)
+    except Exception:
+        pass
 
-    weight = compute_chroma_weight(
-        rgb, screen_type=screen_type, threshold=threshold,
-        soft_band=soft_band, dilate_px=dilate_px,
-    )
-    if weight.shape != ck.shape:
-        return ck.copy()
-
-    # SAM=1 always wins inside body silhouette (overrides chroma test).
-    # Prevents body-interior holes where strong green spill made weight=1 and CK
-    # then miskeyed the body pixel as background. Hair edges extend BEYOND the
-    # SAM silhouette, so they sit in the sam=0 zone where weight*ck still gives
-    # CK's soft alpha for fine hair detail.
-    final = np.where(sam > 0.5, 1.0, weight * ck).astype(np.float32)
+    # CK-confidence-based routing (0ffc24b1 verbatim, 2026-05-07).
+    #   soft_zone  (CK_SOFT_LO < ck < CK_SOFT_HI) → final = ck * sam_buffered.
+    #     CK's soft alpha (hair, edges) preserved within SOFT_ZONE_SAM_BUFFER_PX
+    #     of body. CK's partial alpha far from body (wire echoes, structure
+    #     edge bleed) gets killed because sam_buffered=0 there.
+    #   confident  (ck <= LO or ck >= HI) → final = ck * sam. SAM gates the
+    #     decision: kills CK false positives on walls / floor / shoe halos
+    #     where CK=1 but SAM=0; keeps body where CK and SAM agree.
+    # sam_buffered uses binary dilation (cv2.dilate) — NO Gaussian, see
+    # [[feedback-ck-no-gaussian-on-sam-mask]].
+    import cv2 as _cv2
+    _k = max(1, int(SOFT_ZONE_SAM_BUFFER_PX))
+    _kernel = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (_k * 2 + 1, _k * 2 + 1))
+    sam_buffered = _cv2.dilate(sam.astype(np.uint8), _kernel).astype(np.float32)
+    soft_zone = (ck > CK_SOFT_LO) & (ck < CK_SOFT_HI)
+    final = np.where(soft_zone, ck * sam_buffered, ck * sam).astype(np.float32)
     final = np.clip(final, 0.0, 1.0)
 
-    # 2026-05-16 diagnostic dump — remove once merge validated.
+    # 2026-05-16 diagnostic dump — remove once validated.
     try:
-        import os as _os_diag
         from pathlib import Path as _P_diag
         from PIL import Image as _Img
         _diag_dir = _P_diag(r"C:\Users\ragsn\ck_merge_diag")
         _diag_dir.mkdir(parents=True, exist_ok=True)
         _Img.fromarray((np.clip(ck, 0, 1) * 255).astype(np.uint8), mode="L").save(_diag_dir / "01_ck_input.png")
         _Img.fromarray((sam.astype(np.float32) * 255).astype(np.uint8), mode="L").save(_diag_dir / "02_sam_input.png")
-        _Img.fromarray((weight * 255).astype(np.uint8), mode="L").save(_diag_dir / "03_weight.png")
+        _Img.fromarray((soft_zone.astype(np.float32) * 255).astype(np.uint8), mode="L").save(_diag_dir / "03_soft_zone.png")
         _Img.fromarray((final * 255).astype(np.uint8), mode="L").save(_diag_dir / "04_final_output.png")
-        # Sample RGB at known locations for quick scan
-        _h, _w = ck.shape
         _samples_path = _diag_dir / "05_samples.txt"
         with open(_samples_path, "w", encoding="utf-8") as _f:
-            _f.write(f"shape: ck={ck.shape} sam={sam.shape} rgb={rgb.shape}\n")
+            _f.write(f"shape: ck={ck.shape} sam={sam.shape}\n")
             _f.write(f"ck stats: min={float(ck.min()):.4f} max={float(ck.max()):.4f} mean={float(ck.mean()):.4f}\n")
             _f.write(f"sam stats: min={float(sam.min()):.4f} max={float(sam.max()):.4f} mean={float(sam.mean()):.4f}\n")
-            _f.write(f"weight stats: min={float(weight.min()):.4f} max={float(weight.max()):.4f} mean={float(weight.mean()):.4f}\n")
             _f.write(f"final stats: min={float(final.min()):.4f} max={float(final.max()):.4f} mean={float(final.mean()):.4f}\n")
-            _f.write(f"weight==1 pixel count: {int((weight > 0.5).sum())} / {weight.size} = {(weight > 0.5).sum() / weight.size * 100:.1f}%\n")
-            _f.write(f"sam==1 pixel count: {int((sam > 0.5).sum())} / {sam.size} = {(sam > 0.5).sum() / sam.size * 100:.1f}%\n")
-            _f.write(f"settings: threshold={threshold} dilate_px={dilate_px} soft_band={soft_band} screen_type={screen_type}\n")
+            _f.write(f"soft-zone pixels (CK soft, SAM doesn't vote): {int(soft_zone.sum())} / {soft_zone.size} = {soft_zone.sum() / soft_zone.size * 100:.2f}%\n")
+            _f.write(f"confident-fg pixels (CK>={CK_SOFT_HI}, SAM gates): {int((ck >= CK_SOFT_HI).sum())} / {ck.size} = {(ck >= CK_SOFT_HI).sum() / ck.size * 100:.2f}%\n")
+            _f.write(f"confident-bg pixels (CK<={CK_SOFT_LO}, output 0): {int((ck <= CK_SOFT_LO).sum())} / {ck.size} = {(ck <= CK_SOFT_LO).sum() / ck.size * 100:.2f}%\n")
+            _f.write(f"CK_SOFT_LO={CK_SOFT_LO} CK_SOFT_HI={CK_SOFT_HI}\n")
     except Exception:
         pass
 
