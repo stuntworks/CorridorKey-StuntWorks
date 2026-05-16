@@ -42,6 +42,23 @@ USE_CHROMA_GATED_MERGE = True
 DEBUG_ENABLED = False
 DEBUG_MODE = False
 
+# 2026-05-16: chroma-weight blend restored from c96deb07 (May 6 perfect-map state).
+# Hard binary chroma test: pixel is on-green if (G - max(R, B)) >= threshold.
+# On-green pixels => CK rules (soft hair alpha shines through).
+# Off-green pixels => SAM_binary rules (hard kill of floor/wire/walls).
+# Trimap+CFM architecture from 9093bb8 is archived as _v22_trimap_cfm_archived
+# below for hot-revert if this regresses.
+CHROMA_GATE_THRESHOLD = 0.20
+# 2026-05-16: bumped 0.01 → 0.20 after diagnostic showed 96% weight=1 coverage on
+# Berto's BRAW (G channel mean 0.39). The 0.01 was for dim greens; this clip has
+# a bright screen with mild spill onto the body, so threshold must be high enough
+# to exclude spill (~0.19) and low enough to catch hair edges (~0.25–0.30).
+CHROMA_GATE_DILATE_PX = 0
+# 2026-05-16: 50 → 0. cv2.dilate expands in ALL directions and dragged the
+# on-green region into adjacent off-green junk (carpet, lift, walls), giving
+# them CK-rule when they should have been SAM-rule.
+CHROMA_GATE_SOFT_BAND = 0.0
+
 # Saturation ramp endpoints (logit space) — see logits_to_soft_mask below.
 # A 4-logit-wide soft band gives a 2-4 px feather at typical SAM 2 grad
 # magnitudes around the contour. Berto verified on 4K Kitchen Fight.
@@ -377,7 +394,143 @@ def merge_ck_with_sam(ck_alpha: np.ndarray, sam_silhouette: Optional[np.ndarray]
     return np.clip(ck + difference, 0.0, 1.0).astype(np.float32)
 
 
-def merge_ck_with_sam_chroma_gated(ck_alpha, sam_silhouette, source_rgb=None):
+def compute_chroma_weight(
+    source_rgb: np.ndarray,
+    screen_type: str = "green",
+    threshold: float = CHROMA_GATE_THRESHOLD,
+    soft_band: float = CHROMA_GATE_SOFT_BAND,
+    dilate_px: int = CHROMA_GATE_DILATE_PX,
+) -> np.ndarray:
+    # WHAT IT DOES: Per-pixel float [0, 1] weight encoding "is this pixel on the
+    #   green-screen side?" 1 = on-green (CK rules), 0 = off-green (SAM rules).
+    #   chroma_score = G - max(R, B) for green; B - max(R, G) for blue. Binary
+    #   threshold by default; optional smoothstep soft band; optional inward
+    #   dilation of the on-green region for body parts that sit inside the green
+    #   area but have no spill (butt-notch case from 2026-05-05 testing).
+    # DEPENDS ON:   source_rgb is (H, W, 3) float32 in [0, 1]. cv2 imported lazily.
+    # AFFECTS:      sole authority signal for merge_ck_with_sam_chroma_gated.
+    if screen_type == "blue":
+        chroma_score = source_rgb[..., 2] - np.maximum(source_rgb[..., 0], source_rgb[..., 1])
+    else:
+        chroma_score = source_rgb[..., 1] - np.maximum(source_rgb[..., 0], source_rgb[..., 2])
+    chroma_score = np.clip(chroma_score, 0.0, 1.0)
+
+    # DANGER ZONE FRAGILE: do NOT add Gaussian blur to weight or chroma_score.
+    # SMART BLEND in sam2_combine.apply_sam2_gate_weighted stacked three sources
+    # of softness and produced 50% ghost bands at body-green edges where CK soft
+    # alpha 0.5 blended with SAM 1.0 gave 0.75 output (Berto 2026-05-01).
+    if soft_band <= 0.0:
+        weight = (chroma_score >= threshold).astype(np.float32)
+    else:
+        t = np.clip((chroma_score - threshold) / soft_band, 0.0, 1.0)
+        weight = (t * t * (3.0 - 2.0 * t)).astype(np.float32)
+
+    if dilate_px > 0:
+        # Extend on-green region INTO body interior by dilate_px pixels. Covers
+        # body parts (butt, fingertips) that sit inside the green area but have
+        # no spill, so CK can rule there instead of SAM.
+        import cv2 as _cv2
+        binary = (weight > 0.5).astype(np.uint8)
+        _k = int(dilate_px) * 2 + 1
+        kernel = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (_k, _k))
+        dilated = _cv2.dilate(binary, kernel).astype(np.float32)
+        weight = np.maximum(weight, dilated)
+
+    return weight
+
+
+def merge_ck_with_sam_chroma_gated(
+    ck_alpha: np.ndarray,
+    sam_silhouette: Optional[np.ndarray],
+    source_rgb: np.ndarray,
+    screen_type: str = "green",
+    threshold: float = CHROMA_GATE_THRESHOLD,
+    soft_band: float = CHROMA_GATE_SOFT_BAND,
+    dilate_px: int = CHROMA_GATE_DILATE_PX,
+) -> np.ndarray:
+    # WHAT IT DOES: c96deb07 chroma-weight blend. final = weight * CK + (1 - weight) * SAM_binary.
+    #   On-green pixels (weight=1): CK rules — soft hair alpha shines through.
+    #   Off-green pixels (weight=0): SAM rules — hard binary kill of floor/wire/walls.
+    #   No CFM solver, no internal Gaussian blur, no trimap, no unknown band.
+    # DEPENDS ON:   ck_alpha and sam_silhouette are (H, W) float32 in [0, 1] with
+    #               matching shapes. source_rgb is (H, W, 3) float32 in [0, 1].
+    #               compute_chroma_weight + binarize_sam_silhouette.
+    # AFFECTS:      every Combined-mode render once dispatched from merge_ck_with_sam_active.
+    if source_rgb is None:
+        raise ValueError("chroma-gated merge requires source_rgb")
+    ck = np.asarray(ck_alpha, dtype=np.float32)
+    if ck.ndim == 3:
+        ck = ck[..., 0]
+    if sam_silhouette is None:
+        return ck.copy()
+    sam = binarize_sam_silhouette(sam_silhouette)
+    if sam.ndim == 3:
+        sam = sam[..., 0]
+    if ck.shape != sam.shape:
+        return ck.copy()
+
+    rgb_in = np.asarray(source_rgb)
+    if rgb_in.dtype != np.float32:
+        rgb = np.clip(rgb_in.astype(np.float32) / 255.0, 0.0, 1.0)
+    else:
+        rgb = np.clip(rgb_in, 0.0, 1.0)
+    if rgb.ndim == 2:
+        rgb = np.stack([rgb, rgb, rgb], axis=-1)
+    if rgb.shape[:2] != ck.shape:
+        import cv2 as _cv2
+        rgb = _cv2.resize(rgb, (ck.shape[1], ck.shape[0]), interpolation=_cv2.INTER_AREA)
+
+    weight = compute_chroma_weight(
+        rgb, screen_type=screen_type, threshold=threshold,
+        soft_band=soft_band, dilate_px=dilate_px,
+    )
+    if weight.shape != ck.shape:
+        return ck.copy()
+
+    # SAM=1 always wins inside body silhouette (overrides chroma test).
+    # Prevents body-interior holes where strong green spill made weight=1 and CK
+    # then miskeyed the body pixel as background. Hair edges extend BEYOND the
+    # SAM silhouette, so they sit in the sam=0 zone where weight*ck still gives
+    # CK's soft alpha for fine hair detail.
+    final = np.where(sam > 0.5, 1.0, weight * ck).astype(np.float32)
+    final = np.clip(final, 0.0, 1.0)
+
+    # 2026-05-16 diagnostic dump — remove once merge validated.
+    try:
+        import os as _os_diag
+        from pathlib import Path as _P_diag
+        from PIL import Image as _Img
+        _diag_dir = _P_diag(r"C:\Users\ragsn\ck_merge_diag")
+        _diag_dir.mkdir(parents=True, exist_ok=True)
+        _Img.fromarray((np.clip(ck, 0, 1) * 255).astype(np.uint8), mode="L").save(_diag_dir / "01_ck_input.png")
+        _Img.fromarray((sam.astype(np.float32) * 255).astype(np.uint8), mode="L").save(_diag_dir / "02_sam_input.png")
+        _Img.fromarray((weight * 255).astype(np.uint8), mode="L").save(_diag_dir / "03_weight.png")
+        _Img.fromarray((final * 255).astype(np.uint8), mode="L").save(_diag_dir / "04_final_output.png")
+        # Sample RGB at known locations for quick scan
+        _h, _w = ck.shape
+        _samples_path = _diag_dir / "05_samples.txt"
+        with open(_samples_path, "w", encoding="utf-8") as _f:
+            _f.write(f"shape: ck={ck.shape} sam={sam.shape} rgb={rgb.shape}\n")
+            _f.write(f"ck stats: min={float(ck.min()):.4f} max={float(ck.max()):.4f} mean={float(ck.mean()):.4f}\n")
+            _f.write(f"sam stats: min={float(sam.min()):.4f} max={float(sam.max()):.4f} mean={float(sam.mean()):.4f}\n")
+            _f.write(f"weight stats: min={float(weight.min()):.4f} max={float(weight.max()):.4f} mean={float(weight.mean()):.4f}\n")
+            _f.write(f"final stats: min={float(final.min()):.4f} max={float(final.max()):.4f} mean={float(final.mean()):.4f}\n")
+            _f.write(f"weight==1 pixel count: {int((weight > 0.5).sum())} / {weight.size} = {(weight > 0.5).sum() / weight.size * 100:.1f}%\n")
+            _f.write(f"sam==1 pixel count: {int((sam > 0.5).sum())} / {sam.size} = {(sam > 0.5).sum() / sam.size * 100:.1f}%\n")
+            _f.write(f"settings: threshold={threshold} dilate_px={dilate_px} soft_band={soft_band} screen_type={screen_type}\n")
+    except Exception:
+        pass
+
+    return final
+
+
+def _v22_trimap_cfm_archived(ck_alpha, sam_silhouette, source_rgb=None):
+    # ARCHIVED 2026-05-16: was merge_ck_with_sam_chroma_gated. Replaced by the
+    # chroma-weight blend from c96deb07 (May 6 perfect-map state — pure binary
+    # switch between CK on-green and SAM off-green; no CFM, no internal blur).
+    # Kept on disk for hot-revert: rename this back to merge_ck_with_sam_chroma_gated
+    # and remove the c96deb07 implementation below.
+    # ORIGINAL HEADER (9093bb8):
     # 9093bb8 verbatim: v2.2 trimap + Closed-Form Matting with CK hair injection
     # in unknown band, hard clamp outside dilated SAM. No "improvements" added.
     # The artist remembers this exact recipe as the "perfect blend." Validate
@@ -505,9 +658,22 @@ def merge_ck_with_sam_active(
     if sam_silhouette is None or source_rgb is None:
         return merge_ck_with_sam(ck_alpha, sam_silhouette)
     try:
-        return merge_ck_with_sam_chroma_gated(ck_alpha, sam_silhouette, source_rgb=source_rgb)
+        return merge_ck_with_sam_chroma_gated(
+            ck_alpha, sam_silhouette, source_rgb,
+            screen_type=screen_type,
+        )
     except Exception:
-        # Safety net: never let a CFM solver hiccup crash the renderer.
+        # 2026-05-16: dump the exception so we can fix it. The previous silent
+        # fallback was hiding a real bug behind a "Combined export OK" log.
+        try:
+            import traceback as _tb_inner
+            from pathlib import Path as _P_inner
+            _P_inner(r"C:\Users\ragsn\ck_chroma_merge_exception.txt").write_text(
+                _tb_inner.format_exc(), encoding="utf-8"
+            )
+        except Exception:
+            pass
+        # Safety net: never let a chroma test or numpy hiccup crash the renderer.
         # Fall back to Path B which always returns a usable alpha.
         return merge_ck_with_sam(ck_alpha, sam_silhouette)
 

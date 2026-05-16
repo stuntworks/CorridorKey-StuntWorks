@@ -194,7 +194,15 @@ from corridorkey_sam_merge import (
     union_binary_silhouettes,
     process_sam_matte,
     logits_to_soft_mask,
+    merge_ck_with_sam_active,
 )
+
+# 2026-05-14: chroma_kill bypass flag. apply_chroma_kill_to_matte did NOT exist
+# in v1.0.1-stable but runs by default in current code at 3 call sites.
+# threshold=0.05 is aggressive and can shave soft hair-edge alpha where green
+# spill is present. Diagnostic bypass for A/B comparison vs v1.0.1 matte
+# quality. Flip True to re-enable.
+_CK_CHROMA_KILL_ENABLED = False
 def _cleanup_on_exit():
     # WHAT IT DOES: Kills the viewer subprocess on Resolve exit and WAITS for it to die.
     #   Without wait(), kill() fires the signal but returns immediately — the viewer
@@ -280,10 +288,10 @@ winLayout = ui.VGroup({"Spacing": 4}, [
     ]),
     ui.HGroup({"Weight": 0, "Spacing": 6}, [
         ui.Label({"Text": "Refiner:", "Weight": 0}),
-        ui.Slider({"ID": "RefinerStrength", "Minimum": 0, "Maximum": 100, "Value": 75, "Weight": 3,
+        ui.Slider({"ID": "RefinerStrength", "Minimum": 0, "Maximum": 100, "Value": 100, "Weight": 3,
                    "Orientation": "Horizontal", "SingleStep": 1,
                    "StyleSheet": "QSlider::groove:horizontal { height: 6px; background: #222; border-radius: 3px; } QSlider::sub-page:horizontal { background: #0dcaf0; border-radius: 3px; } QSlider::handle:horizontal { background: #fff; border: 2px solid #0dcaf0; width: 14px; height: 14px; margin: -4px 0; border-radius: 7px; } QSlider::handle:horizontal:hover { background: #0dcaf0; border-color: #fff; }"}),
-        ui.SpinBox({"ID": "RefinerInput", "Minimum": 0, "Maximum": 100, "Value": 75, "Weight": 0,
+        ui.SpinBox({"ID": "RefinerInput", "Minimum": 0, "Maximum": 100, "Value": 100, "Weight": 0,
                     "StyleSheet": "QSpinBox { background-color: #1a1a1a; color: #ccc; border: 1px solid #333; padding: 4px; border-radius: 3px; min-width: 50px; } QSpinBox::up-button, QSpinBox::down-button { background-color: #2a2a2a; border: none; width: 16px; } QSpinBox::up-button:hover, QSpinBox::down-button:hover { background-color: #0dcaf0; }"}),
         ui.Label({"Text": "%", "Weight": 0, "StyleSheet": "color: #888; font-size: 11px;"}),
     ]),
@@ -448,10 +456,16 @@ items["ExportFormat"].AddItem("Foreground Only")
 # v1.0 codec dropdown — PNG 8-bit default; user upgrades to 16-bit / EXR for
 # lossless / VFX workflows. EXR support via OPENCV_IO_ENABLE_OPENEXR (set at
 # the top of this module).
-items["OutputCodec"].AddItem("PNG 8-bit (default)")
-items["OutputCodec"].AddItem("PNG 16-bit (lossless)")
+items["OutputCodec"].AddItem("PNG 8-bit")
+items["OutputCodec"].AddItem("PNG 16-bit (default, lossless)")
 items["OutputCodec"].AddItem("TIFF 16-bit (lossless)")
 items["OutputCodec"].AddItem("EXR 32-bit (VFX float)")
+# 2026-05-14: default flipped from 0 (PNG 8-bit) to 1 (PNG 16-bit). 8-bit
+# quantizes alpha to 256 levels which destroys soft hair gradient detail.
+# Berto's chunky-hair-edges complaint on yellow-backdrop test 2026-05-14
+# was partly this. 16-bit = 65k alpha levels = soft hair edges restored.
+try: items["OutputCodec"].CurrentIndex = 1  # default PNG 16-bit
+except Exception: pass
 # OutputContent: which file(s) to write. 2026-05-14: default flipped to
 # "CK only" so SAM2 is never combined automatically. SAM combination is
 # the artist's explicit choice (Berto's rule). Item order kept the same so
@@ -512,7 +526,13 @@ def get_settings():
         "screen_type": "green" if items["ScreenType"].CurrentIndex == 0 else "blue",
         "despill_strength": 0.5,    # viewer-owned; overridden by _merge_live_params
         "refiner_strength": max(0.0, min(1.0, int(items["RefinerStrength"].Value) / 100.0)),
-        "despeckle_enabled": True,  # viewer-owned; overridden by _merge_live_params — default ON matches viewer checkbox default
+        # 2026-05-15: despeckle default flipped to False. The engine-internal
+        # despeckle at inference_engine.py:278/376 has area_threshold=400 +
+        # dilation=25 which deletes fine flyaway hair-strand connected
+        # components before the matte leaves the engine. v1.0.1-stable did
+        # not have this internal despeckle. Berto can re-enable per-clip
+        # via the viewer's DESPECKLE checkbox if a specific shot needs it.
+        "despeckle_enabled": False,
         "despeckle_size": 400,      # viewer-owned; overridden by _merge_live_params
         "export_format": items["ExportFormat"].CurrentIndex,
         # 0 = Combined CK x SAM, 1 = Both, 2 = CK only, 3 = SAM only
@@ -617,6 +637,10 @@ def _merge_live_params(settings):
             try: out["despill_strength"] = max(0.0, min(1.0, float(lp["despill"])))
             except (ValueError, TypeError): pass
         if "despeckle" in lp:
+            # 2026-05-15: viewer's DESPECKLE checkbox is the user-facing toggle.
+            # If the user explicitly checks it on, respect that. If it's off
+            # (default or user-unchecked), keep it off — engine despeckle at
+            # area_threshold=400 + dilation=25 deletes fine flyaway hair.
             out["despeckle_enabled"] = bool(lp["despeckle"])
         if "despeckleSize" in lp:
             try: out["despeckle_size"] = max(50, min(2000, int(lp["despeckleSize"])))
@@ -1002,6 +1026,14 @@ def _load_per_object_sam2_gates(frame_shape, settings):
 # DANGER ZONE FRAGILE: do NOT bypass the settings check — the viewer can have
 #   despeckle off, in which case the render must also leave the matte alone.
 def _apply_despeckle_to_alpha(mt, settings):
+    # 2026-05-14 DIAGNOSTIC BYPASS: despeckle did not exist in v1.0.1-stable.
+    # With despeckle_size=2000 (Berto's current setting) it removes connected
+    # components < 2000 px, which can delete loose hair strands. Berto saw
+    # chunky hair edges on CK-only render (yellow-backdrop screenshot
+    # 2026-05-14 23:23). Function returns input unchanged so we can A/B
+    # compare CK output without this post-processing. If hair restored:
+    # re-enable as opt-in (default off) or with much lower default size.
+    return mt
     if mt is None:
         return mt
     if not settings.get("despeckle_enabled", True):
@@ -1614,7 +1646,9 @@ def _read_frame_via_resolve_render(mpi, fn, try_direct=False):
             still_exists = Path(still_path).exists()
             log(f"Resolve render fallback: ExportCurrentFrameAsStill ok={ok} file_exists={still_exists}")
             if still_exists:
-                frame = cv2.imread(still_path, cv2.IMREAD_COLOR)
+                # 2026-05-15: IMREAD_UNCHANGED preserves 16-bit TIF depth from Resolve's RGB16LZW export.
+                # IMREAD_COLOR truncates to uint8 BGR, losing 8 bits per channel = hair edge alpha precision.
+                frame = cv2.imread(still_path, cv2.IMREAD_UNCHANGED)
                 if frame is not None:
                     log(f"Resolve render fallback: OK (Path A — still) shape={frame.shape}")
                     try: Path(still_path).unlink()
@@ -1683,7 +1717,8 @@ def _read_frame_via_resolve_render(mpi, fn, try_direct=False):
                     break
 
             if img_file:
-                frame = cv2.imread(str(img_file), cv2.IMREAD_COLOR)
+                # 2026-05-15: IMREAD_UNCHANGED preserves 16-bit TIF depth from Resolve's RGB16LZW export.
+                frame = cv2.imread(str(img_file), cv2.IMREAD_UNCHANGED)
                 log(f"Resolve render fallback: OK (Path B — image) shape={frame.shape if frame is not None else 'None'}")
                 for m in sorted(temp_dir.glob(f"{temp_name}*")):
                     try: m.unlink()
@@ -2409,15 +2444,16 @@ def reprocess_with_cached():
         ah = generate_alpha_hint(frame, settings)
         fr = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         ah = ah.astype(np.float32) / 255.0 if ah.dtype == np.uint8 else ah
-        ps = ProcessingSettings(screen_type=settings["screen_type"], despill_strength=0.0, refiner_strength=settings["refiner_strength"], despeckle_enabled=settings["despeckle_enabled"], despeckle_size=settings["despeckle_size"], fg_source=settings.get("fg_source", "nn"))
+        ps = ProcessingSettings(screen_type=settings["screen_type"], despill_strength=0.0, refiner_strength=settings["refiner_strength"], despeckle_enabled=False, despeckle_size=settings["despeckle_size"], fg_source=settings.get("fg_source", "nn"))
         log(f"Settings: despeckle_enabled={ps.despeckle_enabled} despeckle_size={ps.despeckle_size} despill={ps.despill_strength} refiner={ps.refiner_strength} fg_source={ps.fg_source}")
         res = proc.process_frame(fr, ah, ps)
         fg, mt = res.get("fg"), res.get("alpha")
         if mt is not None:
-            try:
-                from corridorkey_sam_merge import apply_chroma_kill_to_matte
-                mt = apply_chroma_kill_to_matte(mt, fr, settings.get("screen_type", "green"))
-            except Exception as _ckm_e: log(f"chroma kill failed (non-fatal): {_ckm_e}")
+            if _CK_CHROMA_KILL_ENABLED:
+                try:
+                    from corridorkey_sam_merge import apply_chroma_kill_to_matte
+                    mt = apply_chroma_kill_to_matte(mt, fr, settings.get("screen_type", "green"))
+                except Exception as _ckm_e: log(f"chroma kill failed (non-fatal): {_ckm_e}")
         if fg is not None:
             try: log(f"FG stats — dtype:{fg.dtype} min:{float(fg.min()):.4f} max:{float(fg.max()):.4f} mean R:{float(fg[..., 0].mean()):.4f} G:{float(fg[..., 1].mean()):.4f} B:{float(fg[..., 2].mean()):.4f}")
             except Exception as _e: log(f"FG stat error: {_e}")
@@ -2567,7 +2603,7 @@ def process_current_frame(preview_only=False):
         log("Processing...")
         fr = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         ah = ah.astype(np.float32) / 255.0 if ah.dtype == np.uint8 else ah
-        ps = ProcessingSettings(screen_type=settings["screen_type"], despill_strength=0.0, refiner_strength=settings["refiner_strength"], despeckle_enabled=settings["despeckle_enabled"], despeckle_size=settings["despeckle_size"], fg_source=settings.get("fg_source", "nn"))
+        ps = ProcessingSettings(screen_type=settings["screen_type"], despill_strength=0.0, refiner_strength=settings["refiner_strength"], despeckle_enabled=False, despeckle_size=settings["despeckle_size"], fg_source=settings.get("fg_source", "nn"))
         log(f"Settings: despeckle_enabled={ps.despeckle_enabled} despeckle_size={ps.despeckle_size} despill={ps.despill_strength} refiner={ps.refiner_strength} fg_source={ps.fg_source}")
         if ps.despeckle_enabled:
             log(f"Despeckle: ON (size {ps.despeckle_size})")
@@ -2651,6 +2687,19 @@ def process_current_frame(preview_only=False):
                         log("OutputContent=Combined but SAM PNGs missing — exporting CK alone")
                 except Exception as _merge_e:
                     log(f"Combined merge failed (non-fatal, exporting CK alone): {_merge_e}")
+                    # 2026-05-16 diagnostic: write full traceback to disk so we can
+                    # inspect the merge failure root cause. Remove once chroma-weight
+                    # merge is validated.
+                    try:
+                        import traceback as _tb_diag
+                        _tb_text = _tb_diag.format_exc()
+                        log(f"Combined merge TRACEBACK:\n{_tb_text}")
+                        from pathlib import Path as _P_diag
+                        _dbg_path = _P_diag(r"C:\Users\ragsn\ck_merge_exception.txt")
+                        _dbg_path.write_text(_tb_text, encoding="utf-8")
+                        log(f"Combined merge traceback written to {_dbg_path}")
+                    except Exception as _diag_e:
+                        log(f"Combined merge diagnostic write failed: {_diag_e}")
             save_output(fg, mt_for_save, op, settings["export_format"], codec=settings.get("output_codec", 0))
             log(f"Saved: {op.name}")
         if len(mt.shape) == 3: mt = mt[:, :, 0]
@@ -3078,7 +3127,7 @@ def on_scrub_range(ev):
         screen_type=settings["screen_type"],
         despill_strength=0.0,
         refiner_strength=settings["refiner_strength"],
-        despeckle_enabled=settings["despeckle_enabled"],
+        despeckle_enabled=False,
         despeckle_size=settings["despeckle_size"],
         fg_source=settings.get("fg_source", "nn"),
     )
@@ -3322,7 +3371,13 @@ def on_process_range(ev):
     ss = clip.GetLeftOffset()
     settings = _merge_live_params(get_settings())
     cn = Path(fp).stem
-    od = Path(items["OutputPath"].Text) / f"CK_{cn}"
+    # 2026-05-14: each PROCESS RANGE writes to its own timestamped subdir so the
+    # new render never collides with PNG files locked by MediaPool from a prior
+    # render. Resolve's MediaPool holds file handles on imported sequence clips;
+    # overwriting in-place silently fails with PermissionError on Windows. Subdir
+    # per render also preserves history for A/B comparison.
+    import time as _t_od
+    od = Path(items["OutputPath"].Text) / f"CK_{cn}" / _t_od.strftime("%Y%m%d_%H%M%S")
     od.mkdir(parents=True, exist_ok=True)
     log(f"Saving to: {od}")
     # BRAW range export — must happen on main thread before background thread starts.
@@ -3382,7 +3437,7 @@ def on_process_range(ev):
         log("AI ready (cached)")
     proc = cached_processor["proc"]
     ps = ProcessingSettings(screen_type=settings["screen_type"], despill_strength=0.0,
-                            refiner_strength=settings["refiner_strength"], despeckle_enabled=settings["despeckle_enabled"],
+                            refiner_strength=settings["refiner_strength"], despeckle_enabled=False,
                             despeckle_size=settings["despeckle_size"],
                             fg_source=settings.get("fg_source", "nn"))
     log(f"Settings: despill={ps.despill_strength} refiner={ps.refiner_strength} despeckle={ps.despeckle_enabled} fg_source={ps.fg_source}")
@@ -3557,7 +3612,8 @@ def on_process_range(ev):
                         # closure variable that was unbound when BRAW sync didn't execute
                         # the import (non-BRAW renders produced 21x "cannot access free
                         # variable" errors per range). Use the module-level binding only.
-                        mt = apply_chroma_kill_to_matte(mt, fr, settings.get("screen_type", "green"))
+                        if _CK_CHROMA_KILL_ENABLED:
+                            mt = apply_chroma_kill_to_matte(mt, fr, settings.get("screen_type", "green"))
                     except Exception as _ckm_e: log(f"chroma kill failed (non-fatal): {_ckm_e}")
                 # v1.0 TWO-MASK MODE — CK matte unchanged, SAM matte saved as
                 # a separate alpha-only sidecar PNG. The user composites the
@@ -3572,9 +3628,11 @@ def on_process_range(ev):
                     # the saturation ramp produces; the contour bumpiness from
                     # 2026-05-09 came from binarising before the merge / matte.
                     # union_binary_silhouettes works on soft input (np.maximum).
-                    from corridorkey_sam_merge import (
-                        union_binary_silhouettes, process_sam_matte,
-                    )
+                    # 2026-05-14: inline import REMOVED — was binding both names as
+                    # locals of on_process_range. Inner _run() captured them via
+                    # closure but the import only ran on BRAW path, so non-BRAW
+                    # PROCESS RANGE raised UnboundLocalError inside _run's SAM
+                    # matte block. Use the module-level imports from line 192-197.
                     _gates_for_sam = []
                     _obj_ids = []
                     if _braw_sam2_video_masks and fidx in _braw_sam2_video_masks:
@@ -3835,6 +3893,7 @@ def on_process_range(ev):
                     _tlog(f"Cancelled at frame {pr}/{dur}")
                     _tstatus(f"CANCELLED — {pr} frames saved")
                     break
+                _probe(f"ITER_TOP_{tf}")
                 if braw_frames_dir:
                     fidx = tf - in_f
                     frame = None
@@ -3854,27 +3913,34 @@ def on_process_range(ev):
                         _tlog(f"Read failed at frame {tf} (TIFF index {fidx}) — skipping")
                         continue
                 else:
+                    _probe(f"BEFORE_CAP_SET_{tf}")
                     cap.set(cv2.CAP_PROP_POS_FRAMES, ss + (tf - cs))
+                    _probe(f"AFTER_CAP_SET_{tf}")
                     ret, frame = cap.read()
+                    _probe(f"AFTER_CAP_READ_{tf}")
                     if not ret:
                         _tlog(f"Read failed at frame {tf} — skipping")
                         continue
                 range_idx = tf - in_f
+                _probe(f"BEFORE_CHROMA_{tf}")
                 chroma_float = chroma_hint_gen.generate_hint(frame).astype(np.float32) / 255.0
+                _probe(f"AFTER_CHROMA_{tf}")
                 ah = chroma_float
                 fr = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
                 _torch_m = sys.modules.get("torch")
                 if _torch_m is not None:
                     try: _torch_m.cuda.empty_cache()
                     except Exception: pass
+                _probe(f"BEFORE_PROCESS_FRAME_{tf}")
                 res = proc.process_frame(fr, ah, ps)
+                _probe(f"AFTER_PROCESS_FRAME_{tf}")
                 if _torch_m is not None:
                     try: _torch_m.cuda.synchronize()
                     except Exception: pass
                 fg, mt = res.get("fg"), res.get("alpha")
                 if _despill_str > 0 and fg is not None:
                     fg = _cu.despill_opencv(fg, green_limit_mode="average", strength=_despill_str)
-                if mt is not None:
+                if mt is not None and _CK_CHROMA_KILL_ENABLED:
                     try:
                         mt = apply_chroma_kill_to_matte(mt, fr, settings.get("screen_type", "green"))
                     except Exception as _ckm_e: log(f"chroma kill failed (non-fatal): {_ckm_e}")
@@ -3886,14 +3952,15 @@ def on_process_range(ev):
                 _sam_matte_v1 = None
                 _sam_union = None  # raw binary union for 9093bb8 chroma-gated merge
                 if mt is not None and not bool(settings.get("sam2_bypass", False)):
-                    # Option C — feed CONTINUOUS soft gates straight through.
-                    # Pre-Option C this path called binarize_sam_silhouette
-                    # before the union and process_sam_matte; the binary edge
-                    # plus a downstream MORPH_OPEN was the bumpy contour root
-                    # cause Berto called out 2026-05-09. union_binary_silhouettes
-                    # is np.maximum and works on soft input directly.
+                    # 2026-05-14b: reverted gates-split. The two-list version
+                    # caused PROCESS RANGE to hang silently after frame 1. Back
+                    # to single-list (bypass applied to both combined and sidecar).
+                    # Bug #6 (Both-mode loses SAM when BYPASS MASK 1 checked) will
+                    # be fixed at the UI level instead (guard against bypass during
+                    # render or warn user).
                     _gates_for_sam = []
                     _obj_ids = []
+                    _probe(f"BEFORE_GATES_BUILD_{tf}")
                     if sam2_video_masks and range_idx in sam2_video_masks:
                         _per = sam2_video_masks[range_idx]
                         if isinstance(_per, dict):
@@ -3931,14 +3998,21 @@ def on_process_range(ev):
                                     continue
                                 _gates_for_sam.append(np.asarray(_g, dtype=np.float32))
                                 _obj_ids.append(_oid)
+                    _probe(f"AFTER_GATES_BUILD_{tf}")
                     if _gates_for_sam:
-                        _sam_union = union_binary_silhouettes(_gates_for_sam)
-                        _sam_matte_v1 = process_sam_matte(
-                            _sam_union,
-                            margin_px=float(settings.get("sam2_margin", 0)),
-                            softness_sigma=float(settings.get("sam2_soften", 0)),
-                            fill_kernel_px=int(settings.get("fill_holes", 0)),
-                        )
+                        _probe(f"BEFORE_PROCESS_SAM_MATTE_{tf}")
+                        try:
+                            _sam_union = union_binary_silhouettes(_gates_for_sam)
+                            _sam_matte_v1 = process_sam_matte(
+                                _sam_union,
+                                margin_px=float(settings.get("sam2_margin", 0)),
+                                softness_sigma=float(settings.get("sam2_soften", 0)),
+                                fill_kernel_px=int(settings.get("fill_holes", 0)),
+                            )
+                        except Exception as _psm_e:
+                            _probe(f"PROCESS_SAM_MATTE_ERR_{tf}_{type(_psm_e).__name__}")
+                            _tlog(f"process_sam_matte failed: {_psm_e}")
+                _probe(f"AFTER_SAM_MATTE_{tf}")
                 choke_px = int(settings.get("choke", 0))
                 if choke_px > 0 and mt is not None:
                     k = choke_px * 2 + 1
@@ -3968,23 +4042,35 @@ def on_process_range(ev):
                     # and zeros it outside (kills floor/walls). Math matches
                     # preview_viewer_v2.py:2751 (viewer's Combined tab).
                     if _write_combined:
-                        # 1d648e5 recipe in non-BRAW PROCESS RANGE main-thread loop:
-                        # alpha * dilate(SAM, margin) + Gaussian feather. The actual
-                        # perfect blend (NOT the 9093bb8 CFM detour).
+                        # 2026-05-14 (corrected #2): route through merge_ck_with_sam_active
+                        # which dispatches to merge_ck_with_sam_chroma_gated (v2.2 trimap
+                        # + Closed-Form Matting) per memory [[ck-v22-merge-architecture-stripped-by-phase-a]].
+                        # Per Berto 2026-05-14:
+                        #   "SAM only worked on green-screen areas. Made a wider mask.
+                        #    Transparent on the inside to let CK shine through. Cut
+                        #    everything outside."
+                        # That description matches the v2.2 chroma-gated merge:
+                        #   1. SAM dilated (81px) defines outer boundary
+                        #   2. SAM eroded (41px) defines definite foreground
+                        #   3. Trimap unknown band runs Closed-Form Matting solver
+                        #   4. CK injected post-solve in unknown band (hair preserved)
+                        #   5. Outside dilated SAM = hard zero (walls/floor/junk killed)
+                        # Simple multiply was SUPERSEDED — does not preserve hair past
+                        # the dilation margin and doesn't use chroma awareness in edges.
+                        _probe(f"BEFORE_COMBINED_MERGE_{tf}")
                         if _sam_union is not None:
                             try:
-                                from sam2_combine import apply_sam2_gate_subtract
-                                _m_combined = apply_sam2_gate_subtract(
-                                    _m, _sam_union,
-                                    buffer_px=int(settings.get("sam2_margin", 20) or 20),
-                                    feather_px=4,
+                                _m_combined = merge_ck_with_sam_active(
+                                    _m, _sam_union, source_rgb=fr,
                                 )
                             except Exception as _mge:
                                 _tlog(f"Combined merge failed at frame {pr} (CK alone): {_mge}")
+                                _probe(f"COMBINED_MERGE_ERR_{tf}_{type(_mge).__name__}")
                                 _m_combined = _m
                         else:
                             _m_combined = _m
                         _m_active = _m_combined
+                        _probe(f"AFTER_COMBINED_MERGE_{tf}")
                     else:
                         _m_active = _m
                     # Encode CK / Combined clip in memory — no file I/O on the
@@ -4013,10 +4099,32 @@ def on_process_range(ev):
                             else:
                                 _img = cv2.cvtColor(_fg_int, cv2.COLOR_RGB2BGR)
                         op = od / f"CK_{cn}_{pr:06d}{_ext}"
+                        _probe(f"BEFORE_ENCODE_{tf}")
                         _ret, _buf = cv2.imencode(_ext, _img)
+                        _probe(f"AFTER_ENCODE_{tf}")
                         if _ret:
-                            _save_queue.put(("save", str(op), _buf.tobytes()))
-                            ofs.append(str(op))
+                            # 2026-05-14: write inline. PollTimer drain stops firing
+                            # once Fusion pauses timer dispatch on a long-blocking
+                            # main-thread run, so queued items past frame 1 never
+                            # reach disk. We are on main thread anyway; no queue needed.
+                            # 2026-05-14b: probe save errors directly to disk and
+                            # only count ofs on success. PollTimer-paused _tlog was
+                            # masking PermissionError on re-renders when MediaPool
+                            # held file handles on existing PNG sequence.
+                            _save_ok = False
+                            try:
+                                try:
+                                    if op.exists(): op.unlink()
+                                except Exception: pass
+                                with open(str(op), 'wb') as _sf:
+                                    _sf.write(_buf.tobytes())
+                                _save_ok = True
+                            except Exception as _se:
+                                _tlog(f"Save error {op}: {_se}")
+                                _probe(f"SAVE_ERROR_CK_{tf}_{type(_se).__name__}")
+                            _probe(f"AFTER_QUEUE_PUT_{tf}")
+                            if _save_ok:
+                                ofs.append(str(op))
                     # SAM matte sidecar — alpha-only file in the user's selected
                     # codec. Skipped in Combined / CK-only modes.
                     if _write_sam:
@@ -4030,8 +4138,20 @@ def on_process_range(ev):
                             _sam_img = (_sam * 65535.0).astype(np.uint16)
                         _ret_s, _buf_s = cv2.imencode(_ext, _sam_img)
                         if _ret_s:
-                            _save_queue.put(("save", str(sam_op), _buf_s.tobytes()))
-                            sam_ofs.append(str(sam_op))
+                            # 2026-05-14: write inline. See note on CK save above.
+                            _sam_ok = False
+                            try:
+                                try:
+                                    if sam_op.exists(): sam_op.unlink()
+                                except Exception: pass
+                                with open(str(sam_op), 'wb') as _sf:
+                                    _sf.write(_buf_s.tobytes())
+                                _sam_ok = True
+                            except Exception as _se:
+                                _tlog(f"Save error {sam_op}: {_se}")
+                                _probe(f"SAVE_ERROR_SAM_{tf}_{type(_se).__name__}")
+                            if _sam_ok:
+                                sam_ofs.append(str(sam_op))
                     pr += 1
                     el = time.time() - st
                     fpsr = pr / el if el > 0 else 0
@@ -4039,6 +4159,7 @@ def on_process_range(ev):
                     _tstatus(f"{pr}/{dur} ({fpsr:.1f}fps, {rem:.0f}s left)")
                     _tprogress(pr, dur)
                     if pr % 10 == 0: _tlog(f"{pr}/{dur}")
+                    _probe(f"BEFORE_PROCESS_EVENTS_{tf}")
                     # Path B sync mode: drain _ui_queue + _save_queue via the
                     # main-thread PollTimer, and let Qt process the Cancel
                     # button click. Without this the UI freezes for the whole
@@ -4052,20 +4173,31 @@ def on_process_range(ev):
                             _QApp.processEvents()
                         except Exception:
                             pass
+                    _probe(f"AFTER_PROCESS_EVENTS_{tf}")
             if cap:
                 cap.release()
 
+            _probe(f"LOOP_DONE_ck={len(ofs)}_sam={len(sam_ofs)}")
             if ofs and not processing_cancelled:
                 _tlog(f"Done: {len(ofs)} frames in {time.time()-st:.1f}s")
+                _content_final = int(settings.get("output_content", 0))
+                if _content_final in (1, 3) and not sam_ofs:
+                    _tlog("WARNING: Both/SAM-only mode but 0 SAM frames produced. Check SAM2 anchor points are placed and SAM2 propagation ran.")
                 _tstatus("Importing to MediaPool...")
                 _tprogress(dur, dur)  # fill to 100% before hiding
                 _ui_queue.put(("progress", -1))
-                # Put import task AFTER all save tasks — poll timer processes in order.
-                _save_queue.put(("import", {
-                    "ofs": ofs, "output_track": output_track,
-                    "source_track": source_track, "in_f": in_f, "settings": settings,
-                    "sam_ofs": sam_ofs,  # v1.0 two-mask: SAM matte sidecar PNGs
-                }))
+                # 2026-05-14: call _do_import inline. PollTimer drain stops firing
+                # once Fusion pauses timer dispatch on a long-blocking main-thread run.
+                # We are already on the main thread; MediaPool API is main-thread-only
+                # and that requirement is satisfied.
+                try:
+                    _do_import({
+                        "ofs": ofs, "output_track": output_track,
+                        "source_track": source_track, "in_f": in_f, "settings": settings,
+                        "sam_ofs": sam_ofs,  # v1.0 two-mask: SAM matte sidecar PNGs
+                    })
+                except Exception as _ie:
+                    _tlog(f"Import error: {_ie}")
             else:
                 _ui_queue.put(("progress", -1))
         except BaseException as _e:

@@ -416,6 +416,11 @@ def create_engine(
         from CorridorKeyModule.inference_engine import CorridorKeyEngine
 
         logger.info("Torch engine loaded: %s (device=%s)", ckpt.name, device)
+        # 2026-05-15: restored fp32 + no mixed_precision per commit 9868ff42.
+        # The May 11 revert (994b6a97/560b99a8) was based on a gain-lift bug
+        # that memory [[session-handoff-2026-05-13-late-evening-ck-4-agent-audit]]
+        # later identified as DaVinci project IDT, NOT CK precision. fp16
+        # destroys fine flyaway hair logit detail; fp32 keeps it.
         return CorridorKeyEngine(
-            checkpoint_path=str(ckpt), device=device or "cpu", img_size=img_size, model_precision=torch.float16
+            checkpoint_path=str(ckpt), device=device or "cpu", img_size=img_size, model_precision=torch.float32, mixed_precision=False
         )

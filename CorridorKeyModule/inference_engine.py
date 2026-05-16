@@ -357,16 +357,20 @@ class CorridorKeyEngine:
         non-blocking and returns a :class:`PendingTransfer` — call
         ``.resolve()`` to get the numpy dict later.
         """
-        # Resize on GPU using torchvision (much faster than cv2 at 4K)
+        # Resize on GPU using torchvision (much faster than cv2 at 4K).
+        # 2026-05-15: BICUBIC restored per commit 9868ff42. BILINEAR loses the
+        # high-frequency edge detail (flyaway hair) the upstream baseline
+        # cv2.INTER_LANCZOS4 captures. May 11 revert (994b6a97/560b99a8)
+        # superseded — gain-lift was DaVinci IDT not CK precision.
         alpha = TF.resize(
             pred_alpha.float(),
             [h, w],
-            interpolation=torchvision.transforms.InterpolationMode.BILINEAR,
+            interpolation=torchvision.transforms.InterpolationMode.BICUBIC,
         )
         fg = TF.resize(
             pred_fg.float(),
             [h, w],
-            interpolation=torchvision.transforms.InterpolationMode.BILINEAR,
+            interpolation=torchvision.transforms.InterpolationMode.BICUBIC,
         )
 
         del pred_fg, pred_alpha
