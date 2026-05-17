@@ -60,7 +60,13 @@ CHROMA_GATE_SOFT_BAND = 0.0   # UNUSED in confidence-based merge; kept for hot-r
 # [[feedback-ck-no-gaussian-on-sam-mask]].
 CK_SOFT_LO = 0.05
 CK_SOFT_HI = 0.7
-SOFT_ZONE_SAM_BUFFER_PX = 40
+# 2026-05-16: bumped 40 → 80 after Berto's first test on motion-blur clip.
+# 40px wasn't reaching motion-blurred fingertips that extend past body
+# silhouette + leg-meets-green boundary line. 80px gives CK twice the
+# working area for soft alpha while still killing wire echoes 80+ px from
+# body. Tune higher if hair/fingers still cut, lower if floor mat near
+# body's feet leaks through.
+SOFT_ZONE_SAM_BUFFER_PX = 80
 
 # Saturation ramp endpoints (logit space) — see logits_to_soft_mask below.
 # A 4-logit-wide soft band gives a 2-4 px feather at typical SAM 2 grad
@@ -472,29 +478,98 @@ def merge_ck_with_sam_chroma_gated(
     if ck.shape != sam.shape:
         return ck.copy()
 
-    # Fill SAM2 segmentation holes (small interior gaps from imperfect masks).
+    # Morphological close to fill body-edge concavities and small notches in
+    # the SAM contour (harness gaps, arm pits, finger sub-pixel under-cover).
+    # Kernel 41px from the v2.2 architecture — fills concavities up to ~20px
+    # wide without expanding the outer silhouette enough to leak past feet on
+    # carpet. Binary morphology only — NO Gaussian per
+    # [[feedback-ck-no-gaussian-on-sam-mask]].
+    try:
+        import cv2 as _cv2_close
+        _k_close = _cv2_close.getStructuringElement(_cv2_close.MORPH_ELLIPSE, (41, 41))
+        sam = _cv2_close.morphologyEx(
+            sam.astype(np.uint8), _cv2_close.MORPH_CLOSE, _k_close
+        ).astype(np.float32)
+    except Exception:
+        pass
+
+    # Fill SAM2 segmentation interior holes after the close (any gaps that
+    # survived the close pass).
     try:
         from scipy.ndimage import binary_fill_holes
         sam = binary_fill_holes((sam > 0.5).astype(np.uint8)).astype(np.float32)
     except Exception:
         pass
 
-    # CK-confidence-based routing (0ffc24b1 verbatim, 2026-05-07).
-    #   soft_zone  (CK_SOFT_LO < ck < CK_SOFT_HI) → final = ck * sam_buffered.
-    #     CK's soft alpha (hair, edges) preserved within SOFT_ZONE_SAM_BUFFER_PX
-    #     of body. CK's partial alpha far from body (wire echoes, structure
-    #     edge bleed) gets killed because sam_buffered=0 there.
-    #   confident  (ck <= LO or ck >= HI) → final = ck * sam. SAM gates the
-    #     decision: kills CK false positives on walls / floor / shoe halos
-    #     where CK=1 but SAM=0; keeps body where CK and SAM agree.
-    # sam_buffered uses binary dilation (cv2.dilate) — NO Gaussian, see
-    # [[feedback-ck-no-gaussian-on-sam-mask]].
     import cv2 as _cv2
+
+    # Compute chroma score first — used both for chroma-aware SAM widening and
+    # the chroma-aware soft-zone gate.
+    rgb_in = np.asarray(source_rgb)
+    if rgb_in.dtype != np.float32:
+        rgb = np.clip(rgb_in.astype(np.float32) / 255.0, 0.0, 1.0)
+    else:
+        rgb = np.clip(rgb_in, 0.0, 1.0)
+    if rgb.ndim == 2:
+        rgb = np.stack([rgb, rgb, rgb], axis=-1)
+    if rgb.shape[:2] != ck.shape:
+        rgb = _cv2.resize(rgb, (ck.shape[1], ck.shape[0]), interpolation=_cv2.INTER_AREA)
+    if screen_type == "blue":
+        chroma_score = rgb[..., 2] - np.maximum(rgb[..., 0], rgb[..., 1])
+    else:
+        chroma_score = rgb[..., 1] - np.maximum(rgb[..., 0], rgb[..., 2])
+    # 2026-05-17: TWO separate thresholds + speckle cleanup.
+    #   is_on_green_widen (0.05 + MORPH_OPEN 5px) — generous, controls SAM
+    #     widening. Catches mildly-spilled body edges (hand, harness, waist,
+    #     hair). MORPH_OPEN kills isolated 2-3px chroma speckles on carpet/
+    #     shoe edges that were causing speckled SAM widening artifacts.
+    #   is_on_green_gate (0.25) — strict, controls the soft-zone CK shine-
+    #     through. Only strong-green pixels qualify; kills weak-green
+    #     boundary-line transitions.
+    _is_widen_raw = (chroma_score > 0.05).astype(np.uint8)
+    try:
+        _k_clean = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (5, 5))
+        _is_widen_cleaned = _cv2.morphologyEx(_is_widen_raw, _cv2.MORPH_OPEN, _k_clean)
+        is_on_green_widen = _is_widen_cleaned.astype(bool)
+    except Exception:
+        is_on_green_widen = _is_widen_raw.astype(bool)
+    is_on_green_gate = (chroma_score > 0.25)
+    # Kept for diagnostic dump compat:
+    is_on_green = is_on_green_gate
+
+    # 2026-05-17: CHROMA-AWARE SAM widening — SAM widens 10px ONLY where the
+    # source pixel is on green (uses LOW threshold so mild-spill body edges
+    # get covered). Off-green pixels keep tight SAM so feet on carpet don't
+    # show a 10px halo.
+    # Binary cv2.dilate — NO Gaussian per [[feedback-ck-no-gaussian-on-sam-mask]].
+    try:
+        # 2026-05-17: kernel 21 (10px radius) → 31 (15px radius) so widening
+        # reaches into mild-spilled fingers + waist edges that were under-
+        # covered at 10px.
+        _k_widen = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (31, 31))
+        sam_widened = _cv2.dilate(sam.astype(np.uint8), _k_widen).astype(np.float32)
+        # Use the GENEROUS (speckle-cleaned) widening threshold so body edges
+        # with mild green spill get covered (hand, harness, hair, etc.).
+        sam = np.where(is_on_green_widen, sam_widened, sam)
+    except Exception:
+        pass
+
+    # CK-confidence-based routing (0ffc24b1 + chroma-aware soft gate 2026-05-17).
+    #   soft_zone & on-green → final = ck * sam_buffered. CK's soft alpha
+    #     (hair, edges, motion blur on green) preserved within
+    #     SOFT_ZONE_SAM_BUFFER_PX of body. Off-green partial alpha falls
+    #     through to the confident path and gets killed by SAM=0.
+    #   else → final = ck * sam. SAM gates the decision: kills CK false
+    #     positives on walls / floor where CK=1 but SAM=0; keeps body
+    #     where CK and SAM agree.
     _k = max(1, int(SOFT_ZONE_SAM_BUFFER_PX))
     _kernel = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (_k * 2 + 1, _k * 2 + 1))
     sam_buffered = _cv2.dilate(sam.astype(np.uint8), _kernel).astype(np.float32)
     soft_zone = (ck > CK_SOFT_LO) & (ck < CK_SOFT_HI)
-    final = np.where(soft_zone, ck * sam_buffered, ck * sam).astype(np.float32)
+    # Use the STRICT gate threshold so transitional boundary pixels (chroma
+    # 0.05–0.25) fall through to the confident path and get killed.
+    soft_zone_on_green = soft_zone & is_on_green_gate
+    final = np.where(soft_zone_on_green, ck * sam_buffered, ck * sam).astype(np.float32)
     final = np.clip(final, 0.0, 1.0)
 
     # 2026-05-16 diagnostic dump — remove once validated.
@@ -505,18 +580,21 @@ def merge_ck_with_sam_chroma_gated(
         _diag_dir.mkdir(parents=True, exist_ok=True)
         _Img.fromarray((np.clip(ck, 0, 1) * 255).astype(np.uint8), mode="L").save(_diag_dir / "01_ck_input.png")
         _Img.fromarray((sam.astype(np.float32) * 255).astype(np.uint8), mode="L").save(_diag_dir / "02_sam_input.png")
-        _Img.fromarray((soft_zone.astype(np.float32) * 255).astype(np.uint8), mode="L").save(_diag_dir / "03_soft_zone.png")
+        _Img.fromarray((soft_zone_on_green.astype(np.float32) * 255).astype(np.uint8), mode="L").save(_diag_dir / "03_soft_zone_on_green.png")
+        _Img.fromarray((is_on_green.astype(np.float32) * 255).astype(np.uint8), mode="L").save(_diag_dir / "03b_on_green.png")
         _Img.fromarray((final * 255).astype(np.uint8), mode="L").save(_diag_dir / "04_final_output.png")
         _samples_path = _diag_dir / "05_samples.txt"
         with open(_samples_path, "w", encoding="utf-8") as _f:
             _f.write(f"shape: ck={ck.shape} sam={sam.shape}\n")
             _f.write(f"ck stats: min={float(ck.min()):.4f} max={float(ck.max()):.4f} mean={float(ck.mean()):.4f}\n")
-            _f.write(f"sam stats: min={float(sam.min()):.4f} max={float(sam.max()):.4f} mean={float(sam.mean()):.4f}\n")
+            _f.write(f"sam stats (after close+holefill+10px dilate): min={float(sam.min()):.4f} max={float(sam.max()):.4f} mean={float(sam.mean()):.4f}\n")
             _f.write(f"final stats: min={float(final.min()):.4f} max={float(final.max()):.4f} mean={float(final.mean()):.4f}\n")
-            _f.write(f"soft-zone pixels (CK soft, SAM doesn't vote): {int(soft_zone.sum())} / {soft_zone.size} = {soft_zone.sum() / soft_zone.size * 100:.2f}%\n")
+            _f.write(f"soft-zone pixels: {int(soft_zone.sum())} = {soft_zone.sum() / soft_zone.size * 100:.2f}%\n")
+            _f.write(f"on-green pixels: {int(is_on_green.sum())} = {is_on_green.sum() / is_on_green.size * 100:.2f}%\n")
+            _f.write(f"soft_zone & on_green (where CK shines through buffer): {int(soft_zone_on_green.sum())} = {soft_zone_on_green.sum() / soft_zone_on_green.size * 100:.2f}%\n")
             _f.write(f"confident-fg pixels (CK>={CK_SOFT_HI}, SAM gates): {int((ck >= CK_SOFT_HI).sum())} / {ck.size} = {(ck >= CK_SOFT_HI).sum() / ck.size * 100:.2f}%\n")
             _f.write(f"confident-bg pixels (CK<={CK_SOFT_LO}, output 0): {int((ck <= CK_SOFT_LO).sum())} / {ck.size} = {(ck <= CK_SOFT_LO).sum() / ck.size * 100:.2f}%\n")
-            _f.write(f"CK_SOFT_LO={CK_SOFT_LO} CK_SOFT_HI={CK_SOFT_HI}\n")
+            _f.write(f"CK_SOFT_LO={CK_SOFT_LO} CK_SOFT_HI={CK_SOFT_HI} SOFT_ZONE_SAM_BUFFER_PX={SOFT_ZONE_SAM_BUFFER_PX}\n")
     except Exception:
         pass
 
