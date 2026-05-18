@@ -42,22 +42,20 @@ The plugin finds the engine at runtime by (in order):
 
 ---
 
-## 3. Download the CorridorKey Engine
+## 3. The CorridorKey Engine (Bundled)
 
-The plugin does not contain the neural network. Get it separately:
+The neural network engine ships **inside this plugin repo**. You do not need to clone it separately — cloning the StuntWorks repo in **section 7** brings everything you need.
 
-```
-git clone https://github.com/cnikiforov/CorridorKey.git D:\CorridorKey
-```
+**Attribution**: the engine is **CorridorKey by Niko Pueringer / Corridor Digital**.
+- Original engine repo: https://github.com/nikopueringer/CorridorKey
+- Corridor Digital website: https://www.corridordigital.com/
 
-*(or any folder path you prefer — just remember it for step 4)*
+Model weights (these come with the StuntWorks repo clone, but for reference):
 
-You also need the model weights. Depending on the CorridorKey engine version, the weight file(s) live in:
+- `<plugin>\CorridorKeyModule\checkpoints\CorridorKey.pth` — main keyer model.
+- `<plugin>\sam2_weights\sam2.1_hiera_small.pt` — optional, for SAM2 click-to-mask.
 
-- `<engine>\CorridorKeyModule\checkpoints\CorridorKey.pth` — main keyer model.
-- `<engine>\sam2_weights\sam2.1_hiera_small.pt` — optional, for SAM2 click-to-mask.
-
-If the engine repo does not include weights, follow the engine's own README to download them. **The plugin will fail to start if `CorridorKey.pth` is missing** — you will see "CorridorKey engine not found" or a PyTorch load error.
+**The plugin will fail to start if `CorridorKey.pth` is missing.** If your clone did not pull the weights (Git LFS not initialised, for example), you will see "CorridorKey engine not found" or a PyTorch load error — run `git lfs pull` inside the clone, or download the weights manually from the StuntWorks releases page.
 
 ---
 

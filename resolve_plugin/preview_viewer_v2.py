@@ -2482,6 +2482,31 @@ class PersistentWindow(QtWidgets.QWidget):
                 self.despeckle_cb.setChecked(new_val)
                 self.despeckle_slider.setEnabled(new_val)
                 self.despeckle_cb.blockSignals(False)
+        # 2026-05-18 BYPASS SYNC FIX — mirror despeckle's pattern for every
+        # boolean checkbox in the merge whitelist. Regression from commit
+        # 6c047ec0 (May 4): mask1_bypass/mask2_bypass were added to the merge
+        # list but the corresponding setChecked() sync was never written.
+        # Result: a disk write of mask2_bypass:true silently flipped
+        # self._params while the UI checkbox stayed visually unchecked,
+        # blocking SUBTRACT + carpet-kill at render time. blockSignals stops
+        # the toggle handler from re-saving during programmatic sync.
+        for _cb_key, _cb_attr in (
+            ("mask1_bypass",   "mask1_bypass_checkbox"),
+            ("mask2_bypass",   "mask2_bypass_checkbox"),
+            ("sam2_bypass",    "sam2_bypass_checkbox"),
+            ("sam2_additive",  "sam2_additive_checkbox"),
+            ("sam2_subtract",  "sam2_subtract_checkbox"),
+            ("sam2_weighted",  "sam2_weighted_checkbox"),
+            ("show_sam2",      "show_sam2_checkbox"),
+        ):
+            if _cb_key in params:
+                _cb = getattr(self, _cb_attr, None)
+                if _cb is not None:
+                    _new = bool(merged[_cb_key])
+                    if _cb.isChecked() != _new:
+                        _cb.blockSignals(True)
+                        _cb.setChecked(_new)
+                        _cb.blockSignals(False)
         # Commit the merged params immediately so any _render_now() called below
         # (including from _set_view_mode) sees the correct despeckle value.
         self._params = merged
@@ -3140,11 +3165,53 @@ class PersistentWindow(QtWidgets.QWidget):
             del pred, model
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+            # 2026-05-17 — Multi-candidate save. SAM2 returns 3 mask candidates
+            # per prediction (whole / part / subpart). We save ALL 3 to disk so
+            # the user can pick which is the active mask without re-running SAM.
+            # Read candidate_idx from live_params; default to argmax (broadest).
+            session_dir = self.session.session_dir
+            num_candidates = int(masks_hi.shape[0]) if hasattr(masks_hi, "shape") else 3
+            candidates_soft = []
+            for _ci in range(num_candidates):
+                _soft_padded_ci = logits_to_soft_mask(masks_hi[_ci])
+                _cand_ci = unpad_from_square(_soft_padded_ci, _pad_box)
+                candidates_soft.append(_cand_ci)
+                _gate_u16_ci = (_cand_ci * 65535.0).astype(np.uint16)
+                _cand_gate_path = session_dir / f"sam2_gate_raw_obj{active}_c{_ci}.png"
+                _cand_gate_tmp = session_dir / f"sam2_gate_raw_obj{active}_c{_ci}.tmp.png"
+                cv2.imwrite(str(_cand_gate_tmp), _gate_u16_ci)
+                os.replace(str(_cand_gate_tmp), str(_cand_gate_path))
+                _cand_mask_u8 = (_cand_ci > 0.5).astype(np.uint8) * 255
+                _cand_mask_path = session_dir / f"sam2_mask_obj{active}_c{_ci}.png"
+                _cand_mask_tmp = session_dir / f"sam2_mask_obj{active}_c{_ci}.tmp.png"
+                cv2.imwrite(str(_cand_mask_tmp), _cand_mask_u8)
+                os.replace(str(_cand_mask_tmp), str(_cand_mask_path))
+            # Determine which candidate to use as the ACTIVE mask. Read from
+            # live_params (if user explicitly set) else use argmax. Stash scores.
+            try:
+                _scores_list = scores.tolist() if hasattr(scores, "tolist") else list(scores)
+            except Exception:
+                _scores_list = [0.0] * num_candidates
             best_idx = int(np.argmax(scores))
-            # masks_hi[best_idx] is at padded square shape — apply the soft-
-            # mask ramp first, then crop the square back to source frame shape.
-            _soft_padded = logits_to_soft_mask(masks_hi[best_idx])
-            best = unpad_from_square(_soft_padded, _pad_box)
+            # Read user-selected candidate idx from live_params if available.
+            try:
+                _lp_path = session_dir / "live_params.json"
+                if _lp_path.exists():
+                    import json as _json
+                    _lp = _json.loads(_lp_path.read_text(encoding="utf-8"))
+                    _user_idx = _lp.get(f"sam_candidate_idx_obj{active}", None)
+                    if _user_idx is not None and 0 <= int(_user_idx) < num_candidates:
+                        best_idx = int(_user_idx)
+            except Exception:
+                pass
+            # Track scores + active idx so UI can show them
+            if not hasattr(self, "_sam_candidate_scores"):
+                self._sam_candidate_scores = {}
+            if not hasattr(self, "_sam_candidate_idx"):
+                self._sam_candidate_idx = {}
+            self._sam_candidate_scores[active] = _scores_list
+            self._sam_candidate_idx[active] = best_idx
+            best = candidates_soft[best_idx]
             # Backup the NN alpha if it exists and hasn't been backed up yet.
             # CLEAR restores this backup so the actress comes back without re-processing.
             alpha_path = self.session.session_dir / "alpha.png"

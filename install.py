@@ -163,34 +163,34 @@ def install_resolve(ck_engine_path):
     # Write launcher script
     launcher = utility_dir / "CorridorKey.py"
 
-    # Also generate and install the full standalone plugin
+    # Generate and install the full standalone plugin via write_plugin.py.
+    # 2026-05-18 — removed the old fallback that silently shipped a March-era
+    # launcher referencing the deprecated `resolve_corridorkey` module. That
+    # fallback meant a failed plugin generation could land 2-month-old code
+    # on the user's machine with no warning. Now we hard-fail with a clear
+    # error so the user knows the install did not succeed.
     write_plugin = PLUGIN_ROOT / "write_plugin.py"
-    if write_plugin.exists():
-        print("  Generating standalone plugin...")
-        import subprocess
-        result = subprocess.run(
-            [sys.executable, str(write_plugin)],
-            capture_output=True, text=True, cwd=str(PLUGIN_ROOT)
+    if not write_plugin.exists():
+        raise SystemExit(
+            f"\n[FATAL] write_plugin.py not found at {write_plugin}.\n"
+            f"This file is required to generate the Resolve plugin launcher.\n"
+            f"Make sure your clone is complete (no Git LFS or sparse-checkout issues)."
         )
-        if result.returncode == 0:
-            print("  Standalone plugin installed")
-        else:
-            # Fallback: write a simple launcher
-            launcher.write_text(f'''"""CorridorKey Neural Green Screen"""
-import sys, os
-plugin_dir = os.path.join(os.path.dirname(__file__), "CorridorKey")
-if plugin_dir not in sys.path:
-    sys.path.insert(0, plugin_dir)
-config_path = os.path.join(plugin_dir, "corridorkey_path.txt")
-if os.path.exists(config_path):
-    with open(config_path) as f:
-        ck_root = f.read().strip()
-    if ck_root not in sys.path:
-        sys.path.insert(0, ck_root)
-from resolve_corridorkey import main
-main()
-''')
-            print(f"  Launcher: {launcher.name}")
+    print("  Generating standalone plugin...")
+    import subprocess
+    result = subprocess.run(
+        [sys.executable, str(write_plugin)],
+        capture_output=True, text=True, cwd=str(PLUGIN_ROOT)
+    )
+    if result.returncode == 0:
+        print("  Standalone plugin installed")
+    else:
+        raise SystemExit(
+            f"\n[FATAL] write_plugin.py exited with code {result.returncode}.\n"
+            f"--- stdout ---\n{result.stdout}\n"
+            f"--- stderr ---\n{result.stderr}\n\n"
+            f"Install did NOT complete. Fix the error above and re-run `python install.py`."
+        )
 
     print("  Resolve: INSTALLED")
     print("  Access via: Workspace > Scripts > CorridorKey")

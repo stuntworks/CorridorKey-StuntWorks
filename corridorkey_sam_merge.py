@@ -543,10 +543,12 @@ def merge_ck_with_sam_chroma_gated(
     # show a 10px halo.
     # Binary cv2.dilate — NO Gaussian per [[feedback-ck-no-gaussian-on-sam-mask]].
     try:
-        # 2026-05-17: kernel 21 (10px radius) → 31 (15px radius) so widening
-        # reaches into mild-spilled fingers + waist edges that were under-
-        # covered at 10px.
-        _k_widen = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (31, 31))
+        # 2026-05-17: kernel 21 (10px radius) → 31 (15px radius) → 51 (25px
+        # radius). Berto's test on deploy 084839 showed body outline still
+        # visible at waist, fingers, harness strap, and floor boundary line
+        # at 15px. 25px should push SAM far enough past body on green that
+        # the CK takes over before any visible SAM line.
+        _k_widen = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (51, 51))
         sam_widened = _cv2.dilate(sam.astype(np.uint8), _k_widen).astype(np.float32)
         # Use the GENEROUS (speckle-cleaned) widening threshold so body edges
         # with mild green spill get covered (hand, harness, hair, etc.).
@@ -565,38 +567,133 @@ def merge_ck_with_sam_chroma_gated(
     _k = max(1, int(SOFT_ZONE_SAM_BUFFER_PX))
     _kernel = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (_k * 2 + 1, _k * 2 + 1))
     sam_buffered = _cv2.dilate(sam.astype(np.uint8), _kernel).astype(np.float32)
-    soft_zone = (ck > CK_SOFT_LO) & (ck < CK_SOFT_HI)
-    # Use the STRICT gate threshold so transitional boundary pixels (chroma
-    # 0.05–0.25) fall through to the confident path and get killed.
-    soft_zone_on_green = soft_zone & is_on_green_gate
-    final = np.where(soft_zone_on_green, ck * sam_buffered, ck * sam).astype(np.float32)
+    # 2026-05-17 DISTANCE-FROM-GREEN SOFT GATE (4-agent audit converged here).
+    # Strap and carpet both have the same pixel-level pattern (FG color
+    # outside raw SAM) but differ SPATIALLY: strap is 5-20px from green wall
+    # pixels (rendered against green); carpet under feet is 100-200px from
+    # any green pixel (green wall doesn't extend below body). Distance
+    # transform from on-green pixels distinguishes them, with smooth fade
+    # to avoid the visible-seam artifact a binary np.where would create
+    # (foot at green/floor boundary). Safety fallback for shadow scenes
+    # where is_on_green collapses — without it the test would catastrophically
+    # cut every halo pixel.
+    _green_count = int(is_on_green_widen.sum())
+    if _green_count < 1000:
+        # Shadow / no-green scene — keep prior behavior, accept carpet halo.
+        final = (ck * sam_buffered).astype(np.float32)
+    else:
+        _not_green = (1 - is_on_green_widen.astype(np.uint8)).astype(np.uint8)
+        _dist_to_green = _cv2.distanceTransform(_not_green, _cv2.DIST_L2, 5).astype(np.float32)
+        _NEAR_GREEN_FULL_PX = 10.0
+        _NEAR_GREEN_KILL_PX = 25.0
+        _denom = max(1.0, _NEAR_GREEN_KILL_PX - _NEAR_GREEN_FULL_PX)
+        near_weight = np.clip(
+            (_NEAR_GREEN_KILL_PX - _dist_to_green) / _denom, 0.0, 1.0
+        ).astype(np.float32)
+        # 2026-05-17 BODY-TOPOLOGY PROTECTION (8-agent audit converged here).
+        # Problem: SAM has OPEN-ENDED slits/channels cutting through body
+        # silhouette (left torso ~14px wide, right hip ~127px wide, etc.).
+        # MORPH_CLOSE 41 + binary_fill_holes can't close these because they
+        # open to the silhouette boundary (not topologically enclosed).
+        # When my near_weight gate kicks in inside body interior (near_weight=0
+        # because body is far from green), gate collapses to raw sam — and the
+        # slits show as yellow vertical stripes through the body in the matte.
+        # FIX: build a body-topology mask via aggressive closing (kernel 81)
+        # that bridges the open slits. Inside body_topology: preserve fully.
+        # Outside: apply spatial gate (kills carpet halo, preserves strap).
+        # Trade-off: ~40px carpet ring near feet may re-appear (body_topology
+        # extends 40px past raw SAM). Acceptable vs visible body slits.
+        # 2026-05-17 20:15 — REVERTED kernel back to 81. The 51 attempt broke
+        # body integrity: butt slit re-opened, hair fragmented. 81 was the
+        # working size from deploy 131942. Platform extension (40px past feet)
+        # accepted here — will be addressed separately via SUBTRACT wiring.
+        _k_body_topo = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (81, 81))
+        _body_topo_raw = _cv2.morphologyEx(
+            (sam > 0.5).astype(np.uint8), _cv2.MORPH_CLOSE, _k_body_topo
+        )
+        try:
+            from scipy.ndimage import binary_fill_holes as _fill_topo
+            body_topology = _fill_topo(_body_topo_raw > 0).astype(np.float32)
+        except Exception:
+            body_topology = _body_topo_raw.astype(np.float32)
+        # Inside body_topology: gate=1 (full preserve — kills slits).
+        # Outside body_topology: spatial gate (kills carpet halo).
+        gate_outside = sam_buffered * near_weight
+        gate = np.where(body_topology > 0.5, np.float32(1.0), gate_outside).astype(np.float32)
+        # Raw sam always wins (defensive).
+        gate = np.maximum(sam.astype(np.float32), gate)
+        final = (ck * gate).astype(np.float32)
     final = np.clip(final, 0.0, 1.0)
+
+    # 2026-05-17 RIBBON KILL — distance-orphan partial alpha → 0.
+    # The seam line at the green/carpet boundary is partial alpha (0.3-0.7)
+    # introduced by near_weight ramping CK's solid alpha down. It sits FAR
+    # from confident-FG and CLOSE to confident-BG. Hair (attached to scalp,
+    # d_to_FG ≤ 2px) and motion blur on body (attached to limb, d_to_FG ≤ 3px)
+    # both survive. Isolated seam ribbon (d_to_FG > 4px, d_to_BG < 3px) clips
+    # to 0. Forensic basis: Agent 5 pixel analysis (CK=0.996, final=0.45
+    # along the ridge → merge math is the actor).
+    try:
+        _fg_conf = (final >= 0.70).astype(np.uint8)
+        _bg_conf = (final <= 0.02).astype(np.uint8)
+        if int(_fg_conf.sum()) > 1000 and int(_bg_conf.sum()) > 1000:
+            _d_fg = _cv2.distanceTransform(1 - _fg_conf, _cv2.DIST_L2, 5)
+            _d_bg = _cv2.distanceTransform(1 - _bg_conf, _cv2.DIST_L2, 5)
+            _ridge = (_d_fg > 4.0) & (_d_bg < 3.0) & (final > 0.05) & (final < 0.70)
+            final = np.where(_ridge, np.float32(0.0), final).astype(np.float32)
+            try:
+                from pathlib import Path as _P_r
+                from PIL import Image as _Img_r
+                _r_dir = _P_r(str(__import__("pathlib").Path(__import__("tempfile").gettempdir()) / "ck_merge_diag"))
+                _r_dir.mkdir(parents=True, exist_ok=True)
+                _Img_r.fromarray((_ridge.astype(np.uint8) * 255), mode="L").save(_r_dir / "04b_ridge_mask.png")
+            except Exception:
+                pass
+    except Exception:
+        pass
 
     # 2026-05-16 diagnostic dump — remove once validated.
     try:
         from pathlib import Path as _P_diag
         from PIL import Image as _Img
-        _diag_dir = _P_diag(r"C:\Users\ragsn\ck_merge_diag")
+        _diag_dir = _P_diag(str(__import__("pathlib").Path(__import__("tempfile").gettempdir()) / "ck_merge_diag"))
         _diag_dir.mkdir(parents=True, exist_ok=True)
         _Img.fromarray((np.clip(ck, 0, 1) * 255).astype(np.uint8), mode="L").save(_diag_dir / "01_ck_input.png")
         _Img.fromarray((sam.astype(np.float32) * 255).astype(np.uint8), mode="L").save(_diag_dir / "02_sam_input.png")
-        _Img.fromarray((soft_zone_on_green.astype(np.float32) * 255).astype(np.uint8), mode="L").save(_diag_dir / "03_soft_zone_on_green.png")
-        _Img.fromarray((is_on_green.astype(np.float32) * 255).astype(np.uint8), mode="L").save(_diag_dir / "03b_on_green.png")
+        _Img.fromarray((is_on_green_widen.astype(np.float32) * 255).astype(np.uint8), mode="L").save(_diag_dir / "03_on_green_widen.png")
+        _Img.fromarray((is_on_green_gate.astype(np.float32) * 255).astype(np.uint8), mode="L").save(_diag_dir / "03b_on_green_gate.png")
+        # Visualize the distance-from-green gate (the new near_weight) so we can
+        # see WHERE the merge is killing pixels. White = full preserve, black = killed.
+        if _green_count >= 1000:
+            _Img.fromarray((near_weight * 255).astype(np.uint8), mode="L").save(_diag_dir / "03c_near_weight.png")
+            _Img.fromarray((body_topology * 255).astype(np.uint8), mode="L").save(_diag_dir / "03e_body_topology.png")
+            _Img.fromarray((gate * 255).astype(np.uint8), mode="L").save(_diag_dir / "03d_final_gate.png")
         _Img.fromarray((final * 255).astype(np.uint8), mode="L").save(_diag_dir / "04_final_output.png")
         _samples_path = _diag_dir / "05_samples.txt"
         with open(_samples_path, "w", encoding="utf-8") as _f:
             _f.write(f"shape: ck={ck.shape} sam={sam.shape}\n")
             _f.write(f"ck stats: min={float(ck.min()):.4f} max={float(ck.max()):.4f} mean={float(ck.mean()):.4f}\n")
-            _f.write(f"sam stats (after close+holefill+10px dilate): min={float(sam.min()):.4f} max={float(sam.max()):.4f} mean={float(sam.mean()):.4f}\n")
+            _f.write(f"sam stats (after close+holefill+widen): min={float(sam.min()):.4f} max={float(sam.max()):.4f} mean={float(sam.mean()):.4f}\n")
             _f.write(f"final stats: min={float(final.min()):.4f} max={float(final.max()):.4f} mean={float(final.mean()):.4f}\n")
-            _f.write(f"soft-zone pixels: {int(soft_zone.sum())} = {soft_zone.sum() / soft_zone.size * 100:.2f}%\n")
-            _f.write(f"on-green pixels: {int(is_on_green.sum())} = {is_on_green.sum() / is_on_green.size * 100:.2f}%\n")
-            _f.write(f"soft_zone & on_green (where CK shines through buffer): {int(soft_zone_on_green.sum())} = {soft_zone_on_green.sum() / soft_zone_on_green.size * 100:.2f}%\n")
-            _f.write(f"confident-fg pixels (CK>={CK_SOFT_HI}, SAM gates): {int((ck >= CK_SOFT_HI).sum())} / {ck.size} = {(ck >= CK_SOFT_HI).sum() / ck.size * 100:.2f}%\n")
-            _f.write(f"confident-bg pixels (CK<={CK_SOFT_LO}, output 0): {int((ck <= CK_SOFT_LO).sum())} / {ck.size} = {(ck <= CK_SOFT_LO).sum() / ck.size * 100:.2f}%\n")
+            _f.write(f"on-green-widen pixels (chroma>0.05, MORPH_OPEN): {int(is_on_green_widen.sum())} = {is_on_green_widen.sum() / is_on_green_widen.size * 100:.2f}%\n")
+            _f.write(f"on-green-gate pixels (chroma>0.25): {int(is_on_green_gate.sum())} = {is_on_green_gate.sum() / is_on_green_gate.size * 100:.2f}%\n")
+            _f.write(f"green_count={_green_count} (fallback threshold=1000; using {'fallback ck*sam_buffered' if _green_count < 1000 else 'distance-gate'})\n")
+            if _green_count >= 1000:
+                _f.write(f"near_weight: min={float(near_weight.min()):.4f} max={float(near_weight.max()):.4f} mean={float(near_weight.mean()):.4f}\n")
+                _f.write(f"FULL_PX={_NEAR_GREEN_FULL_PX} KILL_PX={_NEAR_GREEN_KILL_PX}\n")
+            _f.write(f"confident-fg pixels (CK>={CK_SOFT_HI}): {int((ck >= CK_SOFT_HI).sum())} = {(ck >= CK_SOFT_HI).sum() / ck.size * 100:.2f}%\n")
+            _f.write(f"confident-bg pixels (CK<={CK_SOFT_LO}): {int((ck <= CK_SOFT_LO).sum())} = {(ck <= CK_SOFT_LO).sum() / ck.size * 100:.2f}%\n")
             _f.write(f"CK_SOFT_LO={CK_SOFT_LO} CK_SOFT_HI={CK_SOFT_HI} SOFT_ZONE_SAM_BUFFER_PX={SOFT_ZONE_SAM_BUFFER_PX}\n")
-    except Exception:
-        pass
+    except Exception as _diag_exc:
+        # Log the exception so we don't blind-debug again
+        try:
+            from pathlib import Path as _PE
+            with open(_PE(__import__("tempfile").gettempdir()) / "ck_merge_diag_exc.txt", "w", encoding="utf-8") as _ef:
+                import traceback as _tb
+                _ef.write(f"diag dump exception: {type(_diag_exc).__name__}: {_diag_exc}\n")
+                _ef.write(_tb.format_exc())
+        except Exception:
+            pass
 
     return final
 

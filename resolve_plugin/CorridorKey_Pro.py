@@ -340,7 +340,7 @@ winLayout = ui.VGroup({"Spacing": 4}, [
         ui.Button({"ID": "ClearRange", "Text": "Clear", "Weight": 1, "StyleSheet": "QPushButton { background-color: transparent; color: #f66; font-size: 11px; border-radius: 3px; padding: 4px; border: 1px solid #f66; } QPushButton:hover { background-color: rgba(255, 102, 102, 0.2); }"}),
     ]),
     ui.HGroup({"Weight": 0}, [
-        ui.CheckBox({"ID": "DisableTrack1", "Text": "Disable source clip after processing  (uncheck to leave source visible)", "Checked": True,
+        ui.CheckBox({"ID": "DisableTrack1", "Text": "Disable source clip after processing  (uncheck to leave source visible)", "Checked": False,
                     "StyleSheet": "color: #aaa; font-size: 11px;"}),
     ]),
 
@@ -950,12 +950,18 @@ def _panel_dispatch_sam2_combine(alpha, gates, src_rgb, settings, obj_ids=None):
     from corridorkey_sam_merge import (
         binarize_sam_silhouette, union_binary_silhouettes, merge_ck_with_sam_active,
     )
+    import numpy as np
     _m1b = bool(settings.get("mask1_bypass", False))
     _m2b = bool(settings.get("mask2_bypass", False))
-    # Per-mask BYPASS: drop gate(s) the user toggled off. Order doesn't matter
-    # in the union (commutative). src_rgb is forwarded to the active dispatcher
-    # — chroma-gated merge needs it; Path B fallback ignores it.
-    active_silhouettes = []
+    _subtract = bool(settings.get("sam2_subtract", False))
+    # 2026-05-17 — SUBTRACT wired. When SUBTRACT is enabled, MASK 2 acts as a
+    # kill mask (subtractive). MASK 1 goes through the merge as usual; MASK 2
+    # is then multiplied as (1 - mask2) onto the result, removing whatever
+    # region MASK 2 selected. This matches the "INVERT MASK / garbage matte"
+    # feature from past commits (f0294c2d). When SUBTRACT is off, MASK 1 and
+    # MASK 2 union as before.
+    mask1_silhouettes = []
+    mask2_silhouettes = []
     for i, gate in enumerate(gates):
         if gate is None:
             continue
@@ -964,11 +970,133 @@ def _panel_dispatch_sam2_combine(alpha, gates, src_rgb, settings, obj_ids=None):
             continue
         if oid == 2 and _m2b:
             continue
-        active_silhouettes.append(binarize_sam_silhouette(gate))
+        _sil = binarize_sam_silhouette(gate)
+        if oid == 2:
+            mask2_silhouettes.append(_sil)
+        else:
+            mask1_silhouettes.append(_sil)
+    if _subtract and mask2_silhouettes:
+        # SUBTRACT path. MASK 1 (if present) goes through merge; then MASK 2
+        # is applied as a kill multiplier — EXCEPT inside the eroded body core,
+        # which is strictly preserved (prevents MASK 2 from accidentally
+        # clipping body interior when SAM segmentation overlaps body).
+        # 2026-05-18 — TWO architectural fixes from Codex + multi-AI consensus:
+        #   1. Chroma-boundary CC filter on MASK 1 SAM mask before merge.
+        #      Prevents "SAM grows into floor" when MASK 1 positives sit near
+        #      the green/carpet boundary (e.g., on feet). Cuts SAM mask at
+        #      strong-green pixels and keeps only components containing the
+        #      MASK 1 positive prompts.
+        #   2. Body-core override for SUBTRACT. body_core = erode(SAM, 30px).
+        #      Inside body_core: SUBTRACT cannot touch (SAM is truth).
+        #      Outside body_core (including body_topology's 40px ring):
+        #      SUBTRACT kills freely. Solves the "chunky platform between feet
+        #      survives because body_topology preserves it" failure mode.
+        _sam_union_m1 = None
+        _body_core_2d = None
+        if mask1_silhouettes:
+            _sam_union_m1 = union_binary_silhouettes(mask1_silhouettes)
+            # FIX 1 — chroma-boundary CC filter on MASK 1
+            try:
+                import cv2 as _cv2_cc
+                import json as _json_cc
+                from pathlib import Path as _P_cc
+                _lp_path_cc = _P_cc(r"C:\Users\ragsn\AppData\Local\Temp\corridorkey_session\live_params.json")
+                _m1_pos = []
+                if _lp_path_cc.exists():
+                    with open(_lp_path_cc, "r", encoding="utf-8") as _f_cc:
+                        _lp_cc = _json_cc.load(_f_cc)
+                    _m1_pos = _lp_cc.get("sam_positive_obj1", [])
+                if _m1_pos and src_rgb is not None:
+                    _rgb_cc = src_rgb.astype(np.float32)
+                    if _rgb_cc.max() > 1.5:
+                        _rgb_cc = _rgb_cc / 255.0
+                    # Conservative green threshold — strong green only
+                    _chroma_cc = _rgb_cc[..., 1] - np.maximum(_rgb_cc[..., 0], _rgb_cc[..., 2])
+                    _green_strong = (_chroma_cc > 0.15).astype(np.uint8)
+                    _sam_bin_cc = (_sam_union_m1 > 0.5).astype(np.uint8)
+                    _sam_cut = _sam_bin_cc * (1 - _green_strong)
+                    _n_lbl, _labels = _cv2_cc.connectedComponents(_sam_cut, connectivity=8)
+                    _keep = set()
+                    _H_cc, _W_cc = _labels.shape
+                    for _pt in _m1_pos:
+                        _px, _py = int(_pt[0]), int(_pt[1])
+                        if 0 <= _py < _H_cc and 0 <= _px < _W_cc:
+                            _lbl_at = int(_labels[_py, _px])
+                            if _lbl_at > 0:
+                                _keep.add(_lbl_at)
+                    if _keep:
+                        _constrained = np.zeros_like(_sam_bin_cc, dtype=np.float32)
+                        for _lbl in _keep:
+                            _constrained[_labels == _lbl] = 1.0
+                        # Preserve soft edges from original SAM mask where kept
+                        if _sam_union_m1.dtype != np.float32:
+                            _sam_f32 = _sam_union_m1.astype(np.float32)
+                        else:
+                            _sam_f32 = _sam_union_m1
+                        _sam_union_m1 = (_sam_f32 * _constrained).astype(_sam_union_m1.dtype)
+            except Exception:
+                pass
+            merged = merge_ck_with_sam_active(alpha, _sam_union_m1, source_rgb=src_rgb)
+            # FIX 2 — compute body_core for SUBTRACT override
+            try:
+                import cv2 as _cv2_bc
+                _k_body_core = _cv2_bc.getStructuringElement(_cv2_bc.MORPH_ELLIPSE, (61, 61))
+                _sam_bin_bc = (_sam_union_m1 > 0.5).astype(np.uint8)
+                if _sam_bin_bc.ndim == 3:
+                    _sam_bin_bc = _sam_bin_bc[..., 0]
+                _body_core_2d = _cv2_bc.erode(_sam_bin_bc, _k_body_core).astype(np.float32)
+            except Exception:
+                _body_core_2d = None
+        else:
+            merged = alpha
+        mask2_union = union_binary_silhouettes(mask2_silhouettes)
+        _kill = mask2_union.astype(np.float32)
+        if _kill.ndim == 3 and _kill.shape[2] == 1:
+            _kill = _kill[..., 0]
+        # Apply body-core override: SUBTRACT cannot kill inside body_core
+        if _body_core_2d is not None and _body_core_2d.shape == _kill.shape:
+            _kill = _kill * (1.0 - _body_core_2d)
+        if merged.shape[:2] == _kill.shape[:2]:
+            _inv = (1.0 - _kill).astype(np.float32)
+            if merged.ndim == 3:
+                merged = (merged.astype(np.float32) * _inv[..., None]).astype(merged.dtype)
+            else:
+                merged = (merged.astype(np.float32) * _inv).astype(merged.dtype)
+        merged = _apply_edge_feather(merged, settings)
+        return merged
+    # Union path (legacy / default)
+    active_silhouettes = mask1_silhouettes + mask2_silhouettes
     if not active_silhouettes:
-        return alpha
+        return _apply_edge_feather(alpha, settings)
     sam_union = union_binary_silhouettes(active_silhouettes)
-    return merge_ck_with_sam_active(alpha, sam_union, source_rgb=src_rgb)
+    return _apply_edge_feather(
+        merge_ck_with_sam_active(alpha, sam_union, source_rgb=src_rgb),
+        settings,
+    )
+
+
+def _apply_edge_feather(alpha, settings):
+    # 2026-05-17 — EDGE FEATHER. Reads sam2_soften from settings (repurpose
+    # of existing SOFTEN slider) and applies a Gaussian blur on the FINAL
+    # alpha — softens the matte's outer boundary so the FG-to-BG transition
+    # has a smooth gradient. Per Berto: "between the mask and the green need
+    # a 10 pixel buffer that diffuses into green."
+    # 0 = no feather (default). Sigma = feather_px / 3 (3-sigma rule).
+    try:
+        _fp = float(settings.get("sam2_soften", 0.0))
+    except Exception:
+        _fp = 0.0
+    if _fp <= 0.0 or alpha is None:
+        return alpha
+    import cv2 as _cv2_ef
+    import numpy as _np_ef
+    _sigma = max(0.1, _fp / 3.0)
+    _ksize = max(3, int(round(_fp * 2 + 1)))
+    if _ksize % 2 == 0:
+        _ksize += 1
+    _a32 = alpha.astype(_np_ef.float32)
+    _blurred = _cv2_ef.GaussianBlur(_a32, (_ksize, _ksize), _sigma)
+    return _np_ef.clip(_blurred, 0.0, 1.0)
 
 
 # WHAT IT DOES: Reads per-object SAM2 silhouette PNGs (sam2_mask_obj1.png and
