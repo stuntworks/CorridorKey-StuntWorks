@@ -466,15 +466,17 @@ items["OutputCodec"].AddItem("EXR 32-bit (VFX float)")
 # was partly this. 16-bit = 65k alpha levels = soft hair edges restored.
 try: items["OutputCodec"].CurrentIndex = 1  # default PNG 16-bit
 except Exception: pass
-# OutputContent: which file(s) to write. 2026-05-14: default flipped to
-# "CK only" so SAM2 is never combined automatically. SAM combination is
-# the artist's explicit choice (Berto's rule). Item order kept the same so
-# Combined sits at the top of the dropdown for users who want it.
+# OutputContent: which file(s) to write. 2026-05-18: default flipped to
+# "Combined (CK x SAM)" — the merge stack (sam_buffered + body_topology +
+# body_core + chroma-gated) IS the product. "CK only" default silently
+# bypassed the merge on every render, making the rendered PNG look like
+# raw CK matte (slab survives). Power users who want raw CK can still pick
+# it from the dropdown.
 items["OutputContent"].AddItem("Combined (CK x SAM)")
 items["OutputContent"].AddItem("Both (CK + SAM sidecar)")
 items["OutputContent"].AddItem("CK only")
 items["OutputContent"].AddItem("SAM matte only")
-try: items["OutputContent"].CurrentIndex = 2  # default to "CK only"
+try: items["OutputContent"].CurrentIndex = 0  # default to "Combined (CK x SAM)"
 except Exception: pass
 items["OutputMode"].AddItem("Track 2 (Above Source)")
 items["OutputMode"].AddItem("MediaPool Only")
@@ -1041,6 +1043,7 @@ def _panel_dispatch_sam2_combine(alpha, gates, src_rgb, settings, obj_ids=None):
             try:
                 import cv2 as _cv2_bc
                 _k_body_core = _cv2_bc.getStructuringElement(_cv2_bc.MORPH_ELLIPSE, (61, 61))
+                _k_body_core[:30, :] = 0
                 _sam_bin_bc = (_sam_union_m1 > 0.5).astype(np.uint8)
                 if _sam_bin_bc.ndim == 3:
                     _sam_bin_bc = _sam_bin_bc[..., 0]

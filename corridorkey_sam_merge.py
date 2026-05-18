@@ -566,6 +566,7 @@ def merge_ck_with_sam_chroma_gated(
     #     where CK and SAM agree.
     _k = max(1, int(SOFT_ZONE_SAM_BUFFER_PX))
     _kernel = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (_k * 2 + 1, _k * 2 + 1))
+    _kernel[:_k, :] = 0
     sam_buffered = _cv2.dilate(sam.astype(np.uint8), _kernel).astype(np.float32)
     # 2026-05-17 DISTANCE-FROM-GREEN SOFT GATE (4-agent audit converged here).
     # Strap and carpet both have the same pixel-level pattern (FG color
@@ -608,6 +609,7 @@ def merge_ck_with_sam_chroma_gated(
         # working size from deploy 131942. Platform extension (40px past feet)
         # accepted here — will be addressed separately via SUBTRACT wiring.
         _k_body_topo = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (81, 81))
+        _k_body_topo[:40, :] = 0
         _body_topo_raw = _cv2.morphologyEx(
             (sam > 0.5).astype(np.uint8), _cv2.MORPH_CLOSE, _k_body_topo
         )
