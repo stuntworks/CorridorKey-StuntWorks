@@ -1,0 +1,20 @@
+{
+  "timestamp": "2026-05-18_124957",
+  "clean_dummies": false,
+  "operations": [
+    {
+      "op": "deploy",
+      "label": "DaVinci plugin",
+      "source": "D:\\New AI Projects\\CorridorKey\\resolve_plugin\\CorridorKey_Pro.py",
+      "live": "C:\\ProgramData\\Blackmagic Design\\DaVinci Resolve\\Fusion\\Scripts\\Utility\\CorridorKey.py",
+      "backup": "D:\\New AI Projects\\CorridorKey\\.deploy_backups\\2026-05-18_124957\\C__ProgramData_Blackmagic Design_DaVinci Resolve_Fusion_Scripts_Utility_CorridorKey.py"
+    },
+    {
+      "op": "generate",
+      "label": "DaVinci config (engine root path)",
+      "live": "C:\\ProgramData\\Blackmagic Design\\DaVinci Resolve\\Fusion\\Scripts\\Utility\\corridorkey_path.txt",
+      "backup": "D:\\New AI Projects\\CorridorKey\\.deploy_backups\\2026-05-18_124957\\C__ProgramData_Blackmagic Design_DaVinci Resolve_Fusion_Scripts_Utility_corridorkey_path.txt",
+      "content_preview": "D:\\New AI Projects\\CorridorKey"
+    }
+  ]
+}

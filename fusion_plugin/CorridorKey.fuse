@@ -1,0 +1,247 @@
+--[[
+CorridorKey - Neural Green Screen Keyer for DaVinci Resolve Fusion
+AI-powered keying that separates foreground from green/blue screen
+
+Based on Rembg-Fuse architecture pattern
+]]
+
+FuRegisterClass("CorridorKey", CT_Tool, {
+    REGS_Name = "CorridorKey",
+    REGS_Category = "Matte",
+    REGS_OpIconString = "CK",
+    REGS_OpDescription = "AI Neural Green Screen Keyer",
+    REGS_Company = "CorridorKey",
+    REGS_URL = "https://github.com/corridor-digital/corridorkey",
+    REG_NoObjMatCtrls = true,
+    REG_NoMotionBlurCtrls = true,
+    REG_SupportsDoD = false,
+    REG_Fuse_NoEdit = false,
+    REG_Fuse_NoReload = false,
+})
+
+-- Configuration
+local CORRIDORKEY_ROOT = "D:\\New AI Projects\\CorridorKey"
+local PYTHON_SCRIPT = CORRIDORKEY_ROOT .. "\\fusion_plugin\\ck_processor.py"
+local TEMP_DIR = os.getenv("TEMP") or "/tmp"
+
+function Create()
+    -- Input
+    InImage = self:AddInput("Input", "Input", {
+        LINKID_DataType = "Image",
+        LINK_Main = 1,
+    })
+
+    -- Screen Type
+    InScreenType = self:AddInput("Screen Type", "ScreenType", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ComboControl",
+        INP_Default = 0,
+        INP_Integer = true,
+        { CCS_AddString = "Green Screen" },
+        { CCS_AddString = "Blue Screen" },
+    })
+
+    -- Despill Strength
+    InDespill = self:AddInput("Despill", "Despill", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 0.5,
+        INP_MinScale = 0.0,
+        INP_MaxScale = 1.0,
+    })
+
+    -- Refiner Strength
+    InRefiner = self:AddInput("Refiner", "Refiner", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 1.0,
+        INP_MinScale = 0.0,
+        INP_MaxScale = 1.0,
+    })
+
+    -- Despeckle Enable
+    InDespeckle = self:AddInput("Auto Despeckle", "Despeckle", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "CheckboxControl",
+        INP_Default = 1,
+        INP_Integer = true,
+    })
+
+    -- Despeckle Size
+    InDespeckleSize = self:AddInput("Despeckle Size", "DespeckleSize", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 400,
+        INP_MinScale = 50,
+        INP_MaxScale = 2000,
+        INP_Integer = true,
+    })
+
+    -- Python Path
+    InPythonPath = self:AddInput("Python Path", "PythonPath", {
+        LINKID_DataType = "Text",
+        INPID_InputControl = "FileControl",
+        INP_Default = CORRIDORKEY_ROOT .. "\\.venv\\Scripts\\python.exe",
+        FC_IsSaver = false,
+        FC_PathBrowse = true,
+    })
+
+    -- Status display
+    InStatus = self:AddInput("Status", "Status", {
+        LINKID_DataType = "Text",
+        INPID_InputControl = "TextEditControl",
+        INP_Default = "Ready",
+        TEC_ReadOnly = true,
+        TEC_Lines = 1,
+        IC_NoLabel = true,
+        IC_NoReset = true,
+    })
+
+    -- Output
+    OutImage = self:AddOutput("Output", "Output", {
+        LINKID_DataType = "Image",
+        LINK_Main = 1,
+    })
+end
+
+
+function GetScreenType()
+    local idx = InScreenType:GetValue(req).Value
+    if idx == 0 then
+        return "green"
+    else
+        return "blue"
+    end
+end
+
+
+function ExecutePython(python_path, input_path, output_path, screen_type, despill, despeckle, despeckle_size, refiner)
+    -- Build command
+    local cmd
+
+    if package.config:sub(1,1) == "\\" then
+        -- Windows
+        cmd = string.format(
+            '"%s" "%s" "%s" "%s" --screen %s --despill %.3f --despeckle %d --despeckle-size %d --refiner %.3f',
+            python_path,
+            PYTHON_SCRIPT,
+            input_path,
+            output_path,
+            screen_type,
+            despill,
+            despeckle and 1 or 0,
+            despeckle_size,
+            refiner
+        )
+    else
+        -- Linux/Mac
+        cmd = string.format(
+            '%s "%s" "%s" "%s" --screen %s --despill %.3f --despeckle %d --despeckle-size %d --refiner %.3f',
+            python_path,
+            PYTHON_SCRIPT,
+            input_path,
+            output_path,
+            screen_type,
+            despill,
+            despeckle and 1 or 0,
+            despeckle_size,
+            refiner
+        )
+    end
+
+    print("[CorridorKey] Running: " .. cmd)
+    local result = os.execute(cmd)
+    return result == 0 or result == true
+end
+
+
+function Process(req)
+    local img = InImage:GetValue(req)
+
+    if not img then
+        OutImage:Set(req, nil)
+        return
+    end
+
+    -- Get settings
+    local screen_type = GetScreenType()
+    local despill = InDespill:GetValue(req).Value
+    local refiner = InRefiner:GetValue(req).Value
+    local despeckle = InDespeckle:GetValue(req).Value == 1
+    local despeckle_size = InDespeckleSize:GetValue(req).Value
+    local python_path = InPythonPath:GetValue(req).Value
+
+    -- Generate temp file names
+    local frame_num = req.Time
+    local input_path = TEMP_DIR .. string.format("\\ck_input_%d.png", frame_num)
+    local output_path = TEMP_DIR .. string.format("\\ck_output_%d.png", frame_num)
+
+    -- Save input frame
+    print("[CorridorKey] Saving input frame...")
+    local saver = Saver({
+        Clip = input_path,
+        ["OpenEXRFormat.Compression"] = 0,
+    })
+
+    -- Use Fusion's image save
+    local exr = img:Save(input_path, {
+        ["Format"] = "PNG",
+        ["PNGFormat.BitDepth"] = 1,  -- 16-bit
+    })
+
+    if not exr then
+        print("[CorridorKey] ERROR: Could not save input frame")
+        InStatus:SetSource(Text("Error: Save failed"), req.Time)
+        OutImage:Set(req, img)
+        return
+    end
+
+    -- Process with Python
+    print("[CorridorKey] Processing with AI...")
+    InStatus:SetSource(Text("Processing..."), req.Time)
+
+    local success = ExecutePython(
+        python_path,
+        input_path,
+        output_path,
+        screen_type,
+        despill,
+        despeckle,
+        despeckle_size,
+        refiner
+    )
+
+    if not success then
+        print("[CorridorKey] ERROR: Python processing failed")
+        InStatus:SetSource(Text("Error: Processing failed"), req.Time)
+        -- Clean up and return original
+        os.remove(input_path)
+        OutImage:Set(req, img)
+        return
+    end
+
+    -- Load output
+    print("[CorridorKey] Loading result...")
+    local out_img = Image({
+        IMG_Like = img,
+        IMG_CopyChannels = false,
+    })
+
+    local loaded = out_img:Load(output_path)
+
+    if not loaded then
+        print("[CorridorKey] ERROR: Could not load output")
+        InStatus:SetSource(Text("Error: Load failed"), req.Time)
+        os.remove(input_path)
+        os.remove(output_path)
+        OutImage:Set(req, img)
+        return
+    end
+
+    -- Clean up temp files
+    os.remove(input_path)
+    os.remove(output_path)
+
+    InStatus:SetSource(Text("Done"), req.Time)
+    OutImage:Set(req, out_img)
+end

@@ -602,6 +602,24 @@ def merge_ck_with_sam_chroma_gated(
     _kernel = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (_k * 2 + 1, _k * 2 + 1))
     _kernel[:_k, :] = 0
     sam_buffered = _cv2.dilate(sam.astype(np.uint8), _kernel).astype(np.float32)
+
+    # 2026-05-18 SAM PROXIMITY OVERRIDE — rescues body edges SAM2 cut tight.
+    # SAM2 hiera_small ends precisely at the visible silhouette; fingers,
+    # buttock curve, strap edges extend a few px past SAM. Chroma constraint
+    # then drops them (skin-with-spill has chroma_score < 0.05 → off-green
+    # → sam_buffered gated to 0). Result: hard clip at body edge.
+    # FIX: proximity zone around SAM (UP/lateral only, no down — same
+    # direction as sam_buffered, so platform stays dead). Inside proximity,
+    # chroma gate is overridden; outside, current chroma gate still applies.
+    # 2026-05-19: 30 → 10. Berto saw a 10px halo all around feet/legs at
+    # 30px — body's soft-alpha CK transition was preserved too generously.
+    # 10px keeps butt curve + near-hand fingers; longer fingers go back to
+    # cut. Drop further if halo still visible.
+    _k_prox = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (11, 11))
+    _k_prox[:5, :] = 0  # zero top half → dilation UP/lateral only
+    _body_proximity = _cv2.dilate(
+        sam.astype(np.uint8), _k_prox,
+    ).astype(np.float32)
     # 2026-05-18 SIMPLE MULTIPLY + CHROMA-CONSTRAINED KEEP-ZONE.
     # keep_zone = max(sam, sam_buffered * is_on_green_widen).
     # final = ck * keep_zone.
@@ -617,10 +635,13 @@ def merge_ck_with_sam_chroma_gated(
     # at foot level, catching dark mat where CK keys partially).
     # is_on_green_widen kills those bands cleanly. Hair / strap on green
     # wall keep their full sam_buffered coverage because they ARE on green.
+    # keep_zone gate: pixel preserved if EITHER on green wall (hair / strap
+    # context) OR within 30px of SAM body (skin-with-spill body edges).
     _on_green_f = is_on_green_widen.astype(np.float32)
+    _gate = np.maximum(_on_green_f, _body_proximity).astype(np.float32)
     _keep_zone = np.maximum(
         sam.astype(np.float32),
-        sam_buffered.astype(np.float32) * _on_green_f,
+        sam_buffered.astype(np.float32) * _gate,
     ).astype(np.float32)
     final = np.clip(
         ck.astype(np.float32) * _keep_zone, 0.0, 1.0,

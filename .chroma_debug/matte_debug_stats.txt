@@ -1,0 +1,6 @@
+=== matte view final-displayed dump ===
+ops applied to merge_output before display: ['despeckle(399)']
+final alpha shape=(2160, 4096)  mean=0.0507  min=0.0000  max=1.0000
+Compare matte_debug_final.png vs matte_debug_final_displayed.png:
+  - If different: a downstream op altered the merge output.
+  - If identical: the merge inputs (matte_debug_ck_alpha + matte_debug_trimap + matte_debug_alpha_solved) explain the output.

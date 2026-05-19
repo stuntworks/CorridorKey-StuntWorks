@@ -1328,8 +1328,13 @@ def generate_sam2_mask(frame, pos_pts, neg_pts):
         from sam2.sam2_image_predictor import SAM2ImagePredictor
         log("Loading SAM2...")
         status("Loading SAM2...")
-        ckpt = str(CK_ROOT / "sam2_weights" / "sam2.1_hiera_small.pt")
-        cfg = "configs/sam2.1/sam2.1_hiera_s.yaml"
+        # 2026-05-19: hiera_small -> hiera_base_plus. Higher capacity for
+        # multi-texture stunt subjects (harness gear + multi-fabric clothing
+        # + motion blur). Reduces Swiss-cheese internal holes, calf-level
+        # SAM slits, knee-bend hole, finger/butt under-coverage.
+        # +25% latency (~2.4s -> ~3s/frame), 323 MB checkpoint vs 176 MB.
+        ckpt = str(CK_ROOT / "sam2_weights" / "sam2.1_hiera_base_plus.pt")
+        cfg = "configs/sam2.1/sam2.1_hiera_b+.yaml"
         device = "cuda" if torch.cuda.is_available() else "cpu"
         model = build_sam2(cfg, ckpt, device=device)
         pred = SAM2ImagePredictor(model)
@@ -1372,8 +1377,8 @@ def run_sam2_video_propagation(fp, ss, cs, in_f, out_f, pos_pts, neg_pts, anchor
     per-mask combine + union via _panel_dispatch_sam2_combine).
     """
     import cv2, numpy as np, torch, shutil, tempfile
-    ckpt = str(CK_ROOT / "sam2_weights" / "sam2.1_hiera_small.pt")
-    cfg  = "configs/sam2.1/sam2.1_hiera_s.yaml"
+    ckpt = str(CK_ROOT / "sam2_weights" / "sam2.1_hiera_base_plus.pt")
+    cfg  = "configs/sam2.1/sam2.1_hiera_b+.yaml"
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dur = out_f - in_f
 

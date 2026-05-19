@@ -3230,8 +3230,8 @@ class PersistentWindow(QtWidgets.QWidget):
             adjusted_pts = shift_points_for_padding(all_pts, _pad_box)
             # CK_ROOT is two levels up from this script (resolve_plugin/ → engine root)
             ck_root = Path(__file__).parent.parent
-            ckpt = str(ck_root / "sam2_weights" / "sam2.1_hiera_small.pt")
-            cfg   = "configs/sam2.1/sam2.1_hiera_s.yaml"
+            ckpt = str(ck_root / "sam2_weights" / "sam2.1_hiera_base_plus.pt")
+            cfg   = "configs/sam2.1/sam2.1_hiera_b+.yaml"
             device = "cuda" if torch.cuda.is_available() else "cpu"
             from sam2.build_sam import build_sam2
             from sam2.sam2_image_predictor import SAM2ImagePredictor
