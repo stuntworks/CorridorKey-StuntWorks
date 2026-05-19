@@ -2765,18 +2765,67 @@ class PersistentWindow(QtWidgets.QWidget):
                     )
 
                 if self._view_mode == "CK Matte":
-                    img = alpha_to_rgb_u8(alpha)
+                    # 2026-05-18 — CK Matte = RAW chroma engine output only.
+                    # Berto: "ck preview should be ck preview" + "from the CK
+                    # preview, it should only be CK exactly as it comes out."
+                    # Bypass merge_ck_with_sam_active entirely. Re-apply the
+                    # CK-only sliders (CHOKE, DESPECKLE) locally so they still
+                    # affect this view — matte_margin / matte_soften are SAM
+                    # operations and intentionally skipped here.
+                    _ck_only = (self.session.alpha.copy()
+                                if self.session.alpha is not None
+                                else alpha.copy())
+                    _ck_choke = float(params_for_matte.get("choke", 0))
+                    if _ck_choke > 0:
+                        _ic_ck = int(_ck_choke)
+                        _fr_ck = _ck_choke - _ic_ck
+                        _a8_ck = (np.clip(_ck_only, 0, 1) * 255).astype(np.uint8)
+                        _lo_ck = (cv2.erode(
+                            _a8_ck,
+                            cv2.getStructuringElement(
+                                cv2.MORPH_ELLIPSE,
+                                (_ic_ck * 2 + 1, _ic_ck * 2 + 1),
+                            ),
+                        ).astype(np.float32) / 255.0
+                            if _ic_ck > 0 else _ck_only.copy())
+                        if _fr_ck > 0:
+                            _hi_ck = cv2.erode(
+                                _a8_ck,
+                                cv2.getStructuringElement(
+                                    cv2.MORPH_ELLIPSE,
+                                    ((_ic_ck + 1) * 2 + 1, (_ic_ck + 1) * 2 + 1),
+                                ),
+                            ).astype(np.float32) / 255.0
+                            _ck_only = _lo_ck * (1.0 - _fr_ck) + _hi_ck * _fr_ck
+                        else:
+                            _ck_only = _lo_ck
+                    if params_for_matte.get("despeckle", True):
+                        _ck_only = self.cu.clean_matte_opencv(
+                            _ck_only,
+                            area_threshold=int(
+                                params_for_matte.get("despeckleSize", 400)
+                            ),
+                        )
+                    img = alpha_to_rgb_u8(_ck_only)
                 elif self._view_mode == "SAM Matte":
                     img = alpha_to_rgb_u8(_sam_arr if _sam_active else alpha)
                 elif self._view_mode == "Combined":
-                    # Multiply preview — quick visual reference for the user
-                    # before they take the two mattes into Fusion. Output stays
-                    # as two separate mattes; this is a UI-only preview.
-                    if _sam_active:
-                        _combo = np.clip(alpha * _sam_arr, 0.0, 1.0)
-                        img = alpha_to_rgb_u8(_combo)
-                    else:
-                        img = alpha_to_rgb_u8(alpha)
+                    # 2026-05-18 — Combined preview now mirrors the render path.
+                    # OLD: alpha * sam_matte_v1 — a double SAM application that
+                    # made the preview LOOK cleaner than the rendered PNG and
+                    # hid render residue from Berto. NEW: display the merge
+                    # result with the same edge_feather the render applies at
+                    # save time (CorridorKey_Pro.py:_apply_edge_feather).
+                    _combined_view = alpha.copy() if alpha is not None else None
+                    try:
+                        _fp_v = float(params_for_matte.get("sam2_soften", 0.0))
+                    except Exception:
+                        _fp_v = 0.0
+                    if _combined_view is not None and _fp_v > 0:
+                        _combined_view = cv2.GaussianBlur(
+                            _combined_view, (0, 0), _fp_v / 3.0
+                        )
+                    img = alpha_to_rgb_u8(_combined_view if _combined_view is not None else alpha)
                 else:  # Split — CK | gutter | SAM side-by-side
                     if _sam_active:
                         _ck_rgb = alpha_to_rgb_u8(alpha)

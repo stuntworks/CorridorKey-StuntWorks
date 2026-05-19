@@ -66,7 +66,13 @@ CK_SOFT_HI = 0.7
 # working area for soft alpha while still killing wire echoes 80+ px from
 # body. Tune higher if hair/fingers still cut, lower if floor mat near
 # body's feet leaks through.
-SOFT_ZONE_SAM_BUFFER_PX = 80
+# 2026-05-18: 80 -> 25 -> 40.
+#   80: lateral leak right of feet + ankle seam (image #39).
+#   25: line killed, but feet had spill, body edge eaten (butt soft).
+#       Berto: "needs bigger overlap into green."
+#   40: middle. Should reach further into green to kill foot spill without
+#       bringing back the lateral seam at the chroma boundary.
+SOFT_ZONE_SAM_BUFFER_PX = 40
 
 # Saturation ramp endpoints (logit space) — see logits_to_soft_mask below.
 # A 4-logit-wide soft band gives a 2-4 px feather at typical SAM 2 grad
@@ -536,6 +542,13 @@ def merge_ck_with_sam_chroma_gated(
     is_on_green_gate = (chroma_score > 0.25)
     # Kept for diagnostic dump compat:
     is_on_green = is_on_green_gate
+
+    # 2026-05-18: FEET-DOWN SAM extension REVERTED. Tried 11×21 top-half-active
+    # kernel (10px down + 5px laterally). Berto: "SAM mask needs to be tighter
+    # around the feet. it's not really capturing the feet a little bit off."
+    # The 5px lateral spread made the SAM blob loose at feet. Leaving raw SAM
+    # alone here — if feet still need extension, do it via a 3×7 narrow kernel
+    # (1px lateral, 3px down) instead, not the wider 11×21.
 
     # 2026-05-17: CHROMA-AWARE SAM widening — SAM widens 10px ONLY where the
     # source pixel is on green (uses LOW threshold so mild-spill body edges
