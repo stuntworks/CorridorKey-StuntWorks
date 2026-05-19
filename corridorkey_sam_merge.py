@@ -956,6 +956,55 @@ def write_matte_final_dump(alpha_final: np.ndarray, ops_applied) -> None:
     return
 
 
+def compute_garbage_matte(
+    sam_silhouette: np.ndarray,
+    expand_px: int = 0,
+    feather_px: int = 0,
+    y_top_pct: int = 0,
+    y_bot_pct: int = 100,
+    crop_mode: str = "body",
+) -> Optional[np.ndarray]:
+    """2026-05-19 garbage matte: cv2.dilate(SAM, expand_px) + GaussianBlur(feather_px)
+    + optional vertical Y crop (y_top_pct, y_bot_pct).
+    Returns float32 [0,1] (H, W) matte for sidecar export. Returns None if SAM is None.
+
+    expand_px: 0-200, isotropic dilation radius from raw SAM silhouette.
+    feather_px: 0-30, GaussianBlur sigma. 0 = hard binary edge.
+    y_top_pct, y_bot_pct: 0-100, Y crop band.
+    crop_mode: "body" (% of SAM bbox — follows subject across moving camera)
+               or "frame" (% of frame height — locked to frame coords).
+    """
+    if sam_silhouette is None:
+        return None
+    import cv2 as _cv2_g
+    sam_bin = (np.asarray(sam_silhouette) > 0.5).astype(np.uint8)
+    if sam_bin.ndim == 3:
+        sam_bin = sam_bin[..., 0]
+    _ep = max(0, min(200, int(expand_px)))
+    if _ep > 0:
+        _k_g = _cv2_g.getStructuringElement(_cv2_g.MORPH_ELLIPSE, (_ep * 2 + 1, _ep * 2 + 1))
+        sam_bin = _cv2_g.dilate(sam_bin, _k_g)
+    matte = sam_bin.astype(np.float32)
+    _fp = max(0, min(30, int(feather_px)))
+    if _fp > 0:
+        # GaussianBlur with ksize=(0,0) infers from sigma. Sigma = feather_px.
+        matte = _cv2_g.GaussianBlur(matte, (0, 0), float(_fp))
+        matte = np.clip(matte, 0.0, 1.0)
+    # Y crop — zero out rows outside the user-selected vertical band.
+    _yt = max(0, min(100, int(y_top_pct)))
+    _yb = max(0, min(100, int(y_bot_pct)))
+    if _yt > 0 or _yb < 100:
+        _h = matte.shape[0]
+        _y0 = int(_h * _yt / 100)
+        _y1 = int(_h * _yb / 100)
+        if _y1 <= _y0:
+            return np.zeros_like(matte)
+        _crop = np.zeros_like(matte)
+        _crop[_y0:_y1, :] = 1.0
+        matte = matte * _crop
+    return matte
+
+
 # Chroma-aware BG-cleanup pass, restored from the e4ed333 (2026-05-06) known-good
 # matte behavior. The post-5/7 architecture rip removed the BG kill mask Berto
 # was relying on — CK matte now leaves partial-alpha bleed across dim/poorly-lit

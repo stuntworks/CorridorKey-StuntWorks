@@ -835,6 +835,21 @@ class PersistentWindow(QtWidgets.QWidget):
             # FEET SOFTEN: MASK 2-only Gaussian sigma. Softens the feet edge
             # without affecting the body. Default 0 = off.
             "feet_soften": 0.0,
+            # 2026-05-19 GARBAGE MATTE: third sidecar derived from SAM
+            # silhouette via dilate(expand) + GaussianBlur(feather). User
+            # multiplies it against keyed clip in Resolve as a holdout.
+            # expand_px 0-200 (default 0 = matches raw SAM silhouette),
+            # feather_px 0-30 (default 0 = hard edge),
+            # bypass: when True, skip computation and sidecar export.
+            "garbage_expand_px": 0,
+            "garbage_feather_px": 0,
+            "garbage_bypass": False,
+            # 2026-05-19 GARBAGE MATTE Y crop. Vertical band that the garbage
+            # matte is restricted to. Top/bottom in % of frame height.
+            # Default: full frame (no crop). Berto sets GARB Y TOP to ~60 to
+            # cut head/torso, keep only lower-body (calf-seam zone).
+            "garbage_y_top_pct": 0,
+            "garbage_y_bot_pct": 100,
         }
         # Drop-stale: if a new update comes in while we're painting, we only keep
         # the latest one. _pending is None when idle, or a dict when a render is
@@ -2104,6 +2119,101 @@ class PersistentWindow(QtWidgets.QWidget):
         self.show_sam2_checkbox.toggled.connect(self._on_show_sam2_changed)
         grid.addWidget(self.show_sam2_checkbox, 18, 1, 1, 2)
 
+        # 2026-05-19 GARBAGE MATTE — third sidecar matte from SAM silhouette.
+        # Three controls: EXPAND (dilate radius), FEATHER (Gaussian sigma), BYPASS.
+        _GM_EXPAND_TOOLTIP = (
+            "GARBAGE EXPAND — pixels (0-200). Dilates SAM silhouette outward "
+            "to form a garbage-matte holdout. 0 = matches raw SAM. 30-60 = "
+            "covers slab / wing residue. Higher = more generous holdout. "
+            "Sidecar PNG exported as GARBAGE_<frame>.png."
+        )
+        self.gm_expand_label_widget = _label("GARB EXPAND")
+        self.gm_expand_label_widget.setToolTip(_GM_EXPAND_TOOLTIP)
+        grid.addWidget(self.gm_expand_label_widget, 19, 0)
+        self.gm_expand_slider = JumpSlider(QtCore.Qt.Horizontal)
+        self.gm_expand_slider.setRange(0, 200)
+        self.gm_expand_slider.setValue(int(self._params.get("garbage_expand_px", 0)))
+        self.gm_expand_slider.valueChanged.connect(self._on_gm_expand_changed)
+        self.gm_expand_slider.setToolTip(_GM_EXPAND_TOOLTIP)
+        grid.addWidget(self.gm_expand_slider, 19, 1)
+        self.gm_expand_value_label = _label(f"{int(self._params.get('garbage_expand_px', 0))}", "#f0f")
+        self.gm_expand_value_label.setMinimumWidth(42)
+        grid.addWidget(self.gm_expand_value_label, 19, 2)
+
+        _GM_FEATHER_TOOLTIP = (
+            "GARBAGE FEATHER — Gaussian sigma (0-30 px). Softens the garbage "
+            "matte boundary. 0 = hard binary edge (default). 4-8 = soft "
+            "transition for smooth composites downstream."
+        )
+        self.gm_feather_label_widget = _label("GARB FEATHER")
+        self.gm_feather_label_widget.setToolTip(_GM_FEATHER_TOOLTIP)
+        grid.addWidget(self.gm_feather_label_widget, 20, 0)
+        self.gm_feather_slider = JumpSlider(QtCore.Qt.Horizontal)
+        self.gm_feather_slider.setRange(0, 30)
+        self.gm_feather_slider.setValue(int(self._params.get("garbage_feather_px", 0)))
+        self.gm_feather_slider.valueChanged.connect(self._on_gm_feather_changed)
+        self.gm_feather_slider.setToolTip(_GM_FEATHER_TOOLTIP)
+        grid.addWidget(self.gm_feather_slider, 20, 1)
+        self.gm_feather_value_label = _label(f"{int(self._params.get('garbage_feather_px', 0))}", "#f0f")
+        self.gm_feather_value_label.setMinimumWidth(42)
+        grid.addWidget(self.gm_feather_value_label, 20, 2)
+
+        _GM_Y_TOP_TOOLTIP = (
+            "GARB Y TOP — top of preserved garbage-matte band (% of frame "
+            "height from top). 0 = no top crop. Set ~60 to cut head/torso "
+            "and keep only lower body where the calf-seam lives."
+        )
+        self.gm_y_top_label_widget = _label("GARB Y TOP")
+        self.gm_y_top_label_widget.setToolTip(_GM_Y_TOP_TOOLTIP)
+        grid.addWidget(self.gm_y_top_label_widget, 21, 0)
+        self.gm_y_top_slider = JumpSlider(QtCore.Qt.Horizontal)
+        self.gm_y_top_slider.setRange(0, 100)
+        self.gm_y_top_slider.setValue(int(self._params.get("garbage_y_top_pct", 0)))
+        self.gm_y_top_slider.valueChanged.connect(self._on_gm_y_top_changed)
+        self.gm_y_top_slider.setToolTip(_GM_Y_TOP_TOOLTIP)
+        grid.addWidget(self.gm_y_top_slider, 21, 1)
+        self.gm_y_top_value_label = _label(f"{int(self._params.get('garbage_y_top_pct', 0))}", "#f0f")
+        self.gm_y_top_value_label.setMinimumWidth(42)
+        grid.addWidget(self.gm_y_top_value_label, 21, 2)
+
+        _GM_Y_BOT_TOOLTIP = (
+            "GARB Y BOT — bottom of preserved garbage-matte band (% of frame "
+            "height from top). 100 = no bottom crop. Set lower to crop the "
+            "feet/floor off the bottom of the garbage matte."
+        )
+        self.gm_y_bot_label_widget = _label("GARB Y BOT")
+        self.gm_y_bot_label_widget.setToolTip(_GM_Y_BOT_TOOLTIP)
+        grid.addWidget(self.gm_y_bot_label_widget, 22, 0)
+        self.gm_y_bot_slider = JumpSlider(QtCore.Qt.Horizontal)
+        self.gm_y_bot_slider.setRange(0, 100)
+        self.gm_y_bot_slider.setValue(int(self._params.get("garbage_y_bot_pct", 100)))
+        self.gm_y_bot_slider.valueChanged.connect(self._on_gm_y_bot_changed)
+        self.gm_y_bot_slider.setToolTip(_GM_Y_BOT_TOOLTIP)
+        grid.addWidget(self.gm_y_bot_slider, 22, 1)
+        self.gm_y_bot_value_label = _label(f"{int(self._params.get('garbage_y_bot_pct', 100))}", "#f0f")
+        self.gm_y_bot_value_label.setMinimumWidth(42)
+        grid.addWidget(self.gm_y_bot_value_label, 22, 2)
+
+        _GM_BYPASS_TOOLTIP = (
+            "GARBAGE BYPASS — when ON, skip computation and don't write the "
+            "GARBAGE_*.png sidecar. CK and SAM mattes ship unchanged."
+        )
+        self.gm_bypass_label_widget = _label("GARB BYPASS")
+        self.gm_bypass_label_widget.setToolTip(_GM_BYPASS_TOOLTIP)
+        grid.addWidget(self.gm_bypass_label_widget, 23, 0)
+        self.gm_bypass_checkbox = QtWidgets.QCheckBox("")
+        self.gm_bypass_checkbox.setStyleSheet(
+            "QCheckBox { color: #f0f; border: none; background: transparent; "
+            "font-size: 12px; font-weight: 600; letter-spacing: 0.5px; } "
+            "QCheckBox::indicator { width: 12px; height: 12px; border: 1px solid "
+            "#702070; border-radius: 2px; background: #1a001a; } "
+            "QCheckBox::indicator:checked { background: #f0f; border-color: #f0f; }"
+        )
+        self.gm_bypass_checkbox.setChecked(bool(self._params.get("garbage_bypass", False)))
+        self.gm_bypass_checkbox.setToolTip(_GM_BYPASS_TOOLTIP)
+        self.gm_bypass_checkbox.toggled.connect(self._on_gm_bypass_changed)
+        grid.addWidget(self.gm_bypass_checkbox, 23, 1, 1, 2)
+
         grid.setColumnStretch(1, 1)
         parent_layout.addWidget(panel)
 
@@ -2266,6 +2376,36 @@ class PersistentWindow(QtWidgets.QWidget):
     def _on_edge_guard_changed(self, value: int):
         self._params["edge_guard_px"] = int(value)
         self.edge_guard_value_label.setText(f"{int(value)}")
+        self._schedule_render()
+        self._schedule_save()
+
+    # 2026-05-19 GARBAGE MATTE slot handlers.
+    def _on_gm_expand_changed(self, value: int):
+        self._params["garbage_expand_px"] = int(value)
+        self.gm_expand_value_label.setText(f"{int(value)}")
+        self._schedule_render()
+        self._schedule_save()
+
+    def _on_gm_feather_changed(self, value: int):
+        self._params["garbage_feather_px"] = int(value)
+        self.gm_feather_value_label.setText(f"{int(value)}")
+        self._schedule_render()
+        self._schedule_save()
+
+    def _on_gm_bypass_changed(self, checked: bool):
+        self._params["garbage_bypass"] = bool(checked)
+        self._render_now()
+        self._save_live_params_now()
+
+    def _on_gm_y_top_changed(self, value: int):
+        self._params["garbage_y_top_pct"] = int(value)
+        self.gm_y_top_value_label.setText(f"{int(value)}")
+        self._schedule_render()
+        self._schedule_save()
+
+    def _on_gm_y_bot_changed(self, value: int):
+        self._params["garbage_y_bot_pct"] = int(value)
+        self.gm_y_bot_value_label.setText(f"{int(value)}")
         self._schedule_render()
         self._schedule_save()
 
@@ -2744,6 +2884,36 @@ class PersistentWindow(QtWidgets.QWidget):
                             source_rgb=_src_rgb_m,
                             proximity_px=_prox_px_m,
                         )
+                        # 2026-05-19: apply GARBAGE MATTE multiplication so
+                        # Combined preview matches render output.
+                        _gm_bypass_m = bool(params_for_matte.get("garbage_bypass", False))
+                        _gm_exp_m = int(params_for_matte.get("garbage_expand_px", 0))
+                        _gm_fth_m = int(params_for_matte.get("garbage_feather_px", 0))
+                        _gm_yt_m = int(params_for_matte.get("garbage_y_top_pct", 0))
+                        _gm_yb_m = int(params_for_matte.get("garbage_y_bot_pct", 100))
+                        if (not _gm_bypass_m) and (
+                            _gm_exp_m > 0 or _gm_yt_m > 0 or _gm_yb_m < 100
+                        ):
+                            try:
+                                from corridorkey_sam_merge import (
+                                    compute_garbage_matte as _cgm_m,
+                                )
+                                _gm_arr_m = _cgm_m(
+                                    _sam_union_m,
+                                    expand_px=_gm_exp_m,
+                                    feather_px=_gm_fth_m,
+                                    y_top_pct=_gm_yt_m,
+                                    y_bot_pct=_gm_yb_m,
+                                )
+                                if _gm_arr_m is not None and _gm_arr_m.shape[:2] == alpha.shape[:2]:
+                                    if alpha.ndim == 3:
+                                        alpha = (alpha.astype(np.float32)
+                                                 * _gm_arr_m[..., None]).astype(np.float32)
+                                    else:
+                                        alpha = (alpha.astype(np.float32)
+                                                 * _gm_arr_m).astype(np.float32)
+                            except Exception:
+                                pass
                         # Recompute SAM matte from this render's per-frame
                         # gates — same call render_composite makes at line 594.
                         self.session.sam_matte_v1 = process_sam_matte(
@@ -2951,6 +3121,34 @@ class PersistentWindow(QtWidgets.QWidget):
                     _edges = cv2.dilate(_edges, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
                     img = img.copy()
                     img[_edges > 0] = [0, 255, 255]  # cyan (RGB)
+                except Exception:
+                    pass
+
+            # 2026-05-19 GARBAGE MATTE outline (magenta) — live visual feedback
+            # for the GARB EXPAND / FEATHER sliders. Shows the dilated SAM
+            # silhouette boundary on Composite / Foreground / Source views.
+            # Suppressed when bypass is on or in matte views.
+            if (not _is_matte_view) and (not bool(self._params.get("garbage_bypass", False))) \
+                    and self.session is not None \
+                    and self.session.sam2_gate_raw is not None and img is not None:
+                try:
+                    from corridorkey_sam_merge import compute_garbage_matte as _cgm_v
+                    _ge = int(self._params.get("garbage_expand_px", 0))
+                    _gf = int(self._params.get("garbage_feather_px", 0))
+                    _gyt = int(self._params.get("garbage_y_top_pct", 0))
+                    _gyb = int(self._params.get("garbage_y_bot_pct", 100))
+                    _g2 = self.session.sam2_gate_raw
+                    if img.ndim == 3 and (_g2.shape[0] != img.shape[0] or _g2.shape[1] != img.shape[1]):
+                        _g2 = cv2.resize(_g2, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_LINEAR)
+                    _gm_v = _cgm_v(_g2, expand_px=_ge, feather_px=_gf,
+                                   y_top_pct=_gyt, y_bot_pct=_gyb)
+                    if _gm_v is not None:
+                        _gm_bin = (_gm_v > 0.5).astype(np.uint8) * 255
+                        _gm_edges = cv2.Canny(_gm_bin, 50, 150)
+                        _gm_edges = cv2.dilate(_gm_edges, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
+                        if not img.flags.writeable:
+                            img = img.copy()
+                        img[_gm_edges > 0] = [255, 0, 255]  # magenta (RGB)
                 except Exception:
                     pass
 
@@ -3276,8 +3474,8 @@ class PersistentWindow(QtWidgets.QWidget):
             adjusted_pts = shift_points_for_padding(all_pts, _pad_box)
             # CK_ROOT is two levels up from this script (resolve_plugin/ → engine root)
             ck_root = Path(__file__).parent.parent
-            ckpt = str(ck_root / "sam2_weights" / "sam2.1_hiera_base_plus.pt")
-            cfg   = "configs/sam2.1/sam2.1_hiera_b+.yaml"
+            ckpt = str(ck_root / "sam2_weights" / "sam2.1_hiera_small.pt")
+            cfg   = "configs/sam2.1/sam2.1_hiera_s.yaml"
             device = "cuda" if torch.cuda.is_available() else "cpu"
             from sam2.build_sam import build_sam2
             from sam2.sam2_image_predictor import SAM2ImagePredictor

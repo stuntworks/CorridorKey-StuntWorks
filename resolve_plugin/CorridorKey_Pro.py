@@ -602,6 +602,15 @@ def get_settings():
         # MASK 1/2 BYPASS: per-mask isolation, mirrors viewer.
         "mask1_bypass": False,
         "mask2_bypass": False,
+        # 2026-05-19 GARBAGE MATTE: third sidecar derived from SAM silhouette.
+        # garbage_expand_px (0-200): cv2.dilate radius from raw SAM silhouette.
+        # garbage_feather_px (0-30):  cv2.GaussianBlur sigma after dilate.
+        # garbage_bypass: when True, skip computation and sidecar export.
+        "garbage_expand_px": 0,
+        "garbage_feather_px": 0,
+        "garbage_bypass": False,
+        "garbage_y_top_pct": 0,
+        "garbage_y_bot_pct": 100,
     }
 
 # WHAT IT DOES: Overrides panel's despill / despeckle settings with the v2 viewer's
@@ -741,6 +750,30 @@ def _merge_live_params(settings):
                         out[_bk] = bool(int(_bv))
                     except (ValueError, TypeError):
                         pass
+        # 2026-05-19 GARBAGE MATTE — three settings keys.
+        if "garbage_expand_px" in lp:
+            try: out["garbage_expand_px"] = max(0, min(200, int(lp["garbage_expand_px"])))
+            except (ValueError, TypeError): pass
+        if "garbage_feather_px" in lp:
+            try: out["garbage_feather_px"] = max(0, min(30, int(lp["garbage_feather_px"])))
+            except (ValueError, TypeError): pass
+        if "garbage_bypass" in lp:
+            _gbv = lp["garbage_bypass"]
+            if isinstance(_gbv, bool):
+                out["garbage_bypass"] = _gbv
+            elif isinstance(_gbv, str):
+                out["garbage_bypass"] = _gbv.strip().lower() in ("true", "1", "yes", "on")
+            else:
+                try:
+                    out["garbage_bypass"] = bool(int(_gbv))
+                except (ValueError, TypeError):
+                    pass
+        if "garbage_y_top_pct" in lp:
+            try: out["garbage_y_top_pct"] = max(0, min(100, int(lp["garbage_y_top_pct"])))
+            except (ValueError, TypeError): pass
+        if "garbage_y_bot_pct" in lp:
+            try: out["garbage_y_bot_pct"] = max(0, min(100, int(lp["garbage_y_bot_pct"])))
+            except (ValueError, TypeError): pass
         if "sam_positive" in lp or "sam_negative" in lp:
             sam_points["positive"] = [tuple(p) for p in lp.get("sam_positive", [])]
             sam_points["negative"] = [tuple(p) for p in lp.get("sam_negative", [])]
@@ -959,6 +992,19 @@ def _panel_dispatch_sam2_combine(alpha, gates, src_rgb, settings, obj_ids=None):
     # 2026-05-19: EDGE GUARD slider drives SAM proximity (body-edge rescue).
     # Range 0-30, default 7. Low = tight feet, high = generous edge rescue.
     _prox_px = int(settings.get("edge_guard_px", 7))
+    # 2026-05-19 GARBAGE MATTE in-render multiply (applied to merged alpha
+    # at the end of dispatch). When bypass is False, the garbage matte
+    # (dilated SAM + feather + Y-crop) multiplies onto the final alpha,
+    # so the in-app slider controls what ships to CK_*.png directly. No
+    # DaVinci roundtrip needed when the user wants a holdout on a region.
+    _gm_bypass = bool(settings.get("garbage_bypass", False))
+    _gm_expand_px = int(settings.get("garbage_expand_px", 0))
+    _gm_feather_px = int(settings.get("garbage_feather_px", 0))
+    _gm_y_top_pct = int(settings.get("garbage_y_top_pct", 0))
+    _gm_y_bot_pct = int(settings.get("garbage_y_bot_pct", 100))
+    _gm_active = (not _gm_bypass) and (
+        _gm_expand_px > 0 or _gm_y_top_pct > 0 or _gm_y_bot_pct < 100
+    )
     # 2026-05-17 — SUBTRACT wired. When SUBTRACT is enabled, MASK 2 acts as a
     # kill mask (subtractive). MASK 1 goes through the merge as usual; MASK 2
     # is then multiplied as (1 - mask2) onto the result, removing whatever
@@ -1069,16 +1115,40 @@ def _panel_dispatch_sam2_combine(alpha, gates, src_rgb, settings, obj_ids=None):
             else:
                 merged = (merged.astype(np.float32) * _inv).astype(merged.dtype)
         merged = _apply_edge_feather(merged, settings)
+        merged = _apply_garbage_matte(merged, _sam_union_m1 if mask1_silhouettes else None,
+                                       _gm_active, _gm_expand_px, _gm_feather_px,
+                                       _gm_y_top_pct, _gm_y_bot_pct)
         return merged
     # Union path (legacy / default)
     active_silhouettes = mask1_silhouettes + mask2_silhouettes
     if not active_silhouettes:
         return _apply_edge_feather(alpha, settings)
     sam_union = union_binary_silhouettes(active_silhouettes)
-    return _apply_edge_feather(
+    _merged = _apply_edge_feather(
         merge_ck_with_sam_active(alpha, sam_union, source_rgb=src_rgb, proximity_px=_prox_px),
         settings,
     )
+    return _apply_garbage_matte(_merged, sam_union, _gm_active, _gm_expand_px,
+                                _gm_feather_px, _gm_y_top_pct, _gm_y_bot_pct)
+
+
+def _apply_garbage_matte(alpha, sam, active, expand_px, feather_px, y_top_pct, y_bot_pct):
+    """2026-05-19 — multiply garbage matte (dilated SAM + feather + Y crop)
+    onto the final alpha. When not active, returns alpha unchanged."""
+    if not active or sam is None or alpha is None:
+        return alpha
+    try:
+        from corridorkey_sam_merge import compute_garbage_matte as _cgm
+        import numpy as _np
+        _gm = _cgm(sam, expand_px=expand_px, feather_px=feather_px,
+                   y_top_pct=y_top_pct, y_bot_pct=y_bot_pct)
+        if _gm is None or _gm.shape[:2] != alpha.shape[:2]:
+            return alpha
+        if alpha.ndim == 3:
+            return (alpha.astype(_np.float32) * _gm[..., None]).astype(alpha.dtype)
+        return (alpha.astype(_np.float32) * _gm).astype(alpha.dtype)
+    except Exception:
+        return alpha
 
 
 def _apply_edge_feather(alpha, settings):
@@ -1336,8 +1406,8 @@ def generate_sam2_mask(frame, pos_pts, neg_pts):
         # + motion blur). Reduces Swiss-cheese internal holes, calf-level
         # SAM slits, knee-bend hole, finger/butt under-coverage.
         # +25% latency (~2.4s -> ~3s/frame), 323 MB checkpoint vs 176 MB.
-        ckpt = str(CK_ROOT / "sam2_weights" / "sam2.1_hiera_base_plus.pt")
-        cfg = "configs/sam2.1/sam2.1_hiera_b+.yaml"
+        ckpt = str(CK_ROOT / "sam2_weights" / "sam2.1_hiera_small.pt")
+        cfg = "configs/sam2.1/sam2.1_hiera_s.yaml"
         device = "cuda" if torch.cuda.is_available() else "cpu"
         model = build_sam2(cfg, ckpt, device=device)
         pred = SAM2ImagePredictor(model)
@@ -1380,8 +1450,8 @@ def run_sam2_video_propagation(fp, ss, cs, in_f, out_f, pos_pts, neg_pts, anchor
     per-mask combine + union via _panel_dispatch_sam2_combine).
     """
     import cv2, numpy as np, torch, shutil, tempfile
-    ckpt = str(CK_ROOT / "sam2_weights" / "sam2.1_hiera_base_plus.pt")
-    cfg  = "configs/sam2.1/sam2.1_hiera_b+.yaml"
+    ckpt = str(CK_ROOT / "sam2_weights" / "sam2.1_hiera_small.pt")
+    cfg  = "configs/sam2.1/sam2.1_hiera_s.yaml"
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dur = out_f - in_f
 
@@ -2841,6 +2911,34 @@ def process_current_frame(preview_only=False):
                         log(f"Combined merge diagnostic write failed: {_diag_e}")
             save_output(fg, mt_for_save, op, settings["export_format"], codec=settings.get("output_codec", 0))
             log(f"Saved: {op.name}")
+            # 2026-05-19 GARBAGE MATTE sidecar — third PNG alongside CK/SAM,
+            # computed from the SAM silhouette via dilate(expand) + Gaussian(feather).
+            try:
+                if not bool(settings.get("garbage_bypass", False)):
+                    from corridorkey_sam_merge import compute_garbage_matte as _cgm
+                    _ge_px = int(settings.get("garbage_expand_px", 0))
+                    _gf_px = int(settings.get("garbage_feather_px", 0))
+                    _gyt_pct = int(settings.get("garbage_y_top_pct", 0))
+                    _gyb_pct = int(settings.get("garbage_y_bot_pct", 100))
+                    _sam_for_gm = None
+                    try:
+                        if _per_obj_gates:
+                            _g_list = list(_per_obj_gates.values()) if isinstance(_per_obj_gates, dict) else list(_per_obj_gates)
+                            from corridorkey_sam_merge import binarize_sam_silhouette, union_binary_silhouettes
+                            _bins = [binarize_sam_silhouette(_g) for _g in _g_list if _g is not None]
+                            if _bins:
+                                _sam_for_gm = union_binary_silhouettes(_bins)
+                    except Exception:
+                        _sam_for_gm = None
+                    if _sam_for_gm is not None:
+                        _gm = _cgm(_sam_for_gm, expand_px=_ge_px, feather_px=_gf_px,
+                                   y_top_pct=_gyt_pct, y_bot_pct=_gyb_pct)
+                        if _gm is not None:
+                            _g_op = op.parent / f"GARBAGE_{op.stem.replace('CK_', '', 1)}{op.suffix}"
+                            save_alpha_only(_gm, _g_op, codec=settings.get("output_codec", 0))
+                            log(f"GARBAGE matte saved: {_g_op.name} (expand={_ge_px}, feather={_gf_px}, y={_gyt_pct}-{_gyb_pct})")
+            except Exception as _gm_e:
+                log(f"Garbage matte export failed (non-fatal): {_gm_e}")
         if len(mt.shape) == 3: mt = mt[:, :, 0]
         last_preview_data["original"], last_preview_data["keyed"], last_preview_data["alpha"] = frame.copy(), (fg * 255).astype(np.uint8), mt.copy()
         if preview_only:
@@ -3844,6 +3942,25 @@ def on_process_range(ev):
                             except Exception as _mge:
                                 log(f"BRAW Combined merge failed (CK alone): {_mge}")
                                 _mt_for_save = _mt_2d
+                            # 2026-05-19: apply GARBAGE MATTE to range-render output too.
+                            try:
+                                if not bool(settings.get("garbage_bypass", False)):
+                                    _ge_r = int(settings.get("garbage_expand_px", 0))
+                                    _gf_r = int(settings.get("garbage_feather_px", 0))
+                                    _gyt_r = int(settings.get("garbage_y_top_pct", 0))
+                                    _gyb_r = int(settings.get("garbage_y_bot_pct", 100))
+                                    if _ge_r > 0 or _gyt_r > 0 or _gyb_r < 100:
+                                        from corridorkey_sam_merge import compute_garbage_matte as _cgm_r
+                                        _gm_r = _cgm_r(_sam_union, expand_px=_ge_r, feather_px=_gf_r,
+                                                       y_top_pct=_gyt_r, y_bot_pct=_gyb_r)
+                                        if _gm_r is not None and _gm_r.shape[:2] == _mt_for_save.shape[:2]:
+                                            if _mt_for_save.ndim == 3:
+                                                _mt_for_save = (_mt_for_save.astype(np.float32) * _gm_r[..., None]).astype(_mt_for_save.dtype)
+                                            else:
+                                                _mt_for_save = (_mt_for_save.astype(np.float32) * _gm_r).astype(_mt_for_save.dtype)
+                                        log(f"BRAW range: garbage matte applied (expand={_ge_r}, y={_gyt_r}-{_gyb_r})")
+                            except Exception as _gm_e:
+                                log(f"BRAW range garbage matte failed (non-fatal): {_gm_e}")
                         op = od / f"CK_{cn}_{pr:06d}{_ext}"
                         save_output(fg, _mt_for_save, op, settings["export_format"], codec=settings.get("output_codec", 0))
                         ofs.append(str(op))
@@ -4201,11 +4318,31 @@ def on_process_range(ev):
                             try:
                                 _m_combined = merge_ck_with_sam_active(
                                     _m, _sam_union, source_rgb=fr,
+                                    proximity_px=int(settings.get("edge_guard_px", 7)),
                                 )
                             except Exception as _mge:
                                 _tlog(f"Combined merge failed at frame {pr} (CK alone): {_mge}")
                                 _probe(f"COMBINED_MERGE_ERR_{tf}_{type(_mge).__name__}")
                                 _m_combined = _m
+                            # 2026-05-19: apply GARBAGE MATTE to non-BRAW range output.
+                            try:
+                                if not bool(settings.get("garbage_bypass", False)):
+                                    _ge_n = int(settings.get("garbage_expand_px", 0))
+                                    _gf_n = int(settings.get("garbage_feather_px", 0))
+                                    _gyt_n = int(settings.get("garbage_y_top_pct", 0))
+                                    _gyb_n = int(settings.get("garbage_y_bot_pct", 100))
+                                    if _ge_n > 0 or _gyt_n > 0 or _gyb_n < 100:
+                                        from corridorkey_sam_merge import compute_garbage_matte as _cgm_n
+                                        _gm_n = _cgm_n(_sam_union, expand_px=_ge_n, feather_px=_gf_n,
+                                                       y_top_pct=_gyt_n, y_bot_pct=_gyb_n)
+                                        if _gm_n is not None and _gm_n.shape[:2] == _m_combined.shape[:2]:
+                                            if _m_combined.ndim == 3:
+                                                _m_combined = (_m_combined.astype(np.float32) * _gm_n[..., None]).astype(_m_combined.dtype)
+                                            else:
+                                                _m_combined = (_m_combined.astype(np.float32) * _gm_n).astype(_m_combined.dtype)
+                                        _tlog(f"Range garbage matte applied (expand={_ge_n}, y={_gyt_n}-{_gyb_n})")
+                            except Exception as _gm_ne:
+                                _tlog(f"Range garbage matte failed (non-fatal): {_gm_ne}")
                         else:
                             _m_combined = _m
                         _m_active = _m_combined
