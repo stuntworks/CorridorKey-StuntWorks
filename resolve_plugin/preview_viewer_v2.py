@@ -2808,7 +2808,50 @@ class PersistentWindow(QtWidgets.QWidget):
                         )
                     img = alpha_to_rgb_u8(_ck_only)
                 elif self._view_mode == "SAM Matte":
-                    img = alpha_to_rgb_u8(_sam_arr if _sam_active else alpha)
+                    # 2026-05-18 — SAM Matte view now shows FG composited
+                    # against checker with SAM as alpha + cyan outline.
+                    # Pure B&W silhouette made it impossible for Berto to
+                    # judge SAM coverage vs actual body before render.
+                    # Berto: "just hard to tell if the mask is good because
+                    # its only black and white. cant tell until it renders."
+                    if (_sam_active
+                            and self.session.fg_rgb is not None
+                            and _sam_arr is not None):
+                        _sam_2d = (_sam_arr[..., 0]
+                                   if _sam_arr.ndim == 3 else _sam_arr).astype(np.float32)
+                        _h_sm, _w_sm = _sam_2d.shape
+                        _base_sm = self.session.fg_rgb
+                        if _base_sm.shape[:2] != (_h_sm, _w_sm):
+                            _base_sm = cv2.resize(
+                                _base_sm, (_w_sm, _h_sm),
+                                interpolation=cv2.INTER_LINEAR,
+                            )
+                        _checker_sm = self.cu.create_checkerboard(
+                            _w_sm, _h_sm, checker_size=64,
+                        )
+                        _sam_3 = np.stack(
+                            [_sam_2d, _sam_2d, _sam_2d], axis=2,
+                        ).astype(np.float32)
+                        _comp_sm = self.cu.composite_straight(
+                            _base_sm.astype(np.float32),
+                            _checker_sm.astype(np.float32),
+                            _sam_3,
+                        )
+                        _img_sm = np.clip(_comp_sm * 255.0, 0, 255).astype(np.uint8)
+                        try:
+                            _sam_bin = (_sam_2d > 0.5).astype(np.uint8) * 255
+                            _edges_sm = cv2.Canny(_sam_bin, 50, 150)
+                            _edges_sm = cv2.dilate(
+                                _edges_sm,
+                                cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+                            )
+                            _img_sm = _img_sm.copy()
+                            _img_sm[_edges_sm > 0] = [0, 255, 255]  # cyan
+                        except Exception:
+                            pass
+                        img = _img_sm
+                    else:
+                        img = alpha_to_rgb_u8(alpha)
                 elif self._view_mode == "Combined":
                     # 2026-05-18 — Combined preview now mirrors the render path.
                     # OLD: alpha * sam_matte_v1 — a double SAM application that
