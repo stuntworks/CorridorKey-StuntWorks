@@ -990,18 +990,41 @@ def compute_garbage_matte(
         # GaussianBlur with ksize=(0,0) infers from sigma. Sigma = feather_px.
         matte = _cv2_g.GaussianBlur(matte, (0, 0), float(_fp))
         matte = np.clip(matte, 0.0, 1.0)
-    # Y crop — zero out rows outside the user-selected vertical band.
+    # Y crop — holdout applies ONLY inside the user-selected vertical band.
+    # Outside the band, matte = 1.0 (no holdout, CK passes through unchanged).
+    # Inside the band, matte = dilated/feathered SAM (acts as holdout).
+    # 2026-05-19: Y% is RELATIVE TO SAM BBOX (body-mode). SAM tracks the
+    # subject across frames, so the crop band follows the body when the
+    # camera moves or the subject re-frames. Berto: "but it does not
+    # follow the foot, it stays cut off where it is on the frame."
+    # Frame-mode (% of frame height) is the fallback when SAM has no bbox.
     _yt = max(0, min(100, int(y_top_pct)))
     _yb = max(0, min(100, int(y_bot_pct)))
     if _yt > 0 or _yb < 100:
         _h = matte.shape[0]
-        _y0 = int(_h * _yt / 100)
-        _y1 = int(_h * _yb / 100)
+        # Body-mode: % of SAM bbox height. SAM moves with subject → crop follows.
+        _ys_bb = np.where(sam_bin > 0)[0]
+        if _ys_bb.size > 0:
+            _y_min_b = int(_ys_bb.min())
+            _y_max_b = int(_ys_bb.max())
+            _bbox_h = _y_max_b - _y_min_b
+            if _bbox_h > 0:
+                _y0 = _y_min_b + int(_bbox_h * _yt / 100)
+                _y1 = _y_min_b + int(_bbox_h * _yb / 100)
+            else:
+                _y0 = int(_h * _yt / 100)
+                _y1 = int(_h * _yb / 100)
+        else:
+            # No SAM — fall back to frame-relative
+            _y0 = int(_h * _yt / 100)
+            _y1 = int(_h * _yb / 100)
+        _y0 = max(0, min(_h, _y0))
+        _y1 = max(0, min(_h, _y1))
         if _y1 <= _y0:
-            return np.zeros_like(matte)
-        _crop = np.zeros_like(matte)
-        _crop[_y0:_y1, :] = 1.0
-        matte = matte * _crop
+            return np.ones_like(matte)
+        _band = np.zeros_like(matte)
+        _band[_y0:_y1, :] = 1.0
+        matte = matte * _band + (1.0 - _band)
     return matte
 
 
