@@ -626,6 +626,36 @@ def merge_ck_with_sam_chroma_gated(
         ck.astype(np.float32) * _keep_zone, 0.0, 1.0,
     ).astype(np.float32)
 
+    # 2026-05-18 RIDGE KILL — orphaned partial alpha → 0.
+    # The seam line at the green/carpet chroma boundary survives the
+    # multiply because at that band:  sam=1 (inside body), CK=partial
+    # (chroma engine can't decide), so final = CK × 1 = partial alpha
+    # line visible across the legs.
+    #
+    # Detection: pixels with partial alpha (0.05 < final < 0.70) that are
+    # FAR (>4px) from confident-FG (alpha >= 0.70) AND CLOSE (<3px) to
+    # confident-BG (alpha <= 0.02). Hair survives because it's attached to
+    # confident FG (d_to_FG ≤ 2px). Motion blur on a limb survives the
+    # same way. Only ORPHANED ribbons — the chroma seam line — die.
+    try:
+        _fg_conf = (final >= 0.70).astype(np.uint8)
+        _bg_conf = (final <= 0.02).astype(np.uint8)
+        if int(_fg_conf.sum()) > 1000 and int(_bg_conf.sum()) > 1000:
+            _d_fg = _cv2.distanceTransform(1 - _fg_conf, _cv2.DIST_L2, 5)
+            _d_bg = _cv2.distanceTransform(1 - _bg_conf, _cv2.DIST_L2, 5)
+            _ridge = (
+                (_d_fg > 4.0)
+                & (_d_bg < 3.0)
+                & (final > 0.05)
+                & (final < 0.70)
+            )
+            if int(_ridge.sum()) > 0:
+                final = np.where(
+                    _ridge, np.float32(0.0), final,
+                ).astype(np.float32)
+    except Exception:
+        pass
+
     # 2026-05-18 GEOMETRIC WING FILTER — replaces 7-negative-dot UX.
     # Kill alpha pixels that satisfy ALL THREE:
     #   (1) OUTSIDE raw SAM silhouette (so body interior is safe)
