@@ -569,11 +569,27 @@ def merge_ck_with_sam_chroma_gated(
         # 2026-05-19 widened: 10px erode -> 5px (narrow legs lose all interior
         # at 10px), chroma 0.05-0.30 -> 0.0-0.45 (catch wider transition band).
         # ck<1.0 gate still filters out solid-body false positives.
+        # 2026-05-19 morning: Y-restrict to bottom 60% of SAM bbox. Hair with
+        # green spill was getting solidified into a blob (head silhouette had
+        # ambiguous-chroma pixels inside sam_eroded). Seam line is at calf
+        # level — bottom 60% always covers it; top 40% covers head/hair.
         _k_seam = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (11, 11))
         _deep_body_seam = _cv2.erode(_sam_seam_bin, _k_seam)
+        _ys_seam = np.where(_sam_seam_bin > 0)[0]
+        _y_zone = np.zeros_like(_sam_seam_bin)
+        if _ys_seam.size > 0:
+            _y_top_sam = int(_ys_seam.min())
+            _y_bot_sam = int(_ys_seam.max())
+            _y_split = _y_top_sam + int((_y_bot_sam - _y_top_sam) * 0.40)
+            _y_zone[_y_split:, :] = 1
         if int(_deep_body_seam.sum()) > 100:
             _ambig_chroma = (chroma_score > 0.0) & (chroma_score < 0.45)
-            _seam_zone = (_deep_body_seam > 0) & _ambig_chroma & (ck < 1.0)
+            _seam_zone = (
+                (_deep_body_seam > 0)
+                & _ambig_chroma
+                & (ck < 1.0)
+                & (_y_zone > 0)
+            )
             _n_seam = int(_seam_zone.sum())
             if _n_seam > 0:
                 ck = np.where(
@@ -663,12 +679,12 @@ def merge_ck_with_sam_chroma_gated(
     # FIX: proximity zone around SAM (UP/lateral only, no down — same
     # direction as sam_buffered, so platform stays dead). Inside proximity,
     # chroma gate is overridden; outside, current chroma gate still applies.
-    # 2026-05-19: 30 → 10. Berto saw a 10px halo all around feet/legs at
-    # 30px — body's soft-alpha CK transition was preserved too generously.
-    # 10px keeps butt curve + near-hand fingers; longer fingers go back to
-    # cut. Drop further if halo still visible.
-    _k_prox = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (11, 11))
-    _k_prox[:5, :] = 0  # zero top half → dilation UP/lateral only
+    # 2026-05-19: 30 → 10 → 7. Berto saw a halo all around feet/legs at 30
+    # and a smaller but still visible black border at 10. 7 should tighten
+    # the body edge more while still rescuing butt curve and near-hand
+    # fingers (fingers extending beyond 7px go back to cut — accept).
+    _k_prox = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (15, 15))
+    _k_prox[:7, :] = 0  # zero top half → dilation UP/lateral only
     _body_proximity = _cv2.dilate(
         sam.astype(np.uint8), _k_prox,
     ).astype(np.float32)
