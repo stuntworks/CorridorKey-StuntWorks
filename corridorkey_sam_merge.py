@@ -545,6 +545,58 @@ def merge_ck_with_sam_chroma_gated(
         chroma_score = rgb[..., 2] - np.maximum(rgb[..., 0], rgb[..., 1])
     else:
         chroma_score = rgb[..., 1] - np.maximum(rgb[..., 0], rgb[..., 2])
+
+    # 2026-05-19 CHROMA-AMBIGUOUS SEAM SUPPRESSION inside body interior.
+    # The carpet/wall chroma boundary produces a thin band of pixels with
+    # "mix" chroma (0.05-0.30) — neither strong green nor body color. The
+    # chroma engine outputs partial alpha at those pixels, producing the
+    # 2-3 px horizontal seam line Berto's been seeing across the legs.
+    # Fingerprint: inside SAM body + deep from silhouette boundary +
+    # chroma in transition range → that's the seam, force CK to 1.
+    #
+    # Safety vs other features:
+    # - Vertical wire: wire color (gray/black), chroma ≈ 0, outside the
+    #   0.05-0.30 range → untouched.
+    # - Vertical motion blur of body: body chroma (~ 0 or negative),
+    #   outside ambiguous range → untouched.
+    # - Hair tendrils: at silhouette boundary, excluded by sam_eroded.
+    # - Strong-green pixels misclassified as body by SAM: chroma > 0.30,
+    #   outside range → untouched (those die via the normal merge math).
+    # - Body silhouette edge (skin + spill, chroma 0.05-0.20): excluded by
+    #   sam_eroded so SAM body edge softness is preserved.
+    try:
+        _sam_seam_bin = (sam > 0.5).astype(np.uint8)
+        # 2026-05-19 widened: 10px erode -> 5px (narrow legs lose all interior
+        # at 10px), chroma 0.05-0.30 -> 0.0-0.45 (catch wider transition band).
+        # ck<1.0 gate still filters out solid-body false positives.
+        _k_seam = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (11, 11))
+        _deep_body_seam = _cv2.erode(_sam_seam_bin, _k_seam)
+        if int(_deep_body_seam.sum()) > 100:
+            _ambig_chroma = (chroma_score > 0.0) & (chroma_score < 0.45)
+            _seam_zone = (_deep_body_seam > 0) & _ambig_chroma & (ck < 1.0)
+            _n_seam = int(_seam_zone.sum())
+            if _n_seam > 0:
+                ck = np.where(
+                    _seam_zone, np.float32(1.0), ck.astype(np.float32),
+                ).astype(np.float32)
+            # Diagnostic dump so we can verify the mask is firing where we expect.
+            try:
+                from pathlib import Path as _P_sz
+                from PIL import Image as _Img_sz
+                import tempfile as _tf_sz
+                _d_sz = _P_sz(_tf_sz.gettempdir()) / "ck_merge_diag"
+                _d_sz.mkdir(parents=True, exist_ok=True)
+                _Img_sz.fromarray((_seam_zone.astype(np.uint8) * 255), mode="L").save(_d_sz / "06_seam_zone.png")
+                with open(_d_sz / "06_seam_zone_stats.txt", "w") as _f_sz:
+                    _f_sz.write(f"seam_zone pixels: {_n_seam}\n")
+                    _f_sz.write(f"deep_body pixels: {int(_deep_body_seam.sum())}\n")
+                    _f_sz.write(f"chroma_score range: min={float(chroma_score.min()):.3f} max={float(chroma_score.max()):.3f}\n")
+                    _f_sz.write(f"sam mask (after close/fill/CC): nonzero={int(_sam_seam_bin.sum())}\n")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     # 2026-05-17: TWO separate thresholds + speckle cleanup.
     #   is_on_green_widen (0.05 + MORPH_OPEN 5px) — generous, controls SAM
     #     widening. Catches mildly-spilled body edges (hand, harness, waist,
