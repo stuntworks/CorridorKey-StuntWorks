@@ -956,6 +956,9 @@ def _panel_dispatch_sam2_combine(alpha, gates, src_rgb, settings, obj_ids=None):
     _m1b = bool(settings.get("mask1_bypass", False))
     _m2b = bool(settings.get("mask2_bypass", False))
     _subtract = bool(settings.get("sam2_subtract", False))
+    # 2026-05-19: EDGE GUARD slider drives SAM proximity (body-edge rescue).
+    # Range 0-30, default 7. Low = tight feet, high = generous edge rescue.
+    _prox_px = int(settings.get("edge_guard_px", 7))
     # 2026-05-17 — SUBTRACT wired. When SUBTRACT is enabled, MASK 2 acts as a
     # kill mask (subtractive). MASK 1 goes through the merge as usual; MASK 2
     # is then multiplied as (1 - mask2) onto the result, removing whatever
@@ -1038,7 +1041,7 @@ def _panel_dispatch_sam2_combine(alpha, gates, src_rgb, settings, obj_ids=None):
                         _sam_union_m1 = (_sam_f32 * _constrained).astype(_sam_union_m1.dtype)
             except Exception:
                 pass
-            merged = merge_ck_with_sam_active(alpha, _sam_union_m1, source_rgb=src_rgb)
+            merged = merge_ck_with_sam_active(alpha, _sam_union_m1, source_rgb=src_rgb, proximity_px=_prox_px)
             # FIX 2 — compute body_core for SUBTRACT override
             try:
                 import cv2 as _cv2_bc
@@ -1073,7 +1076,7 @@ def _panel_dispatch_sam2_combine(alpha, gates, src_rgb, settings, obj_ids=None):
         return _apply_edge_feather(alpha, settings)
     sam_union = union_binary_silhouettes(active_silhouettes)
     return _apply_edge_feather(
-        merge_ck_with_sam_active(alpha, sam_union, source_rgb=src_rgb),
+        merge_ck_with_sam_active(alpha, sam_union, source_rgb=src_rgb, proximity_px=_prox_px),
         settings,
     )
 

@@ -462,6 +462,7 @@ def merge_ck_with_sam_chroma_gated(
     threshold: float = CHROMA_GATE_THRESHOLD,
     soft_band: float = CHROMA_GATE_SOFT_BAND,
     dilate_px: int = CHROMA_GATE_DILATE_PX,
+    proximity_px: Optional[int] = None,
 ) -> np.ndarray:
     # WHAT IT DOES: c96deb07 chroma-weight blend. final = weight * CK + (1 - weight) * SAM_binary.
     #   On-green pixels (weight=1): CK rules — soft hair alpha shines through.
@@ -679,12 +680,14 @@ def merge_ck_with_sam_chroma_gated(
     # FIX: proximity zone around SAM (UP/lateral only, no down — same
     # direction as sam_buffered, so platform stays dead). Inside proximity,
     # chroma gate is overridden; outside, current chroma gate still applies.
-    # 2026-05-19: 30 → 10 → 7. Berto saw a halo all around feet/legs at 30
-    # and a smaller but still visible black border at 10. 7 should tighten
-    # the body edge more while still rescuing butt curve and near-hand
-    # fingers (fingers extending beyond 7px go back to cut — accept).
-    _k_prox = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (15, 15))
-    _k_prox[:7, :] = 0  # zero top half → dilation UP/lateral only
+    # 2026-05-19: 30 → 10 → 7 → slider-driven via EDGE GUARD (proximity_px).
+    # Range 0-30, default 7. User tunes per shot: low = tight feet, high =
+    # generous body-edge rescue (butt, fingers).
+    _prox_px = int(proximity_px if proximity_px is not None else 7)
+    _prox_px = max(0, min(30, _prox_px))
+    _prox_diam = max(3, _prox_px * 2 + 1)
+    _k_prox = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (_prox_diam, _prox_diam))
+    _k_prox[:_prox_px, :] = 0  # zero top half → dilation UP/lateral only
     _body_proximity = _cv2.dilate(
         sam.astype(np.uint8), _k_prox,
     ).astype(np.float32)
@@ -908,6 +911,7 @@ def merge_ck_with_sam_active(
     sam_silhouette: Optional[np.ndarray],
     source_rgb: Optional[np.ndarray] = None,
     screen_type: str = "green",
+    proximity_px: Optional[int] = None,
 ) -> np.ndarray:
     # WHAT IT DOES: Dispatcher for the active merge mode. Routes to v2.2
     #   chroma-gated merge when USE_CHROMA_GATED_MERGE is True (default after
@@ -929,6 +933,7 @@ def merge_ck_with_sam_active(
         return merge_ck_with_sam_chroma_gated(
             ck_alpha, sam_silhouette, source_rgb,
             screen_type=screen_type,
+            proximity_px=proximity_px,
         )
     except Exception:
         # 2026-05-16: dump the exception so we can fix it. The previous silent

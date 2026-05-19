@@ -589,9 +589,47 @@ def render_composite(cu, session: Session, params: dict):
                 softness_sigma=float(sam2_soften),
                 fill_kernel_px=int(fill_holes),
             )
-    # Display alpha = CK alone (untouched master). SAM matte ships as a
-    # separate alpha clip in Phase B's renderer.
-    alpha = session.alpha.copy()
+    # 2026-05-19: Composite view now uses the merged alpha (CK × keep_zone
+    # via merge_ck_with_sam_active) when SAM is active. Was raw CK alone —
+    # which made the EDGE GUARD slider invisible in Composite (slider drives
+    # the merge proximity, but Composite was bypassing the merge). Now the
+    # slider's effect is visible live against the body composite.
+    if (session.alpha_raw is not None
+            and _per_mask_pairs
+            and not sam2_bypass):
+        # Re-collect active silhouettes (the loop above already filtered
+        # bypassed masks; re-do for clarity since alpha computation needs
+        # a guaranteed union).
+        _comp_silhouettes = []
+        for _oid_c, _gate_c in _per_mask_pairs:
+            if _oid_c == 1 and mask1_bypass:
+                continue
+            if _oid_c == 2 and mask2_bypass:
+                continue
+            if _gate_c.shape != session.alpha_raw.shape:
+                _gate_c = cv2.resize(
+                    _gate_c,
+                    (session.alpha_raw.shape[1], session.alpha_raw.shape[0]),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+            _comp_silhouettes.append(np.asarray(_gate_c, dtype=np.float32))
+        if _comp_silhouettes:
+            from corridorkey_sam_merge import (
+                merge_ck_with_sam_active as _merge_ck_active,
+            )
+            _src_rgb_c = (session.original_rgb
+                          if session.original_rgb is not None
+                          else session.fg_rgb)
+            _sam_u_c = union_binary_silhouettes(_comp_silhouettes)
+            alpha = _merge_ck_active(
+                session.alpha_raw, _sam_u_c,
+                source_rgb=_src_rgb_c,
+                proximity_px=int(params.get("edge_guard_px", 7)),
+            )
+        else:
+            alpha = session.alpha.copy()
+    else:
+        alpha = session.alpha.copy()
     if choke_px > 0:
         int_choke = int(choke_px)
         frac = choke_px - int_choke
@@ -1907,23 +1945,28 @@ class PersistentWindow(QtWidgets.QWidget):
         self.sam2_subtract_checkbox.toggled.connect(self._on_sam2_subtract_changed)
         grid.addWidget(self.sam2_subtract_checkbox, 11, 1, 1, 2)
 
-        # --- EDGE GUARD: isotropic dilation pixels around SAM2 silhouette ---
-        # Slider 0-60 px integer. Higher = wider keep-zone past silhouette
-        # (recovers hair / butt curve / fingertips that SAM2 cut tight).
-        # Smaller = tighter cut, less risk of pulling in junk near subject.
+        # --- EDGE GUARD: SAM proximity (body-edge rescue) — 2026-05-19 ---
+        # Slider 0-30 px integer. Drives proximity_px in the chroma-gated
+        # merge: the keep-zone overrides the chroma constraint within N px
+        # of solid SAM body, so body edges with green spill (butt curve,
+        # near-hand fingers, strap) survive even when off-green.
+        # Low (0-5) = tightest cut, foot border minimal, may clip butt/fingers
+        # Default 7 = current shipping default
+        # High (15-30) = generous rescue for butt / hair fragments / fingers
         _EDGE_GUARD_TOOLTIP = (
-            "EDGE GUARD — pixels the keep-zone extends past the SAM2 "
-            "silhouette. Higher = recovers hair / butt curve / fingertips "
-            "SAM2 cut tight; lower = tighter cut, less junk near subject. "
-            "Default 20. Action shots with motion blur: crank up. Tight "
-            "shots: drop down. Only used when SUBTRACT mode is on."
+            "EDGE GUARD — SAM proximity rescue (px). Within this distance "
+            "of solid SAM body, the chroma gate is overridden so body edges "
+            "with green spill survive (butt curve, fingertips, strap). Low = "
+            "tightest cut, foot border minimal but may clip body edges. "
+            "Default 7. Tight shots: 3-5. Heavy motion blur / soft body "
+            "edges: 10-15. Max 30."
         )
         self.edge_guard_label_widget = _label("EDGE GUARD")
         self.edge_guard_label_widget.setToolTip(_EDGE_GUARD_TOOLTIP)
         grid.addWidget(self.edge_guard_label_widget, 12, 0)
         self.edge_guard_slider = JumpSlider(QtCore.Qt.Horizontal)
-        self.edge_guard_slider.setRange(0, 60)
-        self.edge_guard_slider.setValue(int(self._params.get("edge_guard_px", 20)))
+        self.edge_guard_slider.setRange(0, 30)
+        self.edge_guard_slider.setValue(int(self._params.get("edge_guard_px", 7)))
         self.edge_guard_slider.valueChanged.connect(self._on_edge_guard_changed)
         self.edge_guard_slider.setToolTip(_EDGE_GUARD_TOOLTIP)
         grid.addWidget(self.edge_guard_slider, 12, 1)
@@ -2694,9 +2737,12 @@ class PersistentWindow(QtWidgets.QWidget):
                         self.session.sam_matte_v1 = None
                     else:
                         _sam_union_m = union_binary_silhouettes(_active_silhouettes_m)
+                        # 2026-05-19: EDGE GUARD slider drives proximity_px
+                        _prox_px_m = int(params_for_matte.get("edge_guard_px", 7))
                         alpha = merge_ck_with_sam_active(
                             self.session.alpha_raw, _sam_union_m,
                             source_rgb=_src_rgb_m,
+                            proximity_px=_prox_px_m,
                         )
                         # Recompute SAM matte from this render's per-frame
                         # gates — same call render_composite makes at line 594.
