@@ -507,6 +507,27 @@ def merge_ck_with_sam_chroma_gated(
     except Exception:
         pass
 
+    # 2026-05-18 LARGEST-BLOB FILTER (Nuke / Mocha / Cara industry pattern).
+    # SAM2 occasionally produces satellite blobs near the subject (floor
+    # patches the model thinks are body, hand silhouettes that broke off
+    # from the main body fragment). Keep only the LARGEST connected
+    # component and drop the rest. Cleans up "wing fragments" that survive
+    # the geometric wing filter downstream. Safe failure: if SAM is empty
+    # or single-blob, this is a no-op.
+    try:
+        import cv2 as _cv2_cc_lb
+        _sam_u8 = (sam > 0.5).astype(np.uint8)
+        _n_lbl, _labels = _cv2_cc_lb.connectedComponents(_sam_u8, connectivity=8)
+        if _n_lbl > 2:  # background label 0 + at least 2 foreground blobs
+            # Pick the largest non-background component
+            _sizes = np.bincount(_labels.ravel())
+            _sizes[0] = 0  # ignore background
+            _largest = int(np.argmax(_sizes))
+            if _sizes[_largest] > 100:  # sanity guard against degenerate
+                sam = (_labels == _largest).astype(np.float32)
+    except Exception:
+        pass
+
     import cv2 as _cv2
 
     # Compute chroma score first — used both for chroma-aware SAM widening and
@@ -604,6 +625,51 @@ def merge_ck_with_sam_chroma_gated(
     final = np.clip(
         ck.astype(np.float32) * _keep_zone, 0.0, 1.0,
     ).astype(np.float32)
+
+    # 2026-05-18 GEOMETRIC WING FILTER — replaces 7-negative-dot UX.
+    # Kill alpha pixels that satisfy ALL THREE:
+    #   (1) OUTSIDE raw SAM silhouette (so body interior is safe)
+    #   (2) inside FEET ZONE = bottom 30% of SAM bbox (so hair / hands at
+    #       hip / chest level are safe — feet zone is the only place
+    #       floor wings live)
+    #   (3) > 12px laterally from raw SAM body (so a 1-2px feather at
+    #       the foot edge survives, only the wing pixels die)
+    # Body interior gated by (1). Hair gated by (2). All thresholds use
+    # SAM-relative geometry, not absolute frame coords, so this generalises
+    # across framings / shots. If SAM is empty or bbox degenerate, the
+    # filter is a no-op.
+    try:
+        _sam_bin = (sam > 0.5).astype(np.uint8)
+        if int(_sam_bin.sum()) > 100:  # need a real silhouette
+            _ys, _xs = np.where(_sam_bin > 0)
+            _y_min, _y_max = int(_ys.min()), int(_ys.max())
+            _bbox_h = _y_max - _y_min
+            if _bbox_h > 40:  # need real vertical extent
+                # Feet zone = bottom 30% of bbox
+                _feet_zone_top = _y_min + int(_bbox_h * 0.70)
+                _feet_zone = np.zeros_like(_sam_bin)
+                _feet_zone[_feet_zone_top:_y_max + 1, :] = 1
+                # Distance from raw SAM body, in px (lateral + vertical mixed —
+                # but feet zone restriction makes this effectively horizontal
+                # since vertical extent of feet zone is small).
+                _dist_from_sam = _cv2.distanceTransform(
+                    1 - _sam_bin, _cv2.DIST_L2, 5,
+                )
+                # Wing kill mask: outside SAM AND in feet zone AND > 12px from SAM
+                _WING_DIST_THRESH_PX = 12.0
+                _wing_kill = (
+                    (_sam_bin == 0)
+                    & (_feet_zone > 0)
+                    & (_dist_from_sam > _WING_DIST_THRESH_PX)
+                    & (final > 0.05)
+                )
+                if int(_wing_kill.sum()) > 0:
+                    final = np.where(
+                        _wing_kill, np.float32(0.0), final,
+                    ).astype(np.float32)
+    except Exception:
+        pass
+
     return final
 
 
