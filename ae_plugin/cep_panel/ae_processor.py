@@ -1033,7 +1033,7 @@ def cmd_batch(source_video, output_folder, settings,
                 alpha = apply_despeckle(alpha, settings)
                 fg = apply_despill(fg, settings)
                 fg_uint16 = (np.clip(fg, 0, 1) * 65535).astype(np.uint16)
-                alpha_uint16 = (np.clip(alpha_raw, 0, 1) * 65535).astype(np.uint16)
+                alpha_uint16 = (np.clip(alpha, 0, 1) * 65535).astype(np.uint16)
                 alpha_uint8  = (np.clip(alpha_raw, 0, 1) * 255).astype(np.uint8)
                 fg_bgr = cv2.cvtColor(fg_uint16, cv2.COLOR_RGB2BGR)
                 out_bgra = cv2.merge([fg_bgr[:, :, 0], fg_bgr[:, :, 1], fg_bgr[:, :, 2], alpha_uint16])

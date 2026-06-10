@@ -2334,7 +2334,7 @@ function ckGetSettings() {
         despeckle: false,
         despeckleSize: 400,
         choke: 0,
-        sam2_margin: 0, sam2_soften: 0, fill_holes: 0,
+        sam2_margin: 10, sam2_soften: 0, fill_holes: 0,
         sam_erode_px: 0,
         sam_expand_px: 0
     };
@@ -3123,10 +3123,24 @@ function ckExitWorking() {
     if (topbar) ['cellScreen', 'cellSam'].forEach(function (id) {
         const n = document.getElementById(id); if (n) topbar.appendChild(n);
     });
-    const body = document.getElementById('workPodBody');
-    if (body) ['faderDespill'].forEach(function (id) {
-        const n = document.getElementById(id); if (n) body.appendChild(n);
-    });
+    // faderDespill → compact horizontal strip in the empty middle of the topbar
+    (function () {
+        var de = document.getElementById('faderDespill');
+        var topbar = document.getElementById('workTopBar');
+        if (!de || !topbar) return;
+        de.style.cssText = 'flex:0 0 auto;margin-left:auto;margin-right:420px;display:inline-flex;' +
+            'align-items:center;gap:7px;border:1px solid rgba(255,255,255,0.08);border-radius:5px;' +
+            'padding:3px 8px;background:rgba(0,0,0,0.18);';
+        var head = de.querySelector('.fader-head');
+        if (head) head.style.cssText = 'display:inline-flex;align-items:center;gap:5px;flex-shrink:0;margin-top:0;';
+        var frow = de.querySelector('.fader-row');
+        if (frow) frow.style.cssText = 'display:inline-flex;align-items:center;flex:1;min-width:150px;max-width:200px;margin-top:0;';
+        var track = de.querySelector('.fader-track');
+        if (track) track.style.cssText = 'flex:1;position:relative;height:30px;min-width:0;display:flex;align-items:center;';
+        var scale = de.querySelector('.fader-scale');
+        if (scale) scale.style.display = 'none';
+        topbar.appendChild(de);
+    })();
 
     // 2) pod KEY = PREVIEW this frame (+ SAM mask); COMMIT = render whole clip; Done = exit
     const podKey = document.getElementById('podKey');
@@ -3254,9 +3268,9 @@ function ckResizePanel(w, h) {
             b.id = id; b.type = 'button';
             b.innerHTML = svg + '<span style="margin-left:4px;">' + label + '</span>';
             b.style.cssText = 'position:fixed;top:6px;right:' + rightPx + 'px;z-index:99999;display:inline-flex;' +
-                'align-items:center;font:700 9px system-ui;letter-spacing:.12em;color:#dfe3e8;' +
-                'background:linear-gradient(180deg,#34383d,#222528);border:1px solid #44484e;border-radius:5px;' +
-                'padding:3px 8px;cursor:pointer;box-shadow:0 1px 3px rgba(0,0,0,.55),inset 0 1px 0 rgba(255,255,255,.07);opacity:.92;';
+                'align-items:center;font:700 9.5px system-ui;letter-spacing:.12em;color:#dfe3e8;' +
+                'background:linear-gradient(180deg,#3a3f45,#23262a);border:0;border-radius:4px;' +
+                'padding:5px 9px;cursor:pointer;box-shadow:0 1px 0 rgba(255,255,255,.08) inset,0 1px 2px rgba(0,0,0,.5);';
             b.addEventListener('mouseenter', function () {
                 tip.textContent = tipText;
                 tip.style.display = 'block';
@@ -3279,9 +3293,9 @@ function ckResizePanel(w, h) {
         // easier than cycling"). Each is a toggle: click = show that matte, click the
         // lit one again (or another) = switch; lit button shows the active view.
         var CK_MATTE_BTNS = [
-            { id: 'ckViewCk',   right: 52,  bg: 'matte-ck',  label: 'CK',
+            { id: 'ckViewCk',   right: 68,  bg: 'matte-ck',  label: 'CK',
               tip: 'CK RAW: raw CorridorKey matte before SAM cleanup (diagnostic)' },
-            { id: 'ckViewComb', right: 98,  bg: 'matte',     label: 'RESULT',
+            { id: 'ckViewComb', right: 126, bg: 'matte',     label: 'RESULT',
               tip: 'RESULT: the final combined matte/key this render will produce' }
         ];
         var _mvBtns = [];
@@ -3322,18 +3336,19 @@ function ckResizePanel(w, h) {
             '<path d="M1 6 H11 M3 3 V9 M6 2 V10 M9 3 V9"/></svg>';
         var scrubBar = document.createElement('div');
         scrubBar.id = 'ckScrubBar';
-        scrubBar.style.cssText = 'position:fixed;top:34px;right:8px;z-index:99999;display:none;align-items:center;' +
+        scrubBar.style.cssText = 'display:none;align-items:center;width:100%;box-sizing:border-box;' +
             'background:linear-gradient(180deg,#26292d,#191b1e);border:1px solid #3a3e44;border-radius:6px;' +
-            'padding:4px 10px;box-shadow:0 3px 10px rgba(0,0,0,.6);';
+            'padding:5px 12px;margin-top:4px;box-shadow:0 3px 10px rgba(0,0,0,.6);';
         scrubBar.innerHTML = '<input type="range" id="ckScrubSlider" min="0" max="0" value="0" step="1" ' +
-            'style="width:230px;accent-color:#a5f;vertical-align:middle;">' +
+            'style="flex:1;min-width:0;accent-color:#a5f;vertical-align:middle;">' +
             '<span id="ckScrubLabel" style="font:700 10px system-ui;color:#c9a5ff;margin-left:8px;min-width:52px;display:inline-block;">--</span>';
-        document.body.appendChild(scrubBar);
+        // Insert directly below viewer-wrap so it reads as a timeline scrubber under the monitor
+        (function () { var vw = document.querySelector('.viewer-wrap'); if (vw && vw.parentNode) { vw.parentNode.insertBefore(scrubBar, vw.nextSibling); } else { document.body.appendChild(scrubBar); } })();
         // Frame count input — lets user set how many frames to scrub (1-24) before clicking SCRUB
         var ckScrubCountWrap = document.createElement('div');
-        ckScrubCountWrap.style.cssText = 'position:fixed;top:6px;right:266px;z-index:99999;display:inline-flex;' +
-            'align-items:center;gap:4px;background:linear-gradient(180deg,#34383d,#222528);' +
-            'border:1px solid #44484e;border-radius:5px;padding:3px 7px;box-shadow:0 1px 3px rgba(0,0,0,.55);';
+        ckScrubCountWrap.style.cssText = 'position:fixed;top:6px;right:298px;z-index:99999;display:inline-flex;' +
+            'align-items:center;gap:4px;background:linear-gradient(180deg,#3a3f45,#23262a);' +
+            'border:0;border-radius:4px;padding:3px 7px;box-shadow:0 1px 0 rgba(255,255,255,.08) inset,0 1px 2px rgba(0,0,0,.5);';
         ckScrubCountWrap.innerHTML = '<span style="font:700 9px system-ui;letter-spacing:.12em;color:#8a9299;text-transform:uppercase;">Frames</span>' +
             '<input id="ckScrubMaxInput" type="number" min="1" max="24" value="24" ' +
             'style="width:32px;background:#1a1c1f;border:1px solid #393e44;border-radius:3px;color:#c9a5ff;' +
@@ -3377,7 +3392,7 @@ function ckResizePanel(w, h) {
             var sl = scrubBar.querySelector('#ckScrubSlider');
             sl.addEventListener('input', function () { ckScrubShowFrame(parseInt(sl.value, 10) || 0); });
         } catch (_) {}
-        ckChromeBtn('ckScrubBtn', 164, scrubSvg, 'SCRUB',
+        ckChromeBtn('ckScrubBtn', 206, scrubSvg, 'SCRUB',
             'SCRUB: keys the number of frames you set (Frames input, max 24) from the work area at preview quality. Drag the purple slider to step through; CK / RESULT buttons work on every frame.',
             function () {
                 if (CK_SCRUB.busy) { ckStatus('Scrub already running'); return; }
@@ -3412,7 +3427,7 @@ function ckResizePanel(w, h) {
                         CK_SCRUB.dir = scrubDir; CK_SCRUB.count = count;
                         var sl2 = document.getElementById('ckScrubSlider');
                         if (sl2) { sl2.max = String(count - 1); sl2.value = '0'; }
-                        scrubBar.style.display = 'inline-flex';
+                        scrubBar.style.display = 'flex';
                         try { var _sv4 = document.getElementById('viewer'); if (_sv4) _sv4.classList.add('scrub'); } catch (_) {}
                         window.CK_SCRUB_VIEW = true;
                         ckStatus('Scrub ready — drag the purple slider');
