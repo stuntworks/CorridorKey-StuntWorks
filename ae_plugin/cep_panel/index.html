@@ -1406,29 +1406,6 @@
           <span class="engrave-deep" style="font-size:8px">CHECK ONE FRAME</span>
         </div>
 
-        <!-- LIVE LOOK CONTROLS: the two sliders you set while watching the
-             preview. Matte Tightness and Despill sit side by side here because
-             both are looks you judge against the keyed frame, not buried
-             settings. For real edge detail (hair, spill) judge them on the
-             large cockpit screen (Expand to Cockpit). -->
-        <div class="matte-fader" id="faderMatte">
-          <div class="fader-head">
-            <span class="cell-title">Edge Choke</span>
-            <span class="fader-value" id="matteVal">50</span>
-          </div>
-          <div class="fader-row">
-            <div class="fader-track">
-              <div class="fader-slot"></div>
-              <div class="fader-fill" id="matteFill" style="width:50%"></div>
-              <div class="fader-ticks" id="matteTicks"></div>
-              <input type="range" class="fader" id="matte" min="0" max="100" value="0"
-                     aria-label="Edge choke, 0 to 100" />
-              <div class="fader-cap-lines" id="matteCap" style="left:50%"></div>
-            </div>
-            <div class="fader-scale"><span>Soft</span><span>25</span><span>50</span><span>75</span><span>Tight</span></div>
-          </div>
-        </div>
-
         <!-- Despill: a look you set while watching the preview, so it lives
              alongside Matte Tightness in the approve flow (moved out of Advanced). -->
         <div class="matte-fader" id="faderDespill" style="margin-top:12px">
@@ -1449,26 +1426,6 @@
           </div>
         </div>
 
-        <!-- SAM Margin: grows/shrinks the garbage-matte buffer around SAM's silhouette.
-             The magenta edge in the preview updates LIVE from the cached SAM mask (no re-key). -->
-        <div class="matte-fader" id="faderSamMargin" style="margin-top:12px">
-          <div class="fader-head">
-            <span class="cell-title">Garbage Mask</span>
-            <span class="fader-value" id="samMarginVal">10</span>
-          </div>
-          <div class="fader-row">
-            <div class="fader-track">
-              <div class="fader-slot"></div>
-              <div class="fader-fill" id="samMarginFill" style="width:10%"></div>
-              <div class="fader-ticks" id="samMarginTicks"></div>
-              <input type="range" class="fader" id="samMargin" min="0" max="100" value="10"
-                     aria-label="Garbage mask size, 0 to 100" />
-              <div class="fader-cap-lines" id="samMarginCap" style="left:10%"></div>
-            </div>
-            <div class="fader-scale"><span>Tight</span><span>25</span><span>50</span><span>75</span><span>Wide</span></div>
-          </div>
-        </div>
-
         <div style="margin-top:8px;text-align:right">
           <button type="button" id="samOverlayToggle"
             style="font:inherit;font-size:8.5px;letter-spacing:0.16em;text-transform:uppercase;
@@ -1477,44 +1434,6 @@
                    box-shadow:0 1px 0 rgba(255,255,255,0.08) inset,0 1px 2px rgba(0,0,0,0.5)"
             >Hide Outline</button>
         </div>
-
-        <!-- SAM Erode: shrinks the SAM matte inward uniformly — tightens feet/floor bleed. -->
-        <div class="matte-fader" id="faderSamErode" style="margin-top:12px">
-          <div class="fader-head">
-            <span class="cell-title">Matte Erode</span>
-            <span class="fader-value" id="samErodeVal">4</span>
-          </div>
-          <div class="fader-row">
-            <div class="fader-track">
-              <div class="fader-slot"></div>
-              <div class="fader-fill" id="samErodeFill" style="width:27%"></div>
-              <div class="fader-ticks" id="samErodeTicks"></div>
-              <input type="range" class="fader" id="samErode" min="0" max="15" value="4"
-                     aria-label="SAM matte erode, 0 to 15 pixels" />
-              <div class="fader-cap-lines" id="samErodeCap" style="left:27%"></div>
-            </div>
-            <div class="fader-scale"><span>0</span><span>4</span><span>8</span><span>12</span><span>15</span></div>
-          </div>
-        </div>
-        <!-- SAM Expand: dilates the SAM matte outward — recovers body curves/hair/edges. -->
-        <div class="matte-fader" id="faderSamExpand" style="margin-top:12px">
-          <div class="fader-head">
-            <span class="cell-title">Matte Expand</span>
-            <span class="fader-value" id="samExpandVal">0</span>
-          </div>
-          <div class="fader-row">
-            <div class="fader-track">
-              <div class="fader-slot"></div>
-              <div class="fader-fill" id="samExpandFill" style="width:0%"></div>
-              <div class="fader-ticks" id="samExpandTicks"></div>
-              <input type="range" class="fader" id="samExpand" min="0" max="15" value="0"
-                     aria-label="SAM matte expand, 0 to 15 pixels" />
-              <div class="fader-cap-lines" id="samExpandCap" style="left:0%"></div>
-            </div>
-            <div class="fader-scale"><span>0</span><span>4</span><span>8</span><span>12</span><span>15</span></div>
-          </div>
-        </div>
-
         <div class="gate-actions">
           <button class="approve-btn" id="approveBtn" type="button" aria-label="Approve and render the range">Approve</button>
           <button class="rekey-btn" id="rekeyBtn" type="button" aria-label="Discard preview and go back to source">
@@ -1831,24 +1750,9 @@
       }
     }
   }
-  wireFader('despill');   // Advanced despill fader
-  wireFader('matte');     // live matte tightness fader in the approve gate
-  wireFader('samMargin'); // SAM garbage-matte buffer (px)
-  wireFader('samErode');  // SAM matte erode (px) — tightens matte inward
-  wireFader('samExpand'); // SAM matte expand (px) — dilates matte outward
-  // Live buffer: moving SAM Margin redraws the magenta edge from the CACHED SAM mask —
-  // no re-key, no SAM rerun (the buffer is pure JS dilation on the gate we already have).
+  wireFader('despill');
   (function () {
-    const sm = document.getElementById('samMargin');
-    if (sm) sm.addEventListener('input', function () {
-      SAM_OVERLAY_BUFFER_PX = +sm.value;
-      // Never repaint the outline mid-render — a hidden stale repaint pops back
-      // the moment the render's batch mode lifts (ghost-outline bug, 2026-06-04).
-      if (typeof CK_BATCH_IN_PROGRESS !== 'undefined' && CK_BATCH_IN_PROGRESS) return;
-      if (typeof ckRefreshSamOverlays === 'function' && window.SAM_OVERLAY_VISIBLE !== false) ckRefreshSamOverlays(true);
-    });
-    // Live keyed-preview update on release for all three sliders (fast post-step only).
-    ['matte', 'despill', 'samMargin', 'samErode', 'samExpand'].forEach(function (id) {
+    ['despill'].forEach(function (id) {
       const el = document.getElementById(id);
       if (el) el.addEventListener('change', function () { if (typeof ckScheduleRepreview === 'function') ckScheduleRepreview(); });
     });
@@ -2422,21 +2326,17 @@ function ckGetSettings() {
     const screenBtn = document.querySelector('.seg-btn[data-screen][aria-pressed="true"]');
     const screenType = (screenBtn && screenBtn.dataset.screen === 'blue') ? 'blue' : 'green';
     const despillEl = document.getElementById('despill');
-    const despill = despillEl ? (parseFloat(despillEl.value) / 100) : 0.0;          // fader 0-100 -> 0-1
-    const matteEl = document.getElementById('matte');
-    const choke = matteEl ? Math.round((parseFloat(matteEl.value) / 100) * 20) : 0;  // Matte Tightness -> choke px 0-20
-    const samMarginEl = document.getElementById('samMargin');
-    const samMargin = samMarginEl ? (parseInt(samMarginEl.value, 10) || 0) : 0;       // SAM garbage-matte buffer, source px
+    const despill = despillEl ? (parseFloat(despillEl.value) / 100) : 0.0;
     return {
         screenType: screenType,
         despill: despill,
         refiner: 1.0,
         despeckle: false,
         despeckleSize: 400,
-        choke: choke,
-        sam2_margin: samMargin, sam2_soften: 0, fill_holes: 0,
-        sam_erode_px: (function() { var e = document.getElementById('samErode'); return e ? (parseInt(e.value, 10) || 0) : 4; })(),
-        sam_expand_px: (function() { var e = document.getElementById('samExpand'); return e ? (parseInt(e.value, 10) || 0) : 0; })()
+        choke: 0,
+        sam2_margin: 0, sam2_soften: 0, fill_holes: 0,
+        sam_erode_px: 0,
+        sam_expand_px: 0
     };
 }
 
@@ -2462,7 +2362,7 @@ function ckSamPayload(anchorFrame) {
 // garbage-matte boundary (MAGENTA) on a transparent canvas over the keyed preview.
 // Fires after KEY (sam-apply is a subprocess; true per-click-live needs a persistent
 // worker — separate, later). Pure JS — no OpenCV, no markup changes.
-let SAM_OVERLAY_BUFFER_PX = 10;   // source-px grow for the magenta garbage edge (~Berto's 10px); driven by the SAM Margin fader
+let SAM_OVERLAY_BUFFER_PX = 10;   // source-px grow for the magenta garbage edge (fixed)
 
 function ckDilate(bin, w, h, r) {
     if (r <= 0) return bin.slice();
@@ -3224,7 +3124,7 @@ function ckExitWorking() {
         const n = document.getElementById(id); if (n) topbar.appendChild(n);
     });
     const body = document.getElementById('workPodBody');
-    if (body) ['faderMatte', 'faderDespill', 'faderSamMargin', 'faderSamErode', 'faderSamExpand'].forEach(function (id) {
+    if (body) ['faderDespill'].forEach(function (id) {
         const n = document.getElementById(id); if (n) body.appendChild(n);
     });
 

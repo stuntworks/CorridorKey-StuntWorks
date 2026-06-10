@@ -1085,7 +1085,7 @@ def cmd_batch(source_video, output_folder, settings,
                             softness_sigma=sam_soften,
                             fill_kernel_px=sam_fill,
                         )
-                        _sam_erode_px = int(settings.get("sam_erode_px", 4))
+                        _sam_erode_px = int(settings.get("sam_erode_px", 0))
                         if _sam_erode_px > 0:
                             _ek = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_sam_erode_px * 2 + 1, _sam_erode_px * 2 + 1))
                             _sam_processed = cv2.erode((np.clip(_sam_processed, 0, 1) * 255).astype(np.uint8), _ek, iterations=1).astype(np.float32) / 255.0
@@ -1612,7 +1612,7 @@ def cmd_postproc(session_dir, output_path, settings, background="checker", v1_pa
         _g = cv2.imread(str(gate_path), cv2.IMREAD_UNCHANGED)
         if _g is not None:
             sam_soft = _g.astype(np.float32) / (65535.0 if _g.dtype == np.uint16 else 255.0)
-            _sam_erode_px = int(settings.get("sam_erode_px", 4))
+            _sam_erode_px = int(settings.get("sam_erode_px", 0))
             if _sam_erode_px > 0:
                 _ek = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_sam_erode_px * 2 + 1, _sam_erode_px * 2 + 1))
                 sam_soft = cv2.erode((np.clip(sam_soft, 0, 1) * 255).astype(np.uint8), _ek, iterations=1).astype(np.float32) / 255.0
