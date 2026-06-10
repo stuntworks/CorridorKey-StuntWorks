@@ -1083,9 +1083,9 @@ def cmd_batch(source_video, output_folder, settings,
                             _sam_processed = cv2.dilate((_sam_processed * 255).astype(np.uint8), _ek2, iterations=1).astype(np.float32) / 255.0
                         _sam_u8 = (np.clip(_sam_processed, 0, 1) * 255).astype(np.uint8)
                         _sam_rgba = np.zeros((_sam_u8.shape[0], _sam_u8.shape[1], 4), dtype=np.uint8)
-                        _sam_rgba[:, :, 0] = 255  # B
-                        _sam_rgba[:, :, 1] = 255  # G
-                        _sam_rgba[:, :, 2] = 255  # R
+                        _sam_rgba[:, :, 0] = _sam_u8  # B = mask
+                        _sam_rgba[:, :, 1] = _sam_u8  # G
+                        _sam_rgba[:, :, 2] = _sam_u8  # R
                         _sam_rgba[:, :, 3] = _sam_u8  # Alpha = mask
                         _atomic_imwrite(sam_dir / f"sam_{seq_num:05d}.png", _sam_rgba)
                         if processed == 0:
