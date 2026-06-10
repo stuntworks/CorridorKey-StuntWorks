@@ -2483,7 +2483,7 @@ function ckRepreview() {
         });
     } catch (_) { _ckRepreviewBusy = false; }
 }
-function ckScheduleRepreview() { if (window.CK_SCRUB_VIEW) window.CK_SCRUB_GEN = (window.CK_SCRUB_GEN || 0) + 1; if (_repreviewT) clearTimeout(_repreviewT); _repreviewT = setTimeout(ckRepreview, 200); }
+function ckScheduleRepreview() { if (window.CK_SCRUB_VIEW) window.CK_SCRUB_GEN = (window.CK_SCRUB_GEN || 0) + 1; if (_repreviewT) clearTimeout(_repreviewT); _repreviewT = setTimeout(window.CK_SCRUB_VIEW ? function(){ ckScrubShowFrame((window.CK_SCRUB && window.CK_SCRUB.cur) || 0); } : ckRepreview, 200); }
 
 // Drop the real keyed PNG into the console's viewer + cockpit stage.
 function ckShowKeyed(png) {
@@ -3417,20 +3417,20 @@ function ckResizePanel(w, h) {
                         ckStatus('Scrub ready — drag the purple slider');
                         if (CK_PREVIEW_BG === 'matte-ck' || CK_PREVIEW_BG === 'matte-sam') { ckSetMatteView('matte'); }
                         ckScrubShowFrame(0);
-                        (function prerender(i) {
+                        (function prerender(i, gen) {
                             if (i >= CK_SCRUB.count) return;
                             var fDir = path.join(CK_SCRUB.dir, String(i).padStart(3, '0'));
-                            if (!fs.existsSync(path.join(fDir, 'alpha.png'))) { prerender(i + 1); return; }
+                            if (!fs.existsSync(path.join(fDir, 'alpha.png'))) { prerender(i + 1, gen); return; }
                             var _fMode = (CK_PREVIEW_BG || 'checker').replace(/[^a-z0-9-]/g, '');
-                            var fprev = path.join(fDir, 'preview_' + _fMode + '_g' + (window.CK_SCRUB_GEN || 0) + '.png');
-                            if (fs.existsSync(fprev)) { prerender(i + 1); return; }
+                            var fprev = path.join(fDir, 'preview_' + _fMode + '_g' + gen + '.png');
+                            if (fs.existsSync(fprev)) { prerender(i + 1, gen); return; }
                             var fst = ckGetSettings();
                             try { if (typeof ckSamPayload === 'function') Object.assign(fst, ckSamPayload() || {}); } catch (_) {}
                             var fpp = writeParamsFile(fst);
                             runPythonAsync(['postproc', fDir, fprev, '--params', fpp, '--background', CK_PREVIEW_BG, '--max-width', '1100'],
-                                function () { try { fs.unlinkSync(fpp); } catch (_) {} prerender(i + 1); },
-                                function () { prerender(i + 1); });
-                        })(1);
+                                function () { try { fs.unlinkSync(fpp); } catch (_) {} prerender(i + 1, gen); },
+                                function () { prerender(i + 1, gen); });
+                        })(1, window.CK_SCRUB_GEN || 0);
                     }, function (e) {
                         try { if (typeof vwProc !== 'undefined' && vwProc) vwProc.classList.remove('show'); if (typeof stageProc !== 'undefined' && stageProc) stageProc.classList.remove('show'); if (typeof setBusy === 'function') setBusy(false); } catch (_) {}
                         try { var _sv3 = document.getElementById('viewer'); if (_sv3) _sv3.classList.remove('scrub'); } catch (_) {}
