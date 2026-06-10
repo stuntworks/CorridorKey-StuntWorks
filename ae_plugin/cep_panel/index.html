@@ -1845,7 +1845,7 @@
       // Never repaint the outline mid-render — a hidden stale repaint pops back
       // the moment the render's batch mode lifts (ghost-outline bug, 2026-06-04).
       if (typeof CK_BATCH_IN_PROGRESS !== 'undefined' && CK_BATCH_IN_PROGRESS) return;
-      if (typeof ckRefreshSamOverlays === 'function') ckRefreshSamOverlays(true);
+      if (typeof ckRefreshSamOverlays === 'function' && window.SAM_OVERLAY_VISIBLE !== false) ckRefreshSamOverlays(true);
     });
     // Live keyed-preview update on release for all three sliders (fast post-step only).
     ['matte', 'despill', 'samMargin', 'samErode', 'samExpand'].forEach(function (id) {
@@ -1856,12 +1856,12 @@
 
   // SAM outline overlay toggle
   (function () {
-    var SAM_OVERLAY_VISIBLE = true;
+    window.SAM_OVERLAY_VISIBLE = true;
     var btn = document.getElementById('samOverlayToggle');
     if (btn) btn.addEventListener('click', function () {
-      SAM_OVERLAY_VISIBLE = !SAM_OVERLAY_VISIBLE;
-      btn.textContent = SAM_OVERLAY_VISIBLE ? 'Hide Outline' : 'Show Outline';
-      if (typeof ckRefreshSamOverlays === 'function') ckRefreshSamOverlays(SAM_OVERLAY_VISIBLE);
+      window.SAM_OVERLAY_VISIBLE = !window.SAM_OVERLAY_VISIBLE;
+      btn.textContent = window.SAM_OVERLAY_VISIBLE ? 'Hide Outline' : 'Show Outline';
+      if (typeof ckRefreshSamOverlays === 'function') ckRefreshSamOverlays(window.SAM_OVERLAY_VISIBLE);
     });
   })();
 
@@ -2541,6 +2541,7 @@ let _repreviewT = null;
 let _ckRepreviewBusy = false;
 let CK_PREVIEW_BG = 'checker';   // 'checker' | 'matte' — MATTE view toggle drives all postproc previews
 function ckRepreview() {
+    try { var _sv = document.getElementById('viewer'); if (_sv) _sv.classList.remove('scrub'); } catch (_) {}
     try {
         const sess = CK_SESSION_DIR;
         const _kb = document.getElementById('keyBtn');
@@ -2563,7 +2564,7 @@ function ckRepreview() {
             try { fs.unlinkSync(ppParams); } catch (_) {}
             if (fs.existsSync(prev)) {
                 ckShowKeyed(prev);
-                if (typeof ckRefreshSamOverlays === 'function') ckRefreshSamOverlays(true);
+                if (typeof ckRefreshSamOverlays === 'function' && window.SAM_OVERLAY_VISIBLE !== false) ckRefreshSamOverlays(true);
             }
             ckStatus('Updated');
         }, function () {
@@ -2812,6 +2813,7 @@ function autoKeyAsync() {
     }
     jsxCall(infoFn, [], (info) => {
         if (!info || !info.ok) { ckStatus(info && info.error ? info.error : 'Select a clip to auto-key'); return; }
+        try { var _sv = document.getElementById('viewer'); if (_sv) _sv.classList.remove('scrub'); } catch (_) {}
         if (keyBtn) keyBtn.dataset.busy = '1';
         try { setBusy(true); } catch (_) {}
         if (vwProc) vwProc.classList.add('show');
