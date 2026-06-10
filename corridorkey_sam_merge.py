@@ -1165,13 +1165,33 @@ def merge_ck_with_garbage_matte(
     # where the green screen ends; SAM fills the body beyond that boundary.
     if on_green_hsv is not None:
         try:
-            off_green_body = sam.astype(np.float32) * (1.0 - on_green_hsv)
+            _y_cut = int(ys.min()) + int((ys.max() - ys.min()) * 0.92)
+            _no_shadow = np.ones((h, w), dtype=np.float32)
+            _no_shadow[_y_cut:, :] = 0.0
+            off_green_body = sam.astype(np.float32) * (1.0 - on_green_hsv) * _no_shadow
             final = np.clip(final + off_green_body * (1.0 - final), 0.0, 1.0).astype(np.float32)
         except Exception:
             pass
 
     # Edge choke moved to Fusion (CK_EDGE_CHOKE ErodeDilate node).
     # Adjustable per shot, non-destructive, no re-render needed.
+
+    if source_rgb is not None and on_green_hsv is not None:
+        try:
+            _src_arr = np.asarray(source_rgb)
+            if _src_arr.dtype in (np.float32, np.float64):
+                _fix_u8 = (np.clip(_src_arr, 0.0, 1.0) * 255).astype(np.uint8)
+            else:
+                _fix_u8 = np.clip(_src_arr, 0, 255).astype(np.uint8)
+            if _fix_u8.ndim == 2:
+                _fix_u8 = np.stack([_fix_u8, _fix_u8, _fix_u8], axis=-1)
+            if _fix_u8.shape[:2] != (h, w):
+                _fix_u8 = cv2.resize(_fix_u8, (w, h), interpolation=cv2.INTER_AREA)
+            _hsv_kill = cv2.cvtColor(cv2.cvtColor(_fix_u8, cv2.COLOR_RGB2BGR), cv2.COLOR_BGR2HSV)
+            shadow_kill = ((_hsv_kill[..., 2] < 45).astype(np.float32) * (1.0 - on_green_hsv) * (1.0 - sam.astype(np.float32)))
+            final = np.clip(final * (1.0 - shadow_kill), 0.0, 1.0).astype(np.float32)
+        except Exception:
+            pass
 
     return final
 
