@@ -720,6 +720,18 @@ def cmd_batch(source_video, output_folder, settings,
     sam_active = (len(sam_pos) + len(sam_neg)) > 0
     sam_video_masks = {}  # {seq_num: float32 mask 0..1}
     sam_torch = None
+    try:
+        _manifest = {
+            "source_video": str(Path(source_video).resolve()),
+            "start_frame": int(start_frame),
+            "end_frame": int(end_frame),
+            "screen_type": settings.get("screenType", ""),
+            "sam_active": sam_active,
+        }
+        with open(out_dir / "render_manifest.json", "w") as _mf:
+            json.dump(_manifest, _mf, indent=2)
+    except Exception as _mf_err:
+        log.warning(f"render_manifest.json write failed: {_mf_err}")
     if sam_active:
         try:
             import torch as sam_torch
