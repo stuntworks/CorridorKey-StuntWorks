@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Last modified: 2026-04-14 | Change: Gate PlayerDebugMode behind explicit --allow-unsigned
-#   flag. Default install no longer toggles Adobe's developer mode.
+# Last modified: 2026-05-29 | Change: Stop clobbering the canonical cep_panel/ae_processor.py
+#   with the stale root dummy on Adobe installs (was silently shipping a no-SAM build).
 """
 CorridorKey Plugin — Unified Installer
 Installs to DaVinci Resolve, After Effects, and/or Premiere Pro.
@@ -237,11 +237,13 @@ def install_adobe(ck_engine_path, allow_unsigned=False):
                 shutil.copy2(item, dst)
             print(f"  Copied: {item.name}")
 
-    # Copy the processor script
-    processor = PLUGIN_ROOT / "ae_plugin" / "ae_processor.py"
-    if processor.exists():
-        shutil.copy2(processor, dest_dir / "ae_processor.py")
-        print("  Copied: ae_processor.py")
+    # ae_processor.py was ALREADY installed above as part of the cep_panel/ directory
+    # copy — it lives at ae_plugin/cep_panel/ae_processor.py (the 1180-line canonical
+    # file with full SAM2 batch). The repo-root ae_plugin/ae_processor.py is a stale
+    # 729-line DUMMY with NO SAM batch (see deploy.py DUMMIES).
+    # DANGER ZONE HIGH: do NOT copy the root ae_processor.py over the cep_panel copy here.
+    #   Doing so clobbered the good file on every clean install, silently shipping a
+    #   no-SAM key. / breaks: ships keying with no SAM / depends on: cep_panel copied above
 
     # Copy the live-preview viewer (shared across Resolve / AE / Premiere). The CEP
     # panel spawns this in --persistent mode when the user clicks PREVIEW FRAME.

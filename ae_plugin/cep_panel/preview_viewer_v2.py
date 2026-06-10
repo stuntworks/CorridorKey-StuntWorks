@@ -329,7 +329,7 @@ class Session:
 # DEPENDS-ON: engine's color_utils (despill_opencv, clean_matte_opencv, create_checkerboard,
 #   composite_straight), a loaded Session.
 # AFFECTS: returns a fresh uint8 RGB image for display. Session state unchanged.
-def render_composite(cu, session: Session, params: dict):
+def render_composite(cu, session: Session, params: dict, override_alpha=None):
     despill_strength = float(params.get("despill", 1.0))
     despeckle_on = bool(params.get("despeckle", True))
     despeckle_size = int(params.get("despeckleSize", 400))
@@ -374,9 +374,21 @@ def render_composite(cu, session: Session, params: dict):
             softness_sigma=float(sam2_soften),
             fill_kernel_px=int(fill_holes),
         )
-    # Display alpha = CK alone (untouched master). SAM matte ships as a
-    # separate alpha clip via the renderer when the user opts in.
-    alpha = session.alpha.copy()
+    # Live preview shows the picture WITH SAM applied (CK x SAM) — restored to the
+    # pre-3ebc4ee9 behavior, exactly as git did it: synchronously, inline. (An
+    # off-thread version crashed the viewer, so we keep the proven inline merge.)
+    if session.alpha_nn is not None and session.sam2_gate_raw is not None and not sam2_bypass:
+        from corridorkey_sam_merge import binarize_sam_silhouette, merge_ck_with_sam_active
+        _src_rgb = session.original_rgb if getattr(session, "original_rgb", None) is not None else session.fg_rgb
+        _gate_c = session.sam2_gate_raw.copy()
+        if _gate_c.shape != session.alpha_nn.shape:
+            _gate_c = cv2.resize(_gate_c, (session.alpha_nn.shape[1], session.alpha_nn.shape[0]),
+                                 interpolation=cv2.INTER_LINEAR)
+        alpha = merge_ck_with_sam_active(session.alpha_nn, binarize_sam_silhouette(_gate_c),
+                                         source_rgb=_src_rgb, proximity_px=edge_guard_px,
+                                         carve_points=params.get("sam_negative") or None)  # FIX: preview/render parity
+    else:
+        alpha = session.alpha.copy()
     if choke_px > 0:
         int_choke = int(choke_px)
         frac = choke_px - int_choke
@@ -532,7 +544,6 @@ class PersistentWindow(QtWidgets.QWidget):
         # queued. _painting is True between compute and paint.
         self._pending = None
         self._painting = False
-
         # Live-params persistence: when the user drags a slider IN THE VIEWER, we
         # update self._params immediately (local render), then debounce a write of
         # live_params.json so the panel sees the value for batch processing. The
@@ -1622,6 +1633,7 @@ class PersistentWindow(QtWidgets.QWidget):
             if self._view_mode == "Original":
                 img = self.original_u8.copy()
             elif self._view_mode == "Composite":
+                # render_composite applies SAM inline (CK x SAM) — see its body.
                 img = render_composite(self.cu, self.session, self._params)
             elif self._view_mode == "Foreground":
                 # Pure despilled RGB with NO alpha blend — shows what the colour
@@ -1672,7 +1684,8 @@ class PersistentWindow(QtWidgets.QWidget):
                         )
                     alpha = merge_ck_with_sam_active(self.session.alpha_nn,
                                                      binarize_sam_silhouette(_gate),
-                                                     source_rgb=_src_rgb_m)
+                                                     source_rgb=_src_rgb_m, proximity_px=_edge_guard,
+                                                     carve_points=self._params.get("sam_negative") or None)  # FIX: preview/render parity
                 else:
                     alpha = self.session.alpha.copy()
                 if _m > 0:
@@ -1702,11 +1715,12 @@ class PersistentWindow(QtWidgets.QWidget):
                 elif self._view_mode == "SAM Matte":
                     img = alpha_to_rgb_u8(_sam_arr if _sam_active else alpha)
                 elif self._view_mode == "Combined":
-                    if _sam_active:
-                        _combo = np.clip(alpha * _sam_arr, 0.0, 1.0)
-                        img = alpha_to_rgb_u8(_combo)
-                    else:
-                        img = alpha_to_rgb_u8(alpha)
+                    # `alpha` is ALREADY CK x SAM (computed by the garbage-matte
+                    # merge above, line ~1673). Multiplying it by sam_matte_v1
+                    # again double-applied SAM — squared the soft edge (dark halo)
+                    # and punched holes wherever the soft matte dipped below the
+                    # already-gated CK alpha. Show the single, correct result.
+                    img = alpha_to_rgb_u8(alpha)
                 else:  # Split
                     if _sam_active:
                         _ck_rgb = alpha_to_rgb_u8(alpha)
@@ -1795,6 +1809,10 @@ class PersistentWindow(QtWidgets.QWidget):
                 self._params = next_params
                 # Defer through the event loop so UI stays responsive during drag.
                 QtCore.QTimer.singleShot(0, self._render_now)
+
+    # _on_merge_done / _on_merge_fail / _ensure_merged_alpha / _merge_worker fields
+    # were the off-thread _MatteMergeWorker approach — REMOVED (crashed the viewer;
+    # see comment at line ~379). The proven inline merge in _render_now is the live path.
 
     # WHAT IT DOES: Scales a full-res uint8 RGB array to the current size of the
     #   given label (respecting aspect ratio via a letterbox bounding box) and

@@ -37,13 +37,26 @@
                     <AutoVisible>true</AutoVisible>
                 </Lifecycle>
                 <UI>
-                    <Type>Panel</Type>
+                    <!-- Modeless (not Panel): a floating window that HONORS the manifest
+                         <Size> every open. Docked Panels are workspace-controlled and reopen
+                         at AE's remembered (giant) size, ignoring <Size> — that was the bug.
+                         Modeless floats beside the viewer, is resizable (Min != Max), and does
+                         NOT block AE like ModalDialog. Reopen via Window > Extensions > CorridorKey. -->
+                    <Type>Modeless</Type>
                     <Menu>CorridorKey</Menu>
                     <Geometry>
                         <Size>
-                            <Width>350</Width>
-                            <Height>500</Height>
+                            <Width>480</Width>
+                            <Height>640</Height>
                         </Size>
+                        <MinSize>
+                            <Width>360</Width>
+                            <Height>480</Height>
+                        </MinSize>
+                        <MaxSize>
+                            <Width>1280</Width>
+                            <Height>1440</Height>
+                        </MaxSize>
                     </Geometry>
                     <Icons>
                         <Icon Type="Normal">./icons/icon.png</Icon>

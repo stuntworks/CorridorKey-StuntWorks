@@ -32,13 +32,16 @@ import numpy as np
 
 SAM_BINARIZE_THRESHOLD = 0.5
 
-# 2026-05-13: v2.2 chroma-gated merge restored for combined CK+SAM2 export.
-# When True (default), merge_ck_with_sam_active routes to the trimap+CFM path
-# in merge_ck_with_sam_chroma_gated (CK injected post-solve in unknown band,
-# hard clamp outside dilated SAM). When False, falls back to Path B
-# (max-style) merge_ck_with_sam. Live-preview (reprocess_with_cached) stays
-# CK-only regardless: this flag only controls the export-time merge.
-USE_CHROMA_GATED_MERGE = True
+# 2026-05-27: MERGE_MODE selects the active merge architecture.
+#   "garbage_matte" — CK × zoned_dilated_SAM + chroma escape for hair (NEW)
+#   "chroma_gated"  — v2.3 chroma-weight blend (350 lines, 19 thresholds)
+#   "path_b"        — max(CK, SAM) fallback
+# Toggle this one string to switch. Old functions stay intact for rollback.
+MERGE_MODE = "garbage_matte"
+_VALID_MERGE_MODES = {"garbage_matte", "chroma_gated", "path_b"}
+if MERGE_MODE not in _VALID_MERGE_MODES:
+    raise ValueError(f"MERGE_MODE {MERGE_MODE!r} not in {_VALID_MERGE_MODES}")
+USE_CHROMA_GATED_MERGE = MERGE_MODE == "chroma_gated"
 DEBUG_ENABLED = False
 DEBUG_MODE = False
 
@@ -529,7 +532,13 @@ def merge_ck_with_sam_chroma_gated(
     except Exception:
         pass
 
+    # 2026-05-27 CORE MATTE DISTANCE MAP — saved here (after morph_close +
+    # fill_holes + largest-blob) for the core override applied after final
+    # alpha computation. The "Nuke Way": force solid alpha deep inside SAM
+    # body, let CK detail rule only near the SAM edge.
     import cv2 as _cv2
+    _sam_core_bin = (sam > 0.5).astype(np.uint8)
+    _core_dist = _cv2.distanceTransform(_sam_core_bin, _cv2.DIST_L2, 5)
 
     # Compute chroma score first — used both for chroma-aware SAM widening and
     # the chroma-aware soft-zone gate.
@@ -574,7 +583,7 @@ def merge_ck_with_sam_chroma_gated(
         # green spill was getting solidified into a blob (head silhouette had
         # ambiguous-chroma pixels inside sam_eroded). Seam line is at calf
         # level — bottom 60% always covers it; top 40% covers head/hair.
-        _k_seam = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (11, 11))
+        _k_seam = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (5, 5))
         _deep_body_seam = _cv2.erode(_sam_seam_bin, _k_seam)
         _ys_seam = np.where(_sam_seam_bin > 0)[0]
         _y_zone = np.zeros_like(_sam_seam_bin)
@@ -717,6 +726,14 @@ def merge_ck_with_sam_chroma_gated(
     final = np.clip(
         ck.astype(np.float32) * _keep_zone, 0.0, 1.0,
     ).astype(np.float32)
+
+    # 2026-05-27 CORE MATTE OVERRIDE — REMOVED.
+    # Caused hair blob: seam suppression poisoned ck to 1.0 on green-spill
+    # pixels, then the core override trusted the poisoned value. Also couldn't
+    # reach the feet seam (feet are 1-3px from SAM edge, threshold was 3-5px).
+    # The seam suppression at line ~583 (now with 5x5 kernel) handles the
+    # feet seam directly. _core_dist is still computed above for potential
+    # future use but the hard override is gone.
 
     # 2026-05-18 RIDGE KILL — orphaned partial alpha → 0.
     # The seam line at the green/carpet chroma boundary survives the
@@ -906,49 +923,275 @@ def _v22_trimap_cfm_archived(ck_alpha, sam_silhouette, source_rgb=None):
     return alpha.astype(np.float32)
 
 
+def _selective_carve_reassert(sam_cleaned, sam_raw, carve_points=None):
+    """Re-punch ONLY deliberate operator carves into the cleaned SAM silhouette.
+
+    Cleanup (close/fill/largest-blob) fills both accidental SAM2 interior holes
+    (shirt-crease fragmenting - must STAY filled) and the operator exclusions
+    (wire carve, shackle - must come BACK). Two keep-tests per punched component:
+      shape  - long + thin = wire-like (diag > 150px, mean width < 50px)
+      intent - within 150px of an operator exclude dot (catches blobby rigging
+               hardware like a shackle that shape alone would refill; Berto 2026-06-06)
+    Fence rule: real see-through detail lives in CK alpha - filling SAM
+    accidental holes cannot hide it.
+    carve_points: list of (x, y) full-image pixel coords (sam_negative dots) or None.
+    """
+    import cv2 as _cv2_sc
+    import numpy as _np_sc
+    punched = (sam_cleaned.astype(bool) & ~sam_raw.astype(bool)).astype(_np_sc.uint8)
+    if not punched.any():
+        return sam_cleaned
+    try:
+        n, lbl, stats, cent = _cv2_sc.connectedComponentsWithStats(punched, connectivity=8)
+        out = sam_cleaned.copy()
+        for ci in range(1, n):
+            area = stats[ci, _cv2_sc.CC_STAT_AREA]
+            w = stats[ci, _cv2_sc.CC_STAT_WIDTH]
+            h = stats[ci, _cv2_sc.CC_STAT_HEIGHT]
+            diag = (w * w + h * h) ** 0.5
+            mean_width = area / max(diag, 1.0)
+            keep_punched = (diag > 150.0 and mean_width < 50.0)
+            if not keep_punched and carve_points:
+                cx, cy = cent[ci]
+                for pt in carve_points:
+                    try:
+                        dx = float(pt[0]) - cx
+                        dy = float(pt[1]) - cy
+                    except (TypeError, IndexError):
+                        continue
+                    if (dx * dx + dy * dy) ** 0.5 < 150.0:
+                        keep_punched = True
+                        break
+            if keep_punched:
+                out[lbl == ci] = 0
+        return out
+    except Exception:
+        # Classifier failure -> return the CLEANED mask unchanged (holes stay filled,
+        # carve re-assert skipped). The old fallback intersected with raw, silently
+        # regressing the whole silhouette to pre-cleanup quality (review bug 1).
+        return sam_cleaned
+
+
+def solidify_sam_silhouette(sam_soft, carve_points=None):
+    """The EXACT SAM silhouette the garbage merge uses: binarize -> morph close 3px ->
+    fill interior holes (not boundary concavities) -> largest blob -> selective
+    dot-aware carve re-assert. Shared by merge and panel SAM view so preview == render."""
+    import cv2 as _cv2_ss
+    import numpy as _np_ss
+    sam = _np_ss.asarray(sam_soft, dtype=_np_ss.float32)
+    if sam.ndim == 3:
+        sam = sam[..., 0]          # drop channels BEFORE binarize (BGRA-safe, review bug 3)
+    sam = (sam > 0.5).astype(_np_ss.uint8)
+    sam_raw = sam.copy()
+    try:
+        k_close = _cv2_ss.getStructuringElement(_cv2_ss.MORPH_ELLIPSE, (3, 3))
+        sam = _cv2_ss.morphologyEx(sam, _cv2_ss.MORPH_CLOSE, k_close)
+    except Exception:
+        pass
+    try:
+        import scipy.ndimage as _snd
+        sam = _snd.binary_fill_holes(sam > 0).astype(_np_ss.uint8)
+    except Exception:
+        try:
+            h_ss, w_ss = sam.shape[:2]
+            _inv = (1 - sam).astype(_np_ss.uint8)
+            _ff_mask = _np_ss.zeros((h_ss + 2, w_ss + 2), _np_ss.uint8)
+            _flooded = _inv.copy()
+            for _corner in [(0, 0), (w_ss - 1, 0), (0, h_ss - 1), (w_ss - 1, h_ss - 1)]:
+                _cv2_ss.floodFill(_flooded, _ff_mask, _corner, 0)
+            sam = _np_ss.maximum(sam, _flooded).astype(_np_ss.uint8)
+        except Exception:
+            pass
+    try:
+        n_lbl, labels = _cv2_ss.connectedComponents(sam, connectivity=8)
+        if n_lbl > 2:
+            sizes = _np_ss.bincount(labels.ravel())
+            sizes[0] = 0
+            largest = int(_np_ss.argmax(sizes))
+            if sizes[largest] > 100:
+                sam = (labels == largest).astype(_np_ss.uint8)
+    except Exception:
+        pass
+    return _selective_carve_reassert(sam, sam_raw, carve_points)
+
+
+def merge_ck_with_garbage_matte(
+    ck_alpha: np.ndarray,
+    sam_silhouette: Optional[np.ndarray],
+    source_rgb: Optional[np.ndarray] = None,
+    screen_type: str = "green",
+    proximity_px: Optional[int] = None,
+    carve_points=None,
+) -> np.ndarray:
+    """CK × zoned_dilated_SAM + chroma escape valve for hair.
+
+    SAM is used purely as a garbage matte — kill outside, preserve CK inside.
+    No CK/SAM blending, no chroma-gated mixing, no seam suppression needed.
+    Three zones: generous dilation at head/body (20px, block downward),
+    tight lateral-only at feet (2px, no downward). Chroma escape valve
+    lets CK hair detail survive beyond the dilation boundary on green pixels.
+    """
+    import cv2
+
+    # FIX B: EDGE GUARD slider (proximity_px) drives the generous-dilation kernel and the
+    # chroma-escape radius. None preserves the prior hardcoded behavior EXACTLY (20 / 40.0).
+    _pg = 20 if proximity_px is None else int(proximity_px)
+    _esc = 40.0 if proximity_px is None else float(max(proximity_px * 2, 0))
+
+    ck = np.asarray(ck_alpha, dtype=np.float32)
+    if ck.ndim == 3:
+        ck = ck[..., 0]
+    if sam_silhouette is None:
+        return ck.copy()
+    sam = (np.asarray(sam_silhouette, dtype=np.float32) > 0.5).astype(np.uint8)
+    if sam.ndim == 3:
+        sam = sam[..., 0]
+    if ck.shape != sam.shape:
+        return ck.copy()
+    h, w = ck.shape
+
+    # FIX A v3 (2026-06-06, review-hardened): cleanup + dot-aware carve re-assert via
+    # the ONE shared solidify helper — same function the panel's SAM view calls, so
+    # preview == render by construction (the previous inline copy was drift waiting
+    # to happen; 2026-06-06 Sonnet review, bug 2).
+    sam = solidify_sam_silhouette(sam, carve_points)
+
+    # --- SAM bounding box ---
+    ys = np.where(sam > 0)[0]
+    if ys.size == 0:
+        return ck.copy()
+    bbox_y0, bbox_y1 = int(ys.min()), int(ys.max())
+    bbox_h = max(bbox_y1 - bbox_y0, 1)
+    feet_start = bbox_y0 + int(bbox_h * 0.70)
+    transition_px = 30
+
+    # --- Generous dilation: _pg px (EDGE GUARD), block downward expansion ---
+    k_gen = _pg
+    se_gen = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_gen * 2 + 1, k_gen * 2 + 1))
+    se_gen[:k_gen, :] = 0
+    dilated_generous = cv2.dilate(sam, se_gen)
+
+    # --- Tight dilation: 3px lateral only (no vertical) ---
+    se_tight = np.zeros((1, 7), dtype=np.uint8)
+    se_tight[0, :] = 1
+    dilated_tight = cv2.dilate(sam, se_tight)
+
+    # --- Blend map: 1.0 = generous, 0.0 = tight ---
+    blend = np.ones((h, w), dtype=np.float32)
+    ramp_end = min(feet_start + transition_px, h)
+    for y in range(feet_start, ramp_end):
+        blend[y, :] = 1.0 - (y - feet_start) / float(transition_px)
+    blend[ramp_end:, :] = 0.0
+
+    gen_f = dilated_generous.astype(np.float32)
+    tight_f = dilated_tight.astype(np.float32)
+    garbage_matte = gen_f * blend + tight_f * (1.0 - blend)
+    garbage_matte = np.maximum(garbage_matte, sam.astype(np.float32))
+    garbage_matte = np.clip(garbage_matte, 0.0, 1.0)
+
+    # Proximity-limited chroma escape valve.
+    # Pure on-green chroma escape opens the matte everywhere with green
+    # bounce (walls, ceiling). Pure dilation can't reach flyaway hair
+    # beyond the boundary. Compromise: only let on-green pixels through
+    # if they're within 40px of the SAM body. Hair on green near body =
+    # preserved. Distant walls with green tint = still killed.
+    on_green_hsv = None
+    if source_rgb is not None:
+        try:
+            rgb_in = np.asarray(source_rgb)
+            if rgb_in.dtype != np.float32:
+                img_u8 = np.clip(rgb_in, 0, 255).astype(np.uint8)
+            else:
+                img_u8 = (np.clip(rgb_in, 0.0, 1.0) * 255).astype(np.uint8)
+            if img_u8.ndim == 2:
+                img_u8 = np.stack([img_u8, img_u8, img_u8], axis=-1)
+            if img_u8.shape[:2] != (h, w):
+                img_u8 = cv2.resize(img_u8, (w, h), interpolation=cv2.INTER_AREA)
+            # HSV detection — catches shadowed/dark green that RGB ratio misses
+            img_bgr = cv2.cvtColor(img_u8, cv2.COLOR_RGB2BGR)
+            hsv_map = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+            if screen_type == "blue":
+                _lower, _upper = np.array([100, 50, 50]), np.array([130, 255, 255])
+            else:
+                _lower, _upper = np.array([35, 50, 50]), np.array([85, 255, 255])
+            on_green_hsv = cv2.inRange(hsv_map, _lower, _upper).astype(np.float32) / 255.0
+            # Chroma escape: CK hair beyond dilation boundary passes on green pixels near body
+            sam_inv = (1 - sam).astype(np.uint8)
+            dist_from_sam = cv2.distanceTransform(sam_inv, cv2.DIST_L2, 5)
+            near_sam = (dist_from_sam < _esc).astype(np.float32)
+            escape = on_green_hsv * near_sam
+            garbage_matte = np.maximum(garbage_matte, escape)
+        except Exception:
+            pass
+
+    final = np.clip(ck * garbage_matte, 0.0, 1.0).astype(np.float32)
+
+    # Off-green body fill: SAM adds body parts outside the green screen zone.
+    # Garbage matte returns 0 off-green (CK has no signal there). HSV detects
+    # where the green screen ends; SAM fills the body beyond that boundary.
+    if on_green_hsv is not None:
+        try:
+            off_green_body = sam.astype(np.float32) * (1.0 - on_green_hsv)
+            final = np.clip(final + off_green_body * (1.0 - final), 0.0, 1.0).astype(np.float32)
+        except Exception:
+            pass
+
+    # Edge choke moved to Fusion (CK_EDGE_CHOKE ErodeDilate node).
+    # Adjustable per shot, non-destructive, no re-render needed.
+
+    return final
+
+
 def merge_ck_with_sam_active(
     ck_alpha: np.ndarray,
     sam_silhouette: Optional[np.ndarray],
     source_rgb: Optional[np.ndarray] = None,
     screen_type: str = "green",
     proximity_px: Optional[int] = None,
+    carve_points=None,
 ) -> np.ndarray:
-    # WHAT IT DOES: Dispatcher for the active merge mode. Routes to v2.2
-    #   chroma-gated merge when USE_CHROMA_GATED_MERGE is True (default after
-    #   2026-05-13 restoration). Falls back to Path B (max-style) when the
-    #   flag is False, when sam_silhouette is None, or when source_rgb is
-    #   missing. Single entry point so call sites are agnostic to which
-    #   merge is in effect.
-    # DEPENDS ON: USE_CHROMA_GATED_MERGE flag, merge_ck_with_sam_chroma_gated,
-    #             merge_ck_with_sam (fallback).
-    # AFFECTS: every exporter call site (process_current_frame Combined branch,
-    #          on_process_range Combined branch, AE/Fusion plugin call sites).
-    #          screen_type kwarg accepted for backward compatibility; v2.2
-    #          chroma-gated ignores it (uses RGB matting, not chroma keying).
-    if not USE_CHROMA_GATED_MERGE:
+    # WHAT IT DOES: Dispatcher for the active merge mode. Routes based on
+    #   MERGE_MODE flag: "garbage_matte" (new), "chroma_gated" (v2.3),
+    #   or "path_b" (max-style fallback). Single entry point so call sites
+    #   are agnostic to which merge is in effect.
+    if sam_silhouette is None:
         return merge_ck_with_sam(ck_alpha, sam_silhouette)
-    if sam_silhouette is None or source_rgb is None:
-        return merge_ck_with_sam(ck_alpha, sam_silhouette)
-    try:
-        return merge_ck_with_sam_chroma_gated(
-            ck_alpha, sam_silhouette, source_rgb,
-            screen_type=screen_type,
-            proximity_px=proximity_px,
-        )
-    except Exception:
-        # 2026-05-16: dump the exception so we can fix it. The previous silent
-        # fallback was hiding a real bug behind a "Combined export OK" log.
+    if MERGE_MODE == "garbage_matte":
         try:
-            import traceback as _tb_inner
-            from pathlib import Path as _P_inner
-            _P_inner(r"C:\Users\ragsn\ck_chroma_merge_exception.txt").write_text(
-                _tb_inner.format_exc(), encoding="utf-8"
+            return merge_ck_with_garbage_matte(
+                ck_alpha, sam_silhouette, source_rgb,
+                screen_type=screen_type,
+                proximity_px=proximity_px,
+                carve_points=carve_points,
             )
         except Exception:
-            pass
-        # Safety net: never let a chroma test or numpy hiccup crash the renderer.
-        # Fall back to Path B which always returns a usable alpha.
-        return merge_ck_with_sam(ck_alpha, sam_silhouette)
+            try:
+                import traceback as _tb_gm
+                from pathlib import Path as _P_gm
+                _P_gm(r"C:\Users\ragsn\ck_garbage_merge_exception.txt").write_text(
+                    _tb_gm.format_exc(), encoding="utf-8"
+                )
+            except Exception:
+                pass
+            return merge_ck_with_sam(ck_alpha, sam_silhouette)
+    if MERGE_MODE == "chroma_gated" and source_rgb is not None:
+        try:
+            return merge_ck_with_sam_chroma_gated(
+                ck_alpha, sam_silhouette, source_rgb,
+                screen_type=screen_type,
+                proximity_px=proximity_px,
+            )
+        except Exception:
+            try:
+                import traceback as _tb_inner
+                from pathlib import Path as _P_inner
+                _P_inner(r"C:\Users\ragsn\ck_chroma_merge_exception.txt").write_text(
+                    _tb_inner.format_exc(), encoding="utf-8"
+                )
+            except Exception:
+                pass
+            return merge_ck_with_sam(ck_alpha, sam_silhouette)
+    return merge_ck_with_sam(ck_alpha, sam_silhouette)
 
 
 def write_matte_final_dump(alpha_final: np.ndarray, ops_applied) -> None:

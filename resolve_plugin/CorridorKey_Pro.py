@@ -19,7 +19,7 @@ DEPENDS-ON:
 AFFECTS: Timeline Track 2 (writes keyed frames), MediaPool (creates CorridorKey bin),
   source clip on Track 1 (optionally disabled after processing)
 """
-import sys, os, site, tempfile, math, queue, threading, io, traceback, shutil
+import sys, os, site, tempfile, math, queue, threading, io, traceback, shutil, signal
 from pathlib import Path
 
 # DANGER ZONE FRAGILE: Resolve's embedded Python sets sys.stdout/stderr to None for
@@ -150,6 +150,9 @@ _main_thread_id = threading.get_ident()
 last_preview_data = {"original": None, "keyed": None, "alpha": None}
 cached_source = {"frame": None, "file_path": None, "frame_num": None}
 cached_processor = {"proc": None}  # Holds loaded AI model to avoid reloading every frame
+# Shutdown sentinel — set True in on_close so PollTimer ticks that race the close event no-op.
+# Prevents mid-tick inference (2-5s on UI thread) from blocking on_close from reaching os._exit.
+_shutting_down = False
 # WHAT IT DOES: Holds a CPU-only processor pre-inited at LIVE PREVIEW time for SCRUB RANGE use.
 #   Avoids creating a new CPU proc inside the background thread (which triggers torch.compile
 #   at img_size=2048 on CPU — a 6+ minute hang). Populated once; reused for all scrub runs.
@@ -168,6 +171,7 @@ sam_points_per_obj: dict = {
 frame_range = {"in_frame": None, "out_frame": None}
 _viewer_proc = None      # Tracks Live Preview subprocess — stays alive while scrubber is open
 _scrubber_proc = None   # Tracks SCRUB RANGE subprocess — separate from live preview
+_scrubber_job = None    # Win32 Job Object holding the scrubber — KILL_ON_JOB_CLOSE auto-kills it when Resolve's Python dies (mirrors _viewer_job). Handle must stay referenced or the job closes early.
 _scrubber_frames_dir = None    # TIFF temp dir for scrubber — cleaned up on close/new scrub
 _scrub_pending = []          # frames queued for Phase 1 timer-based export (list of (fi, tl_frame))
 _scrub_pending_buffers = []  # accumulated BytesIO results from Phase 1
@@ -416,13 +420,26 @@ winLayout = ui.VGroup({"Spacing": 4}, [
 _INSTANCE_LOCK = Path(tempfile.gettempdir()) / "corridorkey_instance.lock"
 
 def _check_single_instance():
+    # 2026-05-21 fix v2: previous PID + process-name checks both false-positive
+    # because Resolve hosts CK in its own fusion/fuscript process family — the
+    # name filter matches even when no real CK is running. Use a HEARTBEAT
+    # approach instead: CK touches the lock file every 5s while alive. If the
+    # lock's mtime is more than 15 seconds old, treat as stale.
     if _INSTANCE_LOCK.exists():
         try:
-            pid = int(_INSTANCE_LOCK.read_text().strip())
-            import ctypes
-            handle = ctypes.windll.kernel32.OpenProcess(0x100000, False, pid)  # SYNCHRONIZE
-            if handle:
-                ctypes.windll.kernel32.CloseHandle(handle)
+            import time as _time_lk
+            _lock_age = _time_lk.time() - _INSTANCE_LOCK.stat().st_mtime
+            _show_dialog = False
+            if _lock_age <= 15.0:
+                # Recent lock — verify PID alive. Heartbeat keeps mtime fresh
+                # while CK runs; stale > 15s means previous CK crashed or exited.
+                pid = int(_INSTANCE_LOCK.read_text().strip())
+                import ctypes
+                handle = ctypes.windll.kernel32.OpenProcess(0x100000, False, pid)
+                if handle:
+                    ctypes.windll.kernel32.CloseHandle(handle)
+                    _show_dialog = True
+            if _show_dialog:
                 err_win = disp.AddWindow(
                     {"ID": "CKErr", "WindowTitle": "CorridorKey Already Open", "Geometry": [300, 200, 400, 110]},
                     [ui.VGroup({"Spacing": 10, "Margin": 16}, [
@@ -466,12 +483,12 @@ items["OutputCodec"].AddItem("EXR 32-bit (VFX float)")
 # was partly this. 16-bit = 65k alpha levels = soft hair edges restored.
 try: items["OutputCodec"].CurrentIndex = 1  # default PNG 16-bit
 except Exception: pass
-# OutputContent: which file(s) to write. 2026-05-18: default flipped to
-# "Combined (CK x SAM)" — the merge stack (sam_buffered + body_topology +
-# body_core + chroma-gated) IS the product. "CK only" default silently
-# bypassed the merge on every render, making the rendered PNG look like
-# raw CK matte (slab survives). Power users who want raw CK can still pick
-# it from the dropdown.
+# OutputContent: which file(s) to write. 2026-05-21: REVERTED to "Combined (CK x SAM)"
+# as default. The 5/20 flip to "CK only" was an overnight fix attempt that turned out
+# WORSE — raw CK alpha alone leaves dark greenscreen folds (upper-right corner of
+# typical setups) un-killed because chroma threshold can't catch near-black pixels.
+# The merge stack (SAM silhouette × CK alpha) bounds the keep-zone and kills those
+# folds correctly — that's the user-visible quality CK had at 2026-05-21 00:49.
 items["OutputContent"].AddItem("Combined (CK x SAM)")
 items["OutputContent"].AddItem("Both (CK + SAM sidecar)")
 items["OutputContent"].AddItem("CK only")
@@ -792,9 +809,13 @@ def _merge_live_params(settings):
             sam_points_per_obj[_oid]["frame"]    = lp.get(f"sam_anchor_frame_obj{_oid}", None)
         if any(sam_points_per_obj[oid]["positive"] for oid in (1, 2)):
             out["alpha_method"] = 1
-        # If a SAM2 gate file exists on disk, always activate SAM2 mode regardless of
-        # the panel dropdown or whether live_params.json still has the points. The gate
-        # file persists across viewer restarts; the points in live_params.json do not.
+        # 2026-05-21: RESTORED sam2_mask.png auto-load. If a saved SAM2 mask exists
+        # on disk for this session, activate SAM2 mode automatically — this is what
+        # made CK output clean at 2026-05-21 00:49 (only 2 dots survived). The 5/20
+        # removal of this auto-load was intended to prevent stale-PNG cross-session
+        # contamination but the cost (raw CK alpha showing dark greenscreen folds)
+        # is worse than the disease. If user switches clips and the PNG is stale,
+        # they can clear via the panel.
         if (SESSION_DIR / "sam2_mask.png").exists():
             out["alpha_method"] = 1
         return out
@@ -1051,7 +1072,7 @@ def _panel_dispatch_sam2_combine(alpha, gates, src_rgb, settings, obj_ids=None):
                 import cv2 as _cv2_cc
                 import json as _json_cc
                 from pathlib import Path as _P_cc
-                _lp_path_cc = _P_cc(r"C:\Users\ragsn\AppData\Local\Temp\corridorkey_session\live_params.json")
+                _lp_path_cc = _P_cc(tempfile.gettempdir()) / "corridorkey_session" / "live_params.json"
                 _m1_pos = []
                 if _lp_path_cc.exists():
                     with open(_lp_path_cc, "r", encoding="utf-8") as _f_cc:
@@ -1115,6 +1136,10 @@ def _panel_dispatch_sam2_combine(alpha, gates, src_rgb, settings, obj_ids=None):
             else:
                 merged = (merged.astype(np.float32) * _inv).astype(merged.dtype)
         merged = _apply_edge_feather(merged, settings)
+        # 2026-05-23 shirt rescue — pull yellow/red shirt back from CK-NN
+        # over-keying by deferring to SAM in non-green regions. Runs before
+        # garbage matte so the matte still gates the rescued pixels.
+        merged = _apply_shirt_rescue(merged, _sam_union_m1 if mask1_silhouettes else None, src_rgb)
         merged = _apply_garbage_matte(merged, _sam_union_m1 if mask1_silhouettes else None,
                                        _gm_active, _gm_expand_px, _gm_feather_px,
                                        _gm_y_top_pct, _gm_y_bot_pct)
@@ -1128,8 +1153,68 @@ def _panel_dispatch_sam2_combine(alpha, gates, src_rgb, settings, obj_ids=None):
         merge_ck_with_sam_active(alpha, sam_union, source_rgb=src_rgb, proximity_px=_prox_px),
         settings,
     )
+    # 2026-05-23 shirt rescue (union path) — same fix as SUBTRACT branch above.
+    _merged = _apply_shirt_rescue(_merged, sam_union, src_rgb)
     return _apply_garbage_matte(_merged, sam_union, _gm_active, _gm_expand_px,
                                 _gm_feather_px, _gm_y_top_pct, _gm_y_bot_pct)
+
+
+# WHAT IT DOES: Per-pixel rescue for body content that CK NN over-keyed because
+#   the foreground color (yellow/red shirt, dark prop) reads as green to the NN.
+#   Where the SOURCE pixel is NOT green (chroma score < threshold) AND SAM says
+#   body, force alpha to max(alpha, SAM). On genuine green pixels, no change —
+#   CK's keying is preserved. Implements the "use SAM where green is absent"
+#   half of the Path B KeyMix architecture as a post-merge override.
+# DEPENDS-ON: numpy. Inputs are float32 [0..1] or uint8 [0..255].
+# AFFECTS: returns a fresh alpha array of the same shape/dtype as input.
+def _apply_shirt_rescue(alpha, sam, src_rgb, threshold=0.15, sam_threshold=0.85, erode_px=5):
+    if sam is None or src_rgb is None or alpha is None:
+        return alpha
+    try:
+        import numpy as _np
+        import cv2 as _cv2
+        _rgb = _np.asarray(src_rgb).astype(_np.float32)
+        if _rgb.max() > 1.5:
+            _rgb = _rgb / 255.0
+        # green chroma score: positive where green dominates
+        _green = _rgb[..., 1] - _np.maximum(_rgb[..., 0], _rgb[..., 2])
+        _not_green = _green < float(threshold)
+        _sam_arr = _np.asarray(sam).astype(_np.float32)
+        if _sam_arr.ndim == 3:
+            _sam_arr = _sam_arr[..., 0]
+        if _sam_arr.max() > 1.5:
+            _sam_arr = _sam_arr / 255.0
+        # 2026-05-23: SAM2-video propagation outputs looser edges than single-frame
+        # SAM. Tighten with high threshold + erode to bring rescue zone closer to
+        # actual body edge. Kills the 10px halo seen in range Combined output.
+        _sam_bin = (_sam_arr > float(sam_threshold)).astype(_np.uint8)
+        if erode_px > 0:
+            _k = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (erode_px * 2 + 1, erode_px * 2 + 1))
+            _sam_bin = _cv2.erode(_sam_bin, _k)
+        # Match shape — if alpha is HxW and SAM is HxW, both 2D
+        _a = _np.asarray(alpha).astype(_np.float32)
+        if _a.ndim == 3:
+            _a2d = _a[..., 0]
+        else:
+            _a2d = _a
+        if _a.max() > 1.5:
+            _a2d = _a2d / 255.0
+            _scale = 255.0
+        else:
+            _scale = 1.0
+        if _sam_bin.shape != _a2d.shape or _not_green.shape != _a2d.shape:
+            return alpha  # shape mismatch — bail safely
+        _rescue = _not_green & (_sam_bin > 0)
+        _out = _a2d.copy()
+        _out[_rescue] = _np.maximum(_a2d[_rescue], _sam_bin[_rescue].astype(_np.float32))
+        _out = (_out * _scale).clip(0, _scale)
+        if alpha.ndim == 3:
+            _out_full = _np.repeat(_out[..., None], alpha.shape[2], axis=2)
+            return _out_full.astype(alpha.dtype)
+        return _out.astype(alpha.dtype)
+    except Exception as _se:
+        log(f"shirt rescue failed (non-fatal): {_se}")
+        return alpha
 
 
 def _apply_garbage_matte(alpha, sam, active, expand_px, feather_px, y_top_pct, y_bot_pct):
@@ -1230,28 +1315,89 @@ def _load_per_object_sam2_gates(frame_shape, settings):
 # DANGER ZONE FRAGILE: do NOT bypass the settings check — the viewer can have
 #   despeckle off, in which case the render must also leave the matte alone.
 def _apply_despeckle_to_alpha(mt, settings):
-    # 2026-05-14 DIAGNOSTIC BYPASS: despeckle did not exist in v1.0.1-stable.
-    # With despeckle_size=2000 (Berto's current setting) it removes connected
-    # components < 2000 px, which can delete loose hair strands. Berto saw
-    # chunky hair edges on CK-only render (yellow-backdrop screenshot
-    # 2026-05-14 23:23). Function returns input unchanged so we can A/B
-    # compare CK output without this post-processing. If hair restored:
-    # re-enable as opt-in (default off) or with much lower default size.
+    # 2026-05-21 RESTORED 1-line bypass from deploy 003825 (the "golden" 00:49
+    # quality state per Berto). The "smart despeckle" rewrite (CC + keep-zone
+    # proximity) introduced 2026-05-21_022438 and tuned at 143325 was the named
+    # cause of the "torn-flag artifact in upper corners" — Agent 1 bisect
+    # confirmed. Bypass keeps the 2-month-stable behavior. If real despeckle
+    # is needed later, re-enable as opt-in with a much smaller default size.
     return mt
+    # Dead code below preserved for future re-enable / reference. Unreachable.
     if mt is None:
         return mt
     if not settings.get("despeckle_enabled", True):
         return mt
-    ds_size = int(settings.get("despeckle_size", 400))
-    if ds_size <= 0:
+    area_threshold = int(settings.get("despeckle_size", 300))
+    if area_threshold <= 0:
         return mt
     try:
-        from CorridorKeyModule.core import color_utils as _cu
+        import cv2 as _cv2_sd
+        import numpy as _np_sd
         mt2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
-        return _cu.clean_matte_opencv(mt2d, area_threshold=ds_size)
+        # Normalize to float [0,1] for thresholding regardless of input dtype.
+        if mt2d.dtype == _np_sd.uint8:
+            a = mt2d.astype(_np_sd.float32) / 255.0
+        elif mt2d.dtype == _np_sd.uint16:
+            a = mt2d.astype(_np_sd.float32) / 65535.0
+        else:
+            a = mt2d.astype(_np_sd.float32)
+        body_threshold = float(settings.get("despeckle_body_threshold", 0.5))
+        proximity_px = int(settings.get("despeckle_proximity_px", 30))
+        # 2026-05-21 REVERT: use HIGH threshold (0.5) for CC analysis — matches
+        # the 2-month-stable clean_matte_opencv behavior. The "smart" 0.05
+        # threshold pulled partial-alpha edges into the same component as
+        # large junk, making the component pass area_threshold and persist
+        # (torn-flag artifact in upper corners). 0.5 binarize drops those.
+        low_threshold = 0.5
+        # Body = largest CC of high-confidence alpha
+        body_bin = (a > body_threshold).astype(_np_sd.uint8)
+        n_body, labels_body, stats_body, _c = _cv2_sd.connectedComponentsWithStats(body_bin, connectivity=8)
+        if n_body <= 1:
+            return mt
+        # CC_STAT_AREA index is 4 in OpenCV; argmax over labels 1..N-1
+        body_areas = stats_body[1:, _cv2_sd.CC_STAT_AREA]
+        largest_label = int(_np_sd.argmax(body_areas)) + 1
+        body_mask = (labels_body == largest_label).astype(_np_sd.uint8) * 255
+        # Keep-zone = body dilated by proximity_px (preserves hair tips, flyaways)
+        if proximity_px > 0:
+            k = 2 * proximity_px + 1
+            kernel = _cv2_sd.getStructuringElement(_cv2_sd.MORPH_ELLIPSE, (k, k))
+            keep_zone = _cv2_sd.dilate(body_mask, kernel)
+        else:
+            keep_zone = body_mask
+        # CC on any-alpha (low threshold) — partial alpha hair gets its own component
+        any_bin = (a > low_threshold).astype(_np_sd.uint8)
+        n_any, labels_any, stats_any, _c2 = _cv2_sd.connectedComponentsWithStats(any_bin, connectivity=8)
+        if n_any <= 1:
+            return mt
+        # Build keep mask
+        keep_mask = _np_sd.zeros_like(a, dtype=_np_sd.float32)
+        for i in range(1, n_any):
+            comp_pixels = (labels_any == i)
+            # Component touching keep-zone? Always keep (preserves hair near body).
+            if keep_zone[comp_pixels].any():
+                keep_mask[comp_pixels] = 1.0
+                continue
+            # Outside keep-zone: only keep if large enough (real objects)
+            if stats_any[i, _cv2_sd.CC_STAT_AREA] >= area_threshold:
+                keep_mask[comp_pixels] = 1.0
+            # else: drop (isolated speck — pink reg mark, dust, etc)
+        # Apply keep mask to original alpha
+        result = (a * keep_mask)
+        # Cast back to input dtype
+        if mt2d.dtype == _np_sd.uint8:
+            result_out = (result * 255.0).clip(0, 255).astype(_np_sd.uint8)
+        elif mt2d.dtype == _np_sd.uint16:
+            result_out = (result * 65535.0).clip(0, 65535).astype(_np_sd.uint16)
+        else:
+            result_out = result.astype(mt2d.dtype, copy=False)
+        # Preserve original shape (re-add channel dim if input was 3D)
+        if len(mt.shape) == 3:
+            return result_out[:, :, _np_sd.newaxis]
+        return result_out
     except Exception as _e:
         try:
-            log(f"Despeckle skipped: {_e}")
+            log(f"Smart despeckle skipped: {_e}")
         except Exception:
             pass
         return mt
@@ -1683,6 +1829,24 @@ def run_sam2_video_propagation(fp, ss, cs, in_f, out_f, pos_pts, neg_pts, anchor
                 log(f"SAM2 obj{oid} post-pass: {collapsed_count} interior empties -> NN fallback, "
                     f"{tail_held_count} tail empties held to nearest substantial mask.")
 
+            # SAM2 anchor-frame fix: frame 0 uses no_mem_embed (image-SAM mode,
+            # no temporal memory) producing weaker masks with interior holes.
+            # If frame 2 exists and has >10% more coverage than frames 0 or 1,
+            # copy frame 2 backward to replace the weak anchor frames.
+            for oid, m_dict in masks_per_obj.items():
+                if 2 not in m_dict:
+                    continue
+                ref_cov = m_dict[2].sum()
+                if ref_cov < 100:
+                    continue
+                patched = []
+                for early_f in (0, 1):
+                    if early_f in m_dict and m_dict[early_f].sum() < ref_cov * 0.9:
+                        m_dict[early_f] = m_dict[2].copy()
+                        patched.append(early_f)
+                if patched:
+                    log(f"SAM2 obj{oid}: anchor-fix copied frame 2 -> frames {patched}")
+
             # reset_state releases SAM2's internal CUDA buffers before we drop
             # the predictor — prevents the GPU memory leak on Windows (issue #258).
             try:
@@ -1741,7 +1905,7 @@ def run_sam2_video_propagation(fp, ss, cs, in_f, out_f, pos_pts, neg_pts, anchor
 #   Resolve render. The downside is HEVC files whose FOURCC tag is missing won't be caught;
 #   in that case the user still sees the pink shift and we can extend detection later.
 _hevc_codec_cache = {}
-def _is_hevc_file(fp):
+def _is_hevc_file(fp, mpi=None):
     if not fp: return False
     fp_key = str(fp).lower()
     if fp_key in _hevc_codec_cache:
@@ -1763,8 +1927,370 @@ def _is_hevc_file(fp):
     except Exception as _hp:
         log(f"HEVC probe failed for {os.path.basename(fp)}: {_hp} — assuming non-HEVC")
         is_hevc = False
+    # v1.0 fix 2026-05-20: cv2 FourCC misses 10-bit HEVC (Main 10 L6.1) in
+    # QuickTime containers — returns 0 or an unrecognized tag. Fall back to
+    # the MediaPoolItem's Video Codec property string when the cv2 probe
+    # didn't detect HEVC. Resolve reports something like "H.265 Main 10 L6.1"
+    # for HEVC clips; substring match catches all 10-bit variants.
+    if not is_hevc and mpi is not None:
+        try:
+            _props = mpi.GetClipProperty() if mpi else {}
+            _codec_str = str(_props.get("Video Codec", "") or "").lower()
+            if "265" in _codec_str or "hevc" in _codec_str or "hev" in _codec_str:
+                is_hevc = True
+                log(f"HEVC fallback detection via clip property: '{_codec_str}'")
+        except Exception as _cpe:
+            log(f"HEVC clip-property fallback failed: {_cpe}")
     _hevc_codec_cache[fp_key] = is_hevc
     return is_hevc
+
+
+# WHAT IT DOES: Detects retime / speed ramp / fps conform on a timeline clip.
+# Returns (is_retimed, reason). v1.0 doesn't support retimed input — the
+# Path 0/A/B render fallback for HEVC produces wrong frames on retimed clips
+# (slow-mo seek math is off), which falls through to Path B = Deliver page popup.
+# Workflow guard fires BEFORE any decode/render so the user is told to undo
+# the retime, key on the unaltered source, then re-apply retime to the CK output
+# (standard pro VFX workflow — Mocha/Silhouette/AE all key first, retime after).
+def _is_clip_retimed(timeline_item, timeline_fps=None):
+    if timeline_item is None:
+        return False, ""
+    try:
+        ti_duration = timeline_item.GetDuration()
+        if not ti_duration or ti_duration <= 0:
+            return False, ""
+        mpi = timeline_item.GetMediaPoolItem()
+        if mpi is None:
+            return False, ""
+        props = mpi.GetClipProperty() or {}
+        try:
+            src_fps_str = str(props.get("FPS", "") or props.get("Frame Rate", "")).strip()
+            src_fps = float(src_fps_str) if src_fps_str else None
+        except Exception:
+            src_fps = None
+        if timeline_fps is None:
+            try:
+                timeline_fps = fps_of_timeline()
+            except Exception:
+                timeline_fps = None
+        src_duration_frames = None
+        try:
+            src_start = timeline_item.GetSourceStartFrame()
+            src_end = timeline_item.GetSourceEndFrame()
+            if src_start is not None and src_end is not None:
+                src_duration_frames = src_end - src_start
+        except Exception:
+            pass
+        if src_duration_frames is None:
+            try:
+                left = timeline_item.GetLeftOffset() or 0
+                right = timeline_item.GetRightOffset() or 0
+                total = int(props.get("Frames", "0") or 0)
+                if total > 0:
+                    src_duration_frames = total - left - right
+            except Exception:
+                pass
+        if src_fps is None or timeline_fps is None or not src_duration_frames or src_duration_frames <= 0:
+            return False, ""
+        # 2026-05-23: bail if src_duration_frames is unreasonably small.
+        # Resolve sometimes returns 1 frame from GetSourceStartFrame/EndFrame on
+        # HEVC clips with Clip Attributes fps conform — false-positive retime
+        # warning. If we can't trust the source duration, skip the check.
+        if src_duration_frames < 10:
+            return False, ""
+        expected_ti = src_duration_frames * (float(timeline_fps) / float(src_fps))
+        if expected_ti < 10:
+            return False, ""
+        if src_fps and timeline_fps and abs(float(src_fps) - float(timeline_fps)) < 0.5:
+            return False, ""
+        ratio = ti_duration / expected_ti
+        if abs(ratio - 1.0) > 0.05:
+            reason = (f"clip occupies {ti_duration} timeline frames, "
+                      f"expected {expected_ti:.0f} at 100%% speed "
+                      f"(source {src_duration_frames}fr @ {src_fps}fps -> timeline @ {timeline_fps}fps)")
+            return True, reason
+        return False, ""
+    except Exception as _re:
+        try:
+            log(f"Retime detect error (proceeding without guard): {_re}")
+        except Exception:
+            pass
+        return False, ""
+
+
+def _warn_speed_ramp(reason=""):
+    msg_short = "SPEED RAMP / RETIME DETECTED -- see Log below"
+    try:
+        status(msg_short)
+    except Exception:
+        pass
+    instructions = (
+        "================================================================\n"
+        "CORRIDORKEY: SPEED RAMP / RETIME DETECTED ON THIS CLIP\n"
+        "================================================================\n"
+        "CorridorKey v1 does not key retimed clips. The retime breaks\n"
+        "source-frame seek math and Resolve switches to the Deliver page.\n"
+        "\n"
+        "TO FIX (standard VFX workflow):\n"
+        "  1. Right-click the clip on the timeline\n"
+        "  2. Change Clip Speed -> reset to 100%% (remove any speed ramp)\n"
+        "  3. Run CorridorKey on the unaltered clip\n"
+        "  4. After CK finishes, re-apply your speed ramp to the keyed result\n"
+        "     (Mocha/Silhouette/AE all use this 'key first, retime after' flow)\n"
+        "\n"
+        "Native retime support is on the v1.1 polish queue (PyAV reader).\n"
+        "================================================================"
+    )
+    try:
+        log(instructions)
+    except Exception:
+        pass
+    if reason:
+        try:
+            log(f"Retime detection: {reason}")
+        except Exception:
+            pass
+
+
+# WHAT IT DOES: Decodes a single source frame from an HEVC file via PyAV (FFmpeg).
+#   - Handles 10-bit HEVC Main 10 (cv2 returns frame=None on these).
+#   - libswscale applies the file's BT.709/BT.2020 metadata correctly → no yellow→pink shift.
+#   - PTS-based seek handles FPS conform automatically (source_t in seconds from source start).
+#   - ~0.05-0.1s per frame vs ~2s for Resolve still-export path → 20-40x faster.
+# DEPENDS-ON: PyAV >= 12 in CK venv, cv2 for RGB→BGR conversion.
+# DANGER ZONE LOW: failure returns None — caller must fall back to Resolve render path.
+def _read_frame_via_pyav(fp, source_t):
+    """source_t = seconds from the START of the SOURCE file (not timeline).
+    Returns BGR uint8 ndarray (cv2 convention) or None on error."""
+    try:
+        import av
+        import numpy as _np
+        import cv2 as _cv2
+    except ImportError as _ie:
+        log(f"PyAV import failed: {_ie}")
+        return None
+    container = None
+    try:
+        container = av.open(fp)
+        vs = container.streams.video[0]
+        vs.thread_type = "AUTO"
+        # 2026-05-21 fix v5: read source colorspace + color_range from the
+        # codec_context (NOT decoded frame's `.colorspace` attribute — that
+        # returns an int enum that doesn't stringify usefully). PyAV/swscale
+        # defaults to BT.601 when src_colorspace is omitted, causing the
+        # canonical hot-pink shift on BT.709 HEVC. PyAV Issue #873.
+        try:
+            _cs_int = int(vs.codec_context.colorspace or 0)
+            _rng_int = int(vs.codec_context.color_range or 0)
+        except Exception:
+            _cs_int = 0
+            _rng_int = 0
+        # FFmpeg AVColorSpace enum: 1=BT.709, 0=RGB, 5=BT.470BG (BT.601 PAL),
+        # 6=SMPTE170M (BT.601 NTSC), 9=BT.2020 NCL. Default 709 for HD/UHD.
+        if _cs_int in (5, 6):
+            _src_cs_name = "itu601"
+        elif _cs_int == 9:
+            _src_cs_name = "itu2020_ncl"
+        else:
+            _src_cs_name = "itu709"
+        # FFmpeg AVColorRange enum: 1=MPEG/TV (16-235), 2=JPEG/PC (0-255).
+        _src_rng_name = "jpeg" if _rng_int == 2 else "mpeg"
+        # Seek to source_t. PTS is in vs.time_base units. Backward to nearest keyframe.
+        target_pts = int(source_t / float(vs.time_base))
+        try:
+            container.seek(target_pts, any_frame=False, backward=True, stream=vs)
+        except Exception:
+            container.seek(max(0, target_pts), any_frame=False, backward=True)
+        decoded = None
+        for f in container.decode(vs):
+            if f.pts is None:
+                continue
+            # Walk forward until we land at or past the requested time.
+            if f.pts < target_pts:
+                continue
+            decoded = f
+            break
+        if decoded is None:
+            log(f"PyAV: no frame at t={source_t:.3f}s in {os.path.basename(fp)}")
+            return None
+        # 2026-05-20 fix: reformat to 16-bit RGB (rgb48le) with EXPLICIT colorspace
+        # + range, then >>8 to uint8. Two reasons:
+        # 1) libswscale uses a HIGHER-QUALITY chroma resampler when the output bit
+        #    depth is wider than input (10-bit YUV -> 16-bit RGB picks a multi-tap
+        #    filter vs the default bilinear at 8-bit). This kills the 1-2px green
+        #    halo at sharp luma edges that was fooling the NN into tighter mattes.
+        # 2) dst_range="pc" forces full-range output regardless of whether the source
+        #    bitstream has color_range="tv" or "unspecified" — removes the swscale
+        #    guess that caused crushed blacks / clipped whites on Nikon HEVC.
+        # The >>8 collapse matches the BRAW path exactly (engine line 4198/4104 also
+        # does uint16 >> 8 from Resolve's 16-bit TIFF). Net: NN input bit-identical
+        # to yesterday's good-matte Resolve-still-export path.
+        # 2026-05-21 fix v5: pass src_colorspace + src_color_range + dst variants
+        # explicitly via reformat() — PyAV Issue #873 (swscale defaults to BT.601
+        # if you omit src_colorspace, producing the hot-pink shift on BT.709
+        # source). Range strings must be "mpeg"/"jpeg" — NOT "tv"/"pc". rgb48le
+        # for 16-bit precision, then >>8 to 8-bit, then cvtColor RGB→BGR.
+        try:
+            log(f"PyAV reformat: src_cs={_src_cs_name} src_rng={_src_rng_name}")
+            reformatted = decoded.reformat(
+                format="rgb48le",
+                src_colorspace=_src_cs_name,
+                dst_colorspace="itu709",
+                src_color_range=_src_rng_name,
+                dst_color_range="jpeg",
+            )
+            rgb16 = reformatted.to_ndarray()
+            rgb8 = (rgb16 >> 8).astype(_np.uint8)
+        except Exception as _ref_e:
+            log(f"PyAV reformat fallback (rgb24, 8-bit): {_ref_e}")
+            rgb8 = decoded.to_ndarray(format="rgb24")
+        return _cv2.cvtColor(rgb8, _cv2.COLOR_RGB2BGR)
+    except Exception as _pe:
+        try:
+            log(f"PyAV single-frame read failed for {os.path.basename(fp)}: {_pe}")
+        except Exception:
+            pass
+        return None
+    finally:
+        if container is not None:
+            try: container.close()
+            except Exception: pass
+
+
+# WHAT IT DOES: Exports a range of timeline-aligned frames from an HEVC file via PyAV,
+#   sampling at TIMELINE fps so the output frame count matches what the timeline shows.
+#   - Sequential decode (single seek to start, then walk frames) — fast on RTX hardware.
+#   - Handles FPS conform implicitly because we sample by TIME, not source-frame index.
+#   - Writes frame_NNNNNN.tif files starting at frame_000000 — same shape as
+#     _export_braw_range_to_frames so downstream code needs no changes.
+# DEPENDS-ON: PyAV, cv2 for BGR write, tempfile, Path.
+# DANGER ZONE LOW: failure returns None — caller must fall back to BRAW/Resolve path.
+def _export_hevc_range_via_pyav(fp, source_t_start, n_output_frames, output_fps, status_cb=None):
+    """source_t_start = seconds from source-file start; n_output_frames at output_fps cadence."""
+    try:
+        import av
+        import numpy as _np
+        import cv2 as _cv2
+        import tempfile as _tf
+        import time as _t
+    except ImportError as _ie:
+        log(f"PyAV range export — import failed: {_ie}")
+        return None
+    if n_output_frames <= 0 or output_fps <= 0:
+        log(f"PyAV range export — bad inputs n={n_output_frames} fps={output_fps}")
+        return None
+    container = None
+    try:
+        # 2026-05-23 fix: place temp TIFFs OFF %LOCALAPPDATA%\Temp.
+        # Defender real-time-scans that path heavily — the post-PyAV
+        # glob() over 210 fresh TIFFs blocks the main thread on the scan
+        # queue, producing the PROCESS RANGE silent hang. D: drive scans
+        # via a different (faster) queue and clears the bottleneck.
+        # Falls back to %LOCALAPPDATA%\Temp only if D: is unavailable.
+        try:
+            _ck_temp_root = Path(r"D:\ck_pyav_temp")
+            _ck_temp_root.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            _ck_temp_root = Path(_tf.gettempdir()) / "corridorkey_renders"
+            _ck_temp_root.mkdir(parents=True, exist_ok=True)
+        temp_dir = (_ck_temp_root
+                    / f"CK_PyAvHEVC_{int(source_t_start*1000)}_{n_output_frames}_{int(_t.time())}")
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        container = av.open(fp)
+        vs = container.streams.video[0]
+        vs.thread_type = "AUTO"
+        time_base = float(vs.time_base)
+        target_times = [source_t_start + i / float(output_fps) for i in range(n_output_frames)]
+        start_pts = int(target_times[0] / time_base)
+        try:
+            container.seek(max(0, start_pts), any_frame=False, backward=True, stream=vs)
+        except Exception:
+            container.seek(max(0, start_pts), any_frame=False, backward=True)
+        out_idx = 0
+        for f in container.decode(vs):
+            if out_idx >= n_output_frames:
+                break
+            if f.pts is None:
+                continue
+            t_frame = f.pts * time_base
+            # Emit the current frame for every target that this frame covers.
+            # (For high source-fps to low timeline-fps, one decoded frame covers
+            # one target; for low source-fps to high timeline-fps, one decoded
+            # frame may cover multiple targets — duplicate it.)
+            while out_idx < n_output_frames and t_frame >= target_times[out_idx]:
+                # 2026-05-20 fix: 16-bit RGB output via reformat (rgb48le) with
+                # explicit colorspace+range forces libswscale's high-quality
+                # chroma resampler. 16-bit TIFF written here, engine's
+                # uint16 >> 8 path (line ~4198) collapses to 8-bit at read time —
+                # matches BRAW/Resolve-still bit-depth contract exactly. See
+                # _read_frame_via_pyav for full rationale.
+                rgb16 = f.to_ndarray(format="rgb24")
+                bgr16 = _cv2.cvtColor(rgb16, _cv2.COLOR_RGB2BGR)
+                out_path = temp_dir / f"frame_{out_idx:06d}.tif"
+                _cv2.imwrite(str(out_path), bgr16)
+                out_idx += 1
+                if status_cb is not None and (out_idx % 30 == 0 or out_idx == n_output_frames):
+                    try:
+                        status_cb(f"PyAV HEVC decode: {out_idx}/{n_output_frames}")
+                    except Exception:
+                        pass
+        if out_idx == 0:
+            log(f"PyAV range export: no frames decoded for {os.path.basename(fp)}")
+            return None
+        if out_idx < n_output_frames:
+            # Pad missing tail frames by duplicating the last decoded one — keeps
+            # downstream frame-count contract intact. IMREAD_UNCHANGED preserves
+            # the uint16 bit-depth we just wrote.
+            try:
+                _last = sorted(temp_dir.glob("frame_*.tif"))[-1]
+                last_bgr = _cv2.imread(str(_last), _cv2.IMREAD_UNCHANGED)
+                while out_idx < n_output_frames:
+                    _cv2.imwrite(str(temp_dir / f"frame_{out_idx:06d}.tif"), last_bgr)
+                    out_idx += 1
+            except Exception:
+                pass
+        log(f"PyAV range export done: {out_idx} frames -> {temp_dir.name}")
+        return str(temp_dir)
+    except Exception as _pe:
+        try:
+            log(f"PyAV range export failed for {os.path.basename(fp)}: {_pe}")
+            import traceback as _tb
+            log(_tb.format_exc())
+        except Exception:
+            pass
+        return None
+    finally:
+        # 2026-05-23: container.close() on 4K HEVC after 210-frame extract hangs
+        # the main thread (libav cleanup blocks indefinitely on this codec/file
+        # combo). The container is a temp object — letting Python's GC reclaim
+        # it on next allocation is harmless. Skip close() entirely.
+        # PROBE: confirm we reach this point.
+        try:
+            log(f"PyAV: finally entered, container is None? {container is None}")
+        except Exception:
+            pass
+        # Container intentionally NOT closed — was the hang point.
+
+
+def _source_fps_from_props(props, fallback_fps):
+    """Best-effort source FPS extraction from MediaPoolItem GetClipProperty dict."""
+    try:
+        for key in ("FPS", "Frame Rate", "VFR", "Video FPS"):
+            val = props.get(key) if props else None
+            if val is None or val == "":
+                continue
+            try:
+                f = float(str(val).strip())
+                if f > 0:
+                    return f
+            except Exception:
+                continue
+    except Exception:
+        pass
+    try:
+        return float(fallback_fps)
+    except Exception:
+        return 30.0
 
 
 # WHAT IT DOES: Last-resort frame reader for formats OpenCV cannot decode (BRAW, CinemaDNG, etc).
@@ -2301,7 +2827,18 @@ def grab_background_frame():
                     # BRAW (and other camera-raw formats) cannot be decoded by OpenCV.
                     # HEVC: cv2 decodes but mishandles color metadata (yellow→pink shift) —
                     # route through Resolve's decoder for correct color.
-                    if fp.lower().endswith(('.braw', '.cin', '.dng', '.ari')) or _is_hevc_file(fp):
+                    _is_hevc_bg = _is_hevc_file(fp, mpi=mpi)
+                    if fp.lower().endswith(('.braw', '.cin', '.dng', '.ari')) or _is_hevc_bg:
+                        bg_frame = None
+                        if _is_hevc_bg:
+                            # Fast HEVC path via PyAV (same fix as LIVE PREVIEW).
+                            _src_fps_bg = _source_fps_from_props(props, fps)
+                            _source_t_bg = (c.GetLeftOffset() / _src_fps_bg) + (max(0, cf - c.GetStart()) / float(fps))
+                            bg_frame = None  # A/B 2026-05-21: bypass PyAV — test Resolve-render hypothesis
+                            if bg_frame is not None:
+                                log(f"BG plate from V{track_idx} via PyAV: {os.path.basename(fp)}")
+                                return bg_frame
+                        # Fallback (BRAW always, HEVC if PyAV failed).
                         bg_frame = _read_frame_via_resolve_render(mpi, fn)
                         if bg_frame is not None:
                             log(f"BG plate from V{track_idx} via Resolve render: {os.path.basename(fp)}")
@@ -2333,6 +2870,15 @@ def show_preview_window(orig_bgr, keyed_rgb, alpha):
     # rekeying:false at the end so an already-running viewer reloads the new PNGs.
     import cv2, numpy as np, subprocess, json
     a2d = alpha[:, :, 0] if len(alpha.shape) == 3 else alpha
+    # 2026-05-21: Smart despeckle BEFORE normalization. Preserves hair (proximity-to-body
+    # keep-zone protects any partial-alpha component attached to or near the largest blob)
+    # while removing isolated specks (pink registration marks on the cyc, dust, lighting
+    # variation). Settings come from the panel — defaults via _merge_live_params.
+    try:
+        _despeckle_settings = _merge_live_params(get_settings())
+        a2d = _apply_despeckle_to_alpha(a2d, _despeckle_settings)
+    except Exception as _de:
+        log(f"Smart despeckle in preview skipped: {_de}")
     log(f"Matte debug — dtype:{a2d.dtype} min:{a2d.min():.4f} max:{a2d.max():.4f} mean:{a2d.mean():.4f}")
     if a2d.dtype in (np.float32, np.float64):
         matte_vis = (np.clip(a2d / max(a2d.max(), 1e-6), 0, 1) * 255).astype(np.uint8)
@@ -2429,19 +2975,8 @@ def show_preview_window(orig_bgr, keyed_rgb, alpha):
     if _viewer_proc is not None and _viewer_proc.poll() is None:
         log("Preview updated (existing v2 window)")
         return
-    # DANGER ZONE FRAGILE: Kill any zombie/orphan viewer before spawning a fresh one.
-    # Without this, clicking Preview repeatedly leaves stale python.exe processes holding
-    # VRAM/GPU. poll() returns None if still running — terminate first, hard-kill if needed.
+    # Kill tracked viewer subprocess if it exited (stale handle cleanup)
     if _viewer_proc is not None:
-        if _viewer_proc.poll() is None:
-            try:
-                _viewer_proc.terminate()
-                try:
-                    _viewer_proc.wait(timeout=2)
-                except Exception:
-                    _viewer_proc.kill()
-            except Exception:
-                pass
         _viewer_proc = None
     # Clear stale scrub data so the viewer starts clean, not in scrub mode from last session.
     try:
@@ -2451,16 +2986,57 @@ def show_preview_window(orig_bgr, keyed_rgb, alpha):
             log("Cleared stale scrub_index.json from previous session")
     except Exception:
         pass
-    env = os.environ.copy()
-    env["CORRIDORKEY_PARENT_PID"] = str(os.getpid())
+    try:
+        (SESSION_DIR / "plugin_heartbeat").touch(exist_ok=True)
+    except Exception:
+        pass
+    parent_pid = str(os.getpid())
+    SESSION_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        _pf = SESSION_DIR / "viewer.pid"
+        if _pf.exists():
+            _old_pid = int(_pf.read_text().strip())
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(_old_pid)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3,
+                           creationflags=subprocess.CREATE_NO_WINDOW)
+            import time as _tkill; _tkill.sleep(0.5)
+            log(f"Killed previous viewer PID {_old_pid}")
+    except Exception:
+        pass
+    _env = os.environ.copy()
+    _env["CORRIDORKEY_PARENT_PID"] = parent_pid
     _viewer_proc = subprocess.Popen(
-        [python_exe, viewer_script, "--persistent", "--session", str(SESSION_DIR),
-         "--parent-pid", str(os.getpid())],
+        [python_exe, viewer_script, "--persistent", "--session", str(SESSION_DIR), "--parent-pid", parent_pid],
         creationflags=subprocess.CREATE_NO_WINDOW,
         close_fds=True,
-        env=env,
+        env=_env,
     )
-    log("v2 preview launched (persistent mode)")
+    try:
+        import ctypes as _ct_job
+        from ctypes import wintypes as _wt_job
+        _k32 = _ct_job.windll.kernel32
+        class _JBLI(_ct_job.Structure):
+            _fields_ = [("PerProcessUserTimeLimit", _ct_job.c_int64), ("PerJobUserTimeLimit", _ct_job.c_int64),
+                         ("LimitFlags", _wt_job.DWORD), ("MinimumWorkingSetSize", _ct_job.c_size_t),
+                         ("MaximumWorkingSetSize", _ct_job.c_size_t), ("ActiveProcessLimit", _wt_job.DWORD),
+                         ("Affinity", _ct_job.POINTER(_ct_job.c_ulong)), ("PriorityClass", _wt_job.DWORD),
+                         ("SchedulingClass", _wt_job.DWORD)]
+        class _IOC(_ct_job.Structure):
+            _fields_ = [("R", _ct_job.c_uint64), ("W", _ct_job.c_uint64), ("O", _ct_job.c_uint64),
+                         ("RT", _ct_job.c_uint64), ("WT", _ct_job.c_uint64), ("OT", _ct_job.c_uint64)]
+        class _JELI(_ct_job.Structure):
+            _fields_ = [("Basic", _JBLI), ("Io", _IOC), ("ProcMem", _ct_job.c_size_t),
+                         ("JobMem", _ct_job.c_size_t), ("PeakProc", _ct_job.c_size_t), ("PeakJob", _ct_job.c_size_t)]
+        _job = _k32.CreateJobObjectW(None, None)
+        _info = _JELI()
+        _info.Basic.LimitFlags = 0x2000
+        _k32.SetInformationJobObject(_job, 9, _ct_job.byref(_info), _ct_job.sizeof(_info))
+        _k32.AssignProcessToJobObject(_job, int(_viewer_proc._handle))
+        global _viewer_job
+        _viewer_job = _job
+        log(f"v2 preview launched direct (PID {_viewer_proc.pid}) + Job Object")
+    except Exception as _je:
+        log(f"v2 preview launched direct (PID {_viewer_proc.pid}, Job Object failed: {_je})")
 
 # WHAT IT DOES: Writes the keyed result to disk as PNG. Three export formats:
 #   0 = RGBA (foreground + alpha), 1 = Alpha only (grayscale matte), 2 = Foreground only (no alpha)
@@ -2576,6 +3152,86 @@ def save_alpha_only(matte, path, codec=0):
         cv2.imwrite(str(path), (m * 255.0).astype(np.uint8))
     else:
         cv2.imwrite(str(path), (m * 65535.0).astype(np.uint16))
+
+
+def _write_fusion_sidecars(
+    fg, ck_alpha, sam_union, source_rgb, settings, output_dir, clip_name, frame_num,
+):
+    """Write 5 sidecar PNGs for Editable Layers (Fusion Comp) mode.
+
+    Returns dict of first-frame paths keyed by sidecar type, or empty dict on
+    failure. Uses 16-bit PNG (Fusion reads them reliably, unlike OpenCV TIFFs).
+    """
+    import cv2, numpy as np
+
+    from corridorkey_sam_merge import compute_garbage_matte
+    try:
+        from corridorkey_sam_merge import compute_region_matte
+    except ImportError:
+        compute_region_matte = None
+
+    pad = f"{frame_num:06d}"
+    paths = {}
+
+    # 1. CK_RGB — NN foreground with despill (same as Track 2 export).
+    if fg is not None:
+        fg_clean = np.clip(fg, 0.0, 1.0).copy()
+        _despill_str = float(settings.get("despill_strength", 0.5))
+        if _despill_str > 0:
+            try:
+                from CorridorKeyModule.core import color_utils as _cu_sc
+                fg_clean = _cu_sc.despill_opencv(fg_clean, green_limit_mode="average", strength=_despill_str)
+            except Exception:
+                pass
+        fg_16 = (cv2.cvtColor(fg_clean, cv2.COLOR_RGB2BGR) * 65535.0).astype(np.uint16)
+        p = output_dir / f"CK_RGB_{clip_name}.{pad}.png"
+        cv2.imwrite(str(p), fg_16)
+        paths["ck_rgb"] = str(p)
+
+    def _to_3ch_16(mono):
+        """Convert single-channel matte to 3-channel 16-bit BGR for Fusion compatibility.
+        Fusion treats single-channel PNGs as mask images with no RGB data."""
+        m16 = (np.clip(mono, 0.0, 1.0) * 65535.0).astype(np.uint16)
+        return cv2.merge([m16, m16, m16])
+
+    # 2. CK_ALPHA — CK neural net alpha (3-channel for Fusion Custom tool)
+    if ck_alpha is not None:
+        m = ck_alpha[:, :, 0] if ck_alpha.ndim == 3 else ck_alpha
+        p = output_dir / f"CK_ALPHA_{clip_name}.{pad}.png"
+        cv2.imwrite(str(p), _to_3ch_16(m))
+        paths["ck_alpha"] = str(p)
+
+    # 3. SAM_ALPHA — SAM2 body silhouette (3-channel for Fusion)
+    if sam_union is not None:
+        s = sam_union[:, :, 0] if sam_union.ndim == 3 else sam_union
+        p = output_dir / f"SAM_ALPHA_{clip_name}.{pad}.png"
+        cv2.imwrite(str(p), _to_3ch_16(s))
+        paths["sam_alpha"] = str(p)
+
+    # 4. GARBAGE_ALPHA — garbage matte from SAM bbox + user settings
+    if sam_union is not None and not bool(settings.get("garbage_bypass", False)):
+        _ge = int(settings.get("garbage_expand_px", 0))
+        _gf = int(settings.get("garbage_feather_px", 0))
+        _gyt = int(settings.get("garbage_y_top_pct", 0))
+        _gyb = int(settings.get("garbage_y_bot_pct", 100))
+        if _ge > 0 or _gyt > 0 or _gyb < 100:
+            gm = compute_garbage_matte(sam_union, expand_px=_ge, feather_px=_gf,
+                                       y_top_pct=_gyt, y_bot_pct=_gyb)
+            if gm is not None:
+                p = output_dir / f"GARBAGE_ALPHA_{clip_name}.{pad}.png"
+                cv2.imwrite(str(p), _to_3ch_16(gm))
+                paths["garbage_alpha"] = str(p)
+
+    # 5. REGION_ALPHA — green/blue screen detection zone (3-channel for Fusion)
+    if source_rgb is not None and compute_region_matte is not None:
+        region = compute_region_matte(source_rgb, screen_type=settings.get("screen_type", "green"))
+        if region.dtype == np.uint8:
+            region = region.astype(np.float32) / 255.0
+        p = output_dir / f"REGION_ALPHA_{clip_name}.{pad}.png"
+        cv2.imwrite(str(p), _to_3ch_16(region))
+        paths["region_alpha"] = str(p)
+
+    return paths
 
 
 # Tell Resolve not to apply any IDT to imported CK renders. Without this, on
@@ -2705,17 +3361,39 @@ def process_current_frame(preview_only=False):
     log("=" * 35)
     try:
         if not timeline or not media_pool: status("ERROR: No timeline!"); return
-        clips = timeline.GetItemListInTrack("video", 1) or []
-        if not clips: status("ERROR: No clips!"); return
         settings = _merge_live_params(get_settings())
         sam2_gate_file = SESSION_DIR / "sam2_mask.png"
         log(f"SAM2 gate: alpha_method={settings.get('alpha_method')} sam2_mask.png={'EXISTS' if sam2_gate_file.exists() else 'MISSING'}")
         cf, fps = get_current_frame_info()
         log(f"Frame {cf}")
+        # v1.0 fix 2026-05-20: use the SELECTED clip the user clicked on, not a
+        # hardcoded track-1 walk. Hardcode would pick the wrong clip when the
+        # green-screen is on V2+ or a still photo lives on V1.
         clip = None
-        for c in clips:
-            if c.GetStart() <= cf < c.GetEnd(): clip = c; break
-        if not clip: clip = clips[0]
+        try:
+            clip = timeline.GetCurrentVideoItem()
+        except Exception:
+            clip = None
+        if clip is None:
+            # Fallback: walk all video tracks for the clip at playhead.
+            try:
+                track_count = timeline.GetTrackCount("video")
+            except Exception:
+                track_count = 1
+            for _ti in range(1, max(1, int(track_count)) + 1):
+                _clips_on_track = timeline.GetItemListInTrack("video", _ti) or []
+                for _c in _clips_on_track:
+                    if _c.GetStart() <= cf < _c.GetEnd():
+                        clip = _c
+                        break
+                if clip is not None:
+                    break
+        if clip is None:
+            status("ERROR: No clip selected — click a clip in the timeline first"); return
+        _is_ramped, _ramp_reason = _is_clip_retimed(clip, timeline_fps=fps)
+        if _is_ramped:
+            _warn_speed_ramp(_ramp_reason)
+            return
         cs = clip.GetStart()
         mpi = clip.GetMediaPoolItem()
         props = mpi.GetClipProperty() if mpi else {}
@@ -2724,17 +3402,25 @@ def process_current_frame(preview_only=False):
         fn = clip.GetLeftOffset() + (cf - cs)
         if fn < 0: fn = 0
         # HEVC decode-routing: cv2's HEVC decoder mishandles BT.709/BT.2020 metadata and
-        # produces a yellow→pink color shift on Nikon Z (and similar) clips. Route H.265
-        # files through Resolve's own decoder upfront — same path BRAW uses as a fallback.
-        # Confirmed root cause 2026-04-29 — see _is_hevc_file() docstring.
+        # produces a yellow→pink color shift on Nikon Z (and similar) clips. Also returns
+        # frame=None on 10-bit Main 10 in QT containers. v1.0 fix 2026-05-20: route HEVC
+        # through PyAV (FFmpeg) for both color-correct decoding AND speed (~0.05s/frame vs
+        # ~2s for Resolve still-export). Resolve render stays as last-resort fallback.
         frame = None
-        if _is_hevc_file(fp):
-            log(f"HEVC detected — routing single-frame preview through Resolve render decoder")
-            status("Reading HEVC via Resolve decoder...")
-            frame = _read_frame_via_resolve_render(mpi, fn, try_direct=True)
+        if _is_hevc_file(fp, mpi=mpi):
+            # PyAV samples by TIME, so handle FPS conform correctly:
+            _src_fps_hevc = _source_fps_from_props(props, fps)
+            _source_t = (clip.GetLeftOffset() / _src_fps_hevc) + (max(0, cf - cs) / float(fps))
+            log(f"HEVC detected — PyAV reader, source_t={_source_t:.3f}s (src_fps={_src_fps_hevc} tl_fps={fps})")
+            status("Reading HEVC via PyAV...")
+            frame = None  # A/B 2026-05-21: bypass PyAV — test Resolve-render hypothesis
             if frame is None:
-                log(f"ERROR: HEVC Resolve render returned no frame for {os.path.basename(fp)}")
-                status("ERROR: Cannot read HEVC frame via Resolve"); return
+                log(f"PyAV failed — falling back to Resolve render decoder")
+                status("PyAV failed — Resolve fallback...")
+                frame = _read_frame_via_resolve_render(mpi, fn, try_direct=True)
+            if frame is None:
+                log(f"ERROR: All HEVC decode paths failed for {os.path.basename(fp)}")
+                status("ERROR: Cannot read HEVC frame"); return
         else:
             cap = cv2.VideoCapture(fp)
             opened = cap.isOpened()
@@ -2792,17 +3478,19 @@ def process_current_frame(preview_only=False):
             # the model file is warm in OS cache. Runs async so LIVE PREVIEW doesn't
             # freeze. CORRIDORKEY_SKIP_COMPILE=1 is required — without it, torch.compile
             # fires max-autotune at img_size=2048 on CPU and hangs 6+ minutes.
-            if cached_scrub_cpu_proc["proc"] is None:
-                def _init_cpu_proc():
-                    try:
-                        os.environ["CORRIDORKEY_SKIP_COMPILE"] = "1"
-                        cached_scrub_cpu_proc["proc"] = CorridorKeyProcessor(device="cpu")
-                        log("CPU scrub proc ready — SCRUB RANGE will use CPU inference.")
-                    except Exception as _cpu_e:
-                        log(f"CPU scrub proc failed (scrub will use CUDA fallback): {_cpu_e}")
-                import threading as _cpu_thr
-                _cpu_thr.Thread(target=_init_cpu_proc, daemon=True).start()
-                log("CPU scrub proc loading in background...")
+            # DISABLED: CPU proc pre-init — suspected VRAM pressure breaking SAM2 preview.
+            # Re-enable after SAM2 debug confirms root cause.
+            # if cached_scrub_cpu_proc["proc"] is None:
+            #     def _init_cpu_proc():
+            #         try:
+            #             os.environ["CORRIDORKEY_SKIP_COMPILE"] = "1"
+            #             cached_scrub_cpu_proc["proc"] = CorridorKeyProcessor(device="cpu")
+            #             log("CPU scrub proc ready — SCRUB RANGE will use CPU inference.")
+            #         except Exception as _cpu_e:
+            #             log(f"CPU scrub proc failed (scrub will use CUDA fallback): {_cpu_e}")
+            #     import threading as _cpu_thr
+            #     _cpu_thr.Thread(target=_init_cpu_proc, daemon=True).start()
+            #     log("CPU scrub proc loading in background...")
         else:
             log("AI ready (cached)")
         proc = cached_processor["proc"]
@@ -2817,7 +3505,8 @@ def process_current_frame(preview_only=False):
         if ps.despeckle_enabled:
             log(f"Despeckle: ON (size {ps.despeckle_size})")
         res = proc.process_frame(fr, ah, ps)
-        cn = Path(fp).stem
+        import re as _re_cn
+        cn = _re_cn.sub(r'[^\w.-]', '_', Path(fp).stem)
         od = Path(items["OutputPath"].Text) / f"CK_{cn}"
         od.mkdir(parents=True, exist_ok=True)
         op = od / f"CK_{cn}_{cf:06d}{_codec_extension(settings.get('output_codec', 0))}"
@@ -2904,7 +3593,7 @@ def process_current_frame(preview_only=False):
                         _tb_text = _tb_diag.format_exc()
                         log(f"Combined merge TRACEBACK:\n{_tb_text}")
                         from pathlib import Path as _P_diag
-                        _dbg_path = _P_diag(r"C:\Users\ragsn\ck_merge_exception.txt")
+                        _dbg_path = _P_diag(tempfile.gettempdir()) / "ck_merge_exception.txt"
                         _dbg_path.write_text(_tb_text, encoding="utf-8")
                         log(f"Combined merge traceback written to {_dbg_path}")
                     except Exception as _diag_e:
@@ -3069,7 +3758,7 @@ def fps_of_timeline():
 # AFFECTS: global _scrubber_proc. Live Preview (_viewer_proc) is NOT touched — both windows
 #   stay open so the user can tweak sliders in Live Preview while scrubbing frames.
 def launch_braw_scrubber(frames_dir):
-    global _scrubber_proc
+    global _scrubber_proc, _scrubber_job
     # Kill previous scrubber if still alive — one scrubber at a time, live preview untouched.
     if _scrubber_proc is not None and _scrubber_proc.poll() is None:
         try:
@@ -3089,7 +3778,35 @@ def launch_braw_scrubber(frames_dir):
         creationflags=subprocess.CREATE_NO_WINDOW,
         close_fds=True,
     )
-    log(f"BRAW scrubber launched: {Path(frames_dir).name}")
+    # Kill-on-close Job Object — identical to the live-preview viewer guard (~line 3013).
+    # If on_close's fire-and-forget taskkill loses the race, or Resolve hard-kills our
+    # Python with no signal, Windows auto-terminates the scrubber when this process dies
+    # (and its job handle closes). _scrubber_job MUST stay referenced for the job to live.
+    try:
+        import ctypes as _ct_sj
+        from ctypes import wintypes as _wt_sj
+        _k32s = _ct_sj.windll.kernel32
+        class _JBLI_s(_ct_sj.Structure):
+            _fields_ = [("PerProcessUserTimeLimit", _ct_sj.c_int64), ("PerJobUserTimeLimit", _ct_sj.c_int64),
+                         ("LimitFlags", _wt_sj.DWORD), ("MinimumWorkingSetSize", _ct_sj.c_size_t),
+                         ("MaximumWorkingSetSize", _ct_sj.c_size_t), ("ActiveProcessLimit", _wt_sj.DWORD),
+                         ("Affinity", _ct_sj.POINTER(_ct_sj.c_ulong)), ("PriorityClass", _wt_sj.DWORD),
+                         ("SchedulingClass", _wt_sj.DWORD)]
+        class _IOC_s(_ct_sj.Structure):
+            _fields_ = [("R", _ct_sj.c_uint64), ("W", _ct_sj.c_uint64), ("O", _ct_sj.c_uint64),
+                         ("RT", _ct_sj.c_uint64), ("WT", _ct_sj.c_uint64), ("OT", _ct_sj.c_uint64)]
+        class _JELI_s(_ct_sj.Structure):
+            _fields_ = [("Basic", _JBLI_s), ("Io", _IOC_s), ("ProcMem", _ct_sj.c_size_t),
+                         ("JobMem", _ct_sj.c_size_t), ("PeakProc", _ct_sj.c_size_t), ("PeakJob", _ct_sj.c_size_t)]
+        _job_s = _k32s.CreateJobObjectW(None, None)
+        _info_s = _JELI_s()
+        _info_s.Basic.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        _k32s.SetInformationJobObject(_job_s, 9, _ct_sj.byref(_info_s), _ct_sj.sizeof(_info_s))
+        _k32s.AssignProcessToJobObject(_job_s, int(_scrubber_proc._handle))
+        _scrubber_job = _job_s
+        log(f"BRAW scrubber launched: {Path(frames_dir).name} + Job Object")
+    except Exception as _sje:
+        log(f"BRAW scrubber launched: {Path(frames_dir).name} (Job Object failed: {_sje})")
 
 
 # WHAT IT DOES: Queues SCRUB RANGE Phase 2 keying work for the main-thread timer.
@@ -3337,7 +4054,7 @@ def on_scrub_range(ev):
     # cameras that ship HEVC with BT.709/BT.2020 metadata. Route HEVC clips through the
     # Resolve seek+still path (skip_braw_exe=True so we don't waste a 30s timeout per frame
     # probing a non-BRAW file with braw-decode.exe).
-    _is_hevc = _is_hevc_file(fp) if fp else False
+    _is_hevc = _is_hevc_file(fp, mpi=mi) if fp else False
     # --- Resolve full-clip defaults if no IN/OUT set ---
     cs = mpi.GetStart()
     ce = mpi.GetEnd()
@@ -3541,6 +4258,748 @@ def on_scrub_range(ev):
     log("SCRUB: synchronous keying done.")
 
 
+# WHAT IT DOES: Builds a labeled Fusion comp on a timeline clip pointing at the
+#   sidecar PNG sequences from a CK render. Loads CK_RGB, optional CK_alpha, and
+#   optional SAM_alpha as Loaders; wires a ChannelBooleans MAX as a Stage-1 alpha
+#   union; routes through MediaOut. Stage 2 adds KeyMix + REGION + GARBAGE matte.
+# DEPENDS-ON: Fusion scripting API (AddTool / ConnectInput / SetAttrs / Undo).
+# AFFECTS: Adds nodes to timeline_item.GetFusionCompByIndex(1) inside a single Undo
+#   block so one Resolve undo rolls back the whole graph.
+# DANGER ZONE LOW: nondestructive; if comp #1 already has nodes they stay intact.
+def _build_ck_fusion_comp(timeline_item, ck_rgb_first_path,
+                          ck_alpha_first_path=None, sam_alpha_first_path=None):
+    """Build a CK auto-comp on the given timeline_item. Returns True on success."""
+    if not timeline_item:
+        log("Fusion comp: timeline_item is None")
+        return False
+    if not ck_rgb_first_path:
+        log("Fusion comp: no CK RGB sidecar path provided")
+        return False
+
+    try:
+        comp = timeline_item.GetFusionCompByIndex(1)
+        if comp is None:
+            try:
+                comp = timeline_item.AddFusionComp()
+                log("Fusion comp: AddFusionComp created comp #1")
+            except Exception as _ae:
+                log(f"Fusion comp: AddFusionComp failed: {_ae}")
+                return False
+    except Exception as e:
+        log(f"Fusion comp: GetFusionCompByIndex failed: {e}")
+        return False
+    if not comp:
+        log("Fusion comp: comp handle is None")
+        return False
+
+    try:
+        try:
+            resolve.OpenPage("fusion")
+            import time as _ft
+            for _pw in range(20):
+                if resolve.GetCurrentPage() == "fusion":
+                    break
+                _ft.sleep(0.1)
+        except Exception:
+            pass
+        comp.Lock()
+        comp.StartUndo("CK Auto Comp v1")
+
+        nodes_made = []
+        # CK_RGB Loader (foreground color from CK NN)
+        ck_rgb = comp.AddTool("Loader", 0, 0)
+        if not ck_rgb:
+            log("Fusion comp: AddTool('Loader') returned None — Resolve Studio required, or API restricted")
+            try: comp.EndUndo(True)
+            except Exception: pass
+            try: comp.Unlock()
+            except Exception: pass
+            return False
+        try:
+            ck_rgb.Clip = ck_rgb_first_path
+            ck_rgb.SetAttrs({"TOOLS_Name": "CK_RGB"})
+        except Exception as _se:
+            log(f"Fusion comp: CK_RGB Loader Clip set failed: {_se}")
+        nodes_made.append("CK_RGB")
+
+        # CK_alpha Loader (optional)
+        ck_alpha = None
+        if ck_alpha_first_path:
+            ck_alpha = comp.AddTool("Loader", 1, 0)
+            if ck_alpha:
+                try:
+                    ck_alpha.Clip = ck_alpha_first_path
+                    ck_alpha.SetAttrs({"TOOLS_Name": "CK_ALPHA"})
+                except Exception:
+                    pass
+                nodes_made.append("CK_ALPHA")
+
+        # SAM_alpha Loader (optional)
+        sam_alpha = None
+        if sam_alpha_first_path:
+            sam_alpha = comp.AddTool("Loader", 2, 0)
+            if sam_alpha:
+                try:
+                    sam_alpha.Clip = sam_alpha_first_path
+                    sam_alpha.SetAttrs({"TOOLS_Name": "SAM_ALPHA"})
+                except Exception:
+                    pass
+                nodes_made.append("SAM_ALPHA")
+
+        # ChannelBooleans MAX of CK_alpha + SAM_alpha — Stage 1 simple alpha union.
+        # Stage 2 will replace this with MatteControl + KeyMix using REGION.
+        alpha_combine = None
+        if ck_alpha and sam_alpha:
+            alpha_combine = comp.AddTool("ChannelBoolean", 3, 0)
+            if alpha_combine:
+                try:
+                    alpha_combine.SetAttrs({"TOOLS_Name": "ALPHA_MAX_CK_OR_SAM"})
+                    alpha_combine.SetInput("Operation", 12)  # 12 = Max
+                    alpha_combine.ConnectInput("Background", ck_alpha.Output)
+                    alpha_combine.ConnectInput("Foreground", sam_alpha.Output)
+                except Exception:
+                    pass
+                nodes_made.append("ALPHA_MAX")
+
+        # MediaOut — Stage 1 wires CK_RGB straight through so the timeline clip
+        # plays the CK foreground. Operator can rewire to alpha_combine in Fusion.
+        mo = comp.AddTool("MediaOut", 4, 0)
+        if mo:
+            try:
+                mo.SetAttrs({"TOOLS_Name": "CK_OUTPUT"})
+                mo.ConnectInput("Input", ck_rgb.Output)
+            except Exception:
+                pass
+            nodes_made.append("MediaOut")
+
+        try: comp.EndUndo(True)
+        except Exception: pass
+        try: comp.Unlock()
+        except Exception: pass
+        try: resolve.OpenPage("edit")
+        except Exception: pass
+        log(f"Fusion comp built: {len(nodes_made)} nodes — {', '.join(nodes_made)}")
+        return True
+    except Exception as e:
+        log(f"Fusion comp build error: {type(e).__name__}: {e}")
+        try: comp.EndUndo(False)
+        except Exception: pass
+        try: comp.Unlock()
+        except Exception: pass
+        try: resolve.OpenPage("edit")
+        except Exception: pass
+        return False
+
+
+def _build_ck_fusion_comp_v2(timeline_item, sidecar_paths, render_in=None, render_dur=None, loader_clip_offset=0):
+    """Build organized Fusion comp with labeled nodes and override merge points.
+
+    LAYOUT (no crossing lines, left-to-right flow):
+
+    Row 0 (Color):  CK_RGB -> CK_COLOR_FIX -> CK_COMBINE -> MediaOut
+    Row 1 (Matte):  CK_COMBINED -> CK_EDGE_CHOKE -> SAM_OVERRIDE -> CK_OVERRIDE -> (up to CK_COMBINE)
+    Row 2 (Manual):  SAM_ALPHA (connected to SAM_OVERRIDE fg, inactive)
+                     CK_ALPHA (connected to CK_OVERRIDE fg, inactive)
+    Row 3 (Notes):  Instructions note
+    """
+    if not timeline_item:
+        log("Fusion comp: timeline_item is None")
+        return False
+    if not sidecar_paths.get("ck_rgb"):
+        log("Fusion comp: no CK RGB sidecar path")
+        return False
+
+    try:
+        comp = timeline_item.GetFusionCompByIndex(1)
+        if comp is None:
+            try:
+                comp = timeline_item.AddFusionComp()
+                log("Fusion comp: created new comp")
+            except Exception as _ae:
+                log(f"Fusion comp: AddFusionComp failed: {_ae}")
+                return False
+    except Exception as e:
+        log(f"Fusion comp: GetFusionCompByIndex failed: {e}")
+        return False
+    if not comp:
+        log("Fusion comp: comp handle is None")
+        return False
+
+    try:
+        try:
+            resolve.OpenPage("fusion")
+            import time as _ft
+            for _pw in range(20):
+                if resolve.GetCurrentPage() == "fusion":
+                    break
+                _ft.sleep(0.1)
+        except Exception:
+            pass
+        comp.Lock()
+        comp.StartUndo("CK Editable Layers v3")
+
+        _ck_node_names = [
+            "CK_RGB", "CK_COLOR_FIX", "CK_COMBINED", "CK_ALPHA", "SAM_ALPHA",
+            "REGION_ALPHA", "GARBAGE_ALPHA", "CK_MATTE_MATH", "CK_GARBAGE_GATE",
+            "CK_OVERRIDE_SAM", "CK_OVERRIDE_CK", "CK_EDGE_CHOKE", "CK_LEG_CHOKE",
+            "CK_LEG_MASK", "CK_LEG_CHOKE", "CK_CHOKE_ZONE", "CK_CHOKE_AREA",
+            "SAM_FEET_FIX", "SAM_FEET_MASK",
+            "SAM_OVERRIDE", "CK_OVERRIDE", "CK_NOTE", "ERASE_WIRE",
+            "FOUNDATION_NOTE", "MASK_1_NOTE", "MASK_2_NOTE", "ERASE_WIRE_NOTE",
+            "MASK_1", "MASK_1_AREA", "MASK_2", "MASK_2_AREA", "MASK_3", "MASK_3_AREA",
+            "CK_COMBINE", "CK_OUTPUT", "ALPHA_MAX_CK_OR_SAM",
+            "MediaOut1",
+        ]
+        for _name in _ck_node_names:
+            try:
+                _existing = comp.FindTool(_name)
+                if _existing:
+                    _existing.Delete()
+            except Exception:
+                pass
+
+        _clip_tl_start = timeline_item.GetStart()
+        comp_attrs = comp.GetAttrs() or {}
+        _comp_start = comp_attrs.get("COMPN_GlobalStart", 0)
+        _comp_end = comp_attrs.get("COMPN_GlobalEnd", 1000)
+        _comp_dur = _comp_end - _comp_start
+        _source_lo = timeline_item.GetLeftOffset() or 0
+        if render_in is not None and render_dur is not None:
+            _render_offset = (render_in - _clip_tl_start) if render_in >= _clip_tl_start else 0
+            _loader_start = _comp_start + _source_lo + _render_offset
+            _loader_end = _loader_start + render_dur - 1
+        else:
+            _loader_start = _comp_start
+            _loader_end = _comp_end
+            render_dur = _comp_dur
+        log(f"Fusion comp: comp={_comp_start}-{_comp_end}, loader={_loader_start}-{_loader_end} (dur={render_dur})")
+
+        nodes_made = []
+
+        # Color codes:
+        #   GREEN = touchable (adjustables, masks, areas, paint)
+        #   RED   = do not touch (loaders, plumbing, output)
+        _COLOR_TOUCH = {"R": 0.30, "G": 0.70, "B": 0.30}     # green
+        _COLOR_HANDS_OFF = {"R": 0.80, "G": 0.25, "B": 0.25} # red
+        # Legacy aliases (kept so existing _tint calls below still work):
+        _COLOR_SAM = _COLOR_HANDS_OFF
+        _COLOR_CK = _COLOR_HANDS_OFF
+        _COLOR_ADJ = _COLOR_TOUCH
+        _COLOR_ERASE = _COLOR_TOUCH
+        _COLOR_OUT = _COLOR_HANDS_OFF
+
+        def _tint(node, color):
+            # Try multiple Fusion API forms for tile color (varies by version)
+            try: node.TileColor = color
+            except Exception: pass
+            try: node.SetAttrs({"TileColor": color})
+            except Exception: pass
+            try: node.SetAttrs({"TOOLB_TileColor": color})
+            except Exception: pass
+
+        def _add_loader(name, path, x, y, color=None):
+            node = comp.AddTool("Loader", x, y)
+            if not node:
+                log(f"Fusion comp: AddTool('Loader') failed for {name}")
+                return None
+            _p = str(path).replace("\\", "/")
+            try:
+                node.Clip = _p
+                node.SetAttrs({"TOOLS_Name": name})
+                if color: _tint(node, color)
+                node.SetInput("GlobalIn", _loader_start)
+                node.SetInput("GlobalOut", _loader_end)
+                node.SetInput("ClipTimeStart", 0)
+                node.SetInput("ClipTimeEnd", render_dur - 1)
+                node.SetInput("HoldFirstFrame", 0)
+                node.SetInput("HoldLastFrame", 0)
+                node.SetInput("Loop", 0)
+            except Exception as _le:
+                log(f"Fusion comp: Loader config for {name} failed: {_le}")
+            nodes_made.append(name)
+            return node
+
+        # === ROW 0: COLOR PATH (y=0) ===
+        ck_rgb = _add_loader("CK_RGB", sidecar_paths["ck_rgb"], 0, 0, _COLOR_CK)
+        if not ck_rgb:
+            try: comp.EndUndo(True)
+            except Exception: pass
+            try: comp.Unlock()
+            except Exception: pass
+            return False
+
+        _ck_rgb_ext = str(sidecar_paths.get("ck_rgb", "")).rsplit(".", 1)[-1].lower()
+        _needs_gamut = _ck_rgb_ext in ("png", "tif", "tiff")
+        _color_out = ck_rgb
+        if _needs_gamut:
+            _gamut = comp.AddTool("GamutConvert", 1, 0)
+            if not _gamut:
+                _gamut = comp.AddTool("Gamut", 1, 0)
+            if _gamut:
+                try:
+                    _gamut.SetAttrs({"TOOLS_Name": "CK_COLOR_FIX"})
+                    _tint(_gamut, _COLOR_CK)
+                    _gamut.SetInput("SourceSpace", "sRGB")
+                    _gamut.SetInput("RemoveGamma", 1)
+                    _gamut.ConnectInput("Input", ck_rgb.Output)
+                    _color_out = _gamut
+                    nodes_made.append("CK_COLOR_FIX")
+                except Exception as _ge:
+                    log(f"Fusion comp: GamutConvert failed ({_ge})")
+
+        # === FOUNDATION ROW (column 0): all three matte sources stacked ===
+        # User picks which one feeds the chain. Default = CK_COMBINED.
+        # To switch: delete wire from CK_COMBINED to CK_EDGE_CHOKE,
+        # drag from SAM_ALPHA or CK_ALPHA to CK_EDGE_CHOKE instead.
+        ck_combined = _add_loader("CK_COMBINED", sidecar_paths.get("ck_combined", ""), 0, 2, _COLOR_TOUCH) if sidecar_paths.get("ck_combined") else None
+        # SAM_ALPHA and CK_ALPHA moved up to be visible as foundation options.
+        # Each loader also feeds its respective MASK via foreground (wires set later).
+        sam_alpha_foundation_pos = (0, 3)
+        ck_alpha_foundation_pos = (0, 4)
+        _matte_source = ck_combined
+
+        # CK_EDGE_CHOKE: gentle universal edge shrink (whole body)
+        edge_choke = None
+        if _matte_source:
+            edge_choke = comp.AddTool("ErodeDilate", 1, 2)
+            if edge_choke:
+                try:
+                    edge_choke.SetAttrs({"TOOLS_Name": "CK_EDGE_CHOKE", "TOOLB_NameSet": True})
+                    _tint(edge_choke, _COLOR_ADJ)
+                    edge_choke.SetInput("XAmount", 0.0)
+                    edge_choke.ConnectInput("Input", _matte_source.Output)
+                    nodes_made.append("CK_EDGE_CHOKE")
+                    _matte_source = edge_choke
+                except Exception as _ece:
+                    log(f"Fusion comp: CK_EDGE_CHOKE failed: {_ece}")
+
+        # CK_CHOKE_ZONE: heavier choke limited to a region (CK_CHOKE_AREA Rectangle).
+        # Generic — user moves the rectangle to wherever their shot needs it.
+        leg_choke = None
+        leg_rect = None
+        if _matte_source:
+            leg_choke = comp.AddTool("ErodeDilate", 2, 2)
+            if leg_choke:
+                try:
+                    leg_choke.SetAttrs({"TOOLS_Name": "CK_CHOKE_ZONE", "TOOLB_NameSet": True})
+                    _tint(leg_choke, _COLOR_ADJ)
+                    leg_choke.SetInput("XAmount", 0.0)
+                    leg_choke.ConnectInput("Input", _matte_source.Output)
+                    nodes_made.append("CK_CHOKE_ZONE")
+                    # Rectangle defining where the zone-choke applies. Default to
+                    # bottom 50% as a starting point; user moves it per shot.
+                    leg_rect = comp.AddTool("RectangleMask", 2, 1)
+                    if leg_rect:
+                        try:
+                            leg_rect.SetAttrs({"TOOLS_Name": "CK_CHOKE_AREA", "TOOLB_NameSet": True})
+                            _tint(leg_rect, _COLOR_ADJ)
+                            leg_rect.SetInput("Center", {1: 0.5, 2: 0.25, 3: 0.0})
+                            leg_rect.SetInput("Width", 1.5)
+                            leg_rect.SetInput("Height", 0.5)
+                            leg_rect.SetInput("SoftEdge", 0.02)
+                            leg_choke.ConnectInput("EffectMask", leg_rect.Output)
+                            nodes_made.append("CK_CHOKE_AREA")
+                        except Exception as _lme:
+                            log(f"Fusion comp: CK_CHOKE_AREA failed: {_lme}")
+                    _matte_source = leg_choke
+                except Exception as _lce:
+                    log(f"Fusion comp: CK_CHOKE_ZONE failed: {_lce}")
+
+        # MASK_1: pre-wired SAM-source region override. Pass Through ON by default.
+        # Default Rectangle sits in the lower portion as a starting point;
+        # user moves it per shot. Layout: AREA above, MASK in middle, SAM_ALPHA below.
+        sam_feet_fix = None
+        feet_rect = None
+        if _matte_source:
+            sam_feet_fix = comp.AddTool("Merge", 3, 2)
+            if sam_feet_fix:
+                try:
+                    sam_feet_fix.SetAttrs({"TOOLS_Name": "MASK_1", "TOOLB_NameSet": True, "TOOLB_PassThrough": True})
+                    _tint(sam_feet_fix, _COLOR_TOUCH)
+                    sam_feet_fix.ConnectInput("Background", _matte_source.Output)
+                    nodes_made.append("MASK_1")
+                    feet_rect = comp.AddTool("RectangleMask", 3, 1)
+                    if feet_rect:
+                        try:
+                            feet_rect.SetAttrs({"TOOLS_Name": "MASK_1_AREA", "TOOLB_NameSet": True})
+                            _tint(feet_rect, _COLOR_TOUCH)
+                            feet_rect.SetInput("Center", {1: 0.5, 2: 0.125, 3: 0.0})
+                            feet_rect.SetInput("Width", 1.5)
+                            feet_rect.SetInput("Height", 0.25)
+                            feet_rect.SetInput("SoftEdge", 0.02)
+                            sam_feet_fix.ConnectInput("EffectMask", feet_rect.Output)
+                            nodes_made.append("MASK_1_AREA")
+                        except Exception as _fme:
+                            log(f"Fusion comp: MASK_1_AREA failed: {_fme}")
+                    _matte_source = sam_feet_fix
+                except Exception as _sfe:
+                    log(f"Fusion comp: MASK_1 failed: {_sfe}")
+
+        # MASK_2: pre-wired CK detail recovery slot. Pass Through ON by default.
+        # Layout: AREA above, MASK in middle, CK_ALPHA below.
+        ck_override = None
+        mask2_rect = None
+        if _matte_source:
+            ck_override = comp.AddTool("Merge", 4, 2)
+            if ck_override:
+                try:
+                    ck_override.SetAttrs({"TOOLS_Name": "MASK_2", "TOOLB_NameSet": True, "TOOLB_PassThrough": True})
+                    _tint(ck_override, _COLOR_TOUCH)
+                    ck_override.ConnectInput("Background", _matte_source.Output)
+                    nodes_made.append("MASK_2")
+                    mask2_rect = comp.AddTool("RectangleMask", 4, 1)
+                    if mask2_rect:
+                        try:
+                            mask2_rect.SetAttrs({"TOOLS_Name": "MASK_2_AREA", "TOOLB_NameSet": True})
+                            _tint(mask2_rect, _COLOR_TOUCH)
+                            mask2_rect.SetInput("Center", {1: 0.5, 2: 0.75, 3: 0.0})
+                            mask2_rect.SetInput("Width", 0.3)
+                            mask2_rect.SetInput("Height", 0.3)
+                            mask2_rect.SetInput("SoftEdge", 0.02)
+                            ck_override.ConnectInput("EffectMask", mask2_rect.Output)
+                            nodes_made.append("MASK_2_AREA")
+                        except Exception as _m2e:
+                            log(f"Fusion comp: MASK_2_AREA failed: {_m2e}")
+                    _matte_source = ck_override
+                except Exception as _coe:
+                    log(f"Fusion comp: MASK_2 failed: {_coe}")
+
+        # ERASE_WIRE: Paint node on matte path, pre-configured for wire removal.
+        # Default Pass Through ON. Brush black, small size, moderate softness,
+        # circular shape. User toggles off, paints along wire to kill alpha.
+        wire_paint = None
+        if _matte_source:
+            try:
+                wire_paint = comp.AddTool("Paint", 5, 2)
+                if wire_paint:
+                    wire_paint.SetAttrs({"TOOLS_Name": "ERASE_WIRE", "TOOLB_NameSet": True, "TOOLB_PassThrough": True})
+                    _tint(wire_paint, _COLOR_ERASE)
+                    wire_paint.ConnectInput("Input", _matte_source.Output)
+                    # Pre-configure for wire removal:
+                    # - black color (erase alpha)
+                    # - small brush size (~0.005, wire-width at 1080p)
+                    # - moderate softness for clean edges
+                    # - circular brush shape (default 0)
+                    try:
+                        # Color: pure black (Apply Mode below does the erasing)
+                        wire_paint.SetInput("ColorRed", 0.0)
+                        wire_paint.SetInput("ColorGreen", 0.0)
+                        wire_paint.SetInput("ColorBlue", 0.0)
+                        wire_paint.SetInput("ColorAlpha", 1.0)
+                        # Brush: thin (wire-width at 1080p), soft for blended edges, circular
+                        wire_paint.SetInput("BrushSize", 0.005)
+                        wire_paint.SetInput("BrushSoftness", 0.5)
+                        wire_paint.SetInput("BrushShape", 0)
+                        # Apply Mode: Color (paint solid color = paint black on matte)
+                        wire_paint.SetInput("ApplyMode", "Color")
+                        # All frames so the stroke persists across the clip
+                        wire_paint.SetInput("StrokeAnimation", "AllFrames")
+                        # All channels (matte is grayscale, paint affects R G B A together)
+                        wire_paint.SetInput("PaintChannels", 1)
+                    except Exception as _wpc:
+                        log(f"Fusion comp: ERASE_WIRE config skipped: {_wpc}")
+                    nodes_made.append("ERASE_WIRE")
+                    _matte_source = wire_paint
+            except Exception as _wpe:
+                log(f"Fusion comp: ERASE_WIRE failed: {_wpe}")
+        sam_override = None  # legacy variable, no longer used
+
+        # === ROW 0 continued: CK_COMBINE + MediaOut ===
+        ck_combine = None
+        if _color_out and _matte_source:
+            ck_combine = comp.AddTool("Custom", 6, 0)
+            if ck_combine:
+                try:
+                    ck_combine.SetAttrs({"TOOLS_Name": "CK_COMBINE", "TOOLB_NameSet": True})
+                    _tint(ck_combine, _COLOR_OUT)
+                    ck_combine.SetInput("RedExpression", "r1")
+                    ck_combine.SetInput("GreenExpression", "g1")
+                    ck_combine.SetInput("BlueExpression", "b1")
+                    ck_combine.SetInput("AlphaExpression", "r2")
+                    ck_combine.ConnectInput("Image1", _color_out.Output)
+                    ck_combine.ConnectInput("Image2", _matte_source.Output)
+                except Exception as _cbe:
+                    log(f"Fusion comp: CK_COMBINE setup failed: {_cbe}")
+                nodes_made.append("CK_COMBINE")
+
+        mo = comp.AddTool("MediaOut", 7, 0)
+        if mo:
+            try:
+                _tint(mo, _COLOR_OUT)
+                _final = ck_combine if ck_combine else _color_out
+                mo.ConnectInput("Input", _final.Output)
+            except Exception as _moe:
+                log(f"Fusion comp: MediaOut setup failed: {_moe}")
+            nodes_made.append("MediaOut")
+
+        # === FOUNDATION ROW continued: SAM_ALPHA and CK_ALPHA at front ===
+        # They are foundation options AND they feed MASK_1/MASK_2 foregrounds.
+        sam_alpha = _add_loader("SAM_ALPHA", sidecar_paths.get("sam_alpha", ""), *sam_alpha_foundation_pos, _COLOR_TOUCH) if sidecar_paths.get("sam_alpha") else None
+        ck_alpha = _add_loader("CK_ALPHA", sidecar_paths.get("ck_alpha", ""), *ck_alpha_foundation_pos, _COLOR_TOUCH) if sidecar_paths.get("ck_alpha") else None
+
+        # SAM_ALPHA feeds MASK_1 foreground (junk killer, pre-positioned at feet)
+        if sam_alpha and sam_feet_fix:
+            try:
+                sam_feet_fix.ConnectInput("Foreground", sam_alpha.Output)
+            except Exception:
+                pass
+
+        # CK_ALPHA feeds MASK_2 foreground (detail recovery)
+        if ck_alpha and ck_override:
+            try:
+                ck_override.ConnectInput("Foreground", ck_alpha.Output)
+            except Exception:
+                pass
+
+        # FOUNDATION_NOTE: next to the stacked foundation loaders, explains
+        # the three choices and how to switch base matte.
+        try:
+            fn = comp.AddTool("Note", 1, 3)
+            if fn:
+                fn.SetAttrs({"TOOLS_Name": "FOUNDATION_NOTE", "TOOLB_NameSet": True})
+                _tint(fn, _COLOR_TOUCH)
+                fn.SetInput("Comments",
+                    "PICK YOUR FOUNDATION MATTE\n"
+                    "==========================\n\n"
+                    "Three alpha mattes stacked on the left.\n"
+                    "All three are real images you can SEE.\n\n"
+                    "PREVIEW EACH ONE:\n"
+                    "  Click the small dot below each loader name\n"
+                    "  (the LEFT dot loads it into Viewer 1, RIGHT\n"
+                    "  dot into Viewer 2). Compare them side by side.\n"
+                    "  Pick the one that best fits your shot.\n\n"
+                    "THE THREE OPTIONS:\n\n"
+                    "  CK_COMBINED (default, already wired)\n"
+                    "    Smart blend - CK detail merged with SAM's\n"
+                    "    garbage gate. Background junk is killed,\n"
+                    "    hair and soft edges where SAM agrees.\n"
+                    "    Works for ~90% of shots out of the box.\n\n"
+                    "  SAM_ALPHA\n"
+                    "    Pure body shape from SAM2. Hard clean edge,\n"
+                    "    no junk anywhere, no hair detail. Best when\n"
+                    "    CK is keying things it shouldn't (rope, mat,\n"
+                    "    gear, attached cables).\n\n"
+                    "  CK_ALPHA\n"
+                    "    Pure neural net alpha. Soft hair wisps and\n"
+                    "    fine edges SAM cuts off, but ALSO keeps any\n"
+                    "    non-green junk in the scene. Best for clean\n"
+                    "    plates with no extra equipment in shot.\n\n"
+                    "TO SWITCH FOUNDATION:\n"
+                    "  1. Click the wire going from CK_COMBINED into\n"
+                    "     the chain (the line ending at CK_EDGE_CHOKE\n"
+                    "     input). Press DELETE.\n"
+                    "  2. Drag from SAM_ALPHA (or CK_ALPHA) output\n"
+                    "     square to CK_EDGE_CHOKE's input triangle.\n"
+                    "  3. Done. New foundation drives the rest of\n"
+                    "     the chain (chokes, masks, paint).\n\n"
+                    "WHY THIS IS BETTER THAN ROTOSCOPING:\n"
+                    "  All edits happen on the ALPHA MATTE, not on\n"
+                    "  the source video. The original plate is never\n"
+                    "  re-rendered, never degraded, never resampled.\n"
+                    "  You get the highest possible image quality\n"
+                    "  while still cleaning up the matte to taste."
+                )
+                nodes_made.append("FOUNDATION_NOTE")
+        except Exception as _fne:
+            log(f"Fusion comp: FOUNDATION_NOTE failed: {_fne}")
+
+        # === PER-NODE MINI-NOTES (positioned next to their target node) ===
+        def _add_mini_note(name, x, y, text):
+            try:
+                n = comp.AddTool("Note", x, y)
+                if n:
+                    n.SetAttrs({"TOOLS_Name": name, "TOOLB_NameSet": True})
+                    _tint(n, _COLOR_TOUCH)
+                    n.SetInput("Comments", text)
+                    nodes_made.append(name)
+            except Exception as _mne:
+                log(f"Fusion comp: {name} failed: {_mne}")
+
+        if sam_feet_fix:
+            _add_mini_note("MASK_1_NOTE", 3, 5,
+                "MASK_1 (SAM = subtract junk)\n"
+                "----------------------------\n"
+                "Replaces matte with pure SAM in a region you draw.\n"
+                "SAM excludes wires, tape, mats, attached gear -\n"
+                "so anything SAM doesn't see goes black there.\n\n"
+                "1. Click MASK_1. Inspector: click bypass dot to\n"
+                "   activate (Pass Through OFF).\n"
+                "2. Click MASK_1_AREA. Move/resize Rectangle to\n"
+                "   the area you want to clean.\n"
+                "3. Keyframe Rectangle Center if subject moves."
+            )
+        if ck_override:
+            _add_mini_note("MASK_2_NOTE", 4, 5,
+                "MASK_2 (CK = add back detail)\n"
+                "-----------------------------\n"
+                "Replaces matte with pure CK in a region you draw.\n"
+                "CK has hair wisps and soft edges SAM cuts off.\n"
+                "Use where SAM cut too tight.\n\n"
+                "1. Click MASK_2. Inspector: click bypass dot to\n"
+                "   activate (Pass Through OFF).\n"
+                "2. Click MASK_2_AREA. Move/resize Rectangle to\n"
+                "   the area you want to recover.\n"
+                "3. Keyframe Rectangle Center if subject moves."
+            )
+        if wire_paint:
+            _add_mini_note("ERASE_WIRE_NOTE", 5, 5,
+                "ERASE_WIRE (wire / pole removal on the matte)\n"
+                "---------------------------------------------\n"
+                "Brush pre-set: BLACK, thin, soft, circular,\n"
+                "Apply Mode = Color, All Frames.\n\n"
+                "STEPS:\n"
+                "1. Click ERASE_WIRE. Inspector: toggle\n"
+                "   Pass Through OFF (the red dot at top).\n"
+                "2. In viewer's left-edge toolbar, click the\n"
+                "   PAINT icon (looks like a brush).\n"
+                "3. In viewer's top toolbar, pick stroke type:\n"
+                "   POLYLINE STROKE = click points along wire.\n"
+                "   MULTI STROKE    = freehand drag.\n"
+                "4. Click points along the wire on the matte.\n"
+                "   Each click extends the stroke.\n"
+                "5. Wire pixels go black = transparent in output.\n\n"
+                "ANIMATE (for moving wires):\n"
+                "  In Inspector, right-click 'Stroke Animation'\n"
+                "  -> Animate. Then move time, redraw stroke at\n"
+                "  new wire position. Keyframes are auto-set."
+            )
+
+        # === ROW 3: MASTER INSTRUCTIONS NOTE (y=5) ===
+        try:
+            note = comp.AddTool("Note", 1, 5)
+            if note:
+                note.SetAttrs({"TOOLS_Name": "CK_NOTE", "TOOLB_NameSet": True})
+                note.SetInput("Comments",
+                    "CORRIDORKEY - Node Guide\n"
+                    "========================\n\n"
+                    "COLOR KEY:\n"
+                    "  GREEN = You can touch this. Tune it, toggle it,\n"
+                    "          move it, keyframe it.\n"
+                    "  RED   = Do not touch. Plumbing and output - if\n"
+                    "          you change it the key breaks.\n\n"
+                    "PHILOSOPHY:\n"
+                    "  The base matte (CK_COMBINED) already mixes CK detail with\n"
+                    "  SAM's garbage gate. Background junk is killed. You only\n"
+                    "  need to fix issues on the SUBJECT - everything else handled.\n\n"
+                    "  All adjustable nodes ship OFF. Activate only what you need.\n\n"
+                    "THE THREE MATTE SOURCES (what's what):\n"
+                    "  CK_COMBINED (the default base, in the chain)\n"
+                    "    The smart blend. CK x SAM with garbage gate baked in.\n"
+                    "    Junk outside the body is killed. Hair/edge detail kept\n"
+                    "    where SAM agrees. Good for ~90% of frames as-is.\n\n"
+                    "  SAM_ALPHA (loader, fed into MASK_1)\n"
+                    "    Pure body shape from SAM2. Hard binary edge, no hair\n"
+                    "    detail, no junk. Excludes wires, tape, floor, gear\n"
+                    "    that's not part of the body. Use when CK_COMBINED\n"
+                    "    keeps stuff it shouldn't (floor tape, wire attached\n"
+                    "    to body, mat seam at feet).\n\n"
+                    "  CK_ALPHA (loader, fed into MASK_2)\n"
+                    "    Pure neural net alpha. Has hair wisps and soft edges\n"
+                    "    SAM cuts off, but also keeps non-green junk (cables,\n"
+                    "    dark mat). Use when SAM cut too tight (hair strands,\n"
+                    "    harness strap, anything thin attached to body).\n\n"
+                    "  Rule of thumb in a mask region:\n"
+                    "    MASK_1 (SAM) = SUBTRACT  - removes junk SAM excludes\n"
+                    "    MASK_2 (CK)  = ADD BACK  - restores detail SAM cut\n\n"
+                    "EDGE TUNING (off by default):\n"
+                    "  CK_EDGE_CHOKE - Light shrink, whole frame. Default 0.\n"
+                    "    Push to -0.001 / -0.002 for dark edge fringe everywhere.\n"
+                    "  CK_CHOKE_ZONE - Heavier shrink, only inside CK_CHOKE_AREA.\n"
+                    "    Push to -0.002 / -0.005 for heavier fringe in one area.\n"
+                    "    Move CK_CHOKE_AREA Rectangle to wherever your shot\n"
+                    "    needs the heavier choke (default: bottom 50%).\n\n"
+                    "REGION MASKS (Pass Through ON by default = bypassed):\n"
+                    "  Each mask has an AREA (Rectangle) above it.\n"
+                    "  To use any mask:\n"
+                    "    1. Click MASK_N - in Inspector, toggle Pass Through OFF.\n"
+                    "    2. Click MASK_N_AREA - move/resize the Rectangle to\n"
+                    "       cover the area you want to fix.\n"
+                    "    3. Keyframe Rectangle position for moving subjects.\n\n"
+                    "  MASK_1 (BLUE) - replaces matte with SAM in the area.\n"
+                    "    Pre-positioned at feet. Kills floor tape, mat seam,\n"
+                    "    wires touching the body, anything SAM excludes.\n\n"
+                    "  MASK_2 (ORANGE) - replaces matte with CK in the area.\n"
+                    "    Pre-positioned upper frame. Recovers hair detail,\n"
+                    "    harness straps, anything SAM cut too tight.\n\n"
+                    "ERASE_WIRE (RED, Pass Through ON by default):\n"
+                    "  Paint node on the MATTE (not the video).\n"
+                    "  Use when masks aren't precise enough for detail work.\n"
+                    "    1. Toggle Pass Through OFF in the Inspector.\n"
+                    "    2. In the viewer toolbar, pick Paint mode.\n"
+                    "    3. BLACK brush = erase (kills alpha = transparent).\n"
+                    "       WHITE brush = restore (brings alpha back).\n"
+                    "    4. Each stroke can be keyframed for moving objects.\n"
+                    "  Good for: thin wires running across the body.\n\n"
+                    "READ-ONLY (don't touch):\n"
+                    "  CK_RGB - Foreground color from neural net\n"
+                    "  CK_COLOR_FIX - sRGB gamma correction\n"
+                    "  CK_COMBINED - Base matte (CK + SAM garbage gate)\n"
+                    "  CK_COMBINE - Joins color + matte into final output"
+                )
+                nodes_made.append("CK_NOTE")
+        except Exception:
+            pass
+
+        try: comp.EndUndo(True)
+        except Exception: pass
+        try: comp.Unlock()
+        except Exception: pass
+        try: resolve.OpenPage("edit")
+        except Exception: pass
+        if mo:
+            try: comp.SetActiveTool(mo)
+            except Exception: pass
+        log(f"Fusion comp built: {len(nodes_made)} nodes -- {', '.join(nodes_made)}")
+        return True
+    except Exception as e:
+        log(f"Fusion comp error: {type(e).__name__}: {e}")
+        try: comp.EndUndo(False)
+        except Exception: pass
+        try: comp.Unlock()
+        except Exception: pass
+        try: resolve.OpenPage("edit")
+        except Exception: pass
+        return False
+
+
+# WHAT IT DOES: High-level wrapper called after PROCESS RANGE completes when the
+#   user picked OutputMode=Fusion Comp. Resolves the source timeline item, picks
+#   first-frame sidecar paths, and calls the appropriate Fusion comp builder.
+# DEPENDS-ON: timeline global, _build_ck_fusion_comp / _build_ck_fusion_comp_v2.
+# AFFECTS: Adds Fusion comp to the source clip (the clip the operator pointed at).
+def _build_ck_fusion_comp_after_render(_timeline, source_track_idx, ofs, sam_ofs,
+                                       sidecar_first_paths=None,
+                                       render_in=None, render_dur=None):
+    """Resolve the source clip and build the Fusion comp on it."""
+    if not _timeline:
+        log("Fusion comp after-render: no timeline global")
+        return False
+    tl_item = None
+    try:
+        if hasattr(_timeline, "GetCurrentVideoItem"):
+            tl_item = _timeline.GetCurrentVideoItem()
+    except Exception:
+        tl_item = None
+    if tl_item is None:
+        try:
+            items_on_track = _timeline.GetItemListInTrack("video", int(source_track_idx)) or []
+            if items_on_track:
+                tl_item = items_on_track[0]
+        except Exception as _le:
+            log(f"Fusion comp after-render: source-track lookup failed: {_le}")
+    if tl_item is None:
+        log("Fusion comp after-render: could not resolve source timeline item")
+        return False
+    if sidecar_first_paths and sidecar_first_paths.get("ck_rgb"):
+        return _build_ck_fusion_comp_v2(tl_item, sidecar_first_paths,
+                                         render_in=render_in, render_dur=render_dur)
+    ck_first = (ofs[0] if ofs else None)
+    sam_first = (sam_ofs[0] if sam_ofs else None)
+    return _build_ck_fusion_comp(tl_item, ck_first,
+                                 ck_alpha_first_path=None,
+                                 sam_alpha_first_path=sam_first)
+
+
 def on_process_range(ev):
     # WHAT IT DOES: Starts range processing in a background thread so the UI stays
     #   live and the Cancel button works between frames.
@@ -3573,21 +5032,52 @@ def on_process_range(ev):
     log("=" * 35)
     log("PROCESS RANGE")
     if not timeline or not media_pool: status("ERROR: No timeline!"); return
-    # Find the clip at the current playhead — same logic as process_current_frame
     cf, fps = get_current_frame_info()
     source_track = 1
     clip = None
     track_count = timeline.GetTrackCount("video")
-    for ti in range(1, track_count + 1):
-        clips_on_track = timeline.GetItemListInTrack("video", ti) or []
-        for c in clips_on_track:
-            if c.GetStart() <= cf < c.GetEnd():
-                source_track = ti
-                clip = c
+    # v1.0 fix 2026-05-20: honor the user's selected clip first. Resolve's
+    # GetCurrentVideoItem() returns the timeline item highlighted on the
+    # timeline — that's what CK should key. Old bottom-up track walk would
+    # pick a still photo on V1 when the green screen was on V2+.
+    try:
+        sel = timeline.GetCurrentVideoItem()
+    except Exception:
+        sel = None
+    if sel is not None:
+        # Locate which track the selected clip lives on (needed for source_track).
+        for ti in range(1, track_count + 1):
+            clips_on_track = timeline.GetItemListInTrack("video", ti) or []
+            for c in clips_on_track:
+                try:
+                    same = (c.GetUniqueId() == sel.GetUniqueId())
+                except Exception:
+                    same = (c is sel)
+                if same:
+                    source_track = ti
+                    clip = c
+                    break
+            if clip is not None:
                 break
-        if clip:
-            break
-    if not clip: status("ERROR: No clip at playhead!"); return
+        if clip is None:
+            # Selected item not found in track list (shouldn't happen) — use it anyway.
+            clip = sel
+    if clip is None:
+        # Fallback: walk tracks bottom-up for clip at playhead.
+        for ti in range(1, track_count + 1):
+            clips_on_track = timeline.GetItemListInTrack("video", ti) or []
+            for c in clips_on_track:
+                if c.GetStart() <= cf < c.GetEnd():
+                    source_track = ti
+                    clip = c
+                    break
+            if clip:
+                break
+    if not clip: status("ERROR: No clip selected — click a clip in the timeline first"); return
+    _is_ramped, _ramp_reason = _is_clip_retimed(clip, timeline_fps=fps)
+    if _is_ramped:
+        _warn_speed_ramp(_ramp_reason)
+        return
     # v1.0 two-mask track stacking: never overwrite an existing higher track.
     # CK matte lands on max(source, highest_used) + 1, SAM matte on +2 (decided
     # in _do_import). source_track + 1 used to be the hardcode, which would
@@ -3601,13 +5091,41 @@ def on_process_range(ev):
     in_f, out_f = max(in_f, cs), min(out_f, ce)
     if out_f <= in_f: status("Invalid range!"); return
     dur = out_f - in_f
-    log(f"Range: {in_f}-{out_f} ({dur} frames)")
+    _fr_in_raw = frame_range.get("in_frame")
+    _fr_out_raw = frame_range.get("out_frame")
+    log(f"Range: in_f={in_f} out_f={out_f} dur={dur} cs={cs} ce={ce} frame_range_in={_fr_in_raw} frame_range_out={_fr_out_raw}")
     mpi = clip.GetMediaPoolItem()
     props = mpi.GetClipProperty() if mpi else {}
     fp = props.get("File Path", "")
     ss = clip.GetLeftOffset()
+    log(f"Range: ss(LeftOffset)={ss} fp={fp[:80]}")
+    try:
+        _tl_start = timeline.GetStartFrame() if timeline else "N/A"
+    except Exception:
+        _tl_start = "err"
+    _diag_early = f"cs={cs} ce={ce} ss={ss} in_f={in_f} tl_start={_tl_start} fp={fp}\n"
+    try:
+        Path(r"K:\C_key test\ck_diag.txt").write_text(_diag_early, encoding="utf-8")
+    except Exception:
+        pass
     settings = _merge_live_params(get_settings())
-    cn = Path(fp).stem
+    _output_mode_pre = int(settings.get("output_mode", 0))
+    if _output_mode_pre == 2:
+        _est_mb_per_frame = 103
+        _est_total_gb = (dur * _est_mb_per_frame) / 1024.0
+        try:
+            _out_drive = Path(items["OutputPath"].Text).resolve().drive or "C:"
+            _free_bytes = shutil.disk_usage(_out_drive).free
+            _free_gb = _free_bytes / (1024**3)
+            if _est_total_gb > _free_gb * 0.9:
+                status(f"ABORT: ~{_est_total_gb:.0f}GB needed, only {_free_gb:.0f}GB free on {_out_drive}")
+                log(f"Disk space abort: {_est_total_gb:.1f}GB needed, {_free_gb:.1f}GB free")
+                return
+            log(f"Disk estimate: {_est_total_gb:.1f}GB for {dur} frames ({_free_gb:.1f}GB free)")
+        except Exception as _dse:
+            log(f"Disk space check skipped: {_dse}")
+    import re as _re_cn2
+    cn = _re_cn2.sub(r'[^\w.-]', '_', Path(fp).stem)
     # 2026-05-14: each PROCESS RANGE writes to its own timestamped subdir so the
     # new render never collides with PNG files locked by MediaPool from a prior
     # render. Resolve's MediaPool holds file handles on imported sequence clips;
@@ -3625,28 +5143,50 @@ def on_process_range(ev):
     # path — skip_braw_exe=True so we don't waste a 30s timeout per range probing a non-BRAW
     # file with braw-decode.exe.
     braw_frames_dir = None
-    _is_hevc_clip = _is_hevc_file(fp)
-    if fp.lower().endswith(('.braw', '.cin', '.dng', '.ari')) or _is_hevc_clip:
+    _is_hevc_clip = _is_hevc_file(fp, mpi=mpi)
+    if _is_hevc_clip:
+        # v1.0 fix 2026-05-20: HEVC range export via PyAV. ~20-40x faster than the
+        # Resolve still-export path (~0.05s/frame vs ~2s/frame). PyAV samples by
+        # TIME so FPS conform is handled automatically (no broken src-frame math).
+        _src_fps_range = _source_fps_from_props(props, fps)
+        _source_t_start = (ss / _src_fps_range) + (max(0, in_f - cs) / float(fps))
+        n_output = int(out_f - in_f)
+        log(f"HEVC range detected — PyAV decode, source_t_start={_source_t_start:.3f}s, n={n_output} @ {fps}fps (src_fps={_src_fps_range})")
+        status(f"Decoding HEVC range ({n_output} frames) via PyAV...")
+        braw_frames_dir = _export_hevc_range_via_pyav(
+            fp, _source_t_start, n_output, fps, status_cb=status,
+        )
+        log(f"PROBE A: PyAV returned braw_frames_dir={braw_frames_dir}")
+        if braw_frames_dir is None:
+            # PyAV failed — fall back to the original Resolve still-export path.
+            log("PyAV HEVC decode failed — falling back to Resolve still export")
+            status("PyAV failed — Resolve still-export fallback (slow)...")
+            src_start = ss + (in_f - cs)
+            src_end   = ss + (out_f - cs) + 1
+            braw_frames_dir = _export_braw_range_to_frames(
+                clip, src_start, src_end, timeline, in_f, fps,
+                skip_braw_exe=True,
+            )
+            if braw_frames_dir is None:
+                status("ERROR: HEVC range export failed — see log"); return
+        log("PROBE B: about to glob TIFFs")
+        n_tifs = len(sorted(Path(braw_frames_dir).glob("*.tif*")))
+        log(f"PROBE C: glob done, n_tifs={n_tifs}")
+        log(f"HEVC range export done: {n_tifs} TIFF frames in {Path(braw_frames_dir).name}")
+    elif fp.lower().endswith(('.braw', '.cin', '.dng', '.ari')):
         src_start = ss + (in_f - cs)
         src_end   = ss + (out_f - cs) + 1  # +1: Resolve timeline end is exclusive
-        _kind = "HEVC" if _is_hevc_clip else "BRAW"
-        log(f"{_kind} detected — exporting source frames {src_start}-{src_end} to TIFF sequence...")
-        status(f"Exporting {_kind} range ({dur} frames) — please wait...")
-        # Pass the CLIP (timeline item), not the MediaPoolItem. The wrapper
-        # expects to call .GetMediaPoolItem() on its arg to extract the media.
-        # mpi here was already extracted via clip.GetMediaPoolItem() above
-        # (line ~3126), so passing it instead silently broke the fast BRAW
-        # exe path on every PROCESS RANGE since 2026-04-29 (commit 241aaa44)
-        # — fell back to slow Resolve seek+still for ~12 days. Berto noticed
-        # 2026-05-11.
+        log(f"BRAW detected — exporting source frames {src_start}-{src_end} to TIFF sequence...")
+        status(f"Exporting BRAW range ({dur} frames) — please wait...")
+        # Pass the CLIP (timeline item), not the MediaPoolItem.
         braw_frames_dir = _export_braw_range_to_frames(
             clip, src_start, src_end, timeline, in_f, fps,
-            skip_braw_exe=_is_hevc_clip,
+            skip_braw_exe=False,
         )
         if braw_frames_dir is None:
-            status(f"ERROR: {_kind} range export failed — see log"); return
+            status("ERROR: BRAW range export failed — see log"); return
         n_tifs = len(sorted(Path(braw_frames_dir).glob("*.tif*")))
-        log(f"{_kind} range export done: {n_tifs} TIFF frames in {Path(braw_frames_dir).name}")
+        log(f"BRAW range export done: {n_tifs} TIFF frames in {Path(braw_frames_dir).name}")
     # Kill viewer on main thread before background thread opens VideoCapture.
     # Reuses on_kill_viewer to avoid global scoping issues with nested _run() closure.
     on_kill_viewer(None)
@@ -3753,6 +5293,7 @@ def on_process_range(ev):
         try:
             ofs = []
             sam_ofs = []  # v1.0 two-mask sidecar — populated when SAM is active
+            _combined_ofs = []
             pr = 0
             st = time.time()
             try:
@@ -3813,13 +5354,12 @@ def on_process_range(ev):
                     except Exception as _ge:
                         log(f"SAM2 gate load failed: {_ge}")
 
+            _sidecar_first_paths = {}
             for fidx, _buf in enumerate(_braw_tif_buffers):
                 if processing_cancelled:
                     log(f"Cancelled at frame {pr}/{dur}")
                     status(f"CANCELLED — {pr} frames saved")
                     break
-                # ON-DEMAND DECODE: read one frame from its BytesIO buffer, convert to uint8 BGR,
-                # process it, then let it fall out of scope. This keeps peak numpy RAM at 1 frame.
                 try:
                     _buf.seek(0)
                     _fd_pil = _PILImage.open(_buf).convert("RGB")
@@ -3919,59 +5459,95 @@ def on_process_range(ev):
                 # Despeckle for the rendered output (parity with viewer's render_composite).
                 mt = _apply_despeckle_to_alpha(mt, settings)
                 if fg is not None and mt is not None:
-                    _ext = _codec_extension(settings.get("output_codec", 0))
-                    # OutputContent: 0=Combined, 1=Both, 2=CK only, 3=SAM only.
-                    _content = int(settings.get("output_content", 0))
-                    _write_ck = _content in (1, 2)  # both / CK-only
-                    _write_sam = _content in (1, 3) and _sam_matte_v1 is not None  # both / SAM-only
-                    _write_combined = _content == 0
-                    if _write_combined:
-                        # 1d648e5 recipe (the actual perfect blend, NOT 9093bb8
-                        # CFM): alpha * dilate(SAM, margin) + Gaussian feather.
-                        # Memory [[corridorkey_subtract_is_simple_multiply]].
-                        _mt_2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
-                        _mt_for_save = _mt_2d
+                    _output_mode = int(settings.get("output_mode", 0))
+                    # Editable Layers (Fusion Comp): write sidecars + clean matte.
+                    if _output_mode == 2:
+                        _sc_paths = _write_fusion_sidecars(
+                            fg, mt, _sam_union, fr, settings, od, cn, pr)
+                        if not _sidecar_first_paths and _sc_paths:
+                            _sidecar_first_paths = dict(_sc_paths)
+                        if _sc_paths.get("ck_rgb"):
+                            ofs.append(_sc_paths["ck_rgb"])
+                        if _sc_paths.get("sam_alpha"):
+                            sam_ofs.append(_sc_paths["sam_alpha"])
+                        _mt_clean = mt[:, :, 0] if len(mt.shape) == 3 else mt
                         if _sam_union is not None:
                             try:
-                                from sam2_combine import apply_sam2_gate_subtract
-                                _mt_for_save = apply_sam2_gate_subtract(
-                                    _mt_2d, _sam_union,
-                                    buffer_px=int(settings.get("sam2_margin", 20) or 20),
-                                    feather_px=4,
-                                )
-                            except Exception as _mge:
-                                log(f"BRAW Combined merge failed (CK alone): {_mge}")
-                                _mt_for_save = _mt_2d
-                            # 2026-05-19: apply GARBAGE MATTE to range-render output too.
+                                _mt_clean = merge_ck_with_sam_active(
+                                    _mt_clean, _sam_union, source_rgb=fr,
+                                    proximity_px=int(settings.get("edge_guard_px", 7)))
+                            except Exception: pass
+                            try: _mt_clean = _apply_shirt_rescue(_mt_clean, _sam_union, fr)
+                            except Exception: pass
                             try:
                                 if not bool(settings.get("garbage_bypass", False)):
-                                    _ge_r = int(settings.get("garbage_expand_px", 0))
-                                    _gf_r = int(settings.get("garbage_feather_px", 0))
-                                    _gyt_r = int(settings.get("garbage_y_top_pct", 0))
-                                    _gyb_r = int(settings.get("garbage_y_bot_pct", 100))
-                                    if _ge_r > 0 or _gyt_r > 0 or _gyb_r < 100:
-                                        from corridorkey_sam_merge import compute_garbage_matte as _cgm_r
-                                        _gm_r = _cgm_r(_sam_union, expand_px=_ge_r, feather_px=_gf_r,
-                                                       y_top_pct=_gyt_r, y_bot_pct=_gyb_r)
-                                        if _gm_r is not None and _gm_r.shape[:2] == _mt_for_save.shape[:2]:
-                                            if _mt_for_save.ndim == 3:
-                                                _mt_for_save = (_mt_for_save.astype(np.float32) * _gm_r[..., None]).astype(_mt_for_save.dtype)
-                                            else:
-                                                _mt_for_save = (_mt_for_save.astype(np.float32) * _gm_r).astype(_mt_for_save.dtype)
-                                        log(f"BRAW range: garbage matte applied (expand={_ge_r}, y={_gyt_r}-{_gyb_r})")
-                            except Exception as _gm_e:
-                                log(f"BRAW range garbage matte failed (non-fatal): {_gm_e}")
-                        op = od / f"CK_{cn}_{pr:06d}{_ext}"
-                        save_output(fg, _mt_for_save, op, settings["export_format"], codec=settings.get("output_codec", 0))
-                        ofs.append(str(op))
-                    elif _write_ck:
-                        op = od / f"CK_{cn}_{pr:06d}{_ext}"
-                        save_output(fg, mt, op, settings["export_format"], codec=settings.get("output_codec", 0))
-                        ofs.append(str(op))
-                    if _write_sam:
-                        sam_op = od / f"SAM_{cn}_{pr:06d}{_ext}"
-                        save_alpha_only(_sam_matte_v1, sam_op, codec=settings.get("output_codec", 0))
-                        sam_ofs.append(str(sam_op))
+                                    _ge_c = int(settings.get("garbage_expand_px", 0))
+                                    _gf_c = int(settings.get("garbage_feather_px", 0))
+                                    _gyt_c = int(settings.get("garbage_y_top_pct", 0))
+                                    _gyb_c = int(settings.get("garbage_y_bot_pct", 100))
+                                    if _ge_c > 0 or _gyt_c > 0 or _gyb_c < 100:
+                                        from corridorkey_sam_merge import compute_garbage_matte as _cgm_c
+                                        _gm_c = _cgm_c(_sam_union, expand_px=_ge_c, feather_px=_gf_c,
+                                                        y_top_pct=_gyt_c, y_bot_pct=_gyb_c)
+                                        if _gm_c is not None and _gm_c.shape[:2] == _mt_clean.shape[:2]:
+                                            _mt_clean = (_mt_clean.astype(np.float32) * _gm_c).astype(_mt_clean.dtype)
+                            except Exception: pass
+                        _clean_p = od / f"CK_COMBINED_{cn}.{pr:06d}.png"
+                        _m16 = (np.clip(_mt_clean, 0.0, 1.0) * 65535.0).astype(np.uint16)
+                        cv2.imwrite(str(_clean_p), cv2.merge([_m16, _m16, _m16]))
+                        if not _sidecar_first_paths.get("ck_combined"):
+                            _sidecar_first_paths["ck_combined"] = str(_clean_p)
+                    else:
+                        _ext = _codec_extension(settings.get("output_codec", 0))
+                        _content = int(settings.get("output_content", 0))
+                        _write_ck = _content in (1, 2)
+                        _write_sam = _content in (1, 3) and _sam_matte_v1 is not None
+                        _write_combined = _content == 0
+                        if _write_combined:
+                            _mt_2d = mt[:, :, 0] if len(mt.shape) == 3 else mt
+                            _mt_for_save = _mt_2d
+                            if _sam_union is not None:
+                                try:
+                                    _mt_for_save = merge_ck_with_sam_active(
+                                        _mt_2d, _sam_union, source_rgb=fr,
+                                        proximity_px=int(settings.get("edge_guard_px", 7)),
+                                    )
+                                except Exception as _mge:
+                                    log(f"BRAW Combined merge failed (CK alone): {_mge}")
+                                    _mt_for_save = _mt_2d
+                                try:
+                                    _mt_for_save = _apply_shirt_rescue(_mt_for_save, _sam_union, fr)
+                                except Exception as _sre:
+                                    log(f"Shirt rescue failed (non-fatal): {_sre}")
+                                try:
+                                    if not bool(settings.get("garbage_bypass", False)):
+                                        _ge_r = int(settings.get("garbage_expand_px", 0))
+                                        _gf_r = int(settings.get("garbage_feather_px", 0))
+                                        _gyt_r = int(settings.get("garbage_y_top_pct", 0))
+                                        _gyb_r = int(settings.get("garbage_y_bot_pct", 100))
+                                        if _ge_r > 0 or _gyt_r > 0 or _gyb_r < 100:
+                                            from corridorkey_sam_merge import compute_garbage_matte as _cgm_r
+                                            _gm_r = _cgm_r(_sam_union, expand_px=_ge_r, feather_px=_gf_r,
+                                                           y_top_pct=_gyt_r, y_bot_pct=_gyb_r)
+                                            if _gm_r is not None and _gm_r.shape[:2] == _mt_for_save.shape[:2]:
+                                                if _mt_for_save.ndim == 3:
+                                                    _mt_for_save = (_mt_for_save.astype(np.float32) * _gm_r[..., None]).astype(_mt_for_save.dtype)
+                                                else:
+                                                    _mt_for_save = (_mt_for_save.astype(np.float32) * _gm_r).astype(_mt_for_save.dtype)
+                                                log(f"BRAW range: garbage matte applied (expand={_ge_r}, y={_gyt_r}-{_gyb_r})")
+                                except Exception as _gm_e:
+                                    log(f"BRAW range garbage matte failed (non-fatal): {_gm_e}")
+                            op = od / f"CK_{cn}_{pr:06d}{_ext}"
+                            save_output(fg, _mt_for_save, op, settings["export_format"], codec=settings.get("output_codec", 0))
+                            ofs.append(str(op))
+                        elif _write_ck:
+                            op = od / f"CK_{cn}_{pr:06d}{_ext}"
+                            save_output(fg, mt, op, settings["export_format"], codec=settings.get("output_codec", 0))
+                            ofs.append(str(op))
+                        if _write_sam:
+                            sam_op = od / f"SAM_{cn}_{pr:06d}{_ext}"
+                            save_alpha_only(_sam_matte_v1, sam_op, codec=settings.get("output_codec", 0))
+                            sam_ofs.append(str(sam_op))
                 del frame  # Release this frame's numpy array before the next decode
                 pr += 1
                 el = time.time() - st
@@ -4007,12 +5583,25 @@ def on_process_range(ev):
             try: items["Progress"].Visible = False
             except Exception: pass
             if ofs and not processing_cancelled:
-                status("Importing to MediaPool...")
-                _do_import({
-                    "ofs": ofs, "output_track": output_track,
-                    "source_track": source_track, "in_f": in_f, "settings": settings,
-                    "sam_ofs": sam_ofs,  # v1.0 two-mask: alpha sidecar imported on output_track + 1
-                })
+                _om_braw = int(settings.get("output_mode", 0))
+                if _om_braw != 2:
+                    status("Importing to MediaPool...")
+                    _do_import({
+                        "ofs": ofs, "output_track": output_track,
+                        "source_track": source_track, "in_f": in_f, "settings": settings,
+                        "sam_ofs": sam_ofs,
+                    })
+                if _om_braw == 2:
+                    try:
+                        status("Building Editable Layers comp on source clip...")
+                        _ok = _build_ck_fusion_comp_after_render(
+                            timeline, source_track, ofs, sam_ofs,
+                            sidecar_first_paths=_sidecar_first_paths,
+                            render_in=in_f, render_dur=dur)
+                        status("DONE — CK layers on your clip. Play timeline." if _ok else "Fusion comp build failed — see log")
+                    except Exception as _fce:
+                        log(f"Fusion comp after-render error: {_fce}")
+                        status("Fusion comp build error — see log")
         except Exception as _e:
             log(f"Range error: {_e}")
             log(traceback.format_exc())
@@ -4066,6 +5655,7 @@ def on_process_range(ev):
 
         ofs = []
         sam_ofs = []  # v1.0 two-mask: SAM matte sidecar PNGs
+        _combined_ofs = []
         pr = 0
         st = time.time()
         try:
@@ -4112,6 +5702,7 @@ def on_process_range(ev):
             #   produces a bad result (e.g. rotated media); depends on: SESSION_DIR/sam2_mask.png
             _static_sam2_gate = None          # populated on first frame if needed
             _static_sam2_gate_loaded = False  # guard so we only attempt once
+            _sidecar_first_paths = {}
 
             # For BRAW: read TIFF files from braw_frames_dir (4:4:4, no seeking needed).
             # For normal files: seek with VideoCapture as before.
@@ -4119,7 +5710,10 @@ def on_process_range(ev):
             braw_tif_files = []
             # 2026-05-14 hang diagnostic — write tag to a temp file BEFORE _ui_queue,
             # so we can see exactly where _run stops even if PollTimer never drains.
+            _probes_enabled = os.environ.get("CK_DEBUG_PROBES", "").lower() in ("1", "true", "yes")
             def _probe(tag):
+                if not _probes_enabled:
+                    return
                 try:
                     import tempfile as _tf, os as _os, time as _tm
                     _pp = _os.path.join(_tf.gettempdir(), "ck_run_probe.txt")
@@ -4178,21 +5772,17 @@ def on_process_range(ev):
                         _tlog(f"Read failed at frame {tf} — skipping")
                         continue
                 range_idx = tf - in_f
+                if frame.dtype == np.uint16:
+                    frame = (frame >> 8).astype(np.uint8)
+                elif frame.dtype != np.uint8:
+                    frame = (frame.astype(np.float64) / float(np.iinfo(frame.dtype).max) * 255.0).clip(0, 255).astype(np.uint8)
                 _probe(f"BEFORE_CHROMA_{tf}")
                 chroma_float = chroma_hint_gen.generate_hint(frame).astype(np.float32) / 255.0
                 _probe(f"AFTER_CHROMA_{tf}")
                 ah = chroma_float
                 fr = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-                _torch_m = sys.modules.get("torch")
-                if _torch_m is not None:
-                    try: _torch_m.cuda.empty_cache()
-                    except Exception: pass
                 _probe(f"BEFORE_PROCESS_FRAME_{tf}")
                 res = proc.process_frame(fr, ah, ps)
-                _probe(f"AFTER_PROCESS_FRAME_{tf}")
-                if _torch_m is not None:
-                    try: _torch_m.cuda.synchronize()
-                    except Exception: pass
                 fg, mt = res.get("fg"), res.get("alpha")
                 if _despill_str > 0 and fg is not None:
                     fg = _cu.despill_opencv(fg, green_limit_mode="average", strength=_despill_str)
@@ -4278,156 +5868,170 @@ def on_process_range(ev):
                     log(f"Choke: {choke_px}px")
                 # Despeckle for the rendered output (parity with viewer's render_composite).
                 mt = _apply_despeckle_to_alpha(mt, settings)
+                _probe(f"DESPECKLE_DONE_{tf}_fg={fg is not None}_mt={mt is not None}")
                 if fg is not None and mt is not None:
-                    _codec = int(settings.get("output_codec", 0))
-                    _ext = _codec_extension(_codec)
-                    # OutputContent: 0=Combined, 1=Both, 2=CK only, 3=SAM only.
-                    _content = int(settings.get("output_content", 0))
-                    _write_ck = _content in (1, 2)
-                    _write_sam = _content in (1, 3) and _sam_matte_v1 is not None
-                    _write_combined = _content == 0
-                    _fmt = settings["export_format"]
-                    _m = mt[:, :, 0] if len(mt.shape) == 3 else mt
-                    _m = np.clip(_m, 0.0, 1.0).astype(np.float32)
-                    _fg_clip = np.clip(fg, 0.0, 1.0).astype(np.float32)
-                    # Pre-compute combined alpha for the Combined-output branch.
-                    # 2026-05-14: viewer-parity simple multiply. CK alpha
-                    # multiplied by process_sam_matte(SAM_union) which is
-                    # margin-dilated, softened, hole-filled SAM. Preserves
-                    # CK's fine hair detail inside the dilated SAM region
-                    # and zeros it outside (kills floor/walls). Math matches
-                    # preview_viewer_v2.py:2751 (viewer's Combined tab).
-                    if _write_combined:
-                        # 2026-05-14 (corrected #2): route through merge_ck_with_sam_active
-                        # which dispatches to merge_ck_with_sam_chroma_gated (v2.2 trimap
-                        # + Closed-Form Matting) per memory [[ck-v22-merge-architecture-stripped-by-phase-a]].
-                        # Per Berto 2026-05-14:
-                        #   "SAM only worked on green-screen areas. Made a wider mask.
-                        #    Transparent on the inside to let CK shine through. Cut
-                        #    everything outside."
-                        # That description matches the v2.2 chroma-gated merge:
-                        #   1. SAM dilated (81px) defines outer boundary
-                        #   2. SAM eroded (41px) defines definite foreground
-                        #   3. Trimap unknown band runs Closed-Form Matting solver
-                        #   4. CK injected post-solve in unknown band (hair preserved)
-                        #   5. Outside dilated SAM = hard zero (walls/floor/junk killed)
-                        # Simple multiply was SUPERSEDED — does not preserve hair past
-                        # the dilation margin and doesn't use chroma awareness in edges.
-                        _probe(f"BEFORE_COMBINED_MERGE_{tf}")
+                    _output_mode = int(settings.get("output_mode", 0))
+                    _probe(f"OUTPUT_MODE_{tf}={_output_mode}")
+                    # Editable Layers (Fusion Comp): write sidecars + clean matte.
+                    if _output_mode == 2:
+                        try:
+                            _sc_paths = _write_fusion_sidecars(
+                                fg, mt, _sam_union, fr, settings, od, cn, pr)
+                            _probe(f"SIDECAR_OK_{tf}={list(_sc_paths.keys()) if _sc_paths else 'NONE'}")
+                        except Exception as _swe:
+                            _probe(f"SIDECAR_FAIL_{tf}={type(_swe).__name__}:{_swe}")
+                            _tlog(f"Sidecar write FAILED frame {tf}: {_swe}")
+                            _sc_paths = {}
+                        if not _sidecar_first_paths and _sc_paths:
+                            _sidecar_first_paths = dict(_sc_paths)
+                        if _sc_paths.get("ck_rgb"):
+                            ofs.append(_sc_paths["ck_rgb"])
+                        if _sc_paths.get("sam_alpha"):
+                            sam_ofs.append(_sc_paths["sam_alpha"])
+                        _mt_clean = mt[:, :, 0] if len(mt.shape) == 3 else mt
                         if _sam_union is not None:
                             try:
-                                _m_combined = merge_ck_with_sam_active(
-                                    _m, _sam_union, source_rgb=fr,
-                                    proximity_px=int(settings.get("edge_guard_px", 7)),
-                                )
-                            except Exception as _mge:
-                                _tlog(f"Combined merge failed at frame {pr} (CK alone): {_mge}")
-                                _probe(f"COMBINED_MERGE_ERR_{tf}_{type(_mge).__name__}")
-                                _m_combined = _m
-                            # 2026-05-19: apply GARBAGE MATTE to non-BRAW range output.
+                                _mt_clean = merge_ck_with_sam_active(
+                                    _mt_clean, _sam_union, source_rgb=fr,
+                                    proximity_px=int(settings.get("edge_guard_px", 7)))
+                            except Exception: pass
+                            try: _mt_clean = _apply_shirt_rescue(_mt_clean, _sam_union, fr)
+                            except Exception: pass
                             try:
                                 if not bool(settings.get("garbage_bypass", False)):
-                                    _ge_n = int(settings.get("garbage_expand_px", 0))
-                                    _gf_n = int(settings.get("garbage_feather_px", 0))
-                                    _gyt_n = int(settings.get("garbage_y_top_pct", 0))
-                                    _gyb_n = int(settings.get("garbage_y_bot_pct", 100))
-                                    if _ge_n > 0 or _gyt_n > 0 or _gyb_n < 100:
-                                        from corridorkey_sam_merge import compute_garbage_matte as _cgm_n
-                                        _gm_n = _cgm_n(_sam_union, expand_px=_ge_n, feather_px=_gf_n,
-                                                       y_top_pct=_gyt_n, y_bot_pct=_gyb_n)
-                                        if _gm_n is not None and _gm_n.shape[:2] == _m_combined.shape[:2]:
-                                            if _m_combined.ndim == 3:
-                                                _m_combined = (_m_combined.astype(np.float32) * _gm_n[..., None]).astype(_m_combined.dtype)
-                                            else:
-                                                _m_combined = (_m_combined.astype(np.float32) * _gm_n).astype(_m_combined.dtype)
-                                        _tlog(f"Range garbage matte applied (expand={_ge_n}, y={_gyt_n}-{_gyb_n})")
-                            except Exception as _gm_ne:
-                                _tlog(f"Range garbage matte failed (non-fatal): {_gm_ne}")
-                        else:
-                            _m_combined = _m
-                        _m_active = _m_combined
-                        _probe(f"AFTER_COMBINED_MERGE_{tf}")
+                                    _ge_c = int(settings.get("garbage_expand_px", 0))
+                                    _gf_c = int(settings.get("garbage_feather_px", 0))
+                                    _gyt_c = int(settings.get("garbage_y_top_pct", 0))
+                                    _gyb_c = int(settings.get("garbage_y_bot_pct", 100))
+                                    if _ge_c > 0 or _gyt_c > 0 or _gyb_c < 100:
+                                        from corridorkey_sam_merge import compute_garbage_matte as _cgm_c
+                                        _gm_c = _cgm_c(_sam_union, expand_px=_ge_c, feather_px=_gf_c,
+                                                        y_top_pct=_gyt_c, y_bot_pct=_gyb_c)
+                                        if _gm_c is not None and _gm_c.shape[:2] == _mt_clean.shape[:2]:
+                                            _mt_clean = (_mt_clean.astype(np.float32) * _gm_c).astype(_mt_clean.dtype)
+                            except Exception: pass
+                        _clean_p = od / f"CK_COMBINED_{cn}.{pr:06d}.png"
+                        _m16 = (np.clip(_mt_clean, 0.0, 1.0) * 65535.0).astype(np.uint16)
+                        cv2.imwrite(str(_clean_p), cv2.merge([_m16, _m16, _m16]))
+                        if not _sidecar_first_paths.get("ck_combined"):
+                            _sidecar_first_paths["ck_combined"] = str(_clean_p)
                     else:
-                        _m_active = _m
-                    # Encode CK / Combined clip in memory — no file I/O on the
-                    # worker thread. Codec selection picks bit depth + format.
-                    if _write_ck or _write_combined:
-                        if _codec == 3:
-                            if _fmt == 0:
-                                _fb = cv2.cvtColor(_fg_clip, cv2.COLOR_RGB2BGR)
-                                _img = cv2.merge([_fb[:,:,0], _fb[:,:,1], _fb[:,:,2], _m_active])
-                            elif _fmt == 1:
-                                _img = _m_active
-                            else:
-                                _img = cv2.cvtColor(_fg_clip, cv2.COLOR_RGB2BGR)
-                        else:
-                            if _codec == 0:
-                                _au = (_m_active * 255.0).astype(np.uint8)
-                                _fg_int = (_fg_clip * 255.0).astype(np.uint8)
-                            else:
-                                _au = (_m_active * 65535.0).astype(np.uint16)
-                                _fg_int = (_fg_clip * 65535.0).astype(np.uint16)
-                            if _fmt == 0:
-                                _fb = cv2.cvtColor(_fg_int, cv2.COLOR_RGB2BGR)
-                                _img = cv2.merge([_fb[:,:,0], _fb[:,:,1], _fb[:,:,2], _au])
-                            elif _fmt == 1:
-                                _img = _au
-                            else:
-                                _img = cv2.cvtColor(_fg_int, cv2.COLOR_RGB2BGR)
-                        op = od / f"CK_{cn}_{pr:06d}{_ext}"
-                        _probe(f"BEFORE_ENCODE_{tf}")
-                        _ret, _buf = cv2.imencode(_ext, _img)
-                        _probe(f"AFTER_ENCODE_{tf}")
-                        if _ret:
-                            # 2026-05-14: write inline. PollTimer drain stops firing
-                            # once Fusion pauses timer dispatch on a long-blocking
-                            # main-thread run, so queued items past frame 1 never
-                            # reach disk. We are on main thread anyway; no queue needed.
-                            # 2026-05-14b: probe save errors directly to disk and
-                            # only count ofs on success. PollTimer-paused _tlog was
-                            # masking PermissionError on re-renders when MediaPool
-                            # held file handles on existing PNG sequence.
-                            _save_ok = False
-                            try:
+                        _codec = int(settings.get("output_codec", 0))
+                        _ext = _codec_extension(_codec)
+                        _content = int(settings.get("output_content", 0))
+                        _write_ck = _content in (1, 2)
+                        _write_sam = _content in (1, 3) and _sam_matte_v1 is not None
+                        _write_combined = _content == 0
+                        _fmt = settings["export_format"]
+                        _m = mt[:, :, 0] if len(mt.shape) == 3 else mt
+                        _m = np.clip(_m, 0.0, 1.0).astype(np.float32)
+                        _fg_clip = np.clip(fg, 0.0, 1.0).astype(np.float32)
+                        if _write_combined:
+                            _probe(f"BEFORE_COMBINED_MERGE_{tf}")
+                            if _sam_union is not None:
                                 try:
-                                    if op.exists(): op.unlink()
-                                except Exception: pass
-                                with open(str(op), 'wb') as _sf:
-                                    _sf.write(_buf.tobytes())
-                                _save_ok = True
-                            except Exception as _se:
-                                _tlog(f"Save error {op}: {_se}")
-                                _probe(f"SAVE_ERROR_CK_{tf}_{type(_se).__name__}")
-                            _probe(f"AFTER_QUEUE_PUT_{tf}")
-                            if _save_ok:
-                                ofs.append(str(op))
-                    # SAM matte sidecar — alpha-only file in the user's selected
-                    # codec. Skipped in Combined / CK-only modes.
-                    if _write_sam:
-                        sam_op = od / f"SAM_{cn}_{pr:06d}{_ext}"
-                        _sam = np.clip(_sam_matte_v1, 0.0, 1.0).astype(np.float32)
-                        if _codec == 3:
-                            _sam_img = _sam
-                        elif _codec == 0:
-                            _sam_img = (_sam * 255.0).astype(np.uint8)
-                        else:
-                            _sam_img = (_sam * 65535.0).astype(np.uint16)
-                        _ret_s, _buf_s = cv2.imencode(_ext, _sam_img)
-                        if _ret_s:
-                            # 2026-05-14: write inline. See note on CK save above.
-                            _sam_ok = False
-                            try:
+                                    _m_combined = merge_ck_with_sam_active(
+                                        _m, _sam_union, source_rgb=fr,
+                                        proximity_px=int(settings.get("edge_guard_px", 7)),
+                                    )
+                                except Exception as _mge:
+                                    _tlog(f"Combined merge failed at frame {pr} (CK alone): {_mge}")
+                                    _probe(f"COMBINED_MERGE_ERR_{tf}_{type(_mge).__name__}")
+                                    _m_combined = _m
                                 try:
-                                    if sam_op.exists(): sam_op.unlink()
-                                except Exception: pass
-                                with open(str(sam_op), 'wb') as _sf:
-                                    _sf.write(_buf_s.tobytes())
-                                _sam_ok = True
-                            except Exception as _se:
-                                _tlog(f"Save error {sam_op}: {_se}")
-                                _probe(f"SAVE_ERROR_SAM_{tf}_{type(_se).__name__}")
-                            if _sam_ok:
-                                sam_ofs.append(str(sam_op))
+                                    _m_combined = _apply_shirt_rescue(_m_combined, _sam_union, fr)
+                                except Exception as _sre:
+                                    _tlog(f"Shirt rescue failed at frame {pr} (non-fatal): {_sre}")
+                                try:
+                                    if not bool(settings.get("garbage_bypass", False)):
+                                        _ge_n = int(settings.get("garbage_expand_px", 0))
+                                        _gf_n = int(settings.get("garbage_feather_px", 0))
+                                        _gyt_n = int(settings.get("garbage_y_top_pct", 0))
+                                        _gyb_n = int(settings.get("garbage_y_bot_pct", 100))
+                                        if _ge_n > 0 or _gyt_n > 0 or _gyb_n < 100:
+                                            from corridorkey_sam_merge import compute_garbage_matte as _cgm_n
+                                            _gm_n = _cgm_n(_sam_union, expand_px=_ge_n, feather_px=_gf_n,
+                                                           y_top_pct=_gyt_n, y_bot_pct=_gyb_n)
+                                            if _gm_n is not None and _gm_n.shape[:2] == _m_combined.shape[:2]:
+                                                if _m_combined.ndim == 3:
+                                                    _m_combined = (_m_combined.astype(np.float32) * _gm_n[..., None]).astype(_m_combined.dtype)
+                                                else:
+                                                    _m_combined = (_m_combined.astype(np.float32) * _gm_n).astype(_m_combined.dtype)
+                                                _tlog(f"Range garbage matte applied (expand={_ge_n}, y={_gyt_n}-{_gyb_n})")
+                                except Exception as _gm_ne:
+                                    _tlog(f"Range garbage matte failed (non-fatal): {_gm_ne}")
+                            else:
+                                _m_combined = _m
+                            _m_active = _m_combined
+                            _probe(f"AFTER_COMBINED_MERGE_{tf}")
+                        else:
+                            _m_active = _m
+                        if _write_ck or _write_combined:
+                            if _codec == 3:
+                                if _fmt == 0:
+                                    _fb = cv2.cvtColor(_fg_clip, cv2.COLOR_RGB2BGR)
+                                    _img = cv2.merge([_fb[:,:,0], _fb[:,:,1], _fb[:,:,2], _m_active])
+                                elif _fmt == 1:
+                                    _img = _m_active
+                                else:
+                                    _img = cv2.cvtColor(_fg_clip, cv2.COLOR_RGB2BGR)
+                            else:
+                                if _codec == 0:
+                                    _au = (_m_active * 255.0).astype(np.uint8)
+                                    _fg_int = (_fg_clip * 255.0).astype(np.uint8)
+                                else:
+                                    _au = (_m_active * 65535.0).astype(np.uint16)
+                                    _fg_int = (_fg_clip * 65535.0).astype(np.uint16)
+                                if _fmt == 0:
+                                    _fb = cv2.cvtColor(_fg_int, cv2.COLOR_RGB2BGR)
+                                    _img = cv2.merge([_fb[:,:,0], _fb[:,:,1], _fb[:,:,2], _au])
+                                elif _fmt == 1:
+                                    _img = _au
+                                else:
+                                    _img = cv2.cvtColor(_fg_int, cv2.COLOR_RGB2BGR)
+                            op = od / f"CK_{cn}_{pr:06d}{_ext}"
+                            _probe(f"BEFORE_ENCODE_{tf}")
+                            _ret, _buf = cv2.imencode(_ext, _img)
+                            _probe(f"AFTER_ENCODE_{tf}")
+                            if _ret:
+                                _save_ok = False
+                                try:
+                                    try:
+                                        if op.exists(): op.unlink()
+                                    except Exception: pass
+                                    with open(str(op), 'wb') as _sf:
+                                        _sf.write(_buf.tobytes())
+                                    _save_ok = True
+                                except Exception as _se:
+                                    _tlog(f"Save error {op}: {_se}")
+                                    _probe(f"SAVE_ERROR_CK_{tf}_{type(_se).__name__}")
+                                _probe(f"AFTER_QUEUE_PUT_{tf}")
+                                if _save_ok:
+                                    ofs.append(str(op))
+                        if _write_sam:
+                            sam_op = od / f"SAM_{cn}_{pr:06d}{_ext}"
+                            _sam = np.clip(_sam_matte_v1, 0.0, 1.0).astype(np.float32)
+                            if _codec == 3:
+                                _sam_img = _sam
+                            elif _codec == 0:
+                                _sam_img = (_sam * 255.0).astype(np.uint8)
+                            else:
+                                _sam_img = (_sam * 65535.0).astype(np.uint16)
+                            _ret_s, _buf_s = cv2.imencode(_ext, _sam_img)
+                            if _ret_s:
+                                _sam_ok = False
+                                try:
+                                    try:
+                                        if sam_op.exists(): sam_op.unlink()
+                                    except Exception: pass
+                                    with open(str(sam_op), 'wb') as _sf:
+                                        _sf.write(_buf_s.tobytes())
+                                    _sam_ok = True
+                                except Exception as _se:
+                                    _tlog(f"Save error {sam_op}: {_se}")
+                                    _probe(f"SAVE_ERROR_SAM_{tf}_{type(_se).__name__}")
+                                if _sam_ok:
+                                    sam_ofs.append(str(sam_op))
                     pr += 1
                     el = time.time() - st
                     fpsr = pr / el if el > 0 else 0
@@ -4466,14 +6070,27 @@ def on_process_range(ev):
                 # once Fusion pauses timer dispatch on a long-blocking main-thread run.
                 # We are already on the main thread; MediaPool API is main-thread-only
                 # and that requirement is satisfied.
-                try:
-                    _do_import({
-                        "ofs": ofs, "output_track": output_track,
-                        "source_track": source_track, "in_f": in_f, "settings": settings,
-                        "sam_ofs": sam_ofs,  # v1.0 two-mask: SAM matte sidecar PNGs
-                    })
-                except Exception as _ie:
-                    _tlog(f"Import error: {_ie}")
+                _om_run = int(settings.get("output_mode", 0))
+                if _om_run != 2:
+                    try:
+                        _do_import({
+                            "ofs": ofs, "output_track": output_track,
+                            "source_track": source_track, "in_f": in_f, "settings": settings,
+                            "sam_ofs": sam_ofs,
+                        })
+                    except Exception as _ie:
+                        _tlog(f"Import error: {_ie}")
+                if _om_run == 2:
+                    try:
+                        _tstatus("Building Editable Layers comp on source clip...")
+                        _ok = _build_ck_fusion_comp_after_render(
+                            timeline, source_track, ofs, sam_ofs,
+                            sidecar_first_paths=_sidecar_first_paths,
+                            render_in=in_f, render_dur=dur)
+                        _tstatus("DONE — CK layers on your clip. Play timeline." if _ok else "Fusion comp build failed — see log")
+                    except Exception as _fce:
+                        _tlog(f"Fusion comp after-render error: {_fce}")
+                        _tstatus("Fusion comp build error — see log")
             else:
                 _ui_queue.put(("progress", -1))
         except BaseException as _e:
@@ -4537,6 +6154,24 @@ def on_poll_timer(ev):
     # queue drain raises unexpectedly before reaching it, the timer stays at 500ms
     # forever (never backs off to 5000ms idle), sustaining ASIO interrupt pressure.
     global _range_running, _proxy_mpi, _proxy_mode_saved
+    # Shutdown guard — once on_close fires, no more inference/IO from PollTimer ticks.
+    # Without this, a tick mid-flight in _key_one_scrub_frame() holds the UI thread for
+    # 2-5s and on_close's events queue behind it, deferring os._exit and hanging Resolve.
+    if _shutting_down:
+        return
+    # 2026-05-21 heartbeat: refresh the instance lock's mtime so the next CK
+    # launch's stale-lock check (15s) knows this CK is alive. Cheap — just an
+    # os.utime touch.
+    try:
+        if _INSTANCE_LOCK.exists():
+            os.utime(str(_INSTANCE_LOCK), None)
+    except Exception:
+        pass
+    try:
+        _hb_path = SESSION_DIR / "plugin_heartbeat"
+        _hb_path.touch(exist_ok=True)
+    except Exception:
+        pass
     try:
         import time as _pt, tempfile as _pt_tf
         try:
@@ -4835,7 +6470,10 @@ def on_open_fusion(ev):
 # WHAT IT DOES: Kills any running preview viewer, then exits the Fusion event loop.
 #   Without this, the orphaned Python viewer holds GPU/CUDA open and Resolve can't restart.
 def on_close(ev):
-    global _viewer_proc, _scrubber_proc, processing_cancelled, _range_running
+    global _viewer_proc, _scrubber_proc, processing_cancelled, _range_running, _shutting_down
+    # Shutdown sentinel FIRST — guards PollTimer (and any other re-entry point) from running
+    # inference/IO while on_close tears down. Must precede every other line in this function.
+    _shutting_down = True
     # Signal any running scrub/range worker thread to stop on its next iteration check.
     # Must happen BEFORE killing subprocesses so the thread doesn't try to spawn new ones.
     # DANGER ZONE — CRITICAL: set this FIRST; the worker checks it every frame decode cycle.
@@ -4848,23 +6486,27 @@ def on_close(ev):
     # Stop the PollTimer first — prevents it firing against a half-dead UI during teardown.
     try: items["PollTimer"].Stop()
     except Exception: pass
-    # Kill viewer process tree — taskkill /F /T kills the viewer AND any SAM2 subprocesses
-    # it spawned. Without /T, child processes survive and hold the GPU open, which keeps
-    # Resolve's process manager waiting indefinitely (the "End Task" bug).
+    # Kill viewer process tree FIRE-AND-FORGET — synchronous taskkill with timeout=5
+    # blocks the UI thread up to 10s (5s per subprocess). Spawn daemon threads instead so
+    # the kill happens but the close handler returns immediately to reach os._exit below.
     import subprocess as _sp
+    def _kill_proc_async(_pid):
+        try: _sp.run(["taskkill", "/F", "/T", "/PID", str(_pid)],
+                     stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, timeout=5,
+                     creationflags=_sp.CREATE_NO_WINDOW)
+        except Exception: pass
     for _proc in [_viewer_proc, _scrubber_proc]:
         if _proc is not None:
-            try: _sp.run(["taskkill", "/F", "/T", "/PID", str(_proc.pid)],
-                         stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, timeout=5,
-                         creationflags=_sp.CREATE_NO_WINDOW)
+            try:
+                _t = threading.Thread(target=_kill_proc_async, args=(_proc.pid,), daemon=True)
+                _t.start()
             except Exception: pass
     _viewer_proc = None
     _scrubber_proc = None
-    # Drop CUDA model reference immediately — do NOT call proc.cleanup() here because
-    # CUDA teardown in a closing Resolve session blocks indefinitely on Windows.
-    # Windows reclaims GPU memory when the process dies; we just need to die fast.
-    try: cached_processor["proc"] = None
-    except Exception: pass
+    # NOTE: cached_processor["proc"] is intentionally NOT cleared here. Setting it to None
+    # triggers PyTorch's Tensor.__del__ → CUDA buffer release on the MAIN thread, which can
+    # pin for 5-30s before os._exit fires. Windows reclaims GPU memory on process death
+    # regardless; skip the early dereference and let os._exit kill the process clean.
     try: _INSTANCE_LOCK.unlink(missing_ok=True)
     except: pass
     # Exit immediately — do NOT call disp.ExitLoop() and wait for RunLoop to unwind.
@@ -4872,6 +6514,23 @@ def on_close(ev):
     # indefinitely on a window with no valid Fusion context, causing the Task Manager hang.
     # os._exit skips all Python/CUDA finalizers — Windows reclaims GPU memory on process death.
     os._exit(0)
+
+# WHAT IT DOES: OS signal handler. Resolve sends SIGTERM/SIGBREAK on quit BEFORE the
+# UIDispatcher fires the window Close event. Without this handler, CK only sees the close
+# via win.On.CK.Close — which Resolve may never fire on a hard quit. Catching the signal
+# gives CK a chance to release subprocesses and die fast before Resolve TerminateProcesses us.
+def _on_shutdown_signal(_signum, _frame):
+    global _shutting_down
+    _shutting_down = True
+    try: _cleanup_on_exit()
+    except Exception: pass
+    os._exit(0)
+for _sig_name in ("SIGTERM", "SIGBREAK", "SIGINT"):
+    try:
+        _sig = getattr(signal, _sig_name, None)
+        if _sig is not None:
+            signal.signal(_sig, _on_shutdown_signal)
+    except Exception: pass
 
 win.On.SetInPoint.Clicked = on_set_in_point
 win.On.SetOutPoint.Clicked = on_set_out_point
@@ -4902,6 +6561,16 @@ def on_kill_viewer(ev):
         except Exception:
             pass
         _viewer_proc = None
+    try:
+        import subprocess as _sp_kv
+        _pf = SESSION_DIR / "viewer.pid"
+        if _pf.exists():
+            _old = int(_pf.read_text().strip())
+            _sp_kv.run(["taskkill", "/F", "/T", "/PID", str(_old)],
+                       stdout=_sp_kv.DEVNULL, stderr=_sp_kv.DEVNULL, timeout=3,
+                       creationflags=_sp_kv.CREATE_NO_WINDOW)
+    except Exception:
+        pass
     status("Viewer killed — click Preview to reopen")
 
 win.On.KillViewer.Clicked = on_kill_viewer
@@ -5086,7 +6755,9 @@ log("CorridorKey Pro Ready")
 log("SAM2 | Frame Range | Export Modes")
 win.Show()
 disp.RunLoop()
-win.Hide()
+# win.Hide() removed — when RunLoop returns due to Resolve shutdown (not user click), the
+# Fusion context is already torn down and win.Hide() deadlocks against an invalid handle,
+# preventing os._exit below from running. RunLoop returning is sufficient signal to die.
 # Force-exit immediately after the event loop ends.
 # Python's normal shutdown runs CUDA/torch finalizers which block for 30-60 seconds
 # on Windows with a GPU model loaded — that's why Resolve hangs and needs End Task.

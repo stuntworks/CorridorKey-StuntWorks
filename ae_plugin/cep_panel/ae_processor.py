@@ -1,6 +1,14 @@
 #!/usr/bin/env python
-# Last modified: 2026-04-14 | Change: Add --params JSON mode + extract subcommand,
-#   structured PROGRESS output, stderr logging to %TEMP%\corridorkey.log
+# Last modified: 2026-05-29 | Change: CK_COMBINED merge in batch + surface silent SAM/merge fallbacks (CK_WARN); LIVE-FILE banner. | Full history: git log
+# ============================================================================
+# LIVE FILE — THIS is the canonical CorridorKey AE/Premiere processor (1180 lines,
+# full SAM2 batch). The CEP panel runs THIS copy via a Windows junction:
+#   %APPDATA%\Adobe\CEP\extensions\com.corridorkey.panel  ->  ae_plugin\cep_panel
+# index.html spawns PANEL_DIR/ae_processor.py, which resolves to this file.
+#
+# DANGER ZONE FRAGILE: a 729-line look-alike DUMMY lives at ae_plugin/ae_processor.py.
+#   Edit THIS file. Edits to the dummy change nothing at runtime. / breaks: wrong-file edits
+# ============================================================================
 """CorridorKey After Effects / Premiere Processor.
 
 WHAT IT DOES: Command-line bridge between the CEP panel (which spawns Python via
@@ -129,45 +137,163 @@ def load_settings(params_path, args):
 
 
 # ── Chroma hint ───────────────────────────────────────────────
+# HSV-based detection matches DaVinci's AlphaHintGenerator — catches dark/shadowed
+# green areas that the old RGB ratio test missed (ProRes crash mats, crumpled screen edges).
 def generate_chroma_hint(image, screen_type="green"):
     import numpy as np
     import cv2
-    if screen_type == "green":
-        green = image[:, :, 1]; red = image[:, :, 0]; blue = image[:, :, 2]
-        screen_mask = (green > 0.3) & (green > red * 1.2) & (green > blue * 1.2)
+    if image.dtype != np.uint8:
+        img_uint8 = (np.clip(image, 0, 1) * 255).astype(np.uint8)
     else:
-        blue = image[:, :, 2]; red = image[:, :, 0]; green = image[:, :, 1]
-        screen_mask = (blue > 0.3) & (blue > red * 1.2) & (blue > green * 1.2)
-    alpha_hint = (~screen_mask).astype(np.float32)
-    alpha_hint = cv2.GaussianBlur(alpha_hint, (5, 5), 0)
-    return alpha_hint
+        img_uint8 = image
+    # image is RGB — convert to BGR for HSV
+    img_bgr = cv2.cvtColor(img_uint8, cv2.COLOR_RGB2BGR)
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    if screen_type == "green":
+        lower = np.array([35, 50, 50])
+        upper = np.array([85, 255, 255])
+    else:
+        lower = np.array([100, 50, 50])
+        upper = np.array([130, 255, 255])
+    screen_mask = cv2.inRange(hsv, lower, upper)
+    subject_mask = cv2.bitwise_not(screen_mask)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    subject_mask = cv2.morphologyEx(subject_mask, cv2.MORPH_CLOSE, kernel)
+    subject_mask = cv2.morphologyEx(subject_mask, cv2.MORPH_OPEN, kernel)
+    subject_mask = cv2.GaussianBlur(subject_mask, (5, 5), 0)
+    return subject_mask.astype(np.float32) / 255.0
 
 
 # ── Subcommand: extract ───────────────────────────────────────
+def _extract_frame_pyav(src_path, time_sec):
+    """PyAV decode path for HEVC/H.265. Reads source colorspace from codec_context
+    and passes it explicitly to swscale reformat — avoids BT.601 default that causes
+    wrong colors on BT.709 HEVC (PyAV Issue #873). Returns BGR uint8 ndarray or None."""
+    try:
+        import av
+        import numpy as _np
+        import cv2 as _cv2
+    except ImportError as _ie:
+        log.warning(f"PyAV not available, falling back to cv2: {_ie}")
+        return None
+    container = None
+    try:
+        container = av.open(str(src_path))
+        vs = container.streams.video[0]
+        vs.thread_type = "AUTO"
+        try:
+            _cs_int = int(vs.codec_context.colorspace or 0)
+            _rng_int = int(vs.codec_context.color_range or 0)
+        except Exception:
+            _cs_int = 0
+            _rng_int = 0
+        # FFmpeg AVColorSpace: 5=BT.601-PAL, 6=BT.601-NTSC, 9=BT.2020, else 709
+        if _cs_int in (5, 6):
+            _src_cs = "itu601"
+        elif _cs_int == 9:
+            _src_cs = "itu2020_ncl"
+        else:
+            _src_cs = "itu709"
+        _src_rng = "jpeg" if _rng_int == 2 else "mpeg"
+        target_pts = int(time_sec / float(vs.time_base))
+        try:
+            container.seek(target_pts, any_frame=False, backward=True, stream=vs)
+        except Exception:
+            container.seek(max(0, target_pts), any_frame=False, backward=True)
+        decoded = None
+        for f in container.decode(vs):
+            if f.pts is None:
+                continue
+            if f.pts < target_pts:
+                continue
+            decoded = f
+            break
+        if decoded is None:
+            log.warning(f"PyAV: no frame at t={time_sec:.3f}s")
+            return None
+        try:
+            log.info(f"PyAV reformat: src_cs={_src_cs} src_rng={_src_rng}")
+            reformatted = decoded.reformat(
+                format="rgb48le",
+                src_colorspace=_src_cs,
+                dst_colorspace="itu709",
+                src_color_range=_src_rng,
+                dst_color_range="jpeg",
+            )
+            rgb16 = reformatted.to_ndarray()
+            rgb8 = (rgb16 >> 8).astype(_np.uint8)
+        except Exception as _ref_e:
+            log.warning(f"PyAV reformat fallback (rgb24): {_ref_e}")
+            rgb8 = decoded.to_ndarray(format="rgb24")
+        return _cv2.cvtColor(rgb8, _cv2.COLOR_RGB2BGR)
+    except Exception as _pe:
+        log.warning(f"PyAV extract failed: {_pe}")
+        return None
+    finally:
+        if container is not None:
+            try:
+                container.close()
+            except Exception:
+                pass
+
+
+_HEVC_EXTS = {".hevc", ".heic"}
+_HEVC_CODECS = {"hevc", "h265", "x265"}
+
+
 def cmd_extract(source_video, output_png, frame_idx=None, time_sec=None):
-    """Pull one frame from a video. Prefers time-based seek (CAP_PROP_POS_MSEC) when a
-    time is given — avoids drift on variable-fps or long-GOP sources where
-    CAP_PROP_POS_FRAMES is unreliable. Falls back to frame-index seek for AE."""
+    """Pull one frame from a video. HEVC sources use PyAV with explicit BT.709 colorspace
+    to avoid the BT.601 default that causes wrong colors on H.265 footage (PyAV Issue #873).
+    All other codecs use cv2. Falls back to cv2 if PyAV is not installed."""
     import cv2
     src = Path(source_video)
     if not src.exists():
         log.error(f"Source video not found: {src}")
         return False
+
+    # Resolve time_sec for both paths
+    if time_sec is None:
+        cap_probe = cv2.VideoCapture(str(src))
+        source_fps = cap_probe.get(cv2.CAP_PROP_FPS) or 24.0
+        cap_probe.release()
+        time_sec_resolved = float(frame_idx) / source_fps
+    else:
+        time_sec_resolved = float(time_sec)
+
+    # Detect HEVC by extension or codec name (mp4/mov containers can carry HEVC)
+    _use_pyav = src.suffix.lower() in _HEVC_EXTS
+    if not _use_pyav:
+        try:
+            cap_probe2 = cv2.VideoCapture(str(src))
+            _fourcc_int = int(cap_probe2.get(cv2.CAP_PROP_FOURCC))
+            cap_probe2.release()
+            _fourcc_str = "".join(chr((_fourcc_int >> (8 * i)) & 0xFF) for i in range(4)).lower()
+            _use_pyav = any(c in _fourcc_str for c in _HEVC_CODECS)
+        except Exception:
+            pass
+
+    if _use_pyav:
+        log.info(f"HEVC detected — using PyAV BT.709 decode path")
+        frame = _extract_frame_pyav(src, time_sec_resolved)
+        if frame is not None:
+            out = Path(output_png)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(out), frame)
+            log.info(f"Extracted (PyAV) -> {out}")
+            return True
+        log.warning("PyAV path failed, falling back to cv2")
+
+    # cv2 path (all non-HEVC codecs, or PyAV fallback)
     cap = cv2.VideoCapture(str(src))
     if not cap.isOpened():
         log.error(f"Could not open video: {src}")
         return False
     try:
+        cap.set(cv2.CAP_PROP_POS_MSEC, time_sec_resolved * 1000.0)
         if time_sec is not None:
-            cap.set(cv2.CAP_PROP_POS_MSEC, float(time_sec) * 1000.0)
-            log.info(f"Seek by time: {time_sec:.4f}s")
+            log.info(f"Seek by time: {time_sec_resolved:.4f}s")
         else:
-            # Convert frame index to time — avoids POS_FRAMES off-by-one bug in
-            # OpenCV where set(N)+read() returns frame N+1 on H.264/HEVC/ProRes.
-            source_fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
-            t_ms = float(frame_idx) / source_fps * 1000.0
-            cap.set(cv2.CAP_PROP_POS_MSEC, t_ms)
-            log.info(f"Seek by frame {frame_idx} -> {t_ms:.2f}ms @ {source_fps:.3f}fps")
+            log.info(f"Seek by frame {frame_idx} -> {time_sec_resolved*1000:.2f}ms")
         ok, frame = cap.read()
         if not ok or frame is None:
             log.error("Could not read frame at requested position")
@@ -212,6 +338,141 @@ def load_sam2_gate(sam2_mask_path, target_h, target_w):
 #   (same technique as traditional garbage mattes — gate the output, not the input).
 # DEPENDS-ON: corridorkey_processor, load_sam2_gate.
 # AFFECTS: writes output BGRA PNG + _matte.png.
+# ── Shared matte post-processing — ONE source of truth ────────────────────────
+# cmd_single (KEY CURRENT FRAME), cmd_batch (PROCESS WORK AREA) and cmd_postproc
+# (inline PREVIEW) all run the SAME post-proc through these helpers, so
+# PREVIEW == RENDER == KEY FRAME can never drift again. Canonical order matches the
+# DaVinci live viewer (the artist-facing source of truth):
+#     SAM garbage-matte merge  ->  choke  ->  despeckle  ->  despill
+# despill only touches the foreground, and the SAM merge only reads the source plate
+# (never the despilled fg), so despill being last is order-independent of the matte.
+def sam_garbage_merge(alpha, sam_soft, source_rgb, settings, screen_type="green"):
+    """CK x SAM garbage-matte merge via the shared engine (DaVinci-identical).
+    sam_soft: soft 0..1 SAM silhouette, or None. Returns the merged 2D alpha."""
+    import numpy as np, cv2
+    if sam_soft is None or bool(settings.get("sam2_bypass", False)):
+        return alpha
+    try:
+        from corridorkey_sam_merge import binarize_sam_silhouette, merge_ck_with_sam_active
+    except Exception as e:
+        log.warning(f"SAM merge unavailable, using CK alpha: {e}")
+        return alpha
+    sg = sam_soft
+    if sg.ndim == 3:
+        sg = sg[:, :, 0]
+    if sg.shape != alpha.shape:
+        sg = cv2.resize(sg, (alpha.shape[1], alpha.shape[0]), interpolation=cv2.INTER_LINEAR)
+    try:
+        # GARBAGE MASK buffer: the panel's samMargin fader drives the merge's actual
+        # kill-zone (generous dilation + chroma-escape radius). Before 2026-06-06 the
+        # fader only inflated the exported SAM matte layer — the merge silently ran on
+        # edge_guard_px (default 7) and the operator's buffer setting did nothing here.
+        _buffer_px = settings.get("sam2_margin", None)   # panel fader key (ckGetSettings)
+        if _buffer_px is None:
+            _buffer_px = settings.get("edge_guard_px", 7)
+        return merge_ck_with_sam_active(
+            alpha, binarize_sam_silhouette(sg), source_rgb=source_rgb,
+            screen_type=screen_type, proximity_px=int(_buffer_px),
+            carve_points=settings.get("sam_negative") or None)
+    except Exception as e:
+        log.warning(f"SAM merge failed, using CK alpha: {e}")
+        return alpha
+
+
+def apply_choke(alpha, settings):
+    """Shrink the matte edge inward by N px (cv2.erode, ellipse kernel). 0 = off."""
+    import numpy as np, cv2
+    choke_px = int(settings.get("choke", 0))
+    if choke_px <= 0:
+        return alpha
+    k = choke_px * 2 + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    a8 = (np.clip(alpha, 0, 1) * 255).astype(np.uint8)
+    return cv2.erode(a8, kernel).astype(np.float32) / 255.0
+
+
+def apply_despeckle(alpha, settings):
+    """Remove small disconnected alpha islands. Default OFF — matches DaVinci, where
+    despeckle was disabled because it ate flyaway hair. Opt-in via the panel checkbox."""
+    if not settings.get("despeckle", False):
+        return alpha
+    from CorridorKeyModule.core import color_utils as cu
+    return cu.clean_matte_opencv(
+        alpha, area_threshold=int(settings.get("despeckleSize", 400)), dilation=25, blur_size=5)
+
+
+def apply_despill(fg_rgb, settings):
+    """Green-spill removal on the foreground (average mode). 0 = off (warm wardrobe)."""
+    despill_strength = float(settings.get("despill", 0.0))
+    if despill_strength <= 0.0:
+        return fg_rgb
+    from CorridorKeyModule.core import color_utils as cu
+    return cu.despill_opencv(fg_rgb, green_limit_mode="average", strength=despill_strength)
+
+
+def apply_shirt_rescue(alpha, sam_soft, src_rgb, settings):
+    """PORTED 2026-06-06 from CorridorKey_Pro.py:_apply_shirt_rescue (Resolve, live since
+    2026-05-23). Thin/bright fabric over green keys semi-transparent (green bounces
+    through the weave). Where a pixel is NOT green (chroma < 0.15) AND deep inside the
+    SAM body (>0.85, eroded 5px), force alpha to max(alpha, SAM). Genuine green pixels
+    are untouched — fence holes / real see-through showing greenscreen stay transparent
+    by construction (Berto's fence rule, 2026-06-06)."""
+    if not settings.get("shirtRescue", True):
+        return alpha
+    if sam_soft is None or src_rgb is None:
+        return alpha
+    try:
+        import numpy as np, cv2
+        rgb = np.asarray(src_rgb).astype(np.float32)
+        if rgb.max() > 1.5:
+            rgb = rgb / 255.0
+        green = rgb[..., 1] - np.maximum(rgb[..., 0], rgb[..., 2])
+        not_green = green < 0.15
+        sam_arr = np.asarray(sam_soft).astype(np.float32)
+        if sam_arr.ndim == 3:
+            sam_arr = sam_arr[..., 0]
+        if sam_arr.max() > 1.5:
+            sam_arr = sam_arr / 255.0
+        sam_bin = (sam_arr > 0.85).astype(np.uint8)
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))   # erode 5px
+        sam_bin = cv2.erode(sam_bin, k)
+        if sam_bin.shape != alpha.shape or not_green.shape != alpha.shape:
+            return alpha
+        rescue = not_green & (sam_bin > 0)
+        out = alpha.copy()
+        out[rescue] = np.maximum(alpha[rescue], sam_bin[rescue].astype(np.float32))
+        return np.clip(out, 0.0, 1.0)
+    except Exception as e:
+        log.warning(f"shirt rescue skipped: {e}")
+        return alpha
+
+
+def apply_matte_postproc(fg_rgb, alpha_raw, settings, sam_soft=None, source_rgb=None,
+                         screen_type="green"):
+    """Canonical CK post-proc shared by single / batch / postproc. Returns (fg_rgb, alpha).
+    Order: SAM garbage merge -> choke -> despeckle -> despill."""
+    alpha = alpha_raw.copy()
+    if alpha.ndim == 3:
+        alpha = alpha[:, :, 0]
+    src = source_rgb if source_rgb is not None else fg_rgb
+    alpha = sam_garbage_merge(alpha, sam_soft, src, settings, screen_type)
+    _sam_r = sam_soft
+    if _sam_r is not None:
+        import cv2 as _cv2_r
+        import numpy as _np_r
+        _sam_r = _np_r.asarray(_sam_r)
+        if _sam_r.ndim == 3:
+            _sam_r = _sam_r[..., 0]
+        if _sam_r.shape[:2] != alpha.shape[:2]:
+            _sam_r = _cv2_r.resize(_sam_r, (alpha.shape[1], alpha.shape[0]),
+                                   interpolation=_cv2_r.INTER_LINEAR)
+    alpha = apply_shirt_rescue(alpha, _sam_r, src, settings)
+    alpha = apply_choke(alpha, settings)
+    alpha = apply_despeckle(alpha, settings)
+    fg_rgb = apply_despill(fg_rgb, settings)
+    return fg_rgb, alpha
+
+
 def cmd_single(input_path, output_path, settings, sam2_mask_path=None):
     import numpy as np
     import cv2
@@ -237,11 +498,13 @@ def cmd_single(input_path, output_path, settings, sam2_mask_path=None):
     from CorridorKeyModule.core import color_utils as _cu
     processor = CorridorKeyProcessor(device="cuda")
     try:
-        # Run NN with despill DISABLED — apply manually below to match the viewer's path.
+        # Run NN with despill + despeckle DISABLED. ALL post-proc now runs through the
+        # shared apply_matte_postproc() below, so KEY CURRENT FRAME == PROCESS WORK AREA
+        # == inline PREVIEW. despeckle is a post-NN step now (default OFF, like DaVinci).
         ps = ProcessingSettings(
             screen_type=settings["screenType"],
             despill_strength=0.0,
-            despeckle_enabled=settings["despeckle"],
+            despeckle_enabled=False,
             despeckle_size=settings["despeckleSize"],
             refiner_strength=settings["refiner"],
         )
@@ -253,31 +516,131 @@ def cmd_single(input_path, output_path, settings, sam2_mask_path=None):
             return False
         if len(alpha.shape) == 3:
             alpha = alpha[:, :, 0]
-        # Apply despill via the same despill_opencv path the live viewer uses so that
-        # KEY CURRENT FRAME output matches what the preview window showed.
-        despill_str = float(settings.get("despill", 1.0))
-        if despill_str > 0:
-            fg = _cu.despill_opencv(fg, green_limit_mode="average", strength=despill_str)
-        # Apply SAM2 garbage matte gate to output alpha (post-keyer)
-        h, w = alpha.shape[:2]
-        gate = load_sam2_gate(sam2_mask_path, h, w)
-        if gate is not None:
-            before_mean = float(alpha.mean())
-            alpha = alpha * gate
-            log.info(f"SAM2 gate applied — alpha mean {before_mean:.3f} -> {float(alpha.mean()):.3f}")
-        fg_uint8 = (np.clip(fg, 0, 1) * 255).astype(np.uint8)
-        alpha_uint8 = (np.clip(alpha, 0, 1) * 255).astype(np.uint8)
-        fg_bgr = cv2.cvtColor(fg_uint8, cv2.COLOR_RGB2BGR)
-        out_bgra = cv2.merge([fg_bgr[:, :, 0], fg_bgr[:, :, 1], fg_bgr[:, :, 2], alpha_uint8])
+        # Optional SAM gate file -> soft silhouette for the shared garbage-matte merge.
+        sam_soft = None
+        if sam2_mask_path:
+            _g = cv2.imread(str(sam2_mask_path), cv2.IMREAD_UNCHANGED)
+            if _g is not None:
+                sam_soft = _g.astype(np.float32) / (65535.0 if _g.dtype == np.uint16 else 255.0)
+        # Shared post-proc: SAM merge -> choke -> despeckle -> despill. source_rgb is the
+        # REAL frame so the merge's hair chroma-escape sees true green (matches batch).
+        fg, alpha = apply_matte_postproc(
+            fg, alpha, settings, sam_soft=sam_soft, source_rgb=img_rgb,
+            screen_type=settings["screenType"])
+        fg_uint16 = (np.clip(fg, 0, 1) * 65535).astype(np.uint16)
+        alpha_uint16 = (np.clip(alpha, 0, 1) * 65535).astype(np.uint16)
+        fg_bgr = cv2.cvtColor(fg_uint16, cv2.COLOR_RGB2BGR)
+        out_bgra = cv2.merge([fg_bgr[:, :, 0], fg_bgr[:, :, 1], fg_bgr[:, :, 2], alpha_uint16])
         out_path = Path(output_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(out_path), out_bgra)
         matte_path = out_path.with_name(out_path.stem + "_matte.png")
-        cv2.imwrite(str(matte_path), alpha_uint8)
+        cv2.imwrite(str(matte_path), alpha_uint16)
         log.info(f"Saved: {out_path}")
         return True
     finally:
         processor.cleanup()
+
+
+def _atomic_imwrite(path, img, params=None):
+    """imwrite via temp-name + os.replace so importers / live-preview copies never
+    see a half-written frame, and a False return (disk full, bad path) raises
+    instead of silently dropping the frame. cv2 infers format from extension, so
+    the temp name keeps .png (``x.png`` -> ``x.tmp.png`` -> rename to ``x.png``)."""
+    import cv2
+    path = str(path)
+    tmp = path[:-4] + ".tmp.png" if path.lower().endswith(".png") else path + ".tmp"
+    ok = cv2.imwrite(tmp, img) if params is None else cv2.imwrite(tmp, img, params)
+    if not ok:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise IOError(f"imwrite failed (disk full or bad path): {path}")
+    os.replace(tmp, path)
+
+
+# ── Named sidecar passes (Editable Layers / Fusion-comp parity) ───
+# WHAT IT DOES: writes the four named CK sidecar PNGs for one frame, each into its
+#   OWN clean subfolder so the host imports each as an isolated numbered-stills
+#   sequence:  CK_RGB/, CK_COMBINED/, CK_ALPHA/, SAM_ALPHA/.
+# PORTED FROM: CorridorKey_Pro.py:3156-3231 `_write_fusion_sidecars`. The Resolve
+#   version writes per-clip-named files into ONE dir (Fusion Loader contract). AE's
+#   host (Premiere/AE numbered-stills importer) wants one PNG pattern per folder
+#   plus a dummy 00000 frame (the importer silently drops the first frame), so the
+#   folder layout follows the SAME convention cmd_batch already uses for
+#   output_/mattes/sam_mattes. Folder NAMES, 16-bit depth, the 3-channel-for-matte
+#   write path, and the despill-on-FG step all match the Resolve source exactly.
+# AFFECTS: writes <out_dir>/{CK_RGB,CK_COMBINED,CK_ALPHA,SAM_ALPHA}/<name>_NNNNN.png
+#   (16-bit) plus a per-folder <name>_00000.png dummy on the first written frame.
+# GUARDED: any failure is logged as CK_WARN: and swallowed — a sidecar fault must
+#   never crash the main key (matches the loud-fallback pattern in cmd_batch).
+def _write_fusion_sidecars(fg, ck_alpha, ck_combined, sam_union,
+                           settings, out_dir, seq_num, is_first,
+                           fg_despill_done=False):
+    """Write CK_RGB / CK_COMBINED / CK_ALPHA / SAM_ALPHA sidecars for one frame.
+
+    fg              : float32 RGB 0..1 (NN foreground)
+    ck_alpha        : float32 mono 0..1 (RAW CK neural-net alpha)
+    ck_combined     : float32 mono 0..1 (CK x SAM merged matte) or None
+    sam_union       : float32 mono 0..1 (SAM2 soft silhouette) or None
+    fg_despill_done : True when the caller already despilled fg (cmd_batch despills
+                      inline so CK_RGB matches the main export) — skips re-despill.
+    All written as 16-bit PNG. Mattes are written 3-channel (Fusion / numbered-stills
+    importers treat single-channel PNGs as masks with no RGB data).
+    """
+    import cv2, numpy as np
+
+    def _to_3ch_16(mono):
+        m16 = (np.clip(mono, 0.0, 1.0) * 65535.0).astype(np.uint16)
+        return cv2.merge([m16, m16, m16])
+
+    def _write(folder_name, file_stem, img16):
+        sub = out_dir / folder_name
+        sub.mkdir(parents=True, exist_ok=True)
+        _atomic_imwrite(sub / f"{file_stem}_{seq_num:05d}.png", img16)
+        # Dummy 00000 — host's numbered-stills importer silently drops the first
+        # frame, so seed each folder with a copy on the first written frame.
+        if is_first:
+            _atomic_imwrite(sub / f"{file_stem}_00000.png", img16)
+
+    try:
+        # 1. CK_RGB — NN foreground with despill (same as the main Track-2 export).
+        if fg is not None:
+            fg_clean = np.clip(fg, 0.0, 1.0).copy()
+            _despill_str = float(settings.get("despill", 0.5))
+            if _despill_str > 0 and not fg_despill_done:
+                try:
+                    from CorridorKeyModule.core import color_utils as _cu_sc
+                    fg_clean = _cu_sc.despill_opencv(
+                        fg_clean, green_limit_mode="average", strength=_despill_str)
+                except Exception:
+                    pass
+            # Re-clip AFTER despill: despill adds spill*0.5 back to R/B and can push
+            # a bright spill pixel past 1.0 — the uint16 cast would wrap it into a
+            # bright speck (main export path clips post-despill; this path must too).
+            fg_16 = (np.clip(fg_clean, 0.0, 1.0) * 65535.0).astype(np.uint16)
+            fg_16 = cv2.cvtColor(fg_16, cv2.COLOR_RGB2BGR)
+            _write("CK_RGB", "CK_RGB", fg_16)
+
+        # 2. CK_COMBINED — CK x SAM merged matte (the "clean key" the viewer signed off).
+        if ck_combined is not None:
+            m = ck_combined[:, :, 0] if ck_combined.ndim == 3 else ck_combined
+            _write("CK_COMBINED", "CK_COMBINED", _to_3ch_16(m))
+
+        # 3. CK_ALPHA — RAW CK neural-net alpha (un-merged, un-choked).
+        if ck_alpha is not None:
+            m = ck_alpha[:, :, 0] if ck_alpha.ndim == 3 else ck_alpha
+            _write("CK_ALPHA", "CK_ALPHA", _to_3ch_16(m))
+
+        # 4. SAM_ALPHA — SAM2 body silhouette.
+        if sam_union is not None:
+            s = sam_union[:, :, 0] if sam_union.ndim == 3 else sam_union
+            _write("SAM_ALPHA", "SAM_ALPHA", _to_3ch_16(s))
+    except Exception as _sc_err:
+        print(f"CK_WARN: named sidecar pass failed on frame {seq_num} "
+              f"(main key unaffected): {_sc_err}", flush=True)
+        log.warning(f"Sidecar write failed frame {seq_num}: {_sc_err}")
 
 
 # ── Subcommand: batch ─────────────────────────────────────────
@@ -292,6 +655,16 @@ def cmd_batch(source_video, output_folder, settings,
     import cv2
     out_dir = Path(output_folder)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Snapshot the shared merge module's silent-fallback crash files so we can detect
+    # (and loudly surface) a CK_COMBINED merge that faulted and fell back to plain CK
+    # during THIS run. The dispatcher swallows its own errors, so the crash file is the
+    # only external signal. NOTE: those paths are hardcoded to the user home in
+    # corridorkey_sam_merge.py today — a follow-up moves both to %TEMP% in that module.
+    _merge_crash_mtimes = {}
+    for _cf_name in ("ck_garbage_merge_exception.txt", "ck_chroma_merge_exception.txt"):
+        _cf = Path.home() / _cf_name
+        _merge_crash_mtimes[_cf] = _cf.stat().st_mtime if _cf.exists() else None
 
     # Resolve time range to frame indices using SOURCE's native fps. This eliminates
     # the drift that happens when JSX converts seconds->frames using the sequence fps
@@ -315,7 +688,7 @@ def cmd_batch(source_video, output_folder, settings,
         log.info(f"Frame range {start_frame}..{end_frame} (source fps {source_fps:.3f})")
 
     log.info(f"Batch: {source_video}  frames {start_frame}..{end_frame}")
-    cap = cv2.VideoCapture(str(source_video))
+    cap = cv2.VideoCapture(str(source_video), cv2.CAP_FFMPEG)   # FIX C: FFMPEG backend -> POS_FRAMES reliable
     if not cap.isOpened():
         log.error(f"Cannot open: {source_video}")
         return 0
@@ -323,12 +696,12 @@ def cmd_batch(source_video, output_folder, settings,
     from corridorkey_processor import CorridorKeyProcessor, ProcessingSettings
     from CorridorKeyModule.core import color_utils as _cu
     processor = CorridorKeyProcessor(device="cuda")
-    # Run NN with despill DISABLED — we apply despill manually below using the same
-    # despill_opencv path the live viewer uses. This ensures render matches preview.
+    # Run NN with despill + despeckle DISABLED. All post-proc runs through the shared
+    # apply_* helpers below (same as KEY FRAME + inline PREVIEW) so render == preview.
     ps = ProcessingSettings(
         screen_type=settings["screenType"],
         despill_strength=0.0,
-        despeckle_enabled=settings["despeckle"],
+        despeckle_enabled=False,
         despeckle_size=settings["despeckleSize"],
         refiner_strength=settings["refiner"],
     )
@@ -353,8 +726,11 @@ def cmd_batch(source_video, output_folder, settings,
             import tempfile as _sam_tmp
             import shutil as _sam_shutil
             from sam2.build_sam import build_sam2_video_predictor
-            ck_root = Path(os.environ["CORRIDORKEY_ROOT"]) if "CORRIDORKEY_ROOT" in os.environ else Path(__file__).parent.parent
-            ckpt = str(ck_root / "sam2_weights" / "sam2.1_hiera_small.pt")
+            # Use the module-level CK_ROOT (find_corridorkey_root) — the old inline
+            # `Path(__file__).parent.parent` fallback resolved to the CEP extensions
+            # folder, so SAM2 weights load silently failed. CK_ROOT honours the same
+            # env / corridorkey_path.txt / fallback chain the Resolve plugin uses.
+            ckpt = str(CK_ROOT / "sam2_weights" / "sam2.1_hiera_small.pt")
             cfg = "configs/sam2.1/sam2.1_hiera_s.yaml"
             device = "cuda" if sam_torch.cuda.is_available() else "cpu"
 
@@ -384,8 +760,16 @@ def cmd_batch(source_video, output_folder, settings,
             _patch_sam2_png()
             _src_h = _src_w = _pad_box = None
             try:
-                _exp_cap = cv2.VideoCapture(str(source_video))
-                _exp_cap.set(cv2.CAP_PROP_POS_MSEC, float(start_frame) / source_fps * 1000.0)
+                _exp_cap = cv2.VideoCapture(str(source_video), cv2.CAP_FFMPEG)
+                # FIX C: POS_FRAMES + throwaway prime read (MSEC returns a dirty first read on long-GOP).
+                _sf = int(start_frame)
+                if _sf > 0:
+                    _exp_cap.set(cv2.CAP_PROP_POS_FRAMES, _sf - 1)
+                    _exp_cap.read()        # throwaway: warms decoder -> next read = start_frame
+                # start_frame == 0: never seek — _exp_cap was JUST opened, so it already
+                # sits at frame 0 and reads it clean sequentially. Seeking (even to 0)
+                # flushes the decoder and dirties the next read, which fed SAM2 a junk
+                # anchor frame (junk-first-frame bug, Berto 2026-06-04).
                 _exported = 0
                 for _i in range(_count):
                     _ok, _fr = _exp_cap.read()
@@ -444,8 +828,71 @@ def cmd_batch(source_video, output_folder, settings,
                                 _unpad_from_square(_m_padded, _pad_box)
                                 if _pad_box is not None else _m_padded
                             )
+
+                # Empty / collapsed-mask post-pass — ported from CorridorKey_Pro.py
+                # (~1806-1847). SAM2 can yield a near-empty mask on some frames:
+                #   - INTERIOR collapse (mid-range tracking glitch): a frame between
+                #     two substantial masks goes empty. Filling it with a ones-mask
+                #     means CK alone keys that frame (SAM gates nothing) instead of
+                #     writing a black frame (empty SAM × CK = nothing).
+                #   - TAIL / HEAD empties (actor not in frame at the ends): hold the
+                #     nearest substantial mask so the junk SAM was killing stays
+                #     killed when the subject leaves frame.
+                # Operates on the single-object sam_video_masks dict (AE keys by
+                # range-relative frame index; DaVinci keys per obj_id).
+                _sorted_keys = sorted(sam_video_masks.keys())
+                if _sorted_keys:
+                    _first_sub = next(
+                        (f for f in _sorted_keys if sam_video_masks[f].sum() >= 100), None)
+                    _last_sub = next(
+                        (f for f in reversed(_sorted_keys) if sam_video_masks[f].sum() >= 100), None)
+                    _collapsed = 0
+                    _held = 0
+                    if _first_sub is not None and _last_sub is not None:
+                        for _f in _sorted_keys:
+                            if sam_video_masks[_f].sum() >= 100:
+                                continue
+                            if _first_sub <= _f <= _last_sub:
+                                # interior collapse -> ones-mask -> CK-only fallback
+                                sam_video_masks[_f] = np.ones_like(sam_video_masks[_f])
+                                _collapsed += 1
+                            elif _f > _last_sub:
+                                sam_video_masks[_f] = sam_video_masks[_last_sub].copy()
+                                _held += 1
+                            else:  # _f < _first_sub (head empty)
+                                sam_video_masks[_f] = sam_video_masks[_first_sub].copy()
+                                _held += 1
+                    log.info(f"SAM2 post-pass: {_collapsed} interior empties -> NN fallback, "
+                             f"{_held} tail/head empties held to nearest substantial mask.")
+                    # Anchor-frame fix — ported from CorridorKey_Pro.py (~1835-1847).
+                    # Frame 0 uses no_mem_embed (image-SAM mode) producing a weaker
+                    # mask with interior holes. If frame 2 has >10% more coverage than
+                    # frame 0 or 1, copy frame 2 back over the weak anchor frames.
+                    if 2 in sam_video_masks:
+                        _ref_cov = sam_video_masks[2].sum()
+                        if _ref_cov >= 100:
+                            _patched = []
+                            for _early in (0, 1):
+                                if _early in sam_video_masks and sam_video_masks[_early].sum() < _ref_cov * 0.9:
+                                    sam_video_masks[_early] = sam_video_masks[2].copy()
+                                    _patched.append(_early)
+                            if _patched:
+                                log.info(f"SAM2 anchor-fix: copied frame 2 -> frames {_patched}")
+
+                # VRAM teardown — ported from CorridorKey_Pro.py (1849-1862).
+                # reset_state releases SAM2's internal CUDA buffers BEFORE we drop the
+                # predictor (fixes the GPU memory leak on Windows, issue #258). Delete
+                # state first (holds CUDA tensors), then predictor (holds weights) —
+                # wrong order leaks VRAM because the predictor references state.
+                # synchronize() waits for the GPU before empty_cache() actually frees.
+                try:
+                    _video_predictor.reset_state(_state)
+                except Exception:
+                    pass
+                del _state
                 del _video_predictor
                 if sam_torch.cuda.is_available():
+                    sam_torch.cuda.synchronize()
                     sam_torch.cuda.empty_cache()
                 log.info(f"SAM2 video: {len(sam_video_masks)} per-frame masks ready")
             finally:
@@ -457,6 +904,13 @@ def cmd_batch(source_video, output_folder, settings,
             log.warning(f"SAM2 video predictor failed for batch: {_e} — keying without SAM matte sidecar")
             sam_video_masks = {}
 
+    # LOUD fallback surfacing: SAM points were set but propagation yielded nothing.
+    # Without this the batch silently keys CK-only and the result looks like "SAM did
+    # nothing" with no signal. The panel greps stdout for the "CK_WARN:" prefix.
+    if sam_active and not sam_video_masks:
+        print("CK_WARN: SAM points were set but propagation produced 0 masks. Keying WITHOUT SAM (no CK_COMBINED).", flush=True)
+        log.warning("SAM active but 0 masks produced — keying without SAM.")
+
     # Sidecar dir is created up front so the dummy-first-frame write never
     # races a missing parent. Empty dir is cheap; gets removed by the caller
     # if no SAM points were active and no files were ever written.
@@ -467,15 +921,61 @@ def cmd_batch(source_video, output_folder, settings,
         # Option C — feed soft mask straight in; no binarise step.
         from corridorkey_sam_merge import process_sam_matte
 
+    # CK_COMBINED merge: when a per-frame SAM mask exists, combine the RAW CK alpha
+    # with the soft SAM silhouette via the SAME dispatcher DaVinci uses
+    # (merge_ck_with_sam_active -> garbage_matte mode). This is what makes the AE key
+    # match Resolve's clean key instead of raw, over-keyed CK.
+    # DRIFT NOTE: AE v1 omits _apply_shirt_rescue (a Resolve-only refinement that lives
+    # in the Resolve plugin, not the shared engine). Flagged for a follow-up port.
+    from corridorkey_sam_merge import merge_ck_with_sam_active
+
     processed = 0
     failed = []
     total = max(1, end_frame - start_frame)
 
+    # Disk preflight — refuse to start a render the volume can't hold. Measured
+    # cost on 4K is ~30 MB/frame across output+sidecars; estimate from actual
+    # source dims at ~5 bytes/px (PNG-compressed, all outputs) with 1.3x margin
+    # so the render fails HERE with a clear message, not at frame 184 of 238.
     try:
-        # Seek once via MSEC — avoids the off-by-one bug in POS_FRAMES where
-        # set(N) + read() returns frame N+1 on H.264/HEVC with some OpenCV builds.
-        # After the initial MSEC seek, subsequent reads advance frame-by-frame normally.
-        cap.set(cv2.CAP_PROP_POS_MSEC, float(start_frame) / source_fps * 1000.0)
+        import shutil as _sh
+        _w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 3840)
+        _h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 2160)
+        _need = int(total * _w * _h * 5 * 1.3)
+        _free = _sh.disk_usage(str(out_dir)).free
+        if _free < _need:
+            cap.release()
+            try:
+                processor.cleanup()   # release CUDA weights — preflight bail is outside the try/finally
+            except Exception:
+                pass
+            print(f"CK_ERROR: not enough disk for this render — need ~"
+                  f"{_need / 1e9:.1f} GB free on {Path(out_dir).drive or out_dir}, "
+                  f"have {_free / 1e9:.1f} GB. Free space or shorten the range.",
+                  flush=True)
+            log.error(f"Disk preflight failed: need {_need}, free {_free}")
+            return False
+    except Exception as _pf_e:          # preflight must never block a render itself
+        log.warning(f"Disk preflight skipped: {_pf_e}")
+
+    try:
+        # FIX C: POS_FRAMES seek + throwaway prime read. CAP_PROP_POS_MSEC returns a DIRTY
+        # first read on long-GOP H.264/HEVC (the Resolve engine forbids MSEC for exactly
+        # this and seeks via POS_FRAMES). Seek to start_frame-1 and consume one frame so the
+        # decoder is warm and the first REAL read below returns a clean start_frame.
+        # start_frame==0: no -1 to seek to, so prime-read frame 0 then rewind to 0.
+        _sf = int(start_frame)
+        if _sf > 0:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, _sf - 1)
+            cap.read()                 # throwaway: consumes (_sf-1) -> next read = start_frame
+        else:
+            # start_frame == 0: NEVER seek. A POS_FRAMES seek (even to 0) flushes the
+            # long-GOP decoder, and the first read AFTER a seek is the dirty one — the
+            # old warm-read+rewind landed that dirt on the REAL frame 0 (junk first
+            # frame on the timeline, Berto 2026-06-04). A freshly opened demuxer sits
+            # at frame 0 and decodes it clean sequentially, so reopen and don't seek.
+            cap.release()
+            cap = cv2.VideoCapture(str(source_video), cv2.CAP_FFMPEG)
         for frame_idx in range(int(start_frame), int(end_frame)):
             seq_num = frame_idx - int(start_frame)
             ok, frame = cap.read()
@@ -495,30 +995,64 @@ def cmd_batch(source_video, output_folder, settings,
                     continue
                 if len(alpha.shape) == 3:
                     alpha = alpha[:, :, 0]
-                # Apply despill using the same despill_opencv path as the live viewer.
-                # result["fg"] is the raw undespilled sRGB foreground. The engine's
-                # internal despill (via ProcessingSettings) would use a different code
-                # path and produce different results — matching the viewer requires this.
-                despill_str = float(settings.get("despill", 1.0))
-                if despill_str > 0:
-                    fg = _cu.despill_opencv(fg, green_limit_mode="average", strength=despill_str)
-                choke_px = int(settings.get("choke", 0))
-                if choke_px > 0:
-                    k = choke_px * 2 + 1
-                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-                    a8 = (np.clip(alpha, 0, 1) * 255).astype(np.uint8)
-                    alpha = cv2.erode(a8, kernel).astype(np.float32) / 255.0
-                fg_uint8 = (np.clip(fg, 0, 1) * 255).astype(np.uint8)
-                alpha_uint8 = (np.clip(alpha, 0, 1) * 255).astype(np.uint8)
-                fg_bgr = cv2.cvtColor(fg_uint8, cv2.COLOR_RGB2BGR)
-                out_bgra = cv2.merge([fg_bgr[:, :, 0], fg_bgr[:, :, 1], fg_bgr[:, :, 2], alpha_uint8])
-                cv2.imwrite(str(out_dir / f"output_{seq_num:05d}.png"), out_bgra)
+                # RAW CK alpha — snapshot BEFORE choke/merge mutate it. The merge and
+                # (later) the CK_ALPHA sidecar both need the un-choked matte.
+                alpha_raw = alpha.copy()
+                # Shared post-proc — identical helpers to KEY FRAME + inline PREVIEW so
+                # render == preview. SAM garbage-matte merge first (source_rgb=img_rgb
+                # drives the hair chroma-escape valve — same call as the Resolve plugin,
+                # CorridorKey_Pro.py:5447). Snapshot the merged matte for the CK_COMBINED
+                # sidecar BEFORE choke, then choke + despeckle the alpha, despill the fg.
+                alpha = sam_garbage_merge(
+                    alpha_raw, sam_video_masks.get(seq_num), img_rgb, settings,
+                    settings["screenType"])
+                # Shirt rescue in the RENDER path too (2026-06-06 review: it was wired
+                # into apply_matte_postproc only, which cmd_batch does not use —
+                # preview had rescue, renders didn't). Resize the SAM mask to alpha
+                # dims first or the rescue's shape guard silently no-ops on 4K.
+                _sam_for_rescue = sam_video_masks.get(seq_num)
+                if _sam_for_rescue is not None and _sam_for_rescue.shape[:2] != alpha.shape[:2]:
+                    _sam_for_rescue = cv2.resize(
+                        _sam_for_rescue, (alpha.shape[1], alpha.shape[0]),
+                        interpolation=cv2.INTER_LINEAR)
+                alpha = apply_shirt_rescue(alpha, _sam_for_rescue, img_rgb, settings)
+                alpha_combined = alpha.copy()
+                alpha = apply_choke(alpha, settings)
+                alpha = apply_despeckle(alpha, settings)
+                fg = apply_despill(fg, settings)
+                fg_uint16 = (np.clip(fg, 0, 1) * 65535).astype(np.uint16)
+                alpha_uint16 = (np.clip(alpha_raw, 0, 1) * 65535).astype(np.uint16)
+                alpha_uint8  = (np.clip(alpha_raw, 0, 1) * 255).astype(np.uint8)
+                fg_bgr = cv2.cvtColor(fg_uint16, cv2.COLOR_RGB2BGR)
+                out_bgra = cv2.merge([fg_bgr[:, :, 0], fg_bgr[:, :, 1], fg_bgr[:, :, 2], alpha_uint16])
+                _atomic_imwrite(out_dir / f"output_{seq_num:05d}.png", out_bgra)
+                # Named sidecar passes (Editable Layers / Fusion-comp parity) — write
+                # CK_RGB/, CK_COMBINED/, CK_ALPHA/, SAM_ALPHA/ as separate 16-bit
+                # numbered-stills sequences. fg is already despilled here so we tell the
+                # writer not to re-despill. SAM silhouette is the per-frame soft mask
+                # (resized to alpha shape) when present. GUARDED inside _write_fusion_
+                # sidecars — a sidecar fault surfaces as CK_WARN: but never crashes the
+                # main key, matching the loud-fallback pattern below.
+                _sam_for_sidecar = None
+                if seq_num in sam_video_masks:
+                    _sam_for_sidecar = sam_video_masks[seq_num]
+                    if _sam_for_sidecar.shape[:2] != alpha_raw.shape[:2]:
+                        _sam_for_sidecar = cv2.resize(
+                            _sam_for_sidecar,
+                            (alpha_raw.shape[1], alpha_raw.shape[0]),
+                            interpolation=cv2.INTER_LINEAR,
+                        )
+                _write_fusion_sidecars(
+                    fg, alpha_raw, alpha_combined, _sam_for_sidecar,
+                    settings, out_dir, seq_num, is_first=(processed == 0),
+                    fg_despill_done=True,
+                )
                 # Matte goes into a SUBFOLDER so the main out_dir contains exactly one
                 # PNG pattern. Premiere's importAsNumberedStills auto-detects the range
                 # reliably only when the folder is clean.
                 matte_dir = out_dir / "mattes"
                 matte_dir.mkdir(parents=True, exist_ok=True)
-                cv2.imwrite(str(matte_dir / f"matte_{seq_num:05d}.png"), alpha_uint8)
+                _atomic_imwrite(matte_dir / f"matte_{seq_num:05d}.png", alpha_uint8)
                 # v1.0 SAM matte sidecar — one file per frame in sam_mattes/.
                 # uint8 PNG matches the CK matte's format so the host imports
                 # both as identical numbered-stills sequences.
@@ -539,18 +1073,49 @@ def cmd_batch(source_video, output_folder, settings,
                             softness_sigma=sam_soften,
                             fill_kernel_px=sam_fill,
                         )
+                        _sam_erode_px = int(settings.get("sam_erode_px", 4))
+                        if _sam_erode_px > 0:
+                            _ek = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_sam_erode_px * 2 + 1, _sam_erode_px * 2 + 1))
+                            _sam_processed = cv2.erode((np.clip(_sam_processed, 0, 1) * 255).astype(np.uint8), _ek, iterations=1).astype(np.float32) / 255.0
+                        _sam_expand_px = int(settings.get("sam_expand_px", 0))
+                        if _sam_expand_px > 0:
+                            _ek2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_sam_expand_px * 2 + 1, _sam_expand_px * 2 + 1))
+                            _sam_processed = cv2.dilate((_sam_processed * 255).astype(np.uint8), _ek2, iterations=1).astype(np.float32) / 255.0
                         _sam_u8 = (np.clip(_sam_processed, 0, 1) * 255).astype(np.uint8)
-                        cv2.imwrite(str(sam_dir / f"sam_{seq_num:05d}.png"), _sam_u8)
+                        _sam_rgba = np.zeros((_sam_u8.shape[0], _sam_u8.shape[1], 4), dtype=np.uint8)
+                        _sam_rgba[:, :, 0] = 255  # B
+                        _sam_rgba[:, :, 1] = 255  # G
+                        _sam_rgba[:, :, 2] = 255  # R
+                        _sam_rgba[:, :, 3] = _sam_u8  # Alpha = mask
+                        _atomic_imwrite(sam_dir / f"sam_{seq_num:05d}.png", _sam_rgba)
                         if processed == 0:
-                            cv2.imwrite(str(sam_dir / "sam_00000.png"), _sam_u8)
+                            _atomic_imwrite(sam_dir / "sam_00000.png", _sam_rgba)
+                        # ck_masked sidecar — despilled fg RGBA, alpha = alpha_raw * SAM
+                        try:
+                            ck_masked_dir = out_dir / "ck_masked"
+                            ck_masked_dir.mkdir(parents=True, exist_ok=True)
+                            _masked_alpha = np.clip(alpha_raw * _sam_processed, 0, 1)
+                            _cm_fg16 = (np.clip(fg, 0, 1) * 65535).astype(np.uint16)
+                            _cm_bgr = cv2.cvtColor(_cm_fg16, cv2.COLOR_RGB2BGR)
+                            _cm_a16 = (np.clip(_masked_alpha, 0, 1) * 65535).astype(np.uint16)
+                            _cm_rgba = cv2.merge([_cm_bgr[:, :, 0], _cm_bgr[:, :, 1], _cm_bgr[:, :, 2], _cm_a16])
+                            _atomic_imwrite(ck_masked_dir / f"ck_masked_{seq_num:05d}.png", _cm_rgba)
+                            if processed == 0:
+                                _atomic_imwrite(ck_masked_dir / "ck_masked_00000.png", _cm_rgba)
+                        except Exception as _cm_e:
+                            log.warning(f"ck_masked frame {frame_idx}: write failed: {_cm_e}")
                     except Exception as _se:
                         log.warning(f"SAM frame {frame_idx}: sidecar save failed: {_se}")
                 # Premiere Pro's sequence importer silently drops the first frame. Write
                 # a dummy output_00000.png (and matching matte) so the user's actual
                 # frame range survives the import intact.
+                # NOTE: output_00000 is the REAL first frame (seq_num starts at 0), not a
+                # separate leader — this re-write is a harmless no-op duplicate of the
+                # seq-0 write above. Kept for the Premiere drop-first-frame comment above;
+                # FIX C's clean POS_FRAMES decode means frame 0 itself is no longer dirty.
                 if processed == 0:
-                    cv2.imwrite(str(out_dir / "output_00000.png"), out_bgra)
-                    cv2.imwrite(str(matte_dir / "matte_00000.png"), alpha_uint8)
+                    _atomic_imwrite(out_dir / "output_00000.png", out_bgra)
+                    _atomic_imwrite(matte_dir / "matte_00000.png", alpha_uint8)
                 processed += 1
             except Exception as e:
                 failed.append(frame_idx)
@@ -569,6 +1134,17 @@ def cmd_batch(source_video, output_folder, settings,
 
     (out_dir / "batch_result.txt").write_text(f"{processed},{total},{len(failed)}")
     log.info(f"Done: {processed}/{total} ({len(failed)} failed)")
+    # LOUD fallback surfacing: if a merge crash file was (re)written during this run, the
+    # CK_COMBINED merge faulted and silently fell back to plain CK on >=1 frame. Tell the
+    # user instead of shipping a worse key as if it were the clean one.
+    for _cf, _was in _merge_crash_mtimes.items():
+        try:
+            _now = _cf.stat().st_mtime if _cf.exists() else None
+        except Exception:
+            _now = None
+        if _now is not None and _now != _was:
+            print(f"CK_WARN: CK_COMBINED merge faulted and fell back to plain CK on at least one frame. Trace: {_cf}", flush=True)
+            log.warning(f"Merge fallback detected this run — see {_cf}")
     return processed
 
 
@@ -595,7 +1171,7 @@ def cmd_batch_scrub(source_video, scrub_folder, settings,
     scrub_dir.mkdir(parents=True, exist_ok=True)
     log.info(f"Batch-scrub: {source_video} frames {start_frame}..{start_frame+count}")
 
-    cap = cv2.VideoCapture(str(source_video))
+    cap = cv2.VideoCapture(str(source_video), cv2.CAP_FFMPEG)   # FIX C: FFMPEG backend
     if not cap.isOpened():
         log.error(f"Cannot open: {source_video}")
         return 0
@@ -633,6 +1209,11 @@ def cmd_batch_scrub(source_video, scrub_folder, settings,
             sam_anchor_abs = _lp_data.get("sam_anchor_frame")
     except Exception as _e:
         log.warning(f"Could not read SAM2 points from live_params: {_e}")
+    if not sam_pos and not sam_neg:
+        sam_pos = settings.get('sam_positive', []) or []
+        sam_neg = settings.get('sam_negative', []) or []
+    if sam_anchor_abs is None:
+        sam_anchor_abs = settings.get('sam_anchor_frame')
 
     # Map absolute click frame → range-relative index. If the click was
     # outside the scrub range (or never recorded), anchor at frame 0 and
@@ -651,8 +1232,11 @@ def cmd_batch_scrub(source_video, scrub_folder, settings,
             import tempfile as _sam_tmp
             import shutil as _sam_shutil
             from sam2.build_sam import build_sam2_video_predictor
-            ck_root = Path(os.environ["CORRIDORKEY_ROOT"]) if "CORRIDORKEY_ROOT" in os.environ else Path(__file__).parent.parent
-            ckpt = str(ck_root / "sam2_weights" / "sam2.1_hiera_small.pt")
+            # Use the module-level CK_ROOT (find_corridorkey_root) — the old inline
+            # `Path(__file__).parent.parent` fallback resolved to the CEP extensions
+            # folder, so SAM2 weights load silently failed. CK_ROOT honours the same
+            # env / corridorkey_path.txt / fallback chain the Resolve plugin uses.
+            ckpt = str(CK_ROOT / "sam2_weights" / "sam2.1_hiera_small.pt")
             cfg = "configs/sam2.1/sam2.1_hiera_s.yaml"
             device = "cuda" if sam_torch.cuda.is_available() else "cpu"
 
@@ -672,8 +1256,16 @@ def cmd_batch_scrub(source_video, scrub_folder, settings,
             _patch_sam2_png()
             _src_h = _src_w = _pad_box = None
             try:
-                _exp_cap = cv2.VideoCapture(str(source_video))
-                _exp_cap.set(cv2.CAP_PROP_POS_MSEC, float(start_frame) / source_fps * 1000.0)
+                _exp_cap = cv2.VideoCapture(str(source_video), cv2.CAP_FFMPEG)
+                # FIX C: POS_FRAMES + throwaway prime read (MSEC dirty first read on long-GOP).
+                _sf = int(start_frame)
+                if _sf > 0:
+                    _exp_cap.set(cv2.CAP_PROP_POS_FRAMES, _sf - 1)
+                    _exp_cap.read()        # throwaway warm-up -> next read = start_frame
+                else:
+                    _exp_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    _exp_cap.read()
+                    _exp_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 _exported = 0
                 for _i in range(int(count)):
                     _ok, _fr = _exp_cap.read()
@@ -739,8 +1331,20 @@ def cmd_batch_scrub(source_video, scrub_folder, settings,
                                 _unpad_from_square(_m_padded, _pad_box)
                                 if _pad_box is not None else _m_padded
                             )
+                # VRAM teardown — ported from CorridorKey_Pro.py (1849-1862).
+                # reset_state releases SAM2's internal CUDA buffers BEFORE we drop the
+                # predictor (fixes the GPU memory leak on Windows, issue #258). Delete
+                # state first (holds CUDA tensors), then predictor (holds weights) —
+                # wrong order leaks VRAM. synchronize() before empty_cache() so the
+                # GPU has actually finished before the cache is freed.
+                try:
+                    _video_predictor.reset_state(_state)
+                except Exception:
+                    pass
+                del _state
                 del _video_predictor
                 if sam_torch.cuda.is_available():
+                    sam_torch.cuda.synchronize()
                     sam_torch.cuda.empty_cache()
                 log.info(f"SAM2 video: {len(sam_video_masks)} per-frame masks ready")
             finally:
@@ -755,8 +1359,16 @@ def cmd_batch_scrub(source_video, scrub_folder, settings,
     keyed = 0
     failed = []
     try:
-        # MSEC seek — same off-by-one fix as cmd_batch.
-        cap.set(cv2.CAP_PROP_POS_MSEC, float(start_frame) / source_fps * 1000.0)
+        # FIX C: POS_FRAMES seek + throwaway prime read (same as cmd_batch) — MSEC returns a
+        # dirty first read on long-GOP. Warm the decoder so the first real read is clean.
+        _sf = int(start_frame)
+        if _sf > 0:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, _sf - 1)
+            cap.read()                 # throwaway warm-up -> next read = start_frame
+        else:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            cap.read()
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         for frame_offset in range(int(count)):
             frame_idx = start_frame + frame_offset
             ok, frame = cap.read()
@@ -785,6 +1397,9 @@ def cmd_batch_scrub(source_video, scrub_folder, settings,
                 fg_bgr_u16 = cv2.cvtColor(fg_u16, cv2.COLOR_RGB2BGR)
                 cv2.imwrite(str(out_dir / "fg.png"), fg_bgr_u16)
                 cv2.imwrite(str(out_dir / "alpha.png"), alpha_u16)
+                # Raw plate — source_rgb for garbage_matte body fill / chroma escape.
+                plate_u8 = (np.clip(img_rgb, 0, 1) * 255).astype(np.uint8)
+                cv2.imwrite(str(out_dir / "plate.png"), cv2.cvtColor(plate_u8, cv2.COLOR_RGB2BGR))
                 # Pull the pre-propagated video-predictor mask for this frame.
                 # Saving alpha_nn.png + sam2_gate_raw.png makes the viewer's
                 # render do alpha_nn × gate composite (with live margin/soften
@@ -800,6 +1415,14 @@ def cmd_batch_scrub(source_video, scrub_folder, settings,
                                 (alpha.shape[1], alpha.shape[0]),
                                 interpolation=cv2.INTER_LINEAR,
                             )
+                        _sam_erode_px = int(settings.get("sam_erode_px", 4))
+                        if _sam_erode_px > 0:
+                            _ek = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_sam_erode_px * 2 + 1, _sam_erode_px * 2 + 1))
+                            _gate_soft = cv2.erode((_gate_soft * 255).astype(np.uint8), _ek, iterations=1).astype(np.float32) / 255.0
+                        _sam_expand_px = int(settings.get("sam_expand_px", 0))
+                        if _sam_expand_px > 0:
+                            _ek2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_sam_expand_px * 2 + 1, _sam_expand_px * 2 + 1))
+                            _gate_soft = cv2.dilate((_gate_soft * 255).astype(np.uint8), _ek2, iterations=1).astype(np.float32) / 255.0
                         _gate_u16 = (np.clip(_gate_soft, 0, 1) * 65535.0).astype(np.uint16)
                         cv2.imwrite(str(out_dir / "sam2_gate_raw.png"), _gate_u16)
                         cv2.imwrite(str(out_dir / "alpha_nn.png"), alpha_u16)
@@ -899,6 +1522,9 @@ def cmd_cache(input_path, session_dir, settings):
 
         cv2.imwrite(str(sess / "fg.png"), fg_bgr_u16)
         cv2.imwrite(str(sess / "alpha.png"), alpha_u16)
+        # Raw plate — source_rgb for garbage_matte body fill / chroma escape.
+        plate_u8 = (np.clip(img_rgb, 0, 1) * 255).astype(np.uint8)
+        cv2.imwrite(str(sess / "plate.png"), cv2.cvtColor(plate_u8, cv2.COLOR_RGB2BGR))
 
         # frame_num lets the viewer record where the user clicked SAM2 points
         # (as sam_anchor_frame in live_params.json). cmd_batch_scrub uses it
@@ -936,7 +1562,19 @@ def cmd_cache(input_path, session_dir, settings):
 #   'none' = raw RGBA with no composite. 'black'/'white'/'checker' = solid or generated.
 #   'v1-below' expects the caller to pass --v1-path pointing at a PNG of the timeline
 #   V1 frame to use as a background plate.
-def cmd_postproc(session_dir, output_path, settings, background="checker", v1_path=None):
+def _maybe_downscale(img, max_width):
+    # Shrink a BGR/BGRA image to max_width for the inline panel preview. A full 4K
+    # PNG base64s to ~6.5MB which exceeds CEF's data-URI limit and silently fails
+    # to render; a panel-sized preview loads instantly.
+    import cv2
+    if max_width and img.shape[1] > int(max_width):
+        mw = int(max_width)
+        h = int(round(img.shape[0] * mw / img.shape[1]))
+        return cv2.resize(img, (mw, h), interpolation=cv2.INTER_AREA)
+    return img
+
+
+def cmd_postproc(session_dir, output_path, settings, background="checker", v1_path=None, max_width=None):
     import numpy as np
     import cv2
     sess = Path(session_dir)
@@ -961,23 +1599,56 @@ def cmd_postproc(session_dir, output_path, settings, background="checker", v1_pa
         alpha = alpha[:, :, 0]
     fg_rgb = cv2.cvtColor(fg_bgr, cv2.COLOR_BGR2RGB)
 
-    # Reuse engine's post-proc math so our output matches what the full `single`
-    # pipeline produces with the same settings — no drift between preview and commit.
+    # SAM gate (optional) -> soft silhouette, then the SHARED post-proc so the inline
+    # PREVIEW is byte-identical to the RENDER (KEY FRAME / WORK AREA). source_rgb uses
+    # plate.png (raw frame before NN) when available — fixes garbage_matte body fill.
+    sam_soft = None
+    gate_path = sess / "sam2_gate_raw.png"
+    if gate_path.exists():
+        _g = cv2.imread(str(gate_path), cv2.IMREAD_UNCHANGED)
+        if _g is not None:
+            sam_soft = _g.astype(np.float32) / (65535.0 if _g.dtype == np.uint16 else 255.0)
+    # PRE-RENDER MATTE INSPECTOR (Berto 2026-06-06: "we need to see the different
+    # mattes sam/ck/and combined before we render"). matte-ck = the raw NN matte
+    # before any merge; matte-sam = the raw SAM silhouette. Both write-and-return
+    # here, BEFORE post-proc. The 'matte' (combined) view falls through to the
+    # shared post-proc below so it stays byte-identical to the render.
+    if background in ("matte-ck", "matte-sam"):
+        if background == "matte-ck":
+            view = alpha
+        elif sam_soft is not None:
+            try:
+                from corridorkey_sam_merge import solidify_sam_silhouette
+                view = solidify_sam_silhouette(
+                    sam_soft, carve_points=settings.get("sam_negative") or None
+                ).astype(np.float32)
+            except Exception as _sv_e:
+                log.warning(f"SAM view solidify failed, showing raw gate: {_sv_e}")
+                view = sam_soft
+        else:
+            view = np.zeros_like(alpha)
+        m8 = (np.clip(view, 0, 1) * 255).astype(np.uint8)
+        m8 = _maybe_downscale(m8, max_width)
+        _mv_out = Path(output_path)
+        _mv_out.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_imwrite(_mv_out, cv2.merge([m8, m8, m8]))
+        log.info(f"Postproc ({background} view) saved: {_mv_out}")
+        return True
+
+    # Load raw plate if cached — gives garbage_matte correct on-green detection.
+    # Falls back to None (skips body fill entirely) if plate.png absent.
+    _plate_path = sess / "plate.png"
+    _plate_raw = cv2.imread(str(_plate_path), cv2.IMREAD_UNCHANGED) if _plate_path.exists() else None
+    _source_rgb = (
+        cv2.cvtColor(_plate_raw, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        if _plate_raw is not None else None
+    )
+
+    # cu is also used by the background/composite section below.
     from CorridorKeyModule.core import color_utils as cu
-
-    # Despeckle (operates on alpha)
-    if settings.get("despeckle", True):
-        alpha = cu.clean_matte_opencv(
-            alpha,
-            area_threshold=int(settings.get("despeckleSize", 400)),
-            dilation=25,
-            blur_size=5,
-        )
-
-    # Despill (operates on RGB foreground)
-    despill_strength = float(settings.get("despill", 0.5))
-    if despill_strength > 0.0:
-        fg_rgb = cu.despill_opencv(fg_rgb, green_limit_mode="average", strength=despill_strength)
+    fg_rgb, alpha = apply_matte_postproc(
+        fg_rgb, alpha, settings, sam_soft=sam_soft, source_rgb=_source_rgb,
+        screen_type=settings.get("screenType", "green"))
 
     # Build background buffer
     h, w = fg_rgb.shape[:2]
@@ -1002,6 +1673,18 @@ def cmd_postproc(session_dir, output_path, settings, background="checker", v1_pa
                 if v1_rgb.shape[:2] != (h, w):
                     v1_rgb = cv2.resize(v1_rgb, (w, h))
                 bg_rgb = v1_rgb
+    elif background == "matte":
+        # MATTE view (Berto 2026-06-06): show the final post-proc'd alpha itself as a
+        # grayscale image — white subject, black background, gray = semi-transparent.
+        # Same matte the render will use (post SAM merge/choke/despeckle), so the
+        # operator judges dots/holes BEFORE burning a render.
+        m8 = (np.clip(alpha, 0, 1) * 255).astype(np.uint8)
+        m8 = _maybe_downscale(m8, max_width)
+        _matte_out = Path(output_path)
+        _matte_out.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_imwrite(_matte_out, cv2.merge([m8, m8, m8]))
+        log.info(f"Postproc (matte view) saved: {_matte_out}")
+        return True
     elif background == "none":
         bg_rgb = None
     else:
@@ -1014,22 +1697,131 @@ def cmd_postproc(session_dir, output_path, settings, background="checker", v1_pa
     # Expand alpha to (H,W,1) so it broadcasts cleanly against (H,W,3) RGB buffers.
     alpha_3d = alpha[..., np.newaxis] if alpha.ndim == 2 else alpha
     if bg_rgb is None:
-        # Write raw RGBA with alpha channel
-        rgba_u8 = np.dstack([
-            (np.clip(fg_rgb, 0, 1) * 255).astype(np.uint8),
-            (np.clip(alpha, 0, 1) * 255).astype(np.uint8),
-        ])
-        bgra = cv2.cvtColor(rgba_u8, cv2.COLOR_RGBA2BGRA)
-        cv2.imwrite(str(out_path), bgra)
+        # Write straight RGBA. cv2.imwrite writes channels as stored, so convert the
+        # RGB foreground to BGR first, then append alpha -> a correct BGRA buffer.
+        fg_bgr_u8 = cv2.cvtColor((np.clip(fg_rgb, 0, 1) * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
+        bgra = np.dstack([fg_bgr_u8, (np.clip(alpha, 0, 1) * 255).astype(np.uint8)])
+        bgra = _maybe_downscale(bgra, max_width)
+        _atomic_imwrite(out_path, bgra)   # atomic: ckScrubShowFrame checks existsSync before read
     else:
         # composite_straight signature: (fg, bg, alpha) — NOT (fg, alpha, bg). Bug fix.
         comp = cu.composite_straight(fg_rgb, bg_rgb, alpha_3d)
         comp_u8 = (np.clip(comp, 0, 1) * 255).astype(np.uint8)
         comp_bgr = cv2.cvtColor(comp_u8, cv2.COLOR_RGB2BGR)
-        cv2.imwrite(str(out_path), comp_bgr)
+        comp_bgr = _maybe_downscale(comp_bgr, max_width)
+        _atomic_imwrite(out_path, comp_bgr)  # atomic: ckScrubShowFrame checks existsSync before read
 
     log.info(f"Postproc -> {out_path} (bg={background})")
     return True
+
+
+def cmd_sam_apply(session_dir, settings):
+    """Run the SAM2 IMAGE predictor ONCE on a cached frame, from the panel's click
+    points, and write a soft uint16 gate (sam2_gate_raw.png) into the session dir.
+
+    This runs as its OWN short-lived process (invoked via runPython), NOT on any UI
+    thread — which is the whole point: the old Qt viewer ran SAM2 synchronously on its
+    GUI thread and froze ("hourglass of death"). Here a hang/crash just exits non-zero
+    and the panel recovers. Engine is proven ~0.3s standalone.
+
+    Mirrors the proven DaVinci _apply_sam_mask: SAM source = the NN foreground (fg.png),
+    letterbox-pad to square, predict(return_logits=True), saturation-ramp the high-res
+    logits, unpad, save uint16. cmd_postproc then garbage-merges the gate.
+
+    Points come from settings: sam_positive / sam_negative = [[x,y],...] in FULL-RES
+    source pixels (label 1 = include, 0 = exclude)."""
+    import numpy as np
+    import cv2
+    import os
+    sess = Path(session_dir)
+    fg_path = sess / "fg.png"
+    if not fg_path.exists():
+        log.error(f"sam-apply: no fg.png in {sess} — run PREVIEW (cache) first")
+        return False
+    pos = settings.get("sam_positive", []) or []
+    neg = settings.get("sam_negative", []) or []
+    if not pos and not neg:
+        log.error("sam-apply: no SAM points given")
+        return False
+
+    fg_raw = cv2.imread(str(fg_path), cv2.IMREAD_UNCHANGED)
+    if fg_raw is None:
+        log.error("sam-apply: cannot read fg.png")
+        return False
+    if fg_raw.ndim == 3 and fg_raw.shape[2] == 4:
+        fg_raw = cv2.cvtColor(fg_raw, cv2.COLOR_BGRA2BGR)
+    if fg_raw.dtype == np.uint16:
+        fg8 = np.clip(fg_raw.astype(np.float32) / 257.0, 0, 255).astype(np.uint8)
+    else:
+        fg8 = fg_raw.astype(np.uint8)
+    frame_rgb = cv2.cvtColor(fg8, cv2.COLOR_BGR2RGB)
+    ih, iw = frame_rgb.shape[:2]
+
+    try:
+        import torch
+        from sam2.build_sam import build_sam2
+        from sam2.sam2_image_predictor import SAM2ImagePredictor
+        from corridorkey_sam_merge import (
+            pad_to_square, unpad_from_square,
+            shift_points_for_padding, logits_to_soft_mask,
+        )
+    except Exception as e:
+        log.error(f"sam-apply: SAM2 import failed: {e}")
+        return False
+
+    pos_pts = [[int(p[0]), int(p[1])] for p in pos]
+    neg_pts = [[int(p[0]), int(p[1])] for p in neg]
+    all_pts = pos_pts + neg_pts
+    labels = [1] * len(pos_pts) + [0] * len(neg_pts)
+    padded, pad_box = pad_to_square(frame_rgb)
+    adj = shift_points_for_padding(all_pts, pad_box)
+
+    ckpt = str(CK_ROOT / "sam2_weights" / "sam2.1_hiera_small.pt")
+    cfg = "configs/sam2.1/sam2.1_hiera_s.yaml"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = None
+    pred = None
+    try:
+        model = build_sam2(cfg, ckpt, device=device)
+        pred = SAM2ImagePredictor(model)
+        pred.set_image(padded)
+        # return_logits=True → masks_hi is HIGH-RES float logits (not binarised); the
+        # saturation ramp turns it into a soft 0..1 gate with a 2-4px feather. Using the
+        # low-res 256² return instead is what caused the wavy/banded edge — don't.
+        masks_hi, scores, _low = pred.predict(
+            point_coords=np.array(adj),
+            point_labels=np.array(labels),
+            multimask_output=True,
+            return_logits=True,
+        )
+        best_idx = int(np.argmax(scores))
+        soft_padded = logits_to_soft_mask(masks_hi[best_idx])
+        soft = unpad_from_square(soft_padded, pad_box)
+        if soft.shape[:2] != (ih, iw):
+            soft = cv2.resize(soft, (iw, ih), interpolation=cv2.INTER_LINEAR)
+        gate_u16 = (np.clip(soft, 0.0, 1.0) * 65535.0).astype(np.uint16)
+        gate_path = sess / "sam2_gate_raw.png"
+        gate_tmp = sess / "sam2_gate_raw.tmp.png"
+        cv2.imwrite(str(gate_tmp), gate_u16)
+        os.replace(str(gate_tmp), str(gate_path))
+        log.info(f"sam-apply: wrote {gate_path} (score {float(scores[best_idx]):.3f}, "
+                 f"{len(pos_pts)}+ / {len(neg_pts)}- pts)")
+        return True
+    except Exception as e:
+        log.error(f"sam-apply: SAM2 inference failed: {e}")
+        log.error(traceback.format_exc())
+        return False
+    finally:
+        try:
+            del pred, model
+        except Exception:
+            pass
+        try:
+            if device == "cuda":
+                import torch as _t
+                _t.cuda.empty_cache()
+        except Exception:
+            pass
 
 
 # ── Arg parsing ───────────────────────────────────────────────
@@ -1106,8 +1898,15 @@ def build_parser():
     pp.add_argument("--despeckle", type=int)
     pp.add_argument("--despeckle-size", dest="despeckle_size", type=int)
     pp.add_argument("--background", default="checker",
-                    choices=["none", "black", "white", "checker", "v1-below"])
+                    choices=["none", "black", "white", "checker", "v1-below", "matte", "matte-ck", "matte-sam"])
     pp.add_argument("--v1-path", dest="v1_path", help="PNG of V1 frame (required for --background v1-below)")
+    pp.add_argument("--max-width", dest="max_width", type=int, help="Downscale output to this max width (inline panel preview)")
+
+    # sam-apply: single-frame SAM2 image predictor from click points -> writes
+    # sam2_gate_raw.png into the session. Separate process = never freezes the panel.
+    sa = sub.add_parser("sam-apply", help="Run SAM2 on a cached frame from click points; write the gate")
+    sa.add_argument("session_dir", help="Session dir (must contain fg.png)")
+    sa.add_argument("--params", help="JSON with sam_positive / sam_negative (full-res pixel coords)")
     return p
 
 
@@ -1164,7 +1963,13 @@ def main():
         if args.mode == "postproc":
             settings = load_settings(args.params, args)
             ok = cmd_postproc(args.session_dir, args.output, settings,
-                              background=args.background, v1_path=args.v1_path)
+                              background=args.background, v1_path=args.v1_path,
+                              max_width=getattr(args, "max_width", None))
+            sys.exit(0 if ok else 1)
+
+        if args.mode == "sam-apply":
+            settings = load_settings(args.params, args)
+            ok = cmd_sam_apply(args.session_dir, settings)
             sys.exit(0 if ok else 1)
 
         parser.print_help()

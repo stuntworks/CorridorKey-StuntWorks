@@ -1,6 +1,15 @@
 #!/usr/bin/env python
-# Last modified: 2026-04-14 | Change: Add --params JSON mode + extract subcommand,
-#   structured PROGRESS output, stderr logging to %TEMP%\corridorkey.log
+# Last modified: 2026-05-29 | Change: Add DEAD-DUMMY banner; this file is NOT run by the panel. | Full history: git log
+# ============================================================================
+# DEAD DUMMY — DO NOT EDIT. This 729-line copy is NOT run by the shipping keying
+# path and lacks the SAM2 batch the panel needs.
+# Canonical LIVE processor:  ae_plugin/cep_panel/ae_processor.py  (1180 lines).
+# deploy.py lists this file in DUMMIES.
+#
+# DANGER ZONE FRAGILE: still referenced by ae_plugin/golobulus/CorridorKey.py (by path),
+#   so it is NOT deleted yet. Removal is gated on retiring/reconciling Golobulus.
+#   / breaks: deleting this now FileNotFounds the Golobulus effect path
+# ============================================================================
 """CorridorKey After Effects / Premiere Processor.
 
 WHAT IT DOES: Command-line bridge between the CEP panel (which spawns Python via

@@ -9,4 +9,5 @@ __pycache__/
 *.pdb
 *.pyd
 _backup_working/
+.deploy_backups/
 .env

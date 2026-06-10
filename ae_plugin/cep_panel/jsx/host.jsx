@@ -1,7 +1,7 @@
 /**
  * CorridorKey — Host Script (ExtendScript)
- * Last modified: 2026-04-14 | Change: Remove all shell exec + all eval(). Python now
- *   runs from the Node.js panel side (index.html). ExtendScript is pure timeline code.
+ * Last modified: 2026-05-29 | Change: ppro_getFrameInfo returns sourceFrame for the SAM2
+ *   anchor (was seconds-only, so mid-range Premiere clicks lost backward propagation).
  *
  * WHAT IT DOES: Reads timeline state from After Effects / Premiere Pro and returns it
  *   to the CEP panel as a JSON string. Imports the PNG(s) Python produced back onto the
@@ -13,13 +13,16 @@
  */
 
 // ============================================================
-// SAFE JSON STRINGIFY (no parse — we never eval inbound strings)
+// SAFE JSON STRINGIFY + PARSE (ExtendScript has NO native JSON in any AE version)
 // ============================================================
-// WHAT IT DOES: Minimal JSON.stringify implementation for ExtendScript, which has no native
-//   JSON object. We deliberately do NOT ship a JSON.parse — all inbound strings from the
-//   panel arrive as function arguments, not as JSON payloads to be parsed.
+// WHAT IT DOES: Minimal JSON.stringify + JSON.parse for ExtendScript.
+// HISTORY: this block originally shipped stringify ONLY ("we never eval inbound strings"),
+//   then the LAYER LOCK feature (2026-06-04) called JSON.parse — which didn't exist — so
+//   the lock handle silently died on every render ("lock step: no-handle", root-caused
+//   2026-06-05 by 3-way review). The parse below is a strict recursive-descent parser,
+//   NOT eval-based, so the original security stance (no eval of inbound strings) holds.
 // DEPENDS-ON: nothing.
-// AFFECTS: Defines JSON.stringify globally.
+// AFFECTS: Defines JSON.stringify + JSON.parse globally.
 (function() {
     if (typeof JSON === "undefined") JSON = {};
     if (typeof JSON.stringify === "undefined") {
@@ -54,6 +57,93 @@
             return undefined;
         };
     }
+    if (typeof JSON.parse === "undefined") {
+        // Strict recursive-descent JSON parser (ES3, no eval). Throws on malformed input.
+        JSON.parse = function (text) {
+            var at = 0, len = String(text).length, src = String(text);
+            function err(msg) { throw new Error("JSON.parse: " + msg + " at " + at); }
+            function ws() { while (at < len && " \t\n\r".indexOf(src.charAt(at)) >= 0) at++; }
+            function value() {
+                ws();
+                var c = src.charAt(at);
+                if (c === "{") return obj();
+                if (c === "[") return arr();
+                if (c === '"') return str();
+                if (c === "-" || (c >= "0" && c <= "9")) return num();
+                if (src.substr(at, 4) === "true") { at += 4; return true; }
+                if (src.substr(at, 5) === "false") { at += 5; return false; }
+                if (src.substr(at, 4) === "null") { at += 4; return null; }
+                err("unexpected '" + c + "'");
+            }
+            function obj() {
+                var o = {}; at++; ws();
+                if (src.charAt(at) === "}") { at++; return o; }
+                while (at < len) {
+                    ws();
+                    if (src.charAt(at) !== '"') err("expected key string");
+                    var k = str(); ws();
+                    if (src.charAt(at) !== ":") err("expected ':'");
+                    at++;
+                    o[k] = value(); ws();
+                    if (src.charAt(at) === ",") { at++; continue; }
+                    if (src.charAt(at) === "}") { at++; return o; }
+                    err("expected ',' or '}'");
+                }
+                err("unterminated object");
+            }
+            function arr() {
+                var a = []; at++; ws();
+                if (src.charAt(at) === "]") { at++; return a; }
+                while (at < len) {
+                    a.push(value()); ws();
+                    if (src.charAt(at) === ",") { at++; continue; }
+                    if (src.charAt(at) === "]") { at++; return a; }
+                    err("expected ',' or ']'");
+                }
+                err("unterminated array");
+            }
+            function str() {
+                var out = ""; at++;                         // skip opening quote
+                while (at < len) {
+                    var ch = src.charAt(at);
+                    if (ch === '"') { at++; return out; }
+                    if (ch === "\\") {
+                        at++;
+                        var e = src.charAt(at);
+                        if (e === '"') out += '"';
+                        else if (e === "\\") out += "\\";
+                        else if (e === "/") out += "/";
+                        else if (e === "n") out += "\n";
+                        else if (e === "r") out += "\r";
+                        else if (e === "t") out += "\t";
+                        else if (e === "b") out += "\b";
+                        else if (e === "f") out += "\f";
+                        else if (e === "u") {
+                            out += String.fromCharCode(parseInt(src.substr(at + 1, 4), 16));
+                            at += 4;
+                        } else err("bad escape '\\" + e + "'");
+                        at++;
+                    } else { out += ch; at++; }
+                }
+                err("unterminated string");
+            }
+            function num() {
+                var s = at;
+                if (src.charAt(at) === "-") at++;
+                while (at < len && src.charAt(at) >= "0" && src.charAt(at) <= "9") at++;
+                if (src.charAt(at) === ".") { at++; while (at < len && src.charAt(at) >= "0" && src.charAt(at) <= "9") at++; }
+                if (src.charAt(at) === "e" || src.charAt(at) === "E") {
+                    at++;
+                    if (src.charAt(at) === "+" || src.charAt(at) === "-") at++;
+                    while (at < len && src.charAt(at) >= "0" && src.charAt(at) <= "9") at++;
+                }
+                return parseFloat(src.substring(s, at));
+            }
+            var result = value(); ws();
+            if (at < len) err("trailing characters");
+            return result;
+        };
+    }
 })();
 
 // ============================================================
@@ -77,10 +167,19 @@ function getHostApp() {
 function ae_getFrameInfo() {
     try {
         var comp = app.project.activeItem;
-        if (!(comp instanceof CompItem)) return JSON.stringify({ ok: false, error: "No composition selected" });
+        if (!(comp instanceof CompItem)) return JSON.stringify({ ok: false, error: "No composition open" });
         var layer = comp.selectedLayers[0];
-        if (!layer) return JSON.stringify({ ok: false, error: "No layer selected" });
-        if (!layer.source || !layer.source.file) return JSON.stringify({ ok: false, error: "Selected layer has no source file" });
+        // Fall back to the TOPMOST footage layer when nothing is selected (or the
+        // selection isn't footage) so the Source Monitor just shows the clip — no
+        // manual layer-select needed. comp.layer(1) is the top of the stack.
+        if (!layer || !layer.source || !layer.source.file) {
+            layer = null;
+            for (var i = 1; i <= comp.numLayers; i++) {
+                var L = comp.layer(i);
+                if (L.source && L.source.file) { layer = L; break; }
+            }
+        }
+        if (!layer) return JSON.stringify({ ok: false, error: "No footage layer in this comp" });
 
         var fps = 1.0 / comp.frameDuration;
         // AE reports comp.time at the END of the current frame — subtract one frame
@@ -130,7 +229,17 @@ function ae_getWorkAreaInfo() {
             startFrame: startFrame,
             endFrame: endFrame,
             fps: fps,
-            compStartTime: startTime
+            compStartTime: startTime,
+            // LAYER LOCK: durable handle to comp+layer captured NOW (render start) so the
+            // import at render END never depends on what is selected then. comp.id is a
+            // stable per-project integer; layer.index can shift if the user edits during the
+            // long render, so layerName + sourceFsName are carried as re-find fallbacks.
+            lock: {
+                compId: comp.id,
+                layerIndex: layer.index,
+                layerName: layer.name,
+                sourceFsName: layer.source.file.fsName
+            }
         });
     } catch (e) { return JSON.stringify({ ok: false, error: String(e) }); }
 }
@@ -186,60 +295,383 @@ function ae_importFrame(outputPath) {
 //   hides the source layer so the keyed result is immediately visible.
 // DEPENDS-ON: firstFramePath exists; comp has a selected layer (the original source clip).
 // AFFECTS: Adds a new layer to the comp; optionally sets source layer.enabled = false.
-function ae_importSequence(firstFramePath, fps, compStartTime, hideSource, samFirstFramePath) {
+// LAYER LOCK helpers (v1.1): re-find the original target comp+layer from a durable
+// handle so an 11-minute render's import never depends on the live selection.
+function ck_findCompById(id) {
+    for (var i = 1; i <= app.project.numItems; i++) {
+        var it = app.project.item(i);
+        if ((it instanceof CompItem) && it.id === id) return it;
+    }
+    return null;
+}
+// Resolution order: (a) handle comp-by-id + layer-by-index, validated against
+// name+source; (b) re-find within that comp by source path (+name bonus); (c) caller
+// falls back to the current selection. Returns { comp, layer, via } (via = which step won).
+function ck_resolveLockedLayer(activeComp, lockHandleJson) {
+    var lock = null, parseErr = null;
+    try { if (lockHandleJson) lock = JSON.parse(lockHandleJson); }
+    catch (e) { lock = null; parseErr = String(e); }
+    // Distinguish "handle never arrived" from "handle arrived but unparseable" — the
+    // swallowed-parse-error ambiguity is exactly how the missing-JSON.parse bug hid.
+    if (!lock) return { comp: activeComp, layer: null,
+                        via: parseErr ? ("bad-lock-json: " + parseErr) : "no-handle" };
+    var comp = (typeof lock.compId === "number") ? ck_findCompById(lock.compId) : null;
+    if (!(comp instanceof CompItem)) return { comp: activeComp, layer: null, via: "comp-not-found" };
+    // (a) stored index, validated against name + source so a shifted index is rejected
+    if (lock.layerIndex >= 1 && lock.layerIndex <= comp.numLayers) {
+        var Li = comp.layer(lock.layerIndex);
+        var nameOk = (lock.layerName == null) || (Li.name === lock.layerName);
+        var srcOk = (lock.sourceFsName == null) || (Li.source && Li.source.file && Li.source.file.fsName === lock.sourceFsName);
+        if (nameOk && srcOk) return { comp: comp, layer: Li, via: "index" };
+    }
+    // (b) re-find inside the locked comp by source path (durable); name match preferred
+    var bySource = null;
+    for (var i = 1; i <= comp.numLayers; i++) {
+        var L = comp.layer(i);
+        if (!(L.source && L.source.file)) continue;
+        if (lock.sourceFsName != null && L.source.file.fsName === lock.sourceFsName) {
+            if (lock.layerName != null && L.name === lock.layerName) return { comp: comp, layer: L, via: "name+source" };
+            if (!bySource) bySource = L;
+        }
+    }
+    if (bySource) return { comp: comp, layer: bySource, via: "source" };
+    return { comp: comp, layer: null, via: "no-match" };
+}
+
+function ae_importSequence(firstFramePath, fps, compStartTime, hideSource, samFirstFramePath, lockHandleJson, ckMatteFirstFramePath, sourceFsName, finalMatteFirstFramePath, ckRgbFirstFramePath) {
     try {
-        var comp = app.project.activeItem;
-        if (!(comp instanceof CompItem)) return JSON.stringify({ ok: false, error: "No composition selected" });
-        var layer = comp.selectedLayers[0];
-        if (!layer) return JSON.stringify({ ok: false, error: "No layer selected" });
+        // GENERATION TRIPWIRE (2026-06-05): host.jsx loads ONCE per AE session while the
+        // panel reloads per open — a stale engine silently drops trailing args (the lock
+        // bug). Surface the arg count so version skew shows up as data, never silence.
+        var _argc = arguments.length;
+        if (_argc < 10) return JSON.stringify({ ok: false,
+            error: "HOST SCRIPT STALE: ae_importSequence got " + _argc + "/10 args — restart After Effects fully (host.jsx engine is from an older session)." });
+        // LAYER LOCK resolution: (a) handle index, (b) handle re-find by source, (c) selection,
+        // (d) project-wide scan by source path — the render KNOWS which file it keyed, so even
+        // with no lock handle and nothing selected/focused the import still finds its clip
+        // (fix for "No composition (lock step: no-handle)" when AE focus moved mid-render).
+        var activeComp = app.project.activeItem;
+        var res = ck_resolveLockedLayer((activeComp instanceof CompItem) ? activeComp : null, lockHandleJson);
+        var comp = res.comp, layer = res.layer, via = res.via;
+        if (!layer) {                                  // (c) fall back to the live selection
+            if (!(comp instanceof CompItem)) comp = activeComp;
+            if (comp instanceof CompItem) { layer = comp.selectedLayers[0] || null; if (layer) via = "selected-fallback"; }
+        }
+        if (!layer && sourceFsName) {                  // (d) project-wide source-path scan
+            for (var ci = 1; ci <= app.project.numItems; ci++) {
+                var cIt = app.project.item(ci);
+                if (!(cIt instanceof CompItem)) continue;
+                for (var li = 1; li <= cIt.numLayers; li++) {
+                    var cL = cIt.layer(li);
+                    if (cL.source && cL.source.file && cL.source.file.fsName === sourceFsName) {
+                        comp = cIt; layer = cL; via = "project-scan";
+                        break;
+                    }
+                }
+                if (layer) break;
+            }
+        }
+        if (!(comp instanceof CompItem)) return JSON.stringify({ ok: false, error: "No composition (lock step: " + via + ")" });
+        if (!layer) return JSON.stringify({ ok: false, error: "Could not resolve target layer (lock step: " + via + "; locked layer gone and no live selection)" });
         var firstFrame = new File(firstFramePath);
         if (!firstFrame.exists) return JSON.stringify({ ok: false, error: "First frame not found: " + firstFramePath });
 
         app.beginUndoGroup("CorridorKey Batch");
+
+        // Pre-import all sequences before creating the precomp.
         var importOptions = new ImportOptions(firstFrame);
         importOptions.sequence = true;
         var importedSeq = app.project.importFile(importOptions);
-        var ckLayer = null;
-        if (importedSeq) {
-            importedSeq.mainSource.conformFrameRate = Number(fps);
-            ckLayer = comp.layers.add(importedSeq);
-            // moveBefore drops ckLayer immediately ABOVE the source layer (lower
-            // index = higher in stack). v1.0 track-stacking parity with Resolve
-            // / Premiere already comes from this — moveBefore never overwrites
-            // existing layers, only inserts.
-            ckLayer.moveBefore(layer);
-            ckLayer.startTime = Number(compStartTime);
-        }
-        // v1.0 two-mask: optional SAM matte sidecar sequence imported as a
-        // separate layer ABOVE the CK keyed sequence. The user can then use it
-        // as a track matte / Roto Brush source / luma mask without re-running
-        // anything in AE.
+
         var samImported = null;
         if (samFirstFramePath) {
             try {
                 var samFirst = new File(String(samFirstFramePath));
-                if (samFirst.exists) {
-                    var samOpts = new ImportOptions(samFirst);
-                    samOpts.sequence = true;
-                    samImported = app.project.importFile(samOpts);
-                    if (samImported) {
-                        samImported.mainSource.conformFrameRate = Number(fps);
-                        var samLayer = comp.layers.add(samImported);
-                        // Sit above the CK layer if we have one, else above source.
-                        samLayer.moveBefore(ckLayer || layer);
-                        samLayer.startTime = Number(compStartTime);
-                    }
-                }
-            } catch (eSam) {
-                // Non-fatal — CK sequence is in. Caller logs the message.
-            }
+                if (samFirst.exists) { var samOpts = new ImportOptions(samFirst); samOpts.sequence = true; samImported = app.project.importFile(samOpts); }
+            } catch (eSam) {}
         }
+        var ckMatteImported = null;
+        if (ckMatteFirstFramePath) {
+            try {
+                var ckmFirst = new File(String(ckMatteFirstFramePath));
+                if (ckmFirst.exists) { var ckmOpts = new ImportOptions(ckmFirst); ckmOpts.sequence = true; ckMatteImported = app.project.importFile(ckmOpts); }
+            } catch (eCkm) {}
+        }
+        var fgSeq = null, fmSeq = null, pairImported = null;
+        if (finalMatteFirstFramePath && ckRgbFirstFramePath) {
+            try {
+                var fmFirst = new File(String(finalMatteFirstFramePath));
+                var fgFirst = new File(String(ckRgbFirstFramePath));
+                if (fmFirst.exists && fgFirst.exists) {
+                    var fgOpts = new ImportOptions(fgFirst); fgOpts.sequence = true; fgSeq = app.project.importFile(fgOpts);
+                    var fmOpts = new ImportOptions(fmFirst); fmOpts.sequence = true; fmSeq = app.project.importFile(fmOpts);
+                }
+            } catch (ePair) {}
+        }
+
+        // Conform frame rates.
+        if (importedSeq) importedSeq.mainSource.conformFrameRate = Number(fps);
+        if (samImported) samImported.mainSource.conformFrameRate = Number(fps);
+        if (ckMatteImported) ckMatteImported.mainSource.conformFrameRate = Number(fps);
+        if (fgSeq) fgSeq.mainSource.conformFrameRate = Number(fps);
+        if (fmSeq) fmSeq.mainSource.conformFrameRate = Number(fps);
+
+        // Create a dedicated precomp for all CK layers so the main comp gets ONE
+        // clean layer instead of 4-5 loose layers. Double-click the precomp to paint.
+        var srcName = (layer.source && layer.source.name) ? layer.source.name.replace(/\.[^.]+$/, '') : layer.name;
+        var ckCompDuration = (comp.workAreaDuration > 0) ? comp.workAreaDuration : comp.duration;
+        var ckComp = app.project.items.addComp("CK " + srcName, comp.width, comp.height, comp.pixelAspect, ckCompDuration, comp.frameRate);
+
+        // Add layers to precomp in reverse final-stack order — each layers.add() inserts
+        // at position 1 (top), so adding bottom-first produces the right top-to-bottom order.
+        // Final stack top→bottom: SAM | CK MATTE | CK FINAL MATTE (matte) | CK FG | keyed clip.
+        var _warnings = [];  // collect non-fatal layer errors so ok:true still fires on partial success
+        var ckLayer = null;
+        if (importedSeq) {
+            ckLayer = ckComp.layers.add(importedSeq);
+            ckLayer.name = "CK KEY";
+            ckLayer.startTime = 0;
+        }
+        var fgLayer = null, fmLayer = null;
+        if (fgSeq && fmSeq) {
+            try {
+                fgLayer = ckComp.layers.add(fgSeq);
+                fgLayer.name = "CK FG (paint pair)";
+                fgLayer.startTime = 0;
+                fmLayer = ckComp.layers.add(fmSeq);
+                fmLayer.name = "CK FINAL MATTE (paint here)";
+                fmLayer.startTime = 0;
+                // fmLayer is now at pos 1 directly above fgLayer at pos 2 — correct adjacency for track matte.
+                if (typeof fgLayer.setTrackMatte === "function") {
+                    fgLayer.setTrackMatte(fmLayer, TrackMatteType.LUMA);
+                } else {
+                    fgLayer.trackMatteType = TrackMatteType.LUMA;
+                }
+                fmLayer.enabled = false;
+                fgLayer.enabled = false;
+                pairImported = true;
+            } catch (ePair) { _warnings.push("pair layers: " + String(ePair)); }
+        }
+        if (ckMatteImported) {
+            try {
+                var ckmLayer = ckComp.layers.add(ckMatteImported);
+                ckmLayer.name = "CK MATTE";
+                ckmLayer.startTime = 0;
+            } catch (eCkm) { _warnings.push("CK matte layer: " + String(eCkm)); }
+        }
+        if (samImported) {
+            try {
+                var samLayer = ckComp.layers.add(samImported);
+                samLayer.name = "CK SAM";
+                samLayer.startTime = 0;
+            } catch (eSam) { _warnings.push("SAM layer: " + String(eSam)); }
+        }
+
+        // Drop the precomp as a single layer in the main comp above the source clip.
+        var ckPrecompLayer = comp.layers.add(ckComp);
+        ckPrecompLayer.moveBefore(layer);
+        ckPrecompLayer.startTime = Number(compStartTime);
+
         if (String(hideSource) === 'true') {
             layer.enabled = false;
         }
         app.endUndoGroup();
         comp.time = comp.time;
-        return JSON.stringify({ ok: true, samImported: !!samImported });
+        return JSON.stringify({ ok: true, samImported: !!samImported, ckMatteImported: !!ckMatteImported, pairImported: !!pairImported, via: via, warnings: _warnings.length ? _warnings : undefined });
+    } catch (e) { return JSON.stringify({ ok: false, error: String(e) }); }
+}
+
+// ============================================================
+// ADD MASK — drop a rectangle mask on CK KEY or CK SAM layer
+// ============================================================
+// WHAT IT DOES: Finds the CK precomp in the active comp, locates the named
+//   layer inside it ("CK KEY" or "CK SAM"), and adds a rectangle mask covering
+//   the full frame. User then resizes/moves/keyframes the mask natively in AE.
+// WHY: Enables clean CK+SAM compositing — CK mask cuts garbage, SAM mask
+//   isolates feet/limbs that extend off the green screen.
+// AFFECTS: Adds one mask property to one layer inside the precomp. Fully undoable.
+function ck_addLayerMask(layerName, maskModeStr) {
+    try {
+        var comp = app.project.activeItem;
+        if (!(comp instanceof CompItem)) return JSON.stringify({ ok: false, error: "No active comp" });
+
+        // Case A: active comp IS the CK precomp (user double-clicked into it)
+        // Case B: active comp is the parent — find the CK precomp layer inside it
+        var innerComp = null;
+        if (comp.name.indexOf("CK ") === 0) {
+            innerComp = comp;
+        } else {
+            for (var i = 1; i <= comp.layers.length; i++) {
+                var L = comp.layers[i];
+                try {
+                    if ((L.source instanceof CompItem) && L.source.name.indexOf("CK ") === 0) {
+                        innerComp = L.source;
+                        break;
+                    }
+                } catch (_) {}
+            }
+        }
+        // Case C: scan entire project for any comp named "CK *"
+        if (!innerComp) {
+            for (var k = 1; k <= app.project.numItems; k++) {
+                var item = app.project.items[k];
+                if ((item instanceof CompItem) && item.name.indexOf("CK ") === 0) {
+                    innerComp = item;
+                    break;
+                }
+            }
+        }
+        if (!innerComp) return JSON.stringify({ ok: false, error: "No CK precomp found. Run COMMIT first." });
+        var target = null;
+        for (var j = 1; j <= innerComp.layers.length; j++) {
+            if (innerComp.layers[j].name === layerName) { target = innerComp.layers[j]; break; }
+        }
+        if (!target) return JSON.stringify({ ok: false, error: "Layer \"" + layerName + "\" not found in precomp." });
+
+        // Resolve mask mode
+        var mode = MaskMode.ADD;
+        if (maskModeStr === "subtract") mode = MaskMode.SUBTRACT;
+        else if (maskModeStr === "intersect") mode = MaskMode.INTERSECT;
+
+        app.beginUndoGroup("CK Add Mask: " + layerName);
+        var masks = target.property("ADBE Mask Parade");
+        var newMask = masks.addProperty("ADBE Mask Atom");
+        newMask.maskMode = mode;
+
+        // Default rectangle = full frame
+        var w = innerComp.width;
+        var h = innerComp.height;
+        var s = new Shape();
+        s.vertices = [[0, 0], [w, 0], [w, h], [0, h]];
+        s.closed = true;
+        s.inTangents  = [[0,0],[0,0],[0,0],[0,0]];
+        s.outTangents = [[0,0],[0,0],[0,0],[0,0]];
+        newMask.property("ADBE Mask Shape").setValue(s);
+        app.endUndoGroup();
+
+        return JSON.stringify({ ok: true, layer: layerName, mode: maskModeStr });
+    } catch (e) { return JSON.stringify({ ok: false, error: String(e) }); }
+}
+
+// ============================================================
+// SAM PRECOMP — create 3-layer precomp from CK+SAM render
+// ============================================================
+// WHAT IT DOES: Imports the merged CK+SAM result + two B&W matte sequences and
+//   wraps them in a precomp "CK Comp [clip name]" placed above the source layer.
+//   Layer stack top→bottom: CK MERGED | CK MATTE | SAM MATTE.
+//   In basic mode the matte layers are hidden (enabled=false); in advanced they
+//   stay visible so the user can inspect or paint on them.
+// WHEN TO CALL: after a SAM batch render finishes (doSAMCommit in index.html).
+// ARGS:
+//   mergedFirstFramePath  — path to output_00001.png (CK+SAM merged BGRA)
+//   ckMatteFirstFramePath — path to mattes/output_matte_00001.png (CK B&W)
+//   samMatteFirstFramePath— path to sam_mattes/output_sam_00001.png (SAM B&W)
+//   fps                   — clip frame rate
+//   compStartTime         — start time in main comp (seconds)
+//   sourceFsName          — source file fsName for layer-lock fallback
+//   lockHandleJson        — layer lock handle JSON from ae_lockLayer
+//   advanced              — "true" = show matte layers; "false" = hide them
+function ae_createSAMPrecomp(mergedFirstFramePath, ckMatteFirstFramePath, samMatteFirstFramePath,
+                              fps, compStartTime, sourceFsName, lockHandleJson, advanced) {
+    try {
+        var isAdvanced = (String(advanced) === "true");
+        var activeComp = app.project.activeItem;
+        var res = ck_resolveLockedLayer((activeComp instanceof CompItem) ? activeComp : null, lockHandleJson);
+        var comp = res.comp, layer = res.layer, via = res.via;
+        if (!layer) {
+            if (!(comp instanceof CompItem)) comp = activeComp;
+            if (comp instanceof CompItem) { layer = comp.selectedLayers[0] || null; if (layer) via = "selected-fallback"; }
+        }
+        if (!layer && sourceFsName) {
+            for (var ci = 1; ci <= app.project.numItems; ci++) {
+                var cIt = app.project.item(ci);
+                if (!(cIt instanceof CompItem)) continue;
+                for (var li = 1; li <= cIt.numLayers; li++) {
+                    var cL = cIt.layer(li);
+                    if (cL.source && cL.source.file && cL.source.file.fsName === sourceFsName) {
+                        comp = cIt; layer = cL; via = "project-scan"; break;
+                    }
+                }
+                if (layer) break;
+            }
+        }
+        if (!(comp instanceof CompItem)) return JSON.stringify({ ok: false, error: "No composition (lock: " + via + ")" });
+        if (!layer) return JSON.stringify({ ok: false, error: "Could not resolve source layer (lock: " + via + ")" });
+
+        var mergedFirst = new File(mergedFirstFramePath);
+        if (!mergedFirst.exists) return JSON.stringify({ ok: false, error: "Merged sequence not found: " + mergedFirstFramePath });
+
+        app.beginUndoGroup("CorridorKey SAM Precomp");
+
+        // Import sequences
+        var mergedOpts = new ImportOptions(mergedFirst);
+        mergedOpts.sequence = true;
+        var mergedSeq = app.project.importFile(mergedOpts);
+        mergedSeq.mainSource.conformFrameRate = Number(fps);
+
+        var ckMatteSeq = null;
+        if (ckMatteFirstFramePath) {
+            try {
+                var ckmFile = new File(String(ckMatteFirstFramePath));
+                if (ckmFile.exists) {
+                    var ckmOpts = new ImportOptions(ckmFile); ckmOpts.sequence = true;
+                    ckMatteSeq = app.project.importFile(ckmOpts);
+                    ckMatteSeq.mainSource.conformFrameRate = Number(fps);
+                }
+            } catch (eCkm) {}
+        }
+
+        var samMatteSeq = null;
+        if (samMatteFirstFramePath) {
+            try {
+                var samFile = new File(String(samMatteFirstFramePath));
+                if (samFile.exists) {
+                    var samOpts = new ImportOptions(samFile); samOpts.sequence = true;
+                    samMatteSeq = app.project.importFile(samOpts);
+                    samMatteSeq.mainSource.conformFrameRate = Number(fps);
+                }
+            } catch (eSam) {}
+        }
+
+        // Create precomp
+        var srcName = (layer.source && layer.source.name) ? layer.source.name.replace(/\.[^.]+$/, '') : layer.name;
+        var ckCompDuration = (comp.workAreaDuration > 0) ? comp.workAreaDuration : comp.duration;
+        var ckComp = app.project.items.addComp("CK Comp " + srcName, comp.width, comp.height, comp.pixelAspect, ckCompDuration, comp.frameRate);
+
+        // Add in reverse stack order (each add() inserts at top).
+        // Desired top→bottom: CK MERGED | CK MATTE | SAM MATTE
+        // So add: SAM MATTE first, then CK MATTE, then CK MERGED.
+        if (samMatteSeq) {
+            try {
+                var samLayer = ckComp.layers.add(samMatteSeq);
+                samLayer.name = "SAM MATTE";
+                samLayer.startTime = 0;
+                samLayer.enabled = false;
+            } catch (esl) {}
+        }
+        if (ckMatteSeq) {
+            try {
+                var ckmLayer = ckComp.layers.add(ckMatteSeq);
+                ckmLayer.name = "CK MATTE";
+                ckmLayer.startTime = 0;
+                ckmLayer.enabled = false;
+            } catch (eckm) {}
+        }
+        var mergedLayer = ckComp.layers.add(mergedSeq);
+        mergedLayer.name = "CK MERGED";
+        mergedLayer.startTime = 0;
+        mergedLayer.trackMatteType = TrackMatteType.ALPHA;
+
+        // Drop precomp in main comp above source, hide source
+        var precompLayer = comp.layers.add(ckComp);
+        precompLayer.moveBefore(layer);
+        precompLayer.startTime = Number(compStartTime);
+        layer.enabled = false;
+
+        app.endUndoGroup();
+        comp.time = comp.time;
+        return JSON.stringify({ ok: true, compName: ckComp.name, advanced: isAdvanced,
+            ckMatte: !!ckMatteSeq, samMatte: !!samMatteSeq, via: via });
     } catch (e) { return JSON.stringify({ ok: false, error: String(e) }); }
 }
 
@@ -315,10 +747,21 @@ function ppro_getFrameInfo() {
         sourceTimeSec = sourceTimeSec - (1.0 / fps);
         if (sourceTimeSec < 0) sourceTimeSec = 0;
 
+        // sourceFrame = the absolute source-media frame under the playhead. Used ONLY as
+        // the SAM2 anchor (which frame the click points attach to). Without it the panel
+        // sends no anchor and a mid-range click silently degrades to forward-only
+        // propagation from frame 0 (ae_processor.py cmd_batch). Mirrors ae_getFrameInfo.
+        // DANGER ZONE FRAGILE: do NOT use sourceFrame for keying math — keying uses
+        //   sourceTimeSeconds + the source's own fps in Python. Frames here use the
+        //   SEQUENCE fps and would reintroduce drift (ALIGNMENT.md Behavior 2). SAM
+        //   tolerates a frame of anchor slop because it propagates both directions.
+        var sourceFrame = Math.round(sourceTimeSec * fps);
+
         return JSON.stringify({
             ok: true,
             sourceFile: filePath,
             sourceTimeSeconds: sourceTimeSec,
+            sourceFrame: sourceFrame,
             fps: fps,
             playheadSeconds: playerPos.seconds
         });
