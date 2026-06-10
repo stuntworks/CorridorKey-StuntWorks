@@ -209,8 +209,20 @@ function ae_getWorkAreaInfo() {
         var comp = app.project.activeItem;
         if (!(comp instanceof CompItem)) return JSON.stringify({ ok: false, error: "No composition selected" });
         var layer = comp.selectedLayers[0];
-        if (!layer) return JSON.stringify({ ok: false, error: "No layer selected" });
-        if (!layer.source || !layer.source.file) return JSON.stringify({ ok: false, error: "Selected layer has no source file" });
+        if (!layer || !layer.source || !layer.source.file) {
+            // Mirror ae_getFrameInfo: scan for footage layers. Auto-select only when
+            // exactly one exists — ambiguous multi-layer comps keep the explicit error.
+            var footageLayers = [];
+            for (var i = 1; i <= comp.numLayers; i++) {
+                var L = comp.layer(i);
+                if (L.source && L.source.file) footageLayers.push(L);
+            }
+            if (footageLayers.length === 1) {
+                layer = footageLayers[0];
+            } else {
+                return JSON.stringify({ ok: false, error: !layer ? "No layer selected" : "Selected layer has no source file" });
+            }
+        }
 
         var fps = 1.0 / comp.frameDuration;
         var startTime = comp.workAreaStart;

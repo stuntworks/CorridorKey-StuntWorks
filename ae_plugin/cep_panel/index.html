@@ -2534,6 +2534,14 @@ function ckRefreshSamOverlays(show) {
     } catch (e) { ckLog('sam overlay refresh failed: ' + e.message, true); }
 }
 
+// True while scrub frames are being displayed (slider visible). False at all other times.
+window.CK_SCRUB_VIEW = false;
+function ckExitScrubView() {
+    window.CK_SCRUB_VIEW = false;
+    try { var _sv = document.getElementById('viewer'); if (_sv) _sv.classList.remove('scrub'); } catch (_) {}
+    try { var _sb = document.getElementById('ckScrubBar'); if (_sb) _sb.style.display = 'none'; } catch (_) {}
+}
+
 // Live slider feedback: re-run ONLY the fast post-step (despill/choke/SAM merge) on the
 // already-cached frame and repaint — so Matte Tightness / Despill / SAM Margin show their
 // effect on release WITHOUT a full neural re-key. Needs a prior PREVIEW (cached session).
@@ -2541,7 +2549,7 @@ let _repreviewT = null;
 let _ckRepreviewBusy = false;
 let CK_PREVIEW_BG = 'checker';   // 'checker' | 'matte' — MATTE view toggle drives all postproc previews
 function ckRepreview() {
-    try { var _sv = document.getElementById('viewer'); if (_sv) _sv.classList.remove('scrub'); } catch (_) {}
+    if (!window.CK_SCRUB_VIEW) { try { var _sv = document.getElementById('viewer'); if (_sv) _sv.classList.remove('scrub'); } catch (_) {} }
     try {
         const sess = CK_SESSION_DIR;
         const _kb = document.getElementById('keyBtn');
@@ -2607,6 +2615,7 @@ function ckShowKeyed(png) {
 // auto=true: pre-key the visible frame on open as a clean SAMPLE. It paints the
 // keyed preview but does NOT lock the flow (KEY stays pressable for the whole clip).
 function doKey(auto) {
+    if (typeof ckExitScrubView === 'function') ckExitScrubView();
     const keyBtn = document.getElementById('keyBtn');
     if (keyBtn.dataset.busy) return;
     keyBtn.dataset.busy = '1';
@@ -2813,7 +2822,7 @@ function autoKeyAsync() {
     }
     jsxCall(infoFn, [], (info) => {
         if (!info || !info.ok) { ckStatus(info && info.error ? info.error : 'Select a clip to auto-key'); return; }
-        try { var _sv = document.getElementById('viewer'); if (_sv) _sv.classList.remove('scrub'); } catch (_) {}
+        if (typeof ckExitScrubView === 'function') ckExitScrubView();
         if (keyBtn) keyBtn.dataset.busy = '1';
         try { setBusy(true); } catch (_) {}
         if (vwProc) vwProc.classList.add('show');
@@ -3198,6 +3207,7 @@ function ckEnterWorking() {
     ckResizePanel(CK_WORK_W, CK_WORK_H);
 }
 function ckExitWorking() {
+    if (typeof ckExitScrubView === 'function') ckExitScrubView();
     try { const u = document.querySelector('.unit'); if (u) u.classList.remove('working'); } catch (_) {}
     // Done = back to the start screen: snap back down to the small standard size.
     ckResizePanel(CK_STD_W, CK_STD_H);
@@ -3491,6 +3501,7 @@ function ckResizePanel(w, h) {
                         if (sl2) { sl2.max = String(count - 1); sl2.value = '0'; }
                         scrubBar.style.display = 'inline-flex';
                         try { var _sv4 = document.getElementById('viewer'); if (_sv4) _sv4.classList.add('scrub'); } catch (_) {}
+                        window.CK_SCRUB_VIEW = true;
                         ckStatus('Scrub ready — drag the purple slider');
                         ckScrubShowFrame(0);
                         (function prerender(i) {

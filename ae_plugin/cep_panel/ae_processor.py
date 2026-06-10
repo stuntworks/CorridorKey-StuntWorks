@@ -1427,14 +1427,6 @@ def cmd_batch_scrub(source_video, scrub_folder, settings,
                                 (alpha.shape[1], alpha.shape[0]),
                                 interpolation=cv2.INTER_LINEAR,
                             )
-                        _sam_erode_px = int(settings.get("sam_erode_px", 4))
-                        if _sam_erode_px > 0:
-                            _ek = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_sam_erode_px * 2 + 1, _sam_erode_px * 2 + 1))
-                            _gate_soft = cv2.erode((_gate_soft * 255).astype(np.uint8), _ek, iterations=1).astype(np.float32) / 255.0
-                        _sam_expand_px = int(settings.get("sam_expand_px", 0))
-                        if _sam_expand_px > 0:
-                            _ek2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_sam_expand_px * 2 + 1, _sam_expand_px * 2 + 1))
-                            _gate_soft = cv2.dilate((_gate_soft * 255).astype(np.uint8), _ek2, iterations=1).astype(np.float32) / 255.0
                         _gate_u16 = (np.clip(_gate_soft, 0, 1) * 65535.0).astype(np.uint16)
                         cv2.imwrite(str(out_dir / "sam2_gate_raw.png"), _gate_u16)
                         cv2.imwrite(str(out_dir / "alpha_nn.png"), alpha_u16)
@@ -1620,6 +1612,14 @@ def cmd_postproc(session_dir, output_path, settings, background="checker", v1_pa
         _g = cv2.imread(str(gate_path), cv2.IMREAD_UNCHANGED)
         if _g is not None:
             sam_soft = _g.astype(np.float32) / (65535.0 if _g.dtype == np.uint16 else 255.0)
+            _sam_erode_px = int(settings.get("sam_erode_px", 4))
+            if _sam_erode_px > 0:
+                _ek = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_sam_erode_px * 2 + 1, _sam_erode_px * 2 + 1))
+                sam_soft = cv2.erode((np.clip(sam_soft, 0, 1) * 255).astype(np.uint8), _ek, iterations=1).astype(np.float32) / 255.0
+            _sam_expand_px = int(settings.get("sam_expand_px", 0))
+            if _sam_expand_px > 0:
+                _ek2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_sam_expand_px * 2 + 1, _sam_expand_px * 2 + 1))
+                sam_soft = cv2.dilate((np.clip(sam_soft, 0, 1) * 255).astype(np.uint8), _ek2, iterations=1).astype(np.float32) / 255.0
     # PRE-RENDER MATTE INSPECTOR (Berto 2026-06-06: "we need to see the different
     # mattes sam/ck/and combined before we render"). matte-ck = the raw NN matte
     # before any merge; matte-sam = the raw SAM silhouette. Both write-and-return
