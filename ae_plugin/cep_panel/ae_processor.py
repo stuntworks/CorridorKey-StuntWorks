@@ -713,7 +713,7 @@ def cmd_batch(source_video, output_folder, settings,
     sam_pos = settings.get("sam_positive", []) or []
     sam_neg = settings.get("sam_negative", []) or []
     sam_anchor_abs = settings.get("sam_anchor_frame")
-    sam_margin   = float(settings.get("sam2_margin", 0))
+    sam_margin   = float(settings.get("sam_sidecar_margin", settings.get("sam2_margin", 0)))
     sam_soften   = float(settings.get("sam2_soften", 0))
     sam_fill     = int(settings.get("fill_holes", 0))
 

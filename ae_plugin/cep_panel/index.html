@@ -1169,13 +1169,14 @@
   /* ===== Option A: docked TOP info bar + BOTTOM control bar (no floating HUD over the picture) ===== */
   .work-topbar { display: none; }
   .unit.working .work-topbar {
-    display: flex; align-items: center; gap: 20px; flex-wrap: wrap;
-    position: absolute; top: 0; left: 0; right: 0; z-index: 41; min-height: 44px; padding: 7px 14px;
+    display: flex; align-items: flex-end; gap: 20px;
+    position: absolute; top: 0; left: 0; right: 0; z-index: 41; min-height: 58px; padding: 6px 14px 8px;
     background: linear-gradient(180deg, var(--panel-3), var(--panel-2));
     border-bottom: 1px solid var(--groove); box-shadow: 0 1px 0 rgba(255,255,255,.05) inset;
   }
   .unit.working .work-topbar .cell { background: transparent !important; box-shadow: none !important; padding: 0 !important; margin: 0 !important; flex: 0 0 auto; }
   .unit.working .work-topbar .ww { display: none; }
+  .ck-grp { display: flex; flex-direction: column; gap: 5px; }
   /* bottom bar = the old floating pod, re-docked full-width */
   .unit.working .work-pod {
     display: block; left: 0 !important; right: 0 !important; bottom: 0 !important; top: auto !important;
@@ -1196,7 +1197,7 @@
   .unit.working .adv,
   .unit.working .footer,
   .unit.working .approve-gate { display: none !important; }
-  .unit.working .viewer-module { position: absolute; inset: 44px 0 150px 0; margin: 0; border-radius: 0; padding: 8px; }
+  .unit.working .viewer-module { position: absolute; inset: 58px 0 150px 0; margin: 0; border-radius: 0; padding: 8px; }
   /* Working mode: hide the viewer's own head ("Source Monitor" / PREVIEW tag) —
      the 44px top bar already labels everything, and the head was poking out
      half-clipped behind it as ghost text. JS that updates #monLabel still runs
@@ -2153,8 +2154,10 @@
   // wired to the engine bridge below. doKey() owns the busy state + keyed transition.
   keyBtn.addEventListener('click', () => {
     if (keyBtn.dataset.busy) return;
-    // KEY previews THIS frame (keys it + shows the SAM mask) so you always see the
-    // mask first. The separate Approve/COMMIT action renders the whole clip.
+    var _sp = (typeof ckSamPayload === 'function') ? ckSamPayload() : null;
+    if (_sp && _sp.sam_positive && _sp.sam_positive.length > 0 && typeof window.ckRunScrub === 'function' && window.CK_SCRUB && !window.CK_SCRUB.busy) {
+        window.ckRunScrub(); return;
+    }
     if (typeof doKey === 'function') doKey();
   });
 
@@ -2334,7 +2337,7 @@ function ckGetSettings() {
         despeckle: false,
         despeckleSize: 400,
         choke: 0,
-        sam2_margin: 10, sam2_soften: 0, fill_holes: 0,
+        sam2_margin: 0, sam_sidecar_margin: 10, sam2_soften: 0, fill_holes: 0,
         sam_erode_px: 0,
         sam_expand_px: 0
     };
@@ -3117,34 +3120,85 @@ function ckExitWorking() {
     ckResizePanel(CK_STD_W, CK_STD_H);
 }
 (function () {
-    // 1) move the canonical control blocks into the pod (single source of truth)
-    // Option A: info cells -> top bar; the 3 faders -> bottom bar (row). Buttons stay in the pod foot.
-    const topbar = document.getElementById('workTopBar');
-    if (topbar) ['cellScreen', 'cellSam'].forEach(function (id) {
-        const n = document.getElementById(id); if (n) topbar.appendChild(n);
-    });
-    // faderDespill → compact horizontal strip in the empty middle of the topbar
-    (function () {
+    // 1) Build unified two-tier top bar: LEFT (SCREEN + SUBJECT POINTS) | MID (DESPILL) | RIGHT (FRAMES + VIEWS)
+    var topbar = document.getElementById('workTopBar');
+    if (topbar) {
+        // Left cluster — SCREEN + SUBJECT POINTS
+        var ckBarLeft = document.createElement('div');
+        ckBarLeft.style.cssText = 'display:flex;align-items:flex-end;gap:16px;flex:0 0 auto;';
+        topbar.appendChild(ckBarLeft);
+        ['cellScreen', 'cellSam'].forEach(function (id) { var n = document.getElementById(id); if (n) ckBarLeft.appendChild(n); });
+
+        // Middle — DESPILL group (header + fader)
+        var despillGrp = document.createElement('div');
+        despillGrp.className = 'ck-grp';
+        despillGrp.style.cssText = 'flex:1;min-width:120px;max-width:220px;';
+        var despillLbl = document.createElement('span');
+        despillLbl.className = 'cell-title';
+        despillLbl.textContent = 'DESPILL';
+        despillGrp.appendChild(despillLbl);
         var de = document.getElementById('faderDespill');
-        var topbar = document.getElementById('workTopBar');
-        if (!de || !topbar) return;
-        de.style.cssText = 'flex:0 0 auto;margin-left:auto;margin-right:420px;display:inline-flex;' +
-            'align-items:center;gap:7px;border:1px solid rgba(255,255,255,0.08);border-radius:5px;' +
-            'padding:3px 8px;background:rgba(0,0,0,0.18);';
-        var head = de.querySelector('.fader-head');
-        if (head) head.style.cssText = 'display:inline-flex;align-items:center;gap:5px;flex-shrink:0;margin-top:0;';
-        var frow = de.querySelector('.fader-row');
-        if (frow) frow.style.cssText = 'display:inline-flex;align-items:center;flex:1;min-width:150px;max-width:200px;margin-top:0;';
-        var track = de.querySelector('.fader-track');
-        if (track) track.style.cssText = 'flex:1;position:relative;height:30px;min-width:0;display:flex;align-items:center;';
-        var scale = de.querySelector('.fader-scale');
-        if (scale) scale.style.display = 'none';
-        topbar.appendChild(de);
-    })();
+        if (de) {
+            de.style.cssText = 'display:flex;align-items:center;gap:6px;width:100%;margin-top:0;';
+            var deHead = de.querySelector('.fader-head'); if (deHead) deHead.style.display = 'none';
+            var deFrow = de.querySelector('.fader-row');
+            if (deFrow) deFrow.style.cssText = 'display:flex;align-items:center;flex:1;min-width:0;margin-top:0;';
+            var deTrack = de.querySelector('.fader-track');
+            if (deTrack) deTrack.style.cssText = 'flex:1;position:relative;height:30px;min-width:0;display:flex;align-items:center;';
+            // Relocate value readout from hidden .fader-head to sit beside the slider
+            var deVal = document.getElementById('despillVal');
+            if (deFrow && deVal) deFrow.appendChild(deVal);
+            var deScale = de.querySelector('.fader-scale'); if (deScale) deScale.style.display = 'none';
+            despillGrp.appendChild(de);
+        }
+        topbar.appendChild(despillGrp);
+
+        // Right cluster — FRAMES group + VIEWS group
+        var ckBarRight = document.createElement('div');
+        ckBarRight.style.cssText = 'display:flex;align-items:flex-end;gap:16px;flex:0 0 auto;';
+        topbar.appendChild(ckBarRight);
+
+        // FRAMES group
+        var framesGrp = document.createElement('div');
+        framesGrp.className = 'ck-grp';
+        var framesLbl = document.createElement('span');
+        framesLbl.className = 'cell-title';
+        framesLbl.textContent = 'FRAMES';
+        var framesInp = document.createElement('input');
+        framesInp.id = 'ckScrubMaxInput';
+        framesInp.type = 'number'; framesInp.min = '1'; framesInp.max = '24'; framesInp.value = '24';
+        framesInp.style.cssText = 'width:44px;background:#1a1c1f;border:1px solid #393e44;border-radius:3px;' +
+            'color:#c9a5ff;font:700 12px system-ui;text-align:center;padding:2px;outline:none;height:30px;';
+        framesGrp.appendChild(framesLbl);
+        framesGrp.appendChild(framesInp);
+        ckBarRight.appendChild(framesGrp);
+
+        // VIEWS group — chrome buttons (SCRUB/RESULT/CK/RESET) appended here by startup IIFE
+        var viewsGrp = document.createElement('div');
+        viewsGrp.className = 'ck-grp';
+        var viewsLbl = document.createElement('span');
+        viewsLbl.className = 'cell-title';
+        viewsLbl.textContent = 'VIEWS';
+        var viewsCtrl = document.createElement('div');
+        viewsCtrl.id = 'ckViewsCtrl';
+        viewsCtrl.style.cssText = 'display:flex;align-items:center;gap:4px;padding:8px 10px;border-radius:7px;' +
+            'background:linear-gradient(180deg,#2b2f34 0%,#212528 100%);' +
+            'box-shadow:0 1px 0 rgba(255,255,255,0.07) inset,0 -2px 4px rgba(0,0,0,0.45) inset,' +
+            '0 1px 2px rgba(0,0,0,0.5),0 0 0 1px rgba(0,0,0,0.5);';
+        viewsGrp.appendChild(viewsLbl);
+        viewsGrp.appendChild(viewsCtrl);
+        ckBarRight.appendChild(viewsGrp);
+    }
 
     // 2) pod KEY = PREVIEW this frame (+ SAM mask); COMMIT = render whole clip; Done = exit
     const podKey = document.getElementById('podKey');
-    if (podKey) podKey.addEventListener('click', function () { if (typeof doKey === 'function') doKey(); });
+    if (podKey) podKey.addEventListener('click', function () {
+        var _sp = (typeof ckSamPayload === 'function') ? ckSamPayload() : null;
+        if (_sp && _sp.sam_positive && _sp.sam_positive.length > 0 && typeof window.ckRunScrub === 'function' && window.CK_SCRUB && !window.CK_SCRUB.busy) {
+            window.ckRunScrub(); return;
+        }
+        if (typeof doKey === 'function') doKey();
+    });
     const podCommit = document.getElementById('podCommit');
     if (podCommit) podCommit.addEventListener('click', function () { if (typeof doSAMCommit === 'function') doSAMCommit(true); });
     const back = document.getElementById('workBack');
@@ -3258,7 +3312,7 @@ function ckResizePanel(w, h) {
     try {
         var tip = document.createElement('div');
         tip.id = 'ckBtnTip';
-        tip.style.cssText = 'position:fixed;top:32px;right:8px;z-index:99998;display:none;max-width:240px;' +
+        tip.style.cssText = 'position:fixed;top:64px;right:8px;z-index:99998;display:none;max-width:240px;' +
             'font:600 10px/1.45 system-ui;color:#ffd98a;background:linear-gradient(180deg,#26292d,#191b1e);' +
             'border:1px solid #3a3e44;border-radius:6px;padding:6px 9px;box-shadow:0 3px 10px rgba(0,0,0,.6);' +
             'pointer-events:none;letter-spacing:.02em;';
@@ -3267,17 +3321,18 @@ function ckResizePanel(w, h) {
             var b = document.createElement('button');
             b.id = id; b.type = 'button';
             b.innerHTML = svg + '<span style="margin-left:4px;">' + label + '</span>';
-            b.style.cssText = 'position:fixed;top:6px;right:' + rightPx + 'px;z-index:99999;display:inline-flex;' +
-                'align-items:center;font:700 9.5px system-ui;letter-spacing:.12em;color:#dfe3e8;' +
-                'background:linear-gradient(180deg,#3a3f45,#23262a);border:0;border-radius:4px;' +
-                'padding:5px 9px;cursor:pointer;box-shadow:0 1px 0 rgba(255,255,255,.08) inset,0 1px 2px rgba(0,0,0,.5);';
+            b.style.cssText = 'display:inline-flex;align-items:center;font:700 9.5px system-ui;' +
+                'letter-spacing:.12em;color:#dfe3e8;background:linear-gradient(180deg,#3a3f45,#23262a);' +
+                'border:0;border-radius:4px;padding:5px 9px;cursor:pointer;' +
+                'box-shadow:0 1px 0 rgba(255,255,255,.08) inset,0 1px 2px rgba(0,0,0,.5);';
             b.addEventListener('mouseenter', function () {
                 tip.textContent = tipText;
                 tip.style.display = 'block';
             });
             b.addEventListener('mouseleave', function () { tip.style.display = 'none'; });
             b.addEventListener('click', onClick);
-            document.body.appendChild(b);
+            var vc = document.getElementById('ckViewsCtrl');
+            if (vc) { vc.insertBefore(b, vc.firstChild); } else { document.body.appendChild(b); }
             return b;
         }
         // FIT — corner-brackets icon
@@ -3344,16 +3399,7 @@ function ckResizePanel(w, h) {
             '<span id="ckScrubLabel" style="font:700 10px system-ui;color:#c9a5ff;margin-left:8px;min-width:52px;display:inline-block;">--</span>';
         // Insert directly below viewer-wrap so it reads as a timeline scrubber under the monitor
         (function () { var vw = document.querySelector('.viewer-wrap'); if (vw && vw.parentNode) { vw.parentNode.insertBefore(scrubBar, vw.nextSibling); } else { document.body.appendChild(scrubBar); } })();
-        // Frame count input — lets user set how many frames to scrub (1-24) before clicking SCRUB
-        var ckScrubCountWrap = document.createElement('div');
-        ckScrubCountWrap.style.cssText = 'position:fixed;top:6px;right:298px;z-index:99999;display:inline-flex;' +
-            'align-items:center;gap:4px;background:linear-gradient(180deg,#3a3f45,#23262a);' +
-            'border:0;border-radius:4px;padding:3px 7px;box-shadow:0 1px 0 rgba(255,255,255,.08) inset,0 1px 2px rgba(0,0,0,.5);';
-        ckScrubCountWrap.innerHTML = '<span style="font:700 9px system-ui;letter-spacing:.12em;color:#8a9299;text-transform:uppercase;">Frames</span>' +
-            '<input id="ckScrubMaxInput" type="number" min="1" max="24" value="24" ' +
-            'style="width:32px;background:#1a1c1f;border:1px solid #393e44;border-radius:3px;color:#c9a5ff;' +
-            'font:700 10px system-ui;text-align:center;padding:1px 2px;outline:none;">';
-        document.body.appendChild(ckScrubCountWrap);
+        // ckScrubMaxInput is created inside the VIEWS group in the top-bar IIFE above.
         var _scrubT = null;
         function ckScrubShowFrame(idx) {
             if (!CK_SCRUB.dir) return;
@@ -3392,9 +3438,7 @@ function ckResizePanel(w, h) {
             var sl = scrubBar.querySelector('#ckScrubSlider');
             sl.addEventListener('input', function () { ckScrubShowFrame(parseInt(sl.value, 10) || 0); });
         } catch (_) {}
-        ckChromeBtn('ckScrubBtn', 206, scrubSvg, 'SCRUB',
-            'SCRUB: keys the number of frames you set (Frames input, max 24) from the work area at preview quality. Drag the purple slider to step through; CK / RESULT buttons work on every frame.',
-            function () {
+        window.ckRunScrub = function () {
                 if (CK_SCRUB.busy) { ckStatus('Scrub already running'); return; }
                 jsxCall(HOST_APP === 'ppro' ? 'ppro_getInOutInfo' : 'ae_getWorkAreaInfo', [], function (info) {
                     if (!info || !info.ok) { ckStatus('SCRUB: ' + (info && info.error ? info.error : 'Select a clip and set the work area (yellow handles on the timeline), then try SCRUB')); return; }
@@ -3457,7 +3501,10 @@ function ckResizePanel(w, h) {
                         if (m) { ckStatus('Scrubbing frame ' + m[1] + ' of ' + m[2] + '...'); try { if (typeof procLabel !== 'undefined' && procLabel) procLabel.textContent = 'Frame ' + m[1] + ' / ' + m[2]; } catch (_) {} }
                     });
                 });
-            });
+        };
+        ckChromeBtn('ckScrubBtn', 206, scrubSvg, 'SCRUB',
+            'SCRUB: keys the number of frames you set (Frames input, max 24) from the work area at preview quality. Drag the purple slider to step through; CK / RESULT buttons work on every frame.',
+            function () { window.ckRunScrub(); });
     } catch (_) {}
 })();
 </script>
