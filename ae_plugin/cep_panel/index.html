@@ -2852,6 +2852,9 @@ function autoKeyAsync() {
                 const prev = path.join(sess, 'preview.png');
                 const ppParams = writeParamsFile(settings);
                 ckStatus('Compositing...');
+                if (CK_PREVIEW_BG === 'matte-ck' || CK_PREVIEW_BG === 'matte-sam') {
+                    if (typeof window.ckSetMatteView === 'function') window.ckSetMatteView('matte');
+                }
                 runPythonAsync(['postproc', sess, prev, '--params', ppParams, '--background', CK_PREVIEW_BG, '--max-width', '1280'], () => {
                     try { fs.unlinkSync(ppParams); } catch (_) {}
                     if (!fs.existsSync(prev)) return done('Postproc produced no preview', true);
@@ -3376,12 +3379,10 @@ function ckResizePanel(w, h) {
         // easier than cycling"). Each is a toggle: click = show that matte, click the
         // lit one again (or another) = switch; lit button shows the active view.
         var CK_MATTE_BTNS = [
-            { id: 'ckViewSam',  right: 52,  bg: 'matte-sam', label: 'SAM',
-              tip: 'SAM matte — the body silhouette / garbage holdout, cleaned exactly as the render uses it. Click again for the normal picture.' },
-            { id: 'ckViewCk',   right: 98,  bg: 'matte-ck',  label: 'CK',
-              tip: 'CK matte — the neural keyer raw opinion, before SAM touches it. Click again for the normal picture.' },
-            { id: 'ckViewComb', right: 140, bg: 'matte',     label: 'COMB',
-              tip: 'COMBINED matte — CK + SAM merged, exactly what the render will use. White = keeps, black = deleted, gray = see-through. Click again for the normal picture.' }
+            { id: 'ckViewCk',   right: 52,  bg: 'matte-ck',  label: 'CK',
+              tip: 'CK RAW: raw CorridorKey matte before SAM cleanup (diagnostic)' },
+            { id: 'ckViewComb', right: 98,  bg: 'matte',     label: 'RESULT',
+              tip: 'RESULT: the final combined matte/key this render will produce' }
         ];
         var _mvBtns = [];
         function ckSetMatteView(bg) {
@@ -3395,6 +3396,7 @@ function ckResizePanel(w, h) {
             }
             try { ckRepreview(); } catch (_) {}
         }
+        window.ckSetMatteView = ckSetMatteView;
         for (var bi = 0; bi < CK_MATTE_BTNS.length; bi++) {
             (function (def) {
                 var btn = ckChromeBtn(def.id, def.right, matteSvg, def.label, def.tip,
@@ -3467,8 +3469,8 @@ function ckResizePanel(w, h) {
             var sl = scrubBar.querySelector('#ckScrubSlider');
             sl.addEventListener('input', function () { ckScrubShowFrame(parseInt(sl.value, 10) || 0); });
         } catch (_) {}
-        ckChromeBtn('ckScrubBtn', 198, scrubSvg, 'SCRUB',
-            'SCRUB: keys the number of frames you set (Frames input, max 24) from the work area at preview quality. Drag the purple slider to step through; SAM / CK / COMB buttons work on every frame.',
+        ckChromeBtn('ckScrubBtn', 164, scrubSvg, 'SCRUB',
+            'SCRUB: keys the number of frames you set (Frames input, max 24) from the work area at preview quality. Drag the purple slider to step through; CK / RESULT buttons work on every frame.',
             function () {
                 if (CK_SCRUB.busy) { ckStatus('Scrub already running'); return; }
                 jsxCall(HOST_APP === 'ppro' ? 'ppro_getInOutInfo' : 'ae_getWorkAreaInfo', [], function (info) {
@@ -3505,6 +3507,7 @@ function ckResizePanel(w, h) {
                         try { var _sv4 = document.getElementById('viewer'); if (_sv4) _sv4.classList.add('scrub'); } catch (_) {}
                         window.CK_SCRUB_VIEW = true;
                         ckStatus('Scrub ready — drag the purple slider');
+                        if (CK_PREVIEW_BG === 'matte-ck' || CK_PREVIEW_BG === 'matte-sam') { ckSetMatteView('matte'); }
                         ckScrubShowFrame(0);
                         (function prerender(i) {
                             if (i >= CK_SCRUB.count) return;
