@@ -2266,8 +2266,11 @@ function ckLog(msg, isErr) {
     if (isErr) { try { console.error(msg); } catch (_) {} }
 }
 function ckStatus(msg) { try { const g = document.getElementById('gateStatus'); if (g) g.textContent = msg; const p = document.getElementById('podStatus'); if (p) p.textContent = msg; } catch (_) {} }
+// All CK scratch lives on D: — never the C: system temp (Berto 2026-06-10).
+const CK_SCRATCH_ROOT = 'D:\\CK_SCRATCH';
 function randomTempPath(prefix, ext) {
-    return path.join(os.tmpdir(), 'ck_' + prefix + '_' + crypto.randomBytes(12).toString('hex') + (ext || ''));
+    fs.mkdirSync(CK_SCRATCH_ROOT, { recursive: true });
+    return path.join(CK_SCRATCH_ROOT, 'ck_' + prefix + '_' + crypto.randomBytes(12).toString('hex') + (ext || ''));
 }
 function writeParamsFile(obj) {
     const p = randomTempPath('params', '.json');
@@ -3290,6 +3293,76 @@ setTimeout(() => { try { autoKeyAsync(); } catch (_) {} }, 700);
         [80, 300, 800, 1600, 3000].forEach(function (t) { setTimeout(ckReflow, t); });
     } catch (_) {}
 })();
+
+// ---- Launch purge — scratch-junk cleanup (keep-last-3 + 24h purge) ----------
+setTimeout(function () {
+    try {
+        var scratchDir = CK_SCRATCH_ROOT;
+        var KEEP3_PFXS = ['ck_scrub_'];
+        var PURGE24_PFXS = ['ck_session', 'ck_ppro_seq', 'ck_sam2_frames', 'ck_seq_', 'ck_extract_', 'ck_params_'];
+        var entries = [];
+        try { entries = fs.readdirSync(scratchDir); } catch (_) {}
+        var now = Date.now();
+        var MS_24H = 24 * 60 * 60 * 1000;
+        var dirsRemoved = 0, filesRemoved = 0;
+
+        KEEP3_PFXS.forEach(function (pfx) {
+            var matched = entries
+                .filter(function (e) { return e.startsWith(pfx); })
+                .map(function (e) {
+                    var full = path.join(scratchDir, e);
+                    try { return { mtime: fs.statSync(full).mtimeMs, full: full }; } catch (_) { return null; }
+                })
+                .filter(Boolean)
+                .sort(function (a, b) { return b.mtime - a.mtime; });
+            matched.slice(3).forEach(function (item) {
+                try { fs.rmSync(item.full, { recursive: true, force: true }); dirsRemoved++; } catch (_) {}
+            });
+        });
+
+        PURGE24_PFXS.forEach(function (pfx) {
+            entries
+                .filter(function (e) { return e.startsWith(pfx); })
+                .forEach(function (e) {
+                    var full = path.join(scratchDir, e);
+                    try {
+                        var st = fs.statSync(full);
+                        if (now - st.mtimeMs > MS_24H) {
+                            if (st.isDirectory()) {
+                                fs.rmSync(full, { recursive: true, force: true }); dirsRemoved++;
+                            } else {
+                                fs.unlinkSync(full); filesRemoved++;
+                            }
+                        }
+                    } catch (_) {}
+                });
+        });
+
+        // Legacy sweep: old ck_* junk left in the C: system temp from before the
+        // D:\CK_SCRATCH move (also catches crash-leaked Python ck_sam2_* dirs,
+        // which still land in %TEMP%). 24h age gate; corridorkey.log untouched.
+        try {
+            var legacyDir = os.tmpdir();
+            fs.readdirSync(legacyDir)
+                .filter(function (e) { return e.startsWith('ck_'); })
+                .forEach(function (e) {
+                    var full = path.join(legacyDir, e);
+                    try {
+                        var st = fs.statSync(full);
+                        if (now - st.mtimeMs > MS_24H) {
+                            if (st.isDirectory()) {
+                                fs.rmSync(full, { recursive: true, force: true }); dirsRemoved++;
+                            } else {
+                                fs.unlinkSync(full); filesRemoved++;
+                            }
+                        }
+                    } catch (_) {}
+                });
+        } catch (_) {}
+
+        ckLog('launch purge: ' + dirsRemoved + ' dirs, ' + filesRemoved + ' files removed');
+    } catch (_) {}
+}, 3000);
 
 // ---- Standard startup size + one-click Fit (durable) ----
 // The bundled CSInterface.js is a minimal STUB with NO resizeContent — so we call the
