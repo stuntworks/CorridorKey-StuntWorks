@@ -3404,6 +3404,7 @@ function ckResizePanel(w, h) {
                     try { var _sv = document.getElementById('viewer'); if (_sv) _sv.classList.add('scrub'); } catch (_) {}
                     runPythonAsync(['batch-scrub', info.sourceFile, scrubDir, '--params', pp,
                                     '--start-frame', String(info.startFrame), '--count', String(count)], function () {
+                        try { if (typeof vwProc !== 'undefined' && vwProc) vwProc.classList.remove('show'); if (typeof stageProc !== 'undefined' && stageProc) stageProc.classList.remove('show'); } catch (_) {}
                         try { if (typeof setBusy === 'function') setBusy(false); } catch (_) {}
                         try { var _sv2 = document.getElementById('viewer'); if (_sv2) _sv2.classList.remove('scrub'); } catch (_) {}
                         try { fs.unlinkSync(pp); } catch (_) {}
