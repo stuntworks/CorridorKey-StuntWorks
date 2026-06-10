@@ -1065,62 +1065,89 @@ def merge_ck_with_garbage_matte(
     feet_start = bbox_y0 + int(bbox_h * 0.70)
     transition_px = 30
 
-    # --- Generous dilation: _pg px (EDGE GUARD), block downward expansion ---
+    # Resolution-aware kernel scaling — constants calibrated at 1920px wide.
+    _scale = float(w) / 1920.0
+
+    # --- sam_wide: generous dilation (_pg px, block downward expansion) ---
     k_gen = _pg
     se_gen = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_gen * 2 + 1, k_gen * 2 + 1))
     se_gen[:k_gen, :] = 0
-    dilated_generous = cv2.dilate(sam, se_gen)
+    sam_wide = cv2.dilate(sam, se_gen).astype(np.float32)
 
-    # --- Tight dilation: 3px lateral only (no vertical) ---
+    # --- sam_tight: 2px lateral-only dilation (no vertical) ---
     se_tight = np.zeros((1, 7), dtype=np.uint8)
     se_tight[0, :] = 1
-    dilated_tight = cv2.dilate(sam, se_tight)
+    sam_tight = cv2.dilate(sam, se_tight).astype(np.float32)
 
-    # --- Blend map: 1.0 = generous, 0.0 = tight ---
-    blend = np.ones((h, w), dtype=np.float32)
-    ramp_end = min(feet_start + transition_px, h)
-    for y in range(feet_start, ramp_end):
-        blend[y, :] = 1.0 - (y - feet_start) / float(transition_px)
-    blend[ramp_end:, :] = 0.0
-
-    gen_f = dilated_generous.astype(np.float32)
-    tight_f = dilated_tight.astype(np.float32)
-    garbage_matte = gen_f * blend + tight_f * (1.0 - blend)
-    garbage_matte = np.maximum(garbage_matte, sam.astype(np.float32))
-    garbage_matte = np.clip(garbage_matte, 0.0, 1.0)
-
-    # Proximity-limited chroma escape valve.
-    # Pure on-green chroma escape opens the matte everywhere with green
-    # bounce (walls, ceiling). Pure dilation can't reach flyaway hair
-    # beyond the boundary. Compromise: only let on-green pixels through
-    # if they're within 40px of the SAM body. Hair on green near body =
-    # preserved. Distant walls with green tint = still killed.
+    # --- Green-aware blend weight (G_soft) built from source_rgb ------------
+    # Reuses the same HSV thresholds as the chroma escape valve below — one
+    # detection threshold, two uses. on_green_hsv is the raw binary map;
+    # G_soft is the morphologically expanded + blurred version used as the
+    # per-pixel blend weight: 1 = full sam_wide protection, 0 = tight hug.
     on_green_hsv = None
+    G_soft = None
     if source_rgb is not None:
         try:
             rgb_in = np.asarray(source_rgb)
             if rgb_in.dtype != np.float32:
-                img_u8 = np.clip(rgb_in, 0, 255).astype(np.uint8)
+                _img_u8 = np.clip(rgb_in, 0, 255).astype(np.uint8)
             else:
-                img_u8 = (np.clip(rgb_in, 0.0, 1.0) * 255).astype(np.uint8)
-            if img_u8.ndim == 2:
-                img_u8 = np.stack([img_u8, img_u8, img_u8], axis=-1)
-            if img_u8.shape[:2] != (h, w):
-                img_u8 = cv2.resize(img_u8, (w, h), interpolation=cv2.INTER_AREA)
-            # HSV detection — catches shadowed/dark green that RGB ratio misses
-            img_bgr = cv2.cvtColor(img_u8, cv2.COLOR_RGB2BGR)
+                _img_u8 = (np.clip(rgb_in, 0.0, 1.0) * 255).astype(np.uint8)
+            if _img_u8.ndim == 2:
+                _img_u8 = np.stack([_img_u8, _img_u8, _img_u8], axis=-1)
+            if _img_u8.shape[:2] != (h, w):
+                _img_u8 = cv2.resize(_img_u8, (w, h), interpolation=cv2.INTER_AREA)
+            img_bgr = cv2.cvtColor(_img_u8, cv2.COLOR_RGB2BGR)
             hsv_map = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
             if screen_type == "blue":
                 _lower, _upper = np.array([100, 50, 50]), np.array([130, 255, 255])
             else:
                 _lower, _upper = np.array([35, 50, 50]), np.array([85, 255, 255])
-            on_green_hsv = cv2.inRange(hsv_map, _lower, _upper).astype(np.float32) / 255.0
-            # Chroma escape: CK hair beyond dilation boundary passes on green pixels near body
+            _green_bin = cv2.inRange(hsv_map, _lower, _upper)
+            on_green_hsv = _green_bin.astype(np.float32) / 255.0
+            _rc = max(3, int(round(9 * _scale)) | 1)
+            _rd = max(3, int(round(15 * _scale)) | 1)
+            _sg = max(1.0, 8.0 * _scale)
+            _G_closed = cv2.morphologyEx(
+                _green_bin, cv2.MORPH_CLOSE,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_rc, _rc)),
+            )
+            _G_dilated = cv2.dilate(
+                _G_closed,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_rd, _rd)),
+            )
+            _bk = max(3, int(_sg * 6) | 1)
+            G_soft = cv2.GaussianBlur(
+                _G_dilated.astype(np.float32) / 255.0, (_bk, _bk), _sg,
+            )
+            G_soft = np.clip(G_soft, 0.0, 1.0)
+        except Exception:
+            on_green_hsv = None
+            G_soft = None
+
+    # sam_gate: full wide protection where green is behind, tight hug elsewhere.
+    # Falls back to Y-position blend when source_rgb absent (original behavior).
+    if G_soft is not None:
+        garbage_matte = sam_tight * (1.0 - G_soft) + sam_wide * G_soft
+    else:
+        blend = np.ones((h, w), dtype=np.float32)
+        ramp_end = min(feet_start + transition_px, h)
+        for y in range(feet_start, ramp_end):
+            blend[y, :] = 1.0 - (y - feet_start) / float(transition_px)
+        blend[ramp_end:, :] = 0.0
+        garbage_matte = sam_wide * blend + sam_tight * (1.0 - blend)
+    garbage_matte = np.maximum(garbage_matte, sam.astype(np.float32))
+    garbage_matte = np.clip(garbage_matte, 0.0, 1.0)
+
+    # Proximity-limited chroma escape valve — reuses on_green_hsv from above.
+    # CK hair beyond the dilation boundary passes on green pixels near the body.
+    # Distant walls with green tint are still killed by the near_sam distance gate.
+    if on_green_hsv is not None:
+        try:
             sam_inv = (1 - sam).astype(np.uint8)
             dist_from_sam = cv2.distanceTransform(sam_inv, cv2.DIST_L2, 5)
             near_sam = (dist_from_sam < _esc).astype(np.float32)
-            escape = on_green_hsv * near_sam
-            garbage_matte = np.maximum(garbage_matte, escape)
+            garbage_matte = np.maximum(garbage_matte, on_green_hsv * near_sam)
         except Exception:
             pass
 
