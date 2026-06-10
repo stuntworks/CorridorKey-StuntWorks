@@ -1188,7 +1188,7 @@ def merge_ck_with_garbage_matte(
             if _fix_u8.shape[:2] != (h, w):
                 _fix_u8 = cv2.resize(_fix_u8, (w, h), interpolation=cv2.INTER_AREA)
             _hsv_kill = cv2.cvtColor(cv2.cvtColor(_fix_u8, cv2.COLOR_RGB2BGR), cv2.COLOR_BGR2HSV)
-            shadow_kill = ((_hsv_kill[..., 2] < 45).astype(np.float32) * (1.0 - on_green_hsv) * (1.0 - sam.astype(np.float32)))
+            shadow_kill = ((_hsv_kill[..., 2] < 52).astype(np.float32) * (1.0 - on_green_hsv) * (1.0 - sam.astype(np.float32)))
             final = np.clip(final * (1.0 - shadow_kill), 0.0, 1.0).astype(np.float32)
         except Exception:
             pass
