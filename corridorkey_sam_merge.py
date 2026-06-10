@@ -1033,10 +1033,8 @@ def merge_ck_with_garbage_matte(
     """
     import cv2
 
-    # FIX B: EDGE GUARD slider (proximity_px) drives the generous-dilation kernel and the
-    # chroma-escape radius. None preserves the prior hardcoded behavior EXACTLY (20 / 40.0).
-    _pg = 20 if proximity_px is None else int(proximity_px)
-    _esc = 40.0 if proximity_px is None else float(max(proximity_px * 2, 0))
+    # proximity_px accepted for API compat (Resolve caller signature unchanged).
+    # No longer drives dilation width or escape radius — fixed+scaled constants below.
 
     ck = np.asarray(ck_alpha, dtype=np.float32)
     if ck.ndim == 3:
@@ -1067,6 +1065,8 @@ def merge_ck_with_garbage_matte(
 
     # Resolution-aware kernel scaling — constants calibrated at 1920px wide.
     _scale = float(w) / 1920.0
+    _pg = max(1, int(round(20.0 * _scale)))  # sam_wide radius: green-zone CK protection
+    _esc = max(1.0, 12.0 * _scale)           # chroma escape radius: hair/blur near body
 
     # --- sam_wide: generous dilation (_pg px, block downward expansion) ---
     k_gen = _pg
