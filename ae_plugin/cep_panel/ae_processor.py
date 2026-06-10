@@ -1038,6 +1038,32 @@ def cmd_batch(source_video, output_folder, settings,
                 fg_bgr = cv2.cvtColor(fg_uint16, cv2.COLOR_RGB2BGR)
                 out_bgra = cv2.merge([fg_bgr[:, :, 0], fg_bgr[:, :, 1], fg_bgr[:, :, 2], alpha_uint16])
                 _atomic_imwrite(out_dir / f"output_{seq_num:05d}.png", out_bgra)
+                # output_tight — despilled RGB + alpha_raw × tightly-feathered binary SAM.
+                # No buffer/escape zone (proximity_px=0 behaviour). Only written when SAM
+                # has a mask for this frame — no SAM means output_ == plain CK already.
+                _sm_tight = sam_video_masks.get(seq_num)
+                if _sm_tight is not None:
+                    try:
+                        _tw = alpha_raw.shape[1]
+                        if _sm_tight.shape[:2] != alpha_raw.shape[:2]:
+                            _sm_tight = cv2.resize(_sm_tight,
+                                                   (_tw, alpha_raw.shape[0]),
+                                                   interpolation=cv2.INTER_LINEAR)
+                        _smb = (_sm_tight > 0.5).astype(np.uint8)
+                        _smb = cv2.dilate(_smb,
+                                          cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+                        _sigma_t = max(1.0, 1.5 * (_tw / 1920.0))
+                        _smb_f = cv2.GaussianBlur(_smb.astype(np.float32), (0, 0), _sigma_t)
+                        _tight_a16 = (np.clip(alpha_raw * _smb_f, 0, 1) * 65535).astype(np.uint16)
+                        _tight_bgra = cv2.merge([fg_bgr[:, :, 0], fg_bgr[:, :, 1],
+                                                 fg_bgr[:, :, 2], _tight_a16])
+                        _tight_dir = out_dir / "output_tight"
+                        _tight_dir.mkdir(parents=True, exist_ok=True)
+                        _atomic_imwrite(_tight_dir / f"output_tight_{seq_num:05d}.png", _tight_bgra)
+                        if processed == 0:
+                            _atomic_imwrite(_tight_dir / "output_tight_00000.png", _tight_bgra)
+                    except Exception as _te:
+                        log.warning(f"output_tight frame {frame_idx}: write failed: {_te}")
                 # Named sidecar passes (Editable Layers / Fusion-comp parity) — write
                 # CK_RGB/, CK_COMBINED/, CK_ALPHA/, SAM_ALPHA/ as separate 16-bit
                 # numbered-stills sequences. fg is already despilled here so we tell the

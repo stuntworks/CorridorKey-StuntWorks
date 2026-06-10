@@ -3082,6 +3082,15 @@ function doSAMCommit(advanced) {
             const samMatteFirst = path.join(outDir, 'sam_mattes', 'sam_00000.png');
             const samMattePath = fs.existsSync(samMatteFirst) ? samMatteFirst : null;
             ckStatus('Building precomp...');
+            if (HOST_APP === 'ppro') {
+                jsxCall('ppro_importSequence', [
+                    firstFrame, info.inPointSeconds, info.fps, info.sourceFrameRate || info.fps, samMattePath
+                ], (imp) => {
+                    if (!imp || !imp.ok) return finish('Import failed: ' + (imp && imp.error ? imp.error : 'unknown'), true);
+                    if (imp.via) ckLog('samCommit: import target resolved via ' + imp.via);
+                    finish('Done. Keyed clip on your timeline' + (samMattePath ? ' (+ SAM matte)' : '') + '.');
+                });
+            } else {
             jsxCall('ae_createSAMPrecomp', [
                 firstFrame, ckMattePath, samMattePath,
                 info.fps, info.compStartTime,
@@ -3092,6 +3101,7 @@ function doSAMCommit(advanced) {
                 finish('Done. "' + imp.compName + '" on your timeline.' +
                        (!imp.ckMatte && !imp.samMatte ? ' (mattes not found — CK-only render)' : ''));
             });
+            }
         }, e => finish('Render failed: ' + e.message, true),
            line => {
                const m = line.match(/PROGRESS\s+(\d+)\/(\d+)/);
@@ -3207,6 +3217,7 @@ function ckExitWorking() {
     const back = document.getElementById('workBack');
     if (back) back.addEventListener('click', ckExitWorking);
 
+    if (HOST_APP !== 'ppro') {
     // MASK CK / MASK SAM — add a rectangle mask to the named layer inside the precomp
     function doAddMask(layerName) {
         const mode = (document.getElementById('maskMode') || {value: 'subtract'}).value;
@@ -3220,6 +3231,7 @@ function ckExitWorking() {
             }
         });
     }
+    } else { var _wpm = document.getElementById('workPodMasks'); if (_wpm) _wpm.style.display = 'none'; }
 
     // 3) Advanced enters the working view (instead of the old cockpit). The old
     //    cockpit handler still fires first and adds .cockpit; we strip it here.
@@ -3515,6 +3527,10 @@ function ckResizePanel(w, h) {
                 if (CK_SCRUB.busy) { ckStatus('Scrub already running'); return; }
                 jsxCall(HOST_APP === 'ppro' ? 'ppro_getInOutInfo' : 'ae_getWorkAreaInfo', [], function (info) {
                     if (!info || !info.ok) { ckStatus('SCRUB: ' + (info && info.error ? info.error : 'Select a clip and set the work area (yellow handles on the timeline), then try SCRUB')); return; }
+                    if (HOST_APP === 'ppro' && typeof info.startSeconds === 'number') {
+                        info.startFrame = Math.round(info.startSeconds * info.fps);
+                        info.endFrame   = Math.round(info.endSeconds   * info.fps);
+                    }
                     var _smEl = document.getElementById('ckScrubMaxInput');
                     var MAXF = Math.min(24, Math.max(1, parseInt((_smEl && _smEl.value) || '24', 10) || 24));
                     var total = Math.max(1, (info.endFrame - info.startFrame) | 0);
