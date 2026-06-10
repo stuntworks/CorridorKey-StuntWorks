@@ -1192,6 +1192,20 @@ def cmd_batch_scrub(source_video, scrub_folder, settings,
         log.warning("Source fps unknown, defaulting to 24")
         source_fps = 24.0
 
+    # Scrub resolution cap: clamp to 1080p-class to save VRAM and speed up scrub.
+    # RENDER (cmd_batch) runs full-res — only scrub is capped here.
+    _src_w_probe = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1920
+    _src_h_probe = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1080
+    if max(_src_w_probe, _src_h_probe) > 1920:
+        _scrub_scale = 1920.0 / max(_src_w_probe, _src_h_probe)
+        _scrub_w = int(round(_src_w_probe * _scrub_scale))
+        _scrub_h = int(round(_src_h_probe * _scrub_scale))
+        log.info(f"Scrub downscale: {_src_w_probe}x{_src_h_probe} -> {_scrub_w}x{_scrub_h} (scale={_scrub_scale:.4f})")
+    else:
+        _scrub_scale = 1.0
+        _scrub_w = _src_w_probe
+        _scrub_h = _src_h_probe
+
     from corridorkey_processor import CorridorKeyProcessor, ProcessingSettings
     processor = CorridorKeyProcessor(device="cuda")
     ps = ProcessingSettings(
@@ -1284,13 +1298,15 @@ def cmd_batch_scrub(source_video, scrub_folder, settings,
                     if not _ok or _fr is None:
                         log.warning(f"SAM2 video: skipped unreadable frame {start_frame + _i}")
                         continue
+                    _fr_scaled = cv2.resize(_fr, (_scrub_w, _scrub_h), interpolation=cv2.INTER_AREA) if _scrub_scale != 1.0 else _fr
                     if _src_h is None:
                         _src_h, _src_w = _fr.shape[:2]
-                        _, _pad_box = _pad_to_square(_fr)
+                        _, _pad_box = _pad_to_square(_fr_scaled)
                         log.info(f"SAM2 video: source {_src_w}x{_src_h} -> "
-                                 f"padded square {max(_src_h, _src_w)} "
-                                 f"(pad_box={_pad_box})")
-                    _padded, _ = _pad_to_square(_fr)
+                                 f"scrub {_scrub_w}x{_scrub_h} -> "
+                                 f"padded square {max(_scrub_h, _scrub_w)} "
+                                 f"(scale={_scrub_scale:.4f}, pad_box={_pad_box})")
+                    _padded, _ = _pad_to_square(_fr_scaled)
                     cv2.imwrite(str(sam_tmp_dir / f"{_i:06d}.png"), _padded,
                                 [cv2.IMWRITE_PNG_COMPRESSION, 1])
                     _exported += 1
@@ -1306,6 +1322,8 @@ def cmd_batch_scrub(source_video, scrub_folder, settings,
                 _video_predictor = build_sam2_video_predictor(cfg, ckpt, device=device)
                 _all_pts = list(sam_pos) + list(sam_neg)
                 _labels  = [1] * len(sam_pos) + [0] * len(sam_neg)
+                if _scrub_scale != 1.0:
+                    _all_pts = [[p[0] * _scrub_scale, p[1] * _scrub_scale] for p in _all_pts]
                 _all_pts_padded = _shift_pts(_all_pts, _pad_box) if _pad_box is not None else _all_pts
                 log.info(f"SAM2 video: anchor at range frame {sam_anchor_rel} (absolute {sam_anchor_abs})")
                 with sam_torch.inference_mode():
@@ -1390,6 +1408,8 @@ def cmd_batch_scrub(source_video, scrub_folder, settings,
                 continue
             try:
                 img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+                if _scrub_scale != 1.0:
+                    img_rgb = cv2.resize(img_rgb, (_scrub_w, _scrub_h), interpolation=cv2.INTER_AREA)
                 alpha_hint = generate_chroma_hint(img_rgb, settings["screenType"])
                 result = processor.process_frame(img_rgb, alpha_hint, ps)
                 fg = result.get("fg")
