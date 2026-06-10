@@ -1074,8 +1074,9 @@ def merge_ck_with_garbage_matte(
     se_gen[:k_gen, :] = 0
     sam_wide = cv2.dilate(sam, se_gen).astype(np.float32)
 
-    # --- sam_tight: 2px lateral-only dilation (no vertical) ---
-    se_tight = np.zeros((1, 7), dtype=np.uint8)
+    # --- sam_tight: 5px lateral-only dilation (no vertical), scaled ---
+    _tight_r = max(1, int(round(5 * _scale)))
+    se_tight = np.zeros((1, _tight_r * 2 + 1), dtype=np.uint8)
     se_tight[0, :] = 1
     sam_tight = cv2.dilate(sam, se_tight).astype(np.float32)
 
@@ -1137,6 +1138,12 @@ def merge_ck_with_garbage_matte(
         blend[ramp_end:, :] = 0.0
         garbage_matte = sam_wide * blend + sam_tight * (1.0 - blend)
     garbage_matte = np.maximum(garbage_matte, sam.astype(np.float32))
+    garbage_matte = np.clip(garbage_matte, 0.0, 1.0)
+
+    # Feather gate edges — converts hard sam_tight wall into gradient so CK
+    # soft alpha is never clipped by a binary cliff where green detection missed.
+    _gate_sigma = max(1.0, 2.5 * _scale)
+    garbage_matte = cv2.GaussianBlur(garbage_matte, (0, 0), _gate_sigma)
     garbage_matte = np.clip(garbage_matte, 0.0, 1.0)
 
     # Proximity-limited chroma escape valve — reuses on_green_hsv from above.
