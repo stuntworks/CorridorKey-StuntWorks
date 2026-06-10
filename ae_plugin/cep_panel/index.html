@@ -3294,7 +3294,11 @@ function ckResizePanel(w, h) {
                     : 'linear-gradient(180deg,#34383d,#222528)';
                 _mvBtns[i].style.color = on ? '#1c1303' : '#dfe3e8';
             }
-            try { ckRepreview(); } catch (_) {}
+            if (window.CK_SCRUB_VIEW) {
+                ckScrubShowFrame((window.CK_SCRUB && window.CK_SCRUB.cur !== undefined) ? window.CK_SCRUB.cur : 0);
+            } else {
+                try { ckRepreview(); } catch (_) {}
+            }
         }
         window.ckSetMatteView = ckSetMatteView;
         for (var bi = 0; bi < CK_MATTE_BTNS.length; bi++) {
@@ -3352,14 +3356,18 @@ function ckResizePanel(w, h) {
                     var prev = path.join(frameDir, 'preview_' + _sMode + '_g' + (window.CK_SCRUB_GEN || 0) + '.png');
                     if (fs.existsSync(prev)) { ckShowKeyed(prev); if (typeof ckRefreshSamOverlays === 'function') ckRefreshSamOverlays(false); ckStatus('Scrub ' + (idx + 1) + '/' + CK_SCRUB.count); return; }
                     var pp = writeParamsFile(st);
-                    try { if (typeof procLabel !== 'undefined' && procLabel) procLabel.textContent = 'Processing...'; if (typeof vwProc !== 'undefined' && vwProc) vwProc.classList.add('show'); if (typeof stageProc !== 'undefined' && stageProc) stageProc.classList.add('show'); } catch (_) {}
+                    // Keep last clean frame visible — use lightweight corner tag, not the full overlay
+                    var _wTag = document.getElementById('vwPreCacheTag');
+                    if (!_wTag) { _wTag = document.createElement('div'); _wTag.id = 'vwPreCacheTag'; _wTag.className = 'vw-tag'; _wTag.style.cssText = 'left:auto;right:10px;top:auto;bottom:10px;'; var _vwEl = document.getElementById('viewer'); if (_vwEl) _vwEl.appendChild(_wTag); }
+                    if (_wTag) { _wTag.textContent = 'Working…'; _wTag.style.display = 'block'; }
                     runPythonAsync(['postproc', frameDir, prev, '--params', pp, '--background', CK_PREVIEW_BG, '--max-width', '1100'], function () {
-                        try { if (typeof vwProc !== 'undefined' && vwProc) vwProc.classList.remove('show'); if (typeof stageProc !== 'undefined' && stageProc) stageProc.classList.remove('show'); } catch (_) {}
+                        if (idx !== CK_SCRUB.cur) { if (_wTag) _wTag.style.display = 'none'; return; }
+                        if (_wTag) _wTag.style.display = 'none';
                         try { fs.unlinkSync(pp); } catch (_) {}
                         if (fs.existsSync(prev)) { ckShowKeyed(prev); if (typeof ckRefreshSamOverlays === 'function') ckRefreshSamOverlays(false); }
                         ckStatus('Scrub ' + (idx + 1) + '/' + CK_SCRUB.count);
                     }, function () {
-                        try { if (typeof vwProc !== 'undefined' && vwProc) vwProc.classList.remove('show'); if (typeof stageProc !== 'undefined' && stageProc) stageProc.classList.remove('show'); } catch (_) {}
+                        if (_wTag) _wTag.style.display = 'none';
                         ckStatus('Scrub frame failed');
                     });
                 } catch (_) {}
