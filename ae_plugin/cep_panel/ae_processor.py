@@ -719,6 +719,22 @@ def cmd_batch(source_video, output_folder, settings,
 
     sam_active = (len(sam_pos) + len(sam_neg)) > 0
     sam_video_masks = {}  # {seq_num: float32 mask 0..1}
+
+    # SAM temp-frame resolution cap — mirrors cmd_batch_scrub so preview and render
+    # produce identical SAM masks. CK neural-net keying and all outputs stay full-res;
+    # only the frames written to SAM's temp dir are downscaled.
+    _src_w_sam = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1920
+    _src_h_sam = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1080
+    if max(_src_w_sam, _src_h_sam) > 1920:
+        _sam_scale = 1920.0 / max(_src_w_sam, _src_h_sam)
+        _sam_w = int(round(_src_w_sam * _sam_scale))
+        _sam_h = int(round(_src_h_sam * _sam_scale))
+        log.info(f"SAM2 batch: downscale {_src_w_sam}x{_src_h_sam} -> {_sam_w}x{_sam_h} (scale={_sam_scale:.4f})")
+    else:
+        _sam_scale = 1.0
+        _sam_w = _src_w_sam
+        _sam_h = _src_h_sam
+
     sam_torch = None
     try:
         _manifest = {
@@ -788,13 +804,15 @@ def cmd_batch(source_video, output_folder, settings,
                     if not _ok or _fr is None:
                         log.warning(f"SAM2 video: skipped unreadable frame {start_frame + _i}")
                         continue
+                    _fr_scaled = cv2.resize(_fr, (_sam_w, _sam_h), interpolation=cv2.INTER_AREA) if _sam_scale != 1.0 else _fr
                     if _src_h is None:
                         _src_h, _src_w = _fr.shape[:2]
-                        _, _pad_box = _pad_to_square(_fr)
+                        _, _pad_box = _pad_to_square(_fr_scaled)
                         log.info(f"SAM2 video: source {_src_w}x{_src_h} -> "
-                                 f"padded square {max(_src_h, _src_w)} "
-                                 f"(pad_box={_pad_box})")
-                    _padded, _ = _pad_to_square(_fr)
+                                 f"SAM {_sam_w}x{_sam_h} -> "
+                                 f"padded square {max(_sam_h, _sam_w)} "
+                                 f"(scale={_sam_scale:.4f}, pad_box={_pad_box})")
+                    _padded, _ = _pad_to_square(_fr_scaled)
                     cv2.imwrite(str(sam_tmp_dir / f"{_i:06d}.png"), _padded,
                                 [cv2.IMWRITE_PNG_COMPRESSION, 1])
                     _exported += 1
@@ -804,6 +822,8 @@ def cmd_batch(source_video, output_folder, settings,
                 _video_predictor = build_sam2_video_predictor(cfg, ckpt, device=device)
                 _all_pts = list(sam_pos) + list(sam_neg)
                 _labels  = [1] * len(sam_pos) + [0] * len(sam_neg)
+                if _sam_scale != 1.0:
+                    _all_pts = [[p[0] * _sam_scale, p[1] * _sam_scale] for p in _all_pts]
                 _all_pts_padded = _shift_pts(_all_pts, _pad_box) if _pad_box is not None else _all_pts
                 log.info(f"SAM2 video: anchor at range frame {sam_anchor_rel} (absolute {sam_anchor_abs})")
                 with sam_torch.inference_mode():
@@ -854,15 +874,18 @@ def cmd_batch(source_video, output_folder, settings,
                 # range-relative frame index; DaVinci keys per obj_id).
                 _sorted_keys = sorted(sam_video_masks.keys())
                 if _sorted_keys:
+                    # Threshold scales with pixel area so hold/collapse behaviour is
+                    # unchanged whether SAM ran at full-res or 1080p-capped.
+                    _sam_thresh = max(1, int(round(100 * _sam_scale * _sam_scale)))
                     _first_sub = next(
-                        (f for f in _sorted_keys if sam_video_masks[f].sum() >= 100), None)
+                        (f for f in _sorted_keys if sam_video_masks[f].sum() >= _sam_thresh), None)
                     _last_sub = next(
-                        (f for f in reversed(_sorted_keys) if sam_video_masks[f].sum() >= 100), None)
+                        (f for f in reversed(_sorted_keys) if sam_video_masks[f].sum() >= _sam_thresh), None)
                     _collapsed = 0
                     _held = 0
                     if _first_sub is not None and _last_sub is not None:
                         for _f in _sorted_keys:
-                            if sam_video_masks[_f].sum() >= 100:
+                            if sam_video_masks[_f].sum() >= _sam_thresh:
                                 continue
                             if _first_sub <= _f <= _last_sub:
                                 # interior collapse -> ones-mask -> CK-only fallback
@@ -882,7 +905,7 @@ def cmd_batch(source_video, output_folder, settings,
                     # frame 0 or 1, copy frame 2 back over the weak anchor frames.
                     if 2 in sam_video_masks:
                         _ref_cov = sam_video_masks[2].sum()
-                        if _ref_cov >= 100:
+                        if _ref_cov >= _sam_thresh:
                             _patched = []
                             for _early in (0, 1):
                                 if _early in sam_video_masks and sam_video_masks[_early].sum() < _ref_cov * 0.9:
