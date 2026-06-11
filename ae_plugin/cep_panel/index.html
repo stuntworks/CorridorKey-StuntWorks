@@ -3353,10 +3353,12 @@ setTimeout(function () {
         // Legacy sweep: old ck_* junk left in the C: system temp from before the
         // D:\CK_SCRATCH move (also catches crash-leaked Python ck_sam2_* dirs,
         // which still land in %TEMP%). 24h age gate; corridorkey.log untouched.
+        var _LEGACY_PFXS = ['ck_scrub_', 'ck_session', 'ck_ppro_seq', 'ck_sam2_frames',
+                            'ck_seq_', 'ck_extract_', 'ck_params_', 'ck_sam2_batch'];
         try {
             var legacyDir = os.tmpdir();
             fs.readdirSync(legacyDir)
-                .filter(function (e) { return e.startsWith('ck_'); })
+                .filter(function (e) { return _LEGACY_PFXS.some(function (p) { return e.startsWith(p); }); })
                 .forEach(function (e) {
                     var full = path.join(legacyDir, e);
                     try {
@@ -3440,7 +3442,7 @@ function ckResizePanel(w, h) {
         ];
         var _mvBtns = [];
         function ckSetMatteView(bg) {
-            CK_PREVIEW_BG = bg;
+            CK_PREVIEW_BG = (bg || '').replace(/[^a-z0-9-]/g, '');
             for (var i = 0; i < _mvBtns.length; i++) {
                 var on = (_mvBtns[i]._bg === bg);
                 _mvBtns[i].style.background = on
@@ -3528,8 +3530,9 @@ function ckResizePanel(w, h) {
                 jsxCall(HOST_APP === 'ppro' ? 'ppro_getInOutInfo' : 'ae_getWorkAreaInfo', [], function (info) {
                     if (!info || !info.ok) { ckStatus('SCRUB: ' + (info && info.error ? info.error : 'Select a clip and set the work area (yellow handles on the timeline), then try SCRUB')); return; }
                     if (HOST_APP === 'ppro' && typeof info.startSeconds === 'number') {
-                        info.startFrame = Math.round(info.startSeconds * info.fps);
-                        info.endFrame   = Math.round(info.endSeconds   * info.fps);
+                        var _srcFps = info.sourceFrameRate || info.fps;
+                        info.startFrame = Math.round(info.startSeconds * _srcFps);
+                        info.endFrame   = Math.round(info.endSeconds   * _srcFps);
                     }
                     var _smEl = document.getElementById('ckScrubMaxInput');
                     var MAXF = Math.min(24, Math.max(1, parseInt((_smEl && _smEl.value) || '24', 10) || 24));

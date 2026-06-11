@@ -874,8 +874,9 @@ def cmd_batch(source_video, output_folder, settings,
                 # range-relative frame index; DaVinci keys per obj_id).
                 _sorted_keys = sorted(sam_video_masks.keys())
                 if _sorted_keys:
-                    # Threshold scales with pixel area so hold/collapse behaviour is
-                    # unchanged whether SAM ran at full-res or 1080p-capped.
+                    # Soft-coverage sum (logits_to_soft_mask yields float [0..1], so
+                    # sum() = fractional pixel area), scaled by _sam_scale^2 so
+                    # hold/collapse behaviour is identical at full-res and 1080p-cap.
                     _sam_thresh = max(1, int(round(100 * _sam_scale * _sam_scale)))
                     _first_sub = next(
                         (f for f in _sorted_keys if sam_video_masks[f].sum() >= _sam_thresh), None)
