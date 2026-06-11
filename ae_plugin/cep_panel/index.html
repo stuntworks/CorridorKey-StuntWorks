@@ -490,6 +490,36 @@
   .viewer.scrub .sampt { display: none !important; }
   .viewer.batch canvas.sam-overlay { display: none !important; }
   .viewer.scrub canvas.sam-overlay { display: none !important; }
+
+  /* === ZONE OVERLAY === */
+  #zoneOverlay {
+    position: absolute; display: none;
+    border: 2px dashed var(--cyan);
+    border-radius: 50%;
+    box-shadow: 0 0 8px rgba(40,220,228,0.35);
+    pointer-events: none; z-index: 5;
+  }
+  #zoneOverlay.show { display: block; }
+  .viewer.scrub #zoneOverlay,
+  .viewer.batch #zoneOverlay { display: none !important; }
+  #zoneClearChip {
+    position: absolute; display: none;
+    width: 16px; height: 16px; border-radius: 50%;
+    background: rgba(40,220,228,0.88);
+    color: #06231f; font-size: 10px; font-weight: 800;
+    line-height: 16px; text-align: center;
+    cursor: pointer; pointer-events: auto; z-index: 7;
+    transform: translate(-50%, -50%); user-select: none;
+  }
+  #zoneClearChip.show { display: block; }
+  .viewer.scrub #zoneClearChip,
+  .viewer.batch #zoneClearChip { display: none !important; }
+  #zoneModeBtn[aria-pressed="true"] {
+    color: var(--cyan);
+    background: linear-gradient(180deg, #244042, #14282a);
+    box-shadow: 0 0 0 1px rgba(40,220,228,0.5) inset, 0 1px 2px rgba(0,0,0,0.55), 0 0 8px rgba(40,220,228,0.22);
+    text-shadow: 0 0 6px rgba(40,220,228,0.4);
+  }
   /* render progress chip, top-center, above everything; not zoomed, click-through */
   #vwRenderBadge {
     position: absolute; top: 8px; left: 50%; transform: translateX(-50%); z-index: 8; display: none;
@@ -1303,7 +1333,10 @@
           <!-- zoom/pan wrapper: footage bg + SAM dots + SAM overlay canvas live
                here so they scale/translate together. Chrome below stays at
                #viewer level and never zooms. -->
-          <div id="vwZoom"></div>
+          <div id="vwZoom">
+            <div id="zoneOverlay"></div>
+            <div id="zoneClearChip" title="Clear zone">&#x00D7;</div>
+          </div>
           <span class="vw-tag" id="vwTag">Source</span>
           <span class="tick t1"></span><span class="tick t2"></span>
           <span class="tick t3"></span><span class="tick t4"></span>
@@ -1427,6 +1460,25 @@
           </div>
         </div>
 
+        <!-- Junk Mat: garbage matte grow radius, 10–120 px. -->
+        <div class="matte-fader" id="faderJunkMat" style="margin-top:12px">
+          <div class="fader-head">
+            <span class="cell-title">Junk Mat</span>
+            <span class="fader-value" id="junkMatVal">40</span>
+          </div>
+          <div class="fader-row">
+            <div class="fader-track">
+              <div class="fader-slot"></div>
+              <div class="fader-fill" id="junkMatFill" style="width:50%"></div>
+              <div class="fader-ticks" id="junkMatTicks"></div>
+              <input type="range" class="fader" id="junkMat" min="10" max="120" value="40"
+                     aria-label="Junk mat grow, 10 to 120 px" />
+              <div class="fader-cap-lines" id="junkMatCap" style="left:50%"></div>
+            </div>
+            <div class="fader-scale"><span>Tight</span><span>40</span><span>80</span><span>Wide</span></div>
+          </div>
+        </div>
+
         <div style="margin-top:8px;text-align:right">
           <button type="button" id="samOverlayToggle"
             style="font:inherit;font-size:8.5px;letter-spacing:0.16em;text-transform:uppercase;
@@ -1489,6 +1541,7 @@
                     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M21 16v3a2 2 0 0 1-2 2h-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>
                     <span>Expand</span>
                   </button>
+                  <button class="clear-btn" id="zoneModeBtn" type="button" aria-pressed="false" title="Draw a zone ellipse on the viewer to mark an overlap area (e.g. feet). Drag to place, double-click or x to clear.">Zone</button>
                   <button class="clear-btn" id="clearSam" type="button">Clear</button>
                 </div>
               </div>
@@ -1752,8 +1805,9 @@
     }
   }
   wireFader('despill');
+  wireFader('junkMat');
   (function () {
-    ['despill'].forEach(function (id) {
+    ['despill', 'junkMat'].forEach(function (id) {
       const el = document.getElementById(id);
       if (el) el.addEventListener('change', function () { if (typeof ckScheduleRepreview === 'function') ckScheduleRepreview(); });
     });
@@ -2041,7 +2095,8 @@
   // reset) does NOT also place a dot. Ignored during/just-after a middle-drag pan.
   let _vwClickT = null;
   viewer.addEventListener('click', (e) => {
-    if (!viewerTakesPoints()) return;            // page 1 is look-only: no dots before Advance
+    if (_zoneDrew) { _zoneDrew = false; return; }   // absorb click that ended a zone drag
+    if (!viewerTakesPoints() || _zoneArmed) return;
     if (e.button !== 0) return;
     if (vwPanning || vwMoved) return;            // click belongs to a pan, not a placement
     if (e.detail > 1) return;                    // 2nd+ click of a multi-click: skip
@@ -2050,7 +2105,18 @@
     _vwClickT = setTimeout(() => { _vwClickT = null; placePointViewer(e, label); }, 50);
   });
   // Double-click = reset zoom/pan, and cancel the pending single-click so no dot lands.
+  // Zone double-click (inside ellipse) clears zone; fires first via capture so zoom reset is skipped.
   viewer.addEventListener('dblclick', (e) => {
+    if (window.CK_ZONE && typeof zoneOverlay !== 'undefined' && zoneOverlay && zoneOverlay.classList.contains('show')) {
+      const rect = zoneOverlay.getBoundingClientRect();
+      const cx = e.clientX - rect.left - rect.width / 2;
+      const cy = e.clientY - rect.top - rect.height / 2;
+      const a = rect.width / 2, b = rect.height / 2;
+      if (a > 0 && b > 0 && (cx * cx) / (a * a) + (cy * cy) / (b * b) <= 1.2) {
+        if (typeof zoneClear === 'function') zoneClear();
+        e.preventDefault(); return;
+      }
+    }
     e.preventDefault();
     if (_vwClickT) { clearTimeout(_vwClickT); _vwClickT = null; }
     vwReset();
@@ -2061,6 +2127,102 @@
     if (!viewerTakesPoints()) return;            // page 1 is look-only: no dots before Advance
     if (vwPanning || vwMoved) return;
     placePointViewer(e, 0);
+  });
+
+  // ===== ZONE overlay (rough ellipse around overlap areas like feet) =====
+  window.CK_ZONE = null;
+  window.CK_ZONE_ANCHOR_FRAME = null;
+  let _zoneArmed = false, _zoneDragging = false, _zoneDrew = false;
+  let _zoneX0 = 0, _zoneY0 = 0, _zoneX1 = 0, _zoneY1 = 0;
+  const zoneOverlay = document.getElementById('zoneOverlay');
+  const zoneClearChip = document.getElementById('zoneClearChip');
+  const zoneModeBtn = document.getElementById('zoneModeBtn');
+
+  function zoneClear() {
+    window.CK_ZONE = null;
+    window.CK_ZONE_ANCHOR_FRAME = null;
+    _zoneArmed = false;
+    if (zoneModeBtn) zoneModeBtn.setAttribute('aria-pressed', 'false');
+    if (zoneOverlay) zoneOverlay.classList.remove('show');
+    if (zoneClearChip) zoneClearChip.classList.remove('show');
+  }
+  window.ckZoneClear = zoneClear;
+
+  function _zoneContentCoords(e) {
+    const vr = vwZoom.getBoundingClientRect();
+    return [(e.clientX - vr.left) / vwScale, (e.clientY - vr.top) / vwScale];
+  }
+
+  function _zoneUpdateOverlay(x0, y0, x1, y1) {
+    if (!zoneOverlay) return;
+    const left = Math.min(x0, x1), top = Math.min(y0, y1);
+    const w = Math.abs(x1 - x0), h = Math.abs(y1 - y0);
+    zoneOverlay.style.left = left + 'px';
+    zoneOverlay.style.top = top + 'px';
+    zoneOverlay.style.width = w + 'px';
+    zoneOverlay.style.height = h + 'px';
+    zoneOverlay.classList.add('show');
+    if (zoneClearChip) {
+      zoneClearChip.style.left = (left + w) + 'px';
+      zoneClearChip.style.top = top + 'px';
+    }
+  }
+
+  function _zoneContentToSource(x0, y0, x1, y1) {
+    const r = vwZoom.getBoundingClientRect();
+    const W = r.width / vwScale, H = r.height / vwScale;
+    let rw = W, rh = H, ox = 0, oy = 0;
+    if (CK_SRC_W && CK_SRC_H) {
+      const ar = CK_SRC_W / CK_SRC_H;
+      rw = W; rh = W / ar;
+      if (rh > H) { rh = H; rw = H * ar; }
+      ox = (W - rw) / 2; oy = (H - rh) / 2;
+    }
+    const sw = CK_SRC_W || 1, sh = CK_SRC_H || 1;
+    const nx0 = Math.max(0, Math.min(1, (Math.min(x0, x1) - ox) / rw));
+    const ny0 = Math.max(0, Math.min(1, (Math.min(y0, y1) - oy) / rh));
+    const nx1 = Math.max(0, Math.min(1, (Math.max(x0, x1) - ox) / rw));
+    const ny1 = Math.max(0, Math.min(1, (Math.max(y0, y1) - oy) / rh));
+    return { x: Math.round(nx0 * sw), y: Math.round(ny0 * sh), w: Math.round((nx1 - nx0) * sw), h: Math.round((ny1 - ny0) * sh), shape: 'ellipse', feather_px: 8 };
+  }
+
+  if (zoneModeBtn) zoneModeBtn.addEventListener('click', () => {
+    _zoneArmed = !_zoneArmed;
+    zoneModeBtn.setAttribute('aria-pressed', _zoneArmed ? 'true' : 'false');
+  });
+
+  // Zone drag: left button down while armed starts ellipse draw
+  viewer.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0 || !_zoneArmed) return;
+    e.preventDefault();
+    _zoneDragging = true;
+    [_zoneX0, _zoneY0] = _zoneContentCoords(e);
+    _zoneX1 = _zoneX0; _zoneY1 = _zoneY0;
+    try { viewer.setPointerCapture(e.pointerId); } catch (_) {}
+  });
+  viewer.addEventListener('pointermove', (e) => {
+    if (!_zoneDragging) return;
+    [_zoneX1, _zoneY1] = _zoneContentCoords(e);
+    _zoneUpdateOverlay(_zoneX0, _zoneY0, _zoneX1, _zoneY1);
+  });
+  viewer.addEventListener('pointerup', (e) => {
+    if (!_zoneDragging) return;
+    _zoneDragging = false;
+    [_zoneX1, _zoneY1] = _zoneContentCoords(e);
+    const w = Math.abs(_zoneX1 - _zoneX0), h = Math.abs(_zoneY1 - _zoneY0);
+    if (w < 5 || h < 5) { if (zoneOverlay) zoneOverlay.classList.remove('show'); return; }
+    _zoneUpdateOverlay(_zoneX0, _zoneY0, _zoneX1, _zoneY1);
+    if (zoneClearChip) zoneClearChip.classList.add('show');
+    window.CK_ZONE = _zoneContentToSource(_zoneX0, _zoneY0, _zoneX1, _zoneY1);
+    try { window.CK_ZONE_ANCHOR_FRAME = (typeof CK_ANCHOR_FRAME !== 'undefined') ? CK_ANCHOR_FRAME : null; } catch (_) {}
+    _zoneArmed = false;
+    _zoneDrew = true;
+    if (zoneModeBtn) zoneModeBtn.setAttribute('aria-pressed', 'false');
+  });
+
+  if (zoneClearChip) zoneClearChip.addEventListener('click', (e) => {
+    e.stopPropagation();
+    zoneClear();
   });
 
   function clearPoints() {
@@ -2240,6 +2402,7 @@ let CK_SESSION_DIR = null;
 let CK_SRC_W = 0, CK_SRC_H = 0;
 let CK_ANCHOR_FRAME = null;   // source frame the SAM dots were placed on (anchors batch propagation)
 let CK_BATCH_IN_PROGRESS = false;   // true while a KEY CLIP render runs — blocks live re-preview + double-commit
+let CK_LAST_SOURCE = null;   // tracks source file path; zone clears when a different clip is keyed
 
 function findCorridorkeyRoot() {
     const candidates = [];
@@ -2333,7 +2496,9 @@ function ckGetSettings() {
     const screenType = (screenBtn && screenBtn.dataset.screen === 'blue') ? 'blue' : 'green';
     const despillEl = document.getElementById('despill');
     const despill = despillEl ? (parseFloat(despillEl.value) / 100) : 0.0;
-    return {
+    const junkMatEl = document.getElementById('junkMat');
+    const garbage_grow_px = junkMatEl ? (parseInt(junkMatEl.value, 10) || 40) : 40;
+    const settings = {
         screenType: screenType,
         despill: despill,
         refiner: 1.0,
@@ -2342,8 +2507,13 @@ function ckGetSettings() {
         choke: 0,
         sam2_margin: 0, sam_sidecar_margin: 10, sam2_soften: 0, fill_holes: 0,
         sam_erode_px: 0,
-        sam_expand_px: 0
+        sam_expand_px: 0,
+        garbage_grow_px: garbage_grow_px
     };
+    if (window.CK_ZONE) {
+        settings.zone = window.CK_ZONE;
+    }
+    return settings;
 }
 
 // SAM dot payload in SOURCE PIXELS, shared by the KEY-frame preview (doKey) and the
@@ -2543,6 +2713,10 @@ function doKey(auto) {
         setTimeout(() => {     // let the busy state paint before spawnSync blocks
             try {
                 if (!info.ok) throw new Error(info.error || 'Select a clip first');
+                if (info.sourceFile && info.sourceFile !== CK_LAST_SOURCE) {
+                    CK_LAST_SOURCE = info.sourceFile;
+                    if (typeof window.ckZoneClear === 'function') window.ckZoneClear();
+                }
                 const framePng = randomTempPath('extract', '.png');
                 const ea = (typeof info.sourceTimeSeconds === 'number')
                     ? ['extract', info.sourceFile, framePng, '--time', String(info.sourceTimeSeconds)]
@@ -3166,6 +3340,29 @@ function ckExitWorking() {
         }
         topbar.appendChild(despillGrp);
 
+        // JUNK MAT group (header + fader) — next to DESPILL
+        var junkMatGrp = document.createElement('div');
+        junkMatGrp.className = 'ck-grp';
+        junkMatGrp.style.cssText = 'flex:1;min-width:120px;max-width:220px;';
+        var junkMatLbl = document.createElement('span');
+        junkMatLbl.className = 'cell-title';
+        junkMatLbl.textContent = 'JUNK MAT';
+        junkMatGrp.appendChild(junkMatLbl);
+        var jm = document.getElementById('faderJunkMat');
+        if (jm) {
+            jm.style.cssText = 'display:flex;align-items:center;gap:6px;width:100%;margin-top:0;';
+            var jmHead = jm.querySelector('.fader-head'); if (jmHead) jmHead.style.display = 'none';
+            var jmFrow = jm.querySelector('.fader-row');
+            if (jmFrow) jmFrow.style.cssText = 'display:flex;align-items:center;flex:1;min-width:0;margin-top:0;';
+            var jmTrack = jm.querySelector('.fader-track');
+            if (jmTrack) jmTrack.style.cssText = 'flex:1;position:relative;height:30px;min-width:0;display:flex;align-items:center;';
+            var jmVal = document.getElementById('junkMatVal');
+            if (jmFrow && jmVal) jmFrow.appendChild(jmVal);
+            var jmScale = jm.querySelector('.fader-scale'); if (jmScale) jmScale.style.display = 'none';
+            junkMatGrp.appendChild(jm);
+        }
+        topbar.appendChild(junkMatGrp);
+
         // Right cluster — FRAMES group + VIEWS group
         var ckBarRight = document.createElement('div');
         ckBarRight.style.cssText = 'display:flex;align-items:flex-end;gap:16px;flex:0 0 auto;';
@@ -3427,7 +3624,7 @@ function ckResizePanel(w, h) {
             '<path d="M1 4 V1 H4 M8 1 H11 V4 M11 8 V11 H8 M4 11 H1 V8"/></svg>';
         ckChromeBtn('ckFitBtn', 8, fitSvg, 'RESET',
             'RESET: snaps this panel back to its default size if it got dragged too big or too small.',
-            function () { ckResizePanel(CK_STD_W, CK_STD_H); });
+            function () { ckResizePanel(CK_STD_W, CK_STD_H); if (typeof window.ckZoneClear === 'function') window.ckZoneClear(); });
         // MATTE — human-outline (head + shoulders) icon
         var matteSvg = '<svg width="11" height="11" viewBox="0 0 12 12" fill="#ffd98a">' +
             '<circle cx="6" cy="3.2" r="2.1"/><path d="M1.5 11 C1.5 7.8 3.5 6.3 6 6.3 C8.5 6.3 10.5 7.8 10.5 11 Z"/></svg>';

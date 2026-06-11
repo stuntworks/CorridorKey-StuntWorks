@@ -473,6 +473,109 @@ def apply_matte_postproc(fg_rgb, alpha_raw, settings, sam_soft=None, source_rgb=
     return fg_rgb, alpha
 
 
+# ── Recipe composite helpers ───────────────────────────────────
+# ONE shared function used by cmd_batch (render) and cmd_postproc (preview) so
+# the two paths are mathematically identical: preview == render by construction.
+
+def _zone_cut_from_sam(sam_bin, settings, w, h, scale):
+    """zone_cut mask: 1 everywhere except inside user zone where = tight SAM.
+
+    sam_bin : uint8 binary SAM already thresholded at 0.5.
+    scale   : frame_w / 1920 (used for tight SAM feather sigma).
+    Returns float32 H×W mask.
+    """
+    import numpy as np, cv2
+    zone = settings.get('zone')
+    if zone is None:
+        return np.ones((h, w), dtype=np.float32)
+    zone_anchor_bbox = settings.get('zone_anchor_bbox')
+    # Compute current frame SAM bbox for zone transform
+    cols = np.any(sam_bin, axis=0)
+    rows = np.any(sam_bin, axis=1)
+    if not cols.any() or not rows.any():
+        return np.ones((h, w), dtype=np.float32)
+    x_min = int(np.where(cols)[0][0]); x_max = int(np.where(cols)[0][-1])
+    y_min = int(np.where(rows)[0][0]); y_max = int(np.where(rows)[0][-1])
+    cur_w = max(1, x_max - x_min); cur_h = max(1, y_max - y_min)
+    cur_cx = x_min + cur_w / 2.0;   cur_cy = y_min + cur_h / 2.0
+    # Transform zone by bbox center-delta + scale
+    zx = float(zone['x']); zy = float(zone['y'])
+    zw = float(zone['w']); zh = float(zone['h'])
+    zone_cx = zx + zw / 2.0; zone_cy = zy + zh / 2.0
+    if (zone_anchor_bbox is not None
+            and float(zone_anchor_bbox[2]) > 0 and float(zone_anchor_bbox[3]) > 0):
+        anc_cx = float(zone_anchor_bbox[0]) + float(zone_anchor_bbox[2]) / 2.0
+        anc_cy = float(zone_anchor_bbox[1]) + float(zone_anchor_bbox[3]) / 2.0
+        sx = cur_w / float(zone_anchor_bbox[2])
+        sy = cur_h / float(zone_anchor_bbox[3])
+        t_cx = cur_cx + (zone_cx - anc_cx) * sx
+        t_cy = cur_cy + (zone_cy - anc_cy) * sy
+        t_w = zw * sx; t_h = zh * sy
+    else:
+        t_cx = zone_cx; t_cy = zone_cy; t_w = zw; t_h = zh
+    # Build zone mask
+    zone_mask = np.zeros((h, w), dtype=np.uint8)
+    feather_px = float(zone.get('feather_px', 10))
+    shape = zone.get('shape', 'ellipse')
+    if shape == 'ellipse':
+        cv2.ellipse(zone_mask,
+                    (int(round(t_cx)), int(round(t_cy))),
+                    (max(1, int(round(t_w / 2.0))), max(1, int(round(t_h / 2.0)))),
+                    0, 0, 360, 255, -1)
+    else:
+        cv2.rectangle(zone_mask,
+                      (int(round(t_cx - t_w / 2.0)), int(round(t_cy - t_h / 2.0))),
+                      (int(round(t_cx + t_w / 2.0)), int(round(t_cy + t_h / 2.0))),
+                      255, -1)
+    if feather_px > 0:
+        zone_f = cv2.GaussianBlur(zone_mask.astype(np.float32), (0, 0),
+                                  max(0.5, feather_px / 3.0)) / 255.0
+    else:
+        zone_f = zone_mask.astype(np.float32) / 255.0
+    # Tight SAM inside zone: binary SAM dilated 2 px, feathered sigma 1.5*scale
+    k_tight = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    tight = cv2.dilate(sam_bin, k_tight)
+    tight_f = cv2.GaussianBlur(tight.astype(np.float32), (0, 0), max(0.5, 1.5 * scale))
+    # Blend: inside zone -> tight_sam, outside -> 1
+    return np.clip(1.0 - zone_f + zone_f * tight_f, 0.0, 1.0)
+
+
+def apply_recipe_composite(alpha_raw, sam_soft, frame_w, settings):
+    """Deterministic recipe: alpha_final = alpha_raw * garbage_gate * zone_cut.
+
+    garbage_gate : grown + feathered binary SAM (1 = subject region, 0 = junk far outside).
+                   grow radius = garbage_grow_px (settings, default 40) scaled by frame_w/1920.
+                   Gaussian feather sigma = 3 * scale.
+    zone_cut     : 1 everywhere; inside user zone (settings key 'zone') = tight SAM so
+                   cables/slabs near the body are removed with a tighter mask.
+    Zone absent or SAM None -> falls back cleanly (garbage_gate=ones or skip).
+
+    Returns (alpha_final float32, garbage_gate float32|None).
+    garbage_gate is None when sam_soft is None (no SAM active for this frame).
+    """
+    import numpy as np, cv2
+    if sam_soft is None:
+        return alpha_raw, None
+    h, w = alpha_raw.shape[:2]
+    scale = frame_w / 1920.0
+    sam = np.asarray(sam_soft, dtype=np.float32)
+    if sam.ndim == 3:
+        sam = sam[:, :, 0]
+    if sam.shape[:2] != (h, w):
+        sam = cv2.resize(sam, (w, h), interpolation=cv2.INTER_LINEAR)
+    sam_bin = (sam > 0.5).astype(np.uint8)
+    # garbage_gate: dilate binary SAM by garbage_grow_px (scaled), feather sigma 3*scale
+    grow_px = max(1, int(round(float(settings.get('garbage_grow_px', 40)) * scale)))
+    k_size = grow_px * 2 + 1
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
+    g_grown = cv2.dilate(sam_bin, k)
+    garbage_gate = cv2.GaussianBlur(g_grown.astype(np.float32), (0, 0), max(0.5, 3.0 * scale))
+    # zone_cut
+    zone_cut = _zone_cut_from_sam(sam_bin, settings, w, h, scale)
+    alpha_final = np.clip(alpha_raw * garbage_gate * zone_cut, 0.0, 1.0)
+    return alpha_final, garbage_gate
+
+
 def cmd_single(input_path, output_path, settings, sam2_mask_path=None):
     import numpy as np
     import cv2
@@ -957,6 +1060,10 @@ def cmd_batch(source_video, output_folder, settings,
         # Option C — feed soft mask straight in; no binarise step.
         from corridorkey_sam_merge import process_sam_matte
 
+    garbage_dir = out_dir / "garbage_mattes" if sam_active else None
+    if garbage_dir is not None:
+        garbage_dir.mkdir(parents=True, exist_ok=True)
+
     # CK_COMBINED merge: when a per-frame SAM mask exists, combine the RAW CK alpha
     # with the soft SAM silhouette via the SAME dispatcher DaVinci uses
     # (merge_ck_with_sam_active -> garbage_matte mode). This is what makes the AE key
@@ -1031,27 +1138,16 @@ def cmd_batch(source_video, output_folder, settings,
                     continue
                 if len(alpha.shape) == 3:
                     alpha = alpha[:, :, 0]
-                # RAW CK alpha — snapshot BEFORE choke/merge mutate it. The merge and
-                # (later) the CK_ALPHA sidecar both need the un-choked matte.
+                # RAW CK alpha — snapshot BEFORE recipe mutates it. CK_ALPHA sidecar
+                # and matte_ write both need the un-merged matte.
                 alpha_raw = alpha.copy()
-                # Shared post-proc — identical helpers to KEY FRAME + inline PREVIEW so
-                # render == preview. SAM garbage-matte merge first (source_rgb=img_rgb
-                # drives the hair chroma-escape valve — same call as the Resolve plugin,
-                # CorridorKey_Pro.py:5447). Snapshot the merged matte for the CK_COMBINED
-                # sidecar BEFORE choke, then choke + despeckle the alpha, despill the fg.
-                alpha = sam_garbage_merge(
-                    alpha_raw, sam_video_masks.get(seq_num), img_rgb, settings,
-                    settings["screenType"])
-                # Shirt rescue in the RENDER path too (2026-06-06 review: it was wired
-                # into apply_matte_postproc only, which cmd_batch does not use —
-                # preview had rescue, renders didn't). Resize the SAM mask to alpha
-                # dims first or the rescue's shape guard silently no-ops on 4K.
-                _sam_for_rescue = sam_video_masks.get(seq_num)
-                if _sam_for_rescue is not None and _sam_for_rescue.shape[:2] != alpha.shape[:2]:
-                    _sam_for_rescue = cv2.resize(
-                        _sam_for_rescue, (alpha.shape[1], alpha.shape[0]),
-                        interpolation=cv2.INTER_LINEAR)
-                alpha = apply_shirt_rescue(alpha, _sam_for_rescue, img_rgb, settings)
+                # Deterministic recipe: alpha_final = alpha_raw * garbage_gate * zone_cut.
+                # garbage_gate kills slabs/cables far from the SAM body; zone_cut applies
+                # a tighter SAM clip inside the user-defined zone. Same helper used by
+                # cmd_postproc so preview == render by construction.
+                _sam_frame = sam_video_masks.get(seq_num)
+                alpha, _garbage_gate = apply_recipe_composite(
+                    alpha_raw, _sam_frame, alpha.shape[1], settings)
                 alpha_combined = alpha.copy()
                 alpha = apply_choke(alpha, settings)
                 alpha = apply_despeckle(alpha, settings)
@@ -1168,6 +1264,21 @@ def cmd_batch(source_video, output_folder, settings,
                             log.warning(f"ck_masked frame {frame_idx}: write failed: {_cm_e}")
                     except Exception as _se:
                         log.warning(f"SAM frame {frame_idx}: sidecar save failed: {_se}")
+                # garbage_matte sidecar — inverted garbage_gate so AE can use it
+                # directly as a junk-kill layer (white = region to discard).
+                if garbage_dir is not None and _garbage_gate is not None:
+                    try:
+                        _junk_u8 = ((1.0 - np.clip(_garbage_gate, 0, 1)) * 255).astype(np.uint8)
+                        _junk_rgba = np.zeros((_junk_u8.shape[0], _junk_u8.shape[1], 4), dtype=np.uint8)
+                        _junk_rgba[:, :, 0] = _junk_u8
+                        _junk_rgba[:, :, 1] = _junk_u8
+                        _junk_rgba[:, :, 2] = _junk_u8
+                        _junk_rgba[:, :, 3] = _junk_u8
+                        _atomic_imwrite(garbage_dir / f"garbage_{seq_num:05d}.png", _junk_rgba)
+                        if processed == 0:
+                            _atomic_imwrite(garbage_dir / "garbage_00000.png", _junk_rgba)
+                    except Exception as _ge:
+                        log.warning(f"garbage_matte frame {frame_idx}: write failed: {_ge}")
                 # Premiere Pro's sequence importer silently drops the first frame. Write
                 # a dummy output_00000.png (and matching matte) so the user's actual
                 # frame range survives the import intact.
@@ -1726,11 +1837,15 @@ def cmd_postproc(session_dir, output_path, settings, background="checker", v1_pa
         if _plate_raw is not None else None
     )
 
-    # cu is also used by the background/composite section below.
+    # Recipe composite (same math as cmd_batch) so preview == render.
+    # matte-ck / matte-sam diagnostic views returned early above; this path
+    # is the RESULT view only.
     from CorridorKeyModule.core import color_utils as cu
-    fg_rgb, alpha = apply_matte_postproc(
-        fg_rgb, alpha, settings, sam_soft=sam_soft, source_rgb=_source_rgb,
-        screen_type=settings.get("screenType", "green"))
+    if sam_soft is not None and not bool(settings.get("sam2_bypass", False)):
+        alpha, _ = apply_recipe_composite(alpha, sam_soft, fg_rgb.shape[1], settings)
+    alpha = apply_choke(alpha, settings)
+    alpha = apply_despeckle(alpha, settings)
+    fg_rgb = apply_despill(fg_rgb, settings)
 
     # Build background buffer
     h, w = fg_rgb.shape[:2]
