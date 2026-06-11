@@ -477,7 +477,52 @@ def apply_matte_postproc(fg_rgb, alpha_raw, settings, sam_soft=None, source_rgb=
 # ONE shared function used by cmd_batch (render) and cmd_postproc (preview) so
 # the two paths are mathematically identical: preview == render by construction.
 
-def _zone_cut_from_sam(sam_bin, settings, w, h, scale):
+_auto_zone_logged = False  # log throttle: one line per process lifetime
+
+
+def _measure_sam_offset(ck_alpha, sam_binary, zone_mask_or_bbox, scale):
+    """Measure SAM boundary's median distance to nearest CK alpha edge.
+
+    Subsamples every 4th SAM boundary pixel; keeps only samples within 15px
+    of a CK edge crossing (ck_alpha crosses 0.5); returns median clamped to
+    [0, 15] px at current resolution.  Returns None if < 30 valid samples.
+    zone_mask_or_bbox: float32 H×W mask (>0.5 = inside zone) to exclude, or
+                       4-tuple (x, y, w, h) bbox, or None (measure everywhere).
+    """
+    import numpy as np, cv2
+    k1 = np.ones((3, 3), np.uint8)
+    # SAM boundary ring: binary XOR 1px-erosion
+    sam_boundary = sam_binary ^ cv2.erode(sam_binary, k1)
+    # CK edge: pixels where ck_alpha crosses 0.5, XOR with 1px-erosion
+    ck_thresh = (ck_alpha > 0.5).astype(np.uint8)
+    ck_edge = ck_thresh ^ cv2.erode(ck_thresh, k1)
+    # Distance transform: 0 at CK edge pixels, grows outward
+    dist_from_ck = cv2.distanceTransform((ck_edge == 0).astype(np.uint8),
+                                         cv2.DIST_L2, 3)
+    # Collect boundary pixel coords, subsample every 4th
+    by, bx = np.where(sam_boundary > 0)
+    if len(by) == 0:
+        return None
+    idx = np.arange(0, len(by), 4)
+    sy, sx = by[idx], bx[idx]
+    # Exclude zone interior
+    if zone_mask_or_bbox is not None:
+        if isinstance(zone_mask_or_bbox, np.ndarray):
+            inside = zone_mask_or_bbox[sy, sx] > 0.5
+        else:
+            zx, zy, zw, zh = zone_mask_or_bbox
+            inside = (sx >= zx) & (sx < zx + zw) & (sy >= zy) & (sy < zy + zh)
+        sy, sx = sy[~inside], sx[~inside]
+    if len(sy) == 0:
+        return None
+    dists = dist_from_ck[sy, sx]
+    valid = dists[dists <= 15.0]
+    if len(valid) < 30:
+        return None
+    return float(np.clip(np.median(valid), 0.0, 15.0))
+
+
+def _zone_cut_from_sam(sam_bin, settings, w, h, scale, auto_offset=None):
     """zone_cut mask: 1 everywhere except inside user zone where = tight SAM.
 
     sam_bin : uint8 binary SAM already thresholded at 0.5.
@@ -532,9 +577,20 @@ def _zone_cut_from_sam(sam_bin, settings, w, h, scale):
                                   max(0.5, feather_px / 3.0)) / 255.0
     else:
         zone_f = zone_mask.astype(np.float32) / 255.0
-    # Tight SAM inside zone: binary SAM dilated 2 px, feathered sigma 1.5*scale
-    k_tight = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    tight = cv2.dilate(sam_bin, k_tight)
+    # Tight SAM inside zone: erode (effective_erode>0) or dilate (=0) binary SAM, then feather.
+    # zone_erode_px slider default 4 = neutral trim (0 adjustment vs auto measurement).
+    zone_erode_px = int(settings.get('zone_erode_px', 4))
+    if auto_offset is not None:
+        effective_erode = int(np.clip(auto_offset + (zone_erode_px - 4), 0, 20))
+    else:
+        effective_erode = zone_erode_px
+    if effective_erode > 0:
+        erode_r = max(1, int(round(effective_erode * w / 1920)))
+        k_e = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * erode_r + 1, 2 * erode_r + 1))
+        tight = cv2.erode(sam_bin, k_e)
+    else:
+        k_tight = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        tight = cv2.dilate(sam_bin, k_tight)
     tight_f = cv2.GaussianBlur(tight.astype(np.float32), (0, 0), max(0.5, 1.5 * scale))
     # Blend: inside zone -> tight_sam, outside -> 1
     return np.clip(1.0 - zone_f + zone_f * tight_f, 0.0, 1.0)
@@ -570,8 +626,14 @@ def apply_recipe_composite(alpha_raw, sam_soft, frame_w, settings):
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
     g_grown = cv2.dilate(sam_bin, k)
     garbage_gate = cv2.GaussianBlur(g_grown.astype(np.float32), (0, 0), max(0.5, 3.0 * scale))
+    # auto zone tightness: measure SAM looseness vs CK edge, drive zone erosion
+    global _auto_zone_logged
+    auto_offset = _measure_sam_offset(alpha_raw, sam_bin, None, scale)
+    if auto_offset is not None and not _auto_zone_logged:
+        log.info(f'auto zone tighten: measured {auto_offset:.1f}px')
+        _auto_zone_logged = True
     # zone_cut
-    zone_cut = _zone_cut_from_sam(sam_bin, settings, w, h, scale)
+    zone_cut = _zone_cut_from_sam(sam_bin, settings, w, h, scale, auto_offset=auto_offset)
     alpha_final = np.clip(alpha_raw * garbage_gate * zone_cut, 0.0, 1.0)
     return alpha_final, garbage_gate
 

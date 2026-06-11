@@ -1479,6 +1479,25 @@
           </div>
         </div>
 
+        <!-- Zone Edge: SAM erosion radius inside zone, 0–15 px. -->
+        <div class="matte-fader" id="faderZoneEdge" style="margin-top:12px">
+          <div class="fader-head">
+            <span class="cell-title">Zone Edge</span>
+            <span class="fader-value" id="zoneEdgeVal">4</span>
+          </div>
+          <div class="fader-row">
+            <div class="fader-track">
+              <div class="fader-slot"></div>
+              <div class="fader-fill" id="zoneEdgeFill" style="width:27%"></div>
+              <div class="fader-ticks" id="zoneEdgeTicks"></div>
+              <input type="range" class="fader" id="zoneEdge" min="0" max="15" value="4"
+                     aria-label="Zone edge erosion, 0 to 15 px" />
+              <div class="fader-cap-lines" id="zoneEdgeCap" style="left:27%"></div>
+            </div>
+            <div class="fader-scale"><span>0</span><span>4</span><span>8</span><span>12</span><span>15</span></div>
+          </div>
+        </div>
+
         <div style="margin-top:8px;text-align:right">
           <button type="button" id="samOverlayToggle"
             style="font:inherit;font-size:8.5px;letter-spacing:0.16em;text-transform:uppercase;
@@ -1806,8 +1825,9 @@
   }
   wireFader('despill');
   wireFader('junkMat');
+  wireFader('zoneEdge');
   (function () {
-    ['despill', 'junkMat'].forEach(function (id) {
+    ['despill', 'junkMat', 'zoneEdge'].forEach(function (id) {
       const el = document.getElementById(id);
       if (el) el.addEventListener('change', function () { if (typeof ckScheduleRepreview === 'function') ckScheduleRepreview(); });
     });
@@ -2498,6 +2518,9 @@ function ckGetSettings() {
     const despill = despillEl ? (parseFloat(despillEl.value) / 100) : 0.0;
     const junkMatEl = document.getElementById('junkMat');
     const garbage_grow_px = junkMatEl ? (parseInt(junkMatEl.value, 10) || 40) : 40;
+    const zoneEdgeEl = document.getElementById('zoneEdge');
+    const _zeParsed = zoneEdgeEl ? parseInt(zoneEdgeEl.value, 10) : NaN;
+    const zone_erode_px = isNaN(_zeParsed) ? 4 : _zeParsed;
     const settings = {
         screenType: screenType,
         despill: despill,
@@ -2508,7 +2531,8 @@ function ckGetSettings() {
         sam2_margin: 0, sam_sidecar_margin: 10, sam2_soften: 0, fill_holes: 0,
         sam_erode_px: 0,
         sam_expand_px: 0,
-        garbage_grow_px: garbage_grow_px
+        garbage_grow_px: garbage_grow_px,
+        zone_erode_px: zone_erode_px
     };
     if (window.CK_ZONE) {
         settings.zone = window.CK_ZONE;
@@ -3362,6 +3386,29 @@ function ckExitWorking() {
             junkMatGrp.appendChild(jm);
         }
         topbar.appendChild(junkMatGrp);
+
+        // ZONE EDGE group (header + fader) — next to JUNK MAT
+        var zoneEdgeGrp = document.createElement('div');
+        zoneEdgeGrp.className = 'ck-grp';
+        zoneEdgeGrp.style.cssText = 'flex:1;min-width:120px;max-width:220px;';
+        var zoneEdgeLbl = document.createElement('span');
+        zoneEdgeLbl.className = 'cell-title';
+        zoneEdgeLbl.textContent = 'ZONE EDGE';
+        zoneEdgeGrp.appendChild(zoneEdgeLbl);
+        var ze = document.getElementById('faderZoneEdge');
+        if (ze) {
+            ze.style.cssText = 'display:flex;align-items:center;gap:6px;width:100%;margin-top:0;';
+            var zeHead = ze.querySelector('.fader-head'); if (zeHead) zeHead.style.display = 'none';
+            var zeFrow = ze.querySelector('.fader-row');
+            if (zeFrow) zeFrow.style.cssText = 'display:flex;align-items:center;flex:1;min-width:0;margin-top:0;';
+            var zeTrack = ze.querySelector('.fader-track');
+            if (zeTrack) zeTrack.style.cssText = 'flex:1;position:relative;height:30px;min-width:0;display:flex;align-items:center;';
+            var zeVal = document.getElementById('zoneEdgeVal');
+            if (zeFrow && zeVal) zeFrow.appendChild(zeVal);
+            var zeScale = ze.querySelector('.fader-scale'); if (zeScale) zeScale.style.display = 'none';
+            zoneEdgeGrp.appendChild(ze);
+        }
+        topbar.appendChild(zoneEdgeGrp);
 
         // Right cluster — FRAMES group + VIEWS group
         var ckBarRight = document.createElement('div');
