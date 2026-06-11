@@ -1888,6 +1888,20 @@
     if (stageCount) stageCount.textContent = points + (points === 1 ? ' point' : ' points');
     // include/exclude breakdown beside the total (item 4)
     if (stageBreak) stageBreak.textContent = incl + ' incl . ' + excl + ' excl';
+    ckUpdateSamDependentFaders();
+  }
+
+  function ckUpdateSamDependentFaders() {
+    var hasPosPoints = (typeof samPoints !== 'undefined') && samPoints.filter(function(p) { return p.label === 1; }).length > 0;
+    var jm = document.getElementById('faderJunkMat');
+    var ze = document.getElementById('faderZoneEdge');
+    var tip = hasPosPoints ? '' : 'Needs SAM dots — place dots on the subject first';
+    [jm, ze].forEach(function(el) {
+      if (!el) return;
+      el.style.opacity = hasPosPoints ? '' : '0.35';
+      el.style.pointerEvents = hasPosPoints ? '' : 'none';
+      el.title = tip;
+    });
   }
 
   // place a dot at the given screen position on a host element, recording its
@@ -2165,6 +2179,7 @@
     if (zoneModeBtn) zoneModeBtn.setAttribute('aria-pressed', 'false');
     if (zoneOverlay) zoneOverlay.classList.remove('show');
     if (zoneClearChip) zoneClearChip.classList.remove('show');
+    ckUpdateSamDependentFaders();
   }
   window.ckZoneClear = zoneClear;
 
@@ -2238,6 +2253,7 @@
     _zoneArmed = false;
     _zoneDrew = true;
     if (zoneModeBtn) zoneModeBtn.setAttribute('aria-pressed', 'false');
+    ckUpdateSamDependentFaders();
   });
 
   if (zoneClearChip) zoneClearChip.addEventListener('click', (e) => {
@@ -3518,6 +3534,7 @@ function ckExitWorking() {
 })();
 
 setTimeout(() => { try { autoKeyAsync(); } catch (_) {} }, 700);
+try { ckUpdateSamDependentFaders(); } catch (_) {}
 
 // ---- Layout reflow fix (CEP/CEF surface-resize lag) ----------------------
 // AE's CEF host can leave the document stuck at its old width when the panel
