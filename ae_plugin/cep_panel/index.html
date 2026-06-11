@@ -2577,7 +2577,7 @@ function doKey(auto) {
                 }
 
                 const prev = path.join(sess, 'preview.png');
-                const ppParams = writeParamsFile(settings);
+                const ppParams = writeParamsFile(Object.assign({}, settings, samPayload || {}));
                 ckStatus('Compositing...');
                 runPython(['postproc', sess, prev, '--params', ppParams, '--background', CK_PREVIEW_BG, '--max-width', '1280']);
                 try { fs.unlinkSync(ppParams); } catch (_) {}
@@ -2864,8 +2864,11 @@ function doCommit() {
         if (keyBtn) delete keyBtn.dataset.busy;
     }
 
+    if (keyBtn) keyBtn.dataset.busy = '1';
+    CK_BATCH_IN_PROGRESS = true;
+    try { setBusy(true); } catch (_) {}
     jsxCall(infoFn, [], (info) => {
-        if (!info || !info.ok) { ckStatus(info && info.error ? info.error : 'Select the clip on the timeline first'); return; }
+        if (!info || !info.ok) { if (keyBtn) delete keyBtn.dataset.busy; CK_BATCH_IN_PROGRESS = false; try { setBusy(false); } catch (_) {} ckStatus(info && info.error ? info.error : 'Select the clip on the timeline first'); return; }
         // LAYER LOCK: snapshot the durable comp+layer handle NOW (render start) and carry
         // it through the whole render so the import target never depends on the live
         // selection at render end (AE path only). '' when absent -> JSX falls back.
@@ -2874,9 +2877,6 @@ function doCommit() {
         // lock handle was actually captured at render start — the log line pins which side
         // (capture vs transport) loses it.
         ckLog('commit: lock handle ' + (ckLockJson ? 'captured (compId ' + info.lock.compId + ')' : 'EMPTY at capture'));
-        if (keyBtn) keyBtn.dataset.busy = '1';
-        CK_BATCH_IN_PROGRESS = true;
-        try { setBusy(true); } catch (_) {}
         // viewer follows the live render: hide SAM outline + dots + scrim, fit frame
         if (typeof window.ckVwBatch === 'function') window.ckVwBatch(true, 'Rendering');
         if (vwProc) vwProc.classList.add('show');
@@ -3032,12 +3032,12 @@ function doSAMCommit(advanced) {
         if (keyBtn) delete keyBtn.dataset.busy;
     }
 
+    if (keyBtn) keyBtn.dataset.busy = '1';
+    CK_BATCH_IN_PROGRESS = true;
+    try { setBusy(true); } catch (_) {}
     jsxCall(infoFn, [], (info) => {
-        if (!info || !info.ok) { ckStatus(info && info.error ? info.error : 'Select the clip on the timeline first'); return; }
+        if (!info || !info.ok) { if (keyBtn) delete keyBtn.dataset.busy; CK_BATCH_IN_PROGRESS = false; try { setBusy(false); } catch (_) {} ckStatus(info && info.error ? info.error : 'Select the clip on the timeline first'); return; }
         const ckLockJson = (info.lock ? JSON.stringify(info.lock) : '');
-        if (keyBtn) keyBtn.dataset.busy = '1';
-        CK_BATCH_IN_PROGRESS = true;
-        try { setBusy(true); } catch (_) {}
         if (typeof window.ckVwBatch === 'function') window.ckVwBatch(true, 'Rendering');
         if (vwProc) vwProc.classList.add('show');
         if (stageProc) stageProc.classList.add('show');
