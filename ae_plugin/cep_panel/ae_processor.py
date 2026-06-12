@@ -1112,6 +1112,35 @@ def cmd_batch(source_video, output_folder, settings,
         print("CK_WARN: SAM points were set but propagation produced 0 masks. Keying WITHOUT SAM (no CK_COMBINED).", flush=True)
         log.warning("SAM active but 0 masks produced — keying without SAM.")
 
+    # Derive zone_anchor_bbox from the SAM anchor mask when JS did not send it.
+    # _zone_cut_from_sam uses this to track the zone rect as the subject moves.
+    # Without it the zone stays at raw drawn coords and drifts off the subject.
+    if settings.get('zone') is not None and settings.get('zone_anchor_bbox') is None and sam_video_masks:
+        _zaf = settings.get('zone_anchor_frame')
+        _zab_rel = None
+        if _zaf is not None and start_frame <= int(_zaf) < end_frame:
+            _zab_rel = int(_zaf) - int(start_frame)
+        _zab_mask = None
+        if _zab_rel is not None and _zab_rel in sam_video_masks:
+            _zab_mask = sam_video_masks[_zab_rel]
+        if _zab_mask is None:
+            _zab_thresh = max(1, int(round(100 * _sam_scale * _sam_scale)))
+            for _fi in sorted(sam_video_masks.keys()):
+                if sam_video_masks[_fi].sum() >= _zab_thresh:
+                    _zab_mask = sam_video_masks[_fi]
+                    break
+        if _zab_mask is not None:
+            _zb_bin = (_zab_mask > 0.5).astype(np.uint8)
+            _zb_cols = np.any(_zb_bin, axis=0)
+            _zb_rows = np.any(_zb_bin, axis=1)
+            if _zb_cols.any() and _zb_rows.any():
+                _zb_x0 = int(np.where(_zb_cols)[0][0])
+                _zb_x1 = int(np.where(_zb_cols)[0][-1])
+                _zb_y0 = int(np.where(_zb_rows)[0][0])
+                _zb_y1 = int(np.where(_zb_rows)[0][-1])
+                settings['zone_anchor_bbox'] = [_zb_x0, _zb_y0, _zb_x1 - _zb_x0 + 1, _zb_y1 - _zb_y0 + 1]
+                log.info(f"zone_anchor_bbox derived from SAM anchor: {settings['zone_anchor_bbox']}")
+
     # Sidecar dir is created up front so the dummy-first-frame write never
     # races a missing parent. Empty dir is cheap; gets removed by the caller
     # if no SAM points were active and no files were ever written.
@@ -1772,6 +1801,13 @@ def cmd_cache(input_path, session_dir, settings):
         # Raw plate — source_rgb for garbage_matte body fill / chroma escape.
         plate_u8 = (np.clip(img_rgb, 0, 1) * 255).astype(np.uint8)
         cv2.imwrite(str(sess / "plate.png"), cv2.cvtColor(plate_u8, cv2.COLOR_RGB2BGR))
+        # Zone fallback: write an all-ones uint16 gate so cmd_postproc fires
+        # apply_recipe_composite (zone_cut + garbage_gate) on single-frame previews
+        # even when no SAM dots are placed. cmd_sam_apply overwrites this with the
+        # real SAM mask when dots exist.
+        if settings.get('zone') is not None:
+            _ones_gate = np.full(alpha.shape[:2], 65535, dtype=np.uint16)
+            cv2.imwrite(str(sess / "sam2_gate_raw.png"), _ones_gate)
 
         # frame_num lets the viewer record where the user clicked SAM2 points
         # (as sam_anchor_frame in live_params.json). cmd_batch_scrub uses it
