@@ -41,7 +41,7 @@ VENV_PY   = CK_ROOT / ".venv" / "Scripts" / "python.exe"
 AE_PROC   = CK_ROOT / "ae_plugin" / "cep_panel" / "ae_processor.py"
 AE_DIR    = AE_PROC.parent
 CLIPS_JSON = Path(__file__).resolve().parent / "gauntlet_clips.json"
-OUT_ROOT  = Path(r"D:\CLAUDE_JUNK\ck-gauntlet\run1")
+OUT_ROOT  = Path(r"D:\CLAUDE_JUNK\ck-gauntlet\run1")  # overridden by --out at runtime
 
 # ---------------------------------------------------------------------------
 # Base settings (shared across all clips; clip-specific overrides added inline)
@@ -554,7 +554,8 @@ def run_gauntlet():
     # ---- Build contact sheet ----
     _log("")
     _log("Building contact sheet...")
-    sheet_path = OUT_ROOT / "contact_sheet_run1.png"
+    run_name = OUT_ROOT.name
+    sheet_path = OUT_ROOT / f"contact_sheet_{run_name}.png"
     ok = _build_contact_sheet(sheet_rows, sheet_path)
     _log(f"  {'OK' if ok else 'FAILED'}: {sheet_path}")
 
@@ -588,7 +589,7 @@ def _write_scorecard(score_rows, out_path):
         "> **NOTE**: No reference mattes exist. Junk-px and edge-energy are proxies only.",
         "> Junk-px = alpha>0.7 outside SAM boundary (>5% bh). Lower = cleaner.",
         "> Edge energy = sum |Sobel| on matte. Higher NEW/OLD ratio = more detail preserved.",
-        "> **Berto's eye is the authoritative verdict.** Compare contact_sheet_run1.png.",
+        "> **Berto's eye is the authoritative verdict.** Compare the contact_sheet PNG in this run folder.",
         "",
         "---",
         "",
@@ -673,4 +674,11 @@ def _print_status(score_rows, elapsed):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    import argparse as _ap
+    _p = _ap.ArgumentParser(description="Gauntlet runner")
+    _p.add_argument("--out", default=None,
+                    help="Output root dir (default: run1 path)")
+    _args, _ = _p.parse_known_args()
+    if _args.out:
+        OUT_ROOT = Path(_args.out)
     run_gauntlet()
