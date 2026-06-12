@@ -514,11 +514,25 @@
   #zoneClearChip.show { display: block; }
   .viewer.scrub #zoneClearChip,
   .viewer.batch #zoneClearChip { display: none !important; }
+  /* Zone btn: cyan chassis so it reads as a button and stands apart from CLEAR */
+  #zoneModeBtn {
+    border: 1px solid var(--cyan) !important;
+    color: var(--cyan) !important;
+    font-size: 9.5px !important;
+    text-shadow: 0 0 5px rgba(40,220,228,0.25);
+  }
   #zoneModeBtn[aria-pressed="true"] {
-    color: var(--cyan);
-    background: linear-gradient(180deg, #244042, #14282a);
-    box-shadow: 0 0 0 1px rgba(40,220,228,0.5) inset, 0 1px 2px rgba(0,0,0,0.55), 0 0 8px rgba(40,220,228,0.22);
-    text-shadow: 0 0 6px rgba(40,220,228,0.4);
+    background: var(--cyan) !important;
+    color: #06231f !important;
+    box-shadow: 0 0 0 1px var(--cyan) inset, 0 0 14px rgba(40,220,228,0.6), 0 1px 2px rgba(0,0,0,0.55) !important;
+    text-shadow: none !important;
+  }
+  @keyframes ck-zone-pulse {
+    0%, 100% { box-shadow: 0 0 0 1px var(--cyan) inset, 0 0 4px rgba(40,220,228,0.25); opacity: 1; }
+    50%       { box-shadow: 0 0 0 1px var(--cyan) inset, 0 0 14px rgba(40,220,228,0.75); opacity: 0.8; }
+  }
+  #zoneModeBtn.zone-pulse {
+    animation: ck-zone-pulse 2s ease-in-out infinite;
   }
   /* render progress chip, top-center, above everything; not zoomed, click-through */
   #vwRenderBadge {
@@ -1560,7 +1574,7 @@
                     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M21 16v3a2 2 0 0 1-2 2h-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>
                     <span>Expand</span>
                   </button>
-                  <button class="clear-btn" id="zoneModeBtn" type="button" aria-pressed="false" title="Draw a zone ellipse on the viewer to mark an overlap area (e.g. feet). Drag to place, double-click or x to clear.">Zone</button>
+                  <button class="clear-btn" id="zoneModeBtn" type="button" aria-pressed="false" title="ZONE: drag an ellipse around any body part that leaves the green screen (feet, hands). SAM cuts only inside it.">Zone</button>
                   <button class="clear-btn" id="clearSam" type="button">Clear</button>
                 </div>
               </div>
@@ -1888,6 +1902,11 @@
     if (stageCount) stageCount.textContent = points + (points === 1 ? ' point' : ' points');
     // include/exclude breakdown beside the total (item 4)
     if (stageBreak) stageBreak.textContent = incl + ' incl . ' + excl + ' excl';
+    // pulse zone btn when SAM dots exist but no zone drawn yet
+    if (zoneModeBtn) {
+      if (points > 0 && !window.CK_ZONE) zoneModeBtn.classList.add('zone-pulse');
+      else zoneModeBtn.classList.remove('zone-pulse');
+    }
     ckUpdateSamDependentFaders();
   }
 
@@ -2182,7 +2201,7 @@
     window.CK_ZONE = null;
     window.CK_ZONE_ANCHOR_FRAME = null;
     _zoneArmed = false;
-    if (zoneModeBtn) zoneModeBtn.setAttribute('aria-pressed', 'false');
+    if (zoneModeBtn) { zoneModeBtn.setAttribute('aria-pressed', 'false'); zoneModeBtn.classList.remove('zone-pulse'); }
     if (zoneOverlay) zoneOverlay.classList.remove('show');
     if (zoneClearChip) zoneClearChip.classList.remove('show');
     ckUpdateSamDependentFaders();
@@ -2286,7 +2305,7 @@
     } catch (_) {}
     _zoneArmed = false;
     _zoneDrew = true;
-    if (zoneModeBtn) zoneModeBtn.setAttribute('aria-pressed', 'false');
+    if (zoneModeBtn) { zoneModeBtn.setAttribute('aria-pressed', 'false'); zoneModeBtn.classList.remove('zone-pulse'); }
     ckUpdateSamDependentFaders();
   });
 
