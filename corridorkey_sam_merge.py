@@ -1140,6 +1140,15 @@ def merge_ck_with_garbage_matte(
     garbage_matte = np.maximum(garbage_matte, sam.astype(np.float32))
     garbage_matte = np.clip(garbage_matte, 0.0, 1.0)
 
+    # FEET RING KILL (Berto 2026-06-12): "there was always an extra 10px mask
+    # around the feet — remove it." Inside the feet zone (bottom 30% of SAM bbox)
+    # the garbage matte hugs RAW SAM: no lateral dilation, no wide protection.
+    # The 5px@1920 lateral dilation scales to ~11px at 4K — that was the ring.
+    _feet_zone = np.zeros((h, w), dtype=np.float32)
+    _feet_zone[feet_start:, :] = 1.0
+    garbage_matte = (garbage_matte * (1.0 - _feet_zone)
+                     + np.minimum(garbage_matte, sam.astype(np.float32)) * _feet_zone)
+
     # Feather gate edges — converts hard sam_tight wall into gradient so CK
     # soft alpha is never clipped by a binary cliff where green detection missed.
     _gate_sigma = max(1.0, 2.5 * _scale)
@@ -1154,6 +1163,9 @@ def merge_ck_with_garbage_matte(
             sam_inv = (1 - sam).astype(np.uint8)
             dist_from_sam = cv2.distanceTransform(sam_inv, cv2.DIST_L2, 5)
             near_sam = (dist_from_sam < _esc).astype(np.float32)
+            # Feet ring kill: escape valve is for hair — at the feet it re-added
+            # green floor pixels, rebuilding the ring. No valve in the feet zone.
+            near_sam *= (1.0 - _feet_zone)
             garbage_matte = np.maximum(garbage_matte, on_green_hsv * near_sam)
         except Exception:
             pass
