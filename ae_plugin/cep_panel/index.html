@@ -2134,6 +2134,8 @@
     if (e.button !== 0) return;
     if (vwPanning || vwMoved) return;            // click belongs to a pan, not a placement
     if (e.detail > 1) return;                    // 2nd+ click of a multi-click: skip
+    if (window.CK_SCRUB_VIEW) { ckStatus('Exit scrub (DONE) to edit dots'); return; }
+    if ((typeof CK_BATCH_IN_PROGRESS !== 'undefined' && CK_BATCH_IN_PROGRESS) || (window.CK_SCRUB && window.CK_SCRUB.busy) || (typeof keyBtn !== 'undefined' && keyBtn && keyBtn.dataset.busy)) { ckStatus('Busy — wait for the current operation'); return; }
     const label = pointMode === 'neg' ? 0 : 1;
     if (_vwClickT) clearTimeout(_vwClickT);
     _vwClickT = setTimeout(() => { _vwClickT = null; placePointViewer(e, label); }, 50);
@@ -2384,10 +2386,6 @@
   // wired to the engine bridge below. doKey() owns the busy state + keyed transition.
   keyBtn.addEventListener('click', () => {
     if (keyBtn.dataset.busy) return;
-    var _sp = (typeof ckSamPayload === 'function') ? ckSamPayload() : null;
-    if (_sp && _sp.sam_positive && _sp.sam_positive.length > 0 && typeof window.ckRunScrub === 'function' && window.CK_SCRUB && !window.CK_SCRUB.busy) {
-        window.ckRunScrub(); return;
-    }
     if (typeof doKey === 'function') doKey();
   });
 
@@ -3487,10 +3485,6 @@ function ckExitWorking() {
     // 2) pod KEY = PREVIEW this frame (+ SAM mask); COMMIT = render whole clip; Done = exit
     const podKey = document.getElementById('podKey');
     if (podKey) podKey.addEventListener('click', function () {
-        var _sp = (typeof ckSamPayload === 'function') ? ckSamPayload() : null;
-        if (_sp && _sp.sam_positive && _sp.sam_positive.length > 0 && typeof window.ckRunScrub === 'function' && window.CK_SCRUB && !window.CK_SCRUB.busy) {
-            window.ckRunScrub(); return;
-        }
         if (typeof doKey === 'function') doKey();
     });
     const podCommit = document.getElementById('podCommit');
@@ -3855,6 +3849,16 @@ function ckResizePanel(w, h) {
                     if (CK_SCRUB.dir) { try { fs.rmSync(CK_SCRUB.dir, { recursive: true, force: true }); } catch (_) {} CK_SCRUB.dir = null; }
                     var scrubDir = randomTempPath('scrub');
                     var pp = writeParamsFile(st);
+                    var _bigTrackLabel = document.getElementById('ckScrubBigLabel');
+                    if (!_bigTrackLabel) {
+                        _bigTrackLabel = document.createElement('div');
+                        _bigTrackLabel.id = 'ckScrubBigLabel';
+                        _bigTrackLabel.style.cssText = 'position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-size:20px;font-weight:bold;color:cyan;pointer-events:none;z-index:50;display:none;text-align:center;white-space:nowrap;';
+                        var _vEl = document.getElementById('viewer');
+                        if (_vEl) { if (!_vEl.style.position) _vEl.style.position = 'relative'; _vEl.appendChild(_bigTrackLabel); }
+                    }
+                    _bigTrackLabel.textContent = 'TRACKING ' + count + ' FRAMES…';
+                    _bigTrackLabel.style.display = 'block';
                     CK_SCRUB.busy = true;
                     ckStatus('Scrubbing ' + count + ' frames...');
                     try { if (typeof procLabel !== 'undefined' && procLabel) procLabel.textContent = 'Scrubbing...'; if (typeof vwProc !== 'undefined' && vwProc) vwProc.classList.add('show'); if (typeof stageProc !== 'undefined' && stageProc) stageProc.classList.add('show'); if (typeof setBusy === 'function') setBusy(true); } catch (_) {}
@@ -3866,6 +3870,7 @@ function ckResizePanel(w, h) {
                         try { var _sv2 = document.getElementById('viewer'); if (_sv2) _sv2.classList.remove('scrub'); } catch (_) {}
                         try { fs.unlinkSync(pp); } catch (_) {}
                         CK_SCRUB.busy = false;
+                        try { if (_bigTrackLabel) _bigTrackLabel.style.display = 'none'; } catch (_) {}
                         CK_SCRUB.dir = scrubDir; CK_SCRUB.count = count;
                         var sl2 = document.getElementById('ckScrubSlider');
                         if (sl2) { sl2.max = String(count - 1); sl2.value = '0'; }
@@ -3892,11 +3897,11 @@ function ckResizePanel(w, h) {
                     }, function (e) {
                         try { if (typeof vwProc !== 'undefined' && vwProc) vwProc.classList.remove('show'); if (typeof stageProc !== 'undefined' && stageProc) stageProc.classList.remove('show'); if (typeof setBusy === 'function') setBusy(false); } catch (_) {}
                         try { var _sv3 = document.getElementById('viewer'); if (_sv3) _sv3.classList.remove('scrub'); } catch (_) {}
-                        CK_SCRUB.busy = false; ckStatus('Scrub failed: ' + e.message);
+                        CK_SCRUB.busy = false; try { if (_bigTrackLabel) _bigTrackLabel.style.display = 'none'; } catch (_) {} ckStatus('Scrub failed: ' + e.message);
                     },
                     function (line) {
                         var m = line.match(/PROGRESS\s+(\d+)\/(\d+)/);
-                        if (m) { ckStatus('Scrubbing frame ' + m[1] + ' of ' + m[2] + '...'); try { if (typeof procLabel !== 'undefined' && procLabel) procLabel.textContent = 'Frame ' + m[1] + ' / ' + m[2]; } catch (_) {} }
+                        if (m) { ckStatus('Scrubbing frame ' + m[1] + ' of ' + m[2] + '...'); try { if (typeof procLabel !== 'undefined' && procLabel) procLabel.textContent = 'Frame ' + m[1] + ' / ' + m[2]; } catch (_) {} try { if (_bigTrackLabel) _bigTrackLabel.textContent = 'TRACKING ' + m[1] + ' / ' + m[2]; } catch (_) {} }
                     });
                 });
         };
