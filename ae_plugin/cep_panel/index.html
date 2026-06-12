@@ -424,6 +424,14 @@
     text-shadow: 0 0 22px rgba(40,220,228,0.85);
   }
 
+  #ck-busy-strip .bs-inner {
+    display: flex; flex-direction: column; align-items: center; gap: 3px;
+  }
+  #ck-busy-promo {
+    font-size: 9px; letter-spacing: 0.10em; color: rgba(40,220,228,0.40);
+    text-transform: none; font-weight: 400;
+  }
+
   .vw-proc .scan {
     position: absolute; left: 0; right: 0; top: 0; height: 30%;
     background: linear-gradient(180deg, rgba(40,220,228,0) 0%, rgba(40,220,228,0.22) 70%, rgba(40,220,228,0.5) 100%);
@@ -1366,7 +1374,10 @@
          ckStatus / procLabel / PROGRESS lines. Hidden when idle. -->
     <div id="ck-busy-strip">
       <span class="bs-scan"></span>
-      <span id="ck-busy-msg">WORKING&hellip;</span>
+      <span class="bs-inner">
+        <span id="ck-busy-msg">WORKING&hellip;</span>
+        <span id="ck-busy-promo"></span>
+      </span>
     </div>
 
     <!-- ============ VIEWER MODULE ============ -->
@@ -1867,6 +1878,11 @@
 
   const fusionV2Btn = document.getElementById('fusionV2');
   if (fusionV2Btn) {
+    // Restore persisted state (global, not per-clip -- survives panel reopen)
+    var _fv2Saved = localStorage.getItem('ck_global_fusion_v2');
+    if (_fv2Saved === 'true' || _fv2Saved === 'false') {
+      fusionV2Btn.setAttribute('aria-pressed', _fv2Saved);
+    }
     function _ckApplyFusionFaderState() {
       var isOn = fusionV2Btn.getAttribute('aria-pressed') === 'true';
       var fExp = document.getElementById('faderFusionExpand');
@@ -1877,10 +1893,11 @@
     fusionV2Btn.addEventListener('click', () => {
       const fOn = fusionV2Btn.getAttribute('aria-pressed') === 'true';
       fusionV2Btn.setAttribute('aria-pressed', fOn ? 'false' : 'true');
+      localStorage.setItem('ck_global_fusion_v2', fOn ? 'false' : 'true');
       ckLog('fusion_v2 toggle: ' + (fOn ? 'off' : 'on'));
       _ckApplyFusionFaderState();
     });
-    _ckApplyFusionFaderState();  // apply correct state on load
+    _ckApplyFusionFaderState();  // apply restored state on load
   }
 
   // ---- Advanced = EXPAND TO COCKPIT (not an accordion) ----
@@ -2612,16 +2629,38 @@ function ckStatus(msg) { try { const g = document.getElementById('gateStatus'); 
 (function () {
     var _strip = document.getElementById('ck-busy-strip');
     var _msg = document.getElementById('ck-busy-msg');
+    var _promo = document.getElementById('ck-busy-promo');
     var _active = false;
+    var _PROMO = [
+        'STUNTWORKS CINEMA — youtube.com/@StuntWorksCinema',
+        'github.com/stuntworks/CorridorKey-Plugin',
+        'AI: Niko Pueringer / Corridor Digital  •  Plugin: Roberto & Elvis Lopez / StuntWorks',
+        '☕ ko-fi.com/stuntworks'
+    ];
+    var _promoIdx = 0; var _promoTimer = null;
+    function _promoStart() {
+        if (!_promo) return;
+        _promoIdx = 0; _promo.textContent = _PROMO[0];
+        _promoTimer = setInterval(function () {
+            _promoIdx = (_promoIdx + 1) % _PROMO.length;
+            _promo.textContent = _PROMO[_promoIdx];
+        }, 8000);
+    }
+    function _promoStop() {
+        if (_promoTimer) { clearInterval(_promoTimer); _promoTimer = null; }
+        if (_promo) _promo.textContent = '';
+    }
 
     function _show(text) {
         _active = true;
         if (_msg) _msg.textContent = (text || 'WORKING…').toUpperCase();
         if (_strip) _strip.classList.add('show');
+        if (!_promoTimer) _promoStart();
     }
     function _hide() {
         _active = false;
         if (_strip) _strip.classList.remove('show');
+        _promoStop();
     }
     // Expose for autoPreCache (no setBusy call there)
     window._ckBigShow = _show;
@@ -3640,8 +3679,10 @@ function ckExitWorking() {
         ['faderDespill', 'faderJunkMat', 'faderZoneEdge', 'faderFusionExpand'].forEach(function (id) {
             var f = document.getElementById(id);
             if (!f) return;
+            var _savedDisplay = f.style.display;  // preserve fusion hide state across cssText wipe
             // Restore full-style — clear any compact inline overrides from prior top-bar placement
             f.style.cssText = 'margin-top:0;';
+            if (_savedDisplay === 'none') f.style.display = 'none';
             var head = f.querySelector('.fader-head'); if (head) head.style.display = '';
             var frow = f.querySelector('.fader-row'); if (frow) frow.style.cssText = '';
             var track = f.querySelector('.fader-track'); if (track) track.style.cssText = '';
