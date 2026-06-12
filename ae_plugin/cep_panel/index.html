@@ -1888,7 +1888,10 @@
       var isOn = fusionV2Btn.getAttribute('aria-pressed') === 'true';
       var fExp = document.getElementById('faderFusionExpand');
       var fStr = document.getElementById('faderJunkMat');
-      if (fExp) fExp.style.display = isOn ? '' : 'none';
+      // EXPAND fader RETIRED (Berto 2026-06-12): the zoned auto-bands made it
+      // redundant — no visible effect, "just going to piss people off". The
+      // engine keeps the internal default (fusion_expand 6). Never show it.
+      if (fExp) fExp.style.display = 'none';
       if (fStr) fStr.style.display = isOn ? 'none' : '';
     }
     // Main-toolbar twin button (Berto 2026-06-12: the drawer toggle was invisible —
