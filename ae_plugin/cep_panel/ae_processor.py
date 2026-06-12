@@ -597,18 +597,20 @@ def _zone_cut_from_sam(sam_bin, settings, w, h, scale, auto_offset=None):
 
 
 def apply_recipe_composite(alpha_raw, sam_soft, frame_w, settings):
-    """Deterministic recipe: alpha_final = alpha_raw * garbage_gate * zone_cut.
+    """Deterministic recipe: alpha_final = ck_alpha * keep_mask * zone_cut.
 
-    garbage_gate : blob-based junk mat v2 (1 = keep, 0 = junk blob).
-                   attached = dilate SAM by garbage_grow_px (default 40) scaled by frame_w/1920.
-                   junk = blob > junk_min_area (0.5% of frame) with <5% overlap with attached.
-                   Gaussian feather sigma = 3 * scale on kill mask.
-    zone_cut     : 1 everywhere; inside user zone (settings key 'zone') = tight SAM so
-                   cables/slabs near the body are removed with a tighter mask.
-    Zone absent or SAM None -> falls back cleanly (garbage_gate=ones or skip).
+    Judge-verdict connectivity composite: dilated CK alpha bridges nearby
+    blobs into a connectivity map; connected components are kept if they
+    overlap the binary SAM body or are tiny (< 0.5% of frame). Large blobs
+    that do not overlap SAM are killed. SAM never adds alpha CK did not
+    produce (base = CK only).
 
-    Returns (alpha_final float32, garbage_gate float32|None).
-    garbage_gate is None when sam_soft is None (no SAM active for this frame).
+    keep_mask : float 0..1 (1 = keep). Returned so the caller can invert it
+                for the garbage sidecar (inverted keep_mask = true junk map).
+    zone_cut  : 1 everywhere; inside user zone = tight SAM clip (unchanged).
+
+    Returns (alpha_final float32, keep_mask float32|None).
+    keep_mask is None when sam_soft is None (no SAM active for this frame).
     """
     import numpy as np, cv2
     if sam_soft is None:
@@ -620,35 +622,31 @@ def apply_recipe_composite(alpha_raw, sam_soft, frame_w, settings):
         sam = sam[:, :, 0]
     if sam.shape[:2] != (h, w):
         sam = cv2.resize(sam, (w, h), interpolation=cv2.INTER_LINEAR)
-    sam_bin = (sam > 0.5).astype(np.uint8)
-    # junk mat v2: blob-based, no color detection
-    grow_px = max(1, int(round(float(settings.get('garbage_grow_px', 40)) * scale)))
-    k_size = grow_px * 2 + 1
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
-    attached = cv2.dilate(sam_bin, k)
-    ck_solid = (alpha_raw > 0.5).astype(np.uint8) * 255
+    sam_solid = (sam > 0.5).astype(np.uint8)
+    # Connectivity map: dilated CK alpha OR binary SAM bridges nearby straps/props
+    bridge_px = max(1, int(round(float(settings.get('strap_bridge_px', 8)) * scale)))
+    k_b = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (bridge_px * 2 + 1, bridge_px * 2 + 1))
+    ck_dil = cv2.dilate((alpha_raw > 0.5).astype(np.uint8), k_b)
+    content = np.maximum(ck_dil, sam_solid).astype(np.uint8) * 255
     junk_min_area = int(0.005 * h * w)
-    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(ck_solid, connectivity=8)
-    kill_mask = np.zeros((h, w), dtype=np.uint8)
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(content, connectivity=8)
+    keep_bin = np.zeros((h, w), dtype=np.uint8)
     for lbl in range(1, n_labels):
         comp_area = int(stats[lbl, cv2.CC_STAT_AREA])
-        if comp_area <= junk_min_area:
-            continue
         comp_px = labels == lbl
-        # per-pixel kill: only pixels outside attached die; pixels inside attached survive
-        kill_mask[comp_px & (attached == 0)] = 255
-    kill_f = cv2.GaussianBlur(kill_mask.astype(np.float32), (0, 0), max(0.5, 3.0 * scale)) / 255.0
-    garbage_gate = 1.0 - kill_f
+        if np.any(sam_solid[comp_px]) or comp_area < junk_min_area:
+            keep_bin[comp_px] = 255
+    keep_mask = cv2.GaussianBlur(keep_bin.astype(np.float32), (0, 0), max(0.5, 2.0 * scale)) / 255.0
     # auto zone tightness: measure SAM looseness vs CK edge, drive zone erosion
     global _auto_zone_logged
-    auto_offset = _measure_sam_offset(alpha_raw, sam_bin, None, scale)
+    auto_offset = _measure_sam_offset(alpha_raw, sam_solid, None, scale)
     if auto_offset is not None and not _auto_zone_logged:
         log.info(f'auto zone tighten: measured {auto_offset:.1f}px')
         _auto_zone_logged = True
-    # zone_cut
-    zone_cut = _zone_cut_from_sam(sam_bin, settings, w, h, scale, auto_offset=auto_offset)
-    alpha_final = np.clip(alpha_raw * garbage_gate * zone_cut, 0.0, 1.0)
-    return alpha_final, garbage_gate
+    zone_cut = _zone_cut_from_sam(sam_solid, settings, w, h, scale, auto_offset=auto_offset)
+    # base = CK alpha only; SAM must never add alpha CK did not produce
+    alpha_final = np.clip(alpha_raw * keep_mask * zone_cut, 0.0, 1.0)
+    return alpha_final, keep_mask
 
 
 def cmd_single(input_path, output_path, settings, sam2_mask_path=None):

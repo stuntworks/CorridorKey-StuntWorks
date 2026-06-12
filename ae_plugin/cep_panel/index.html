@@ -1474,22 +1474,22 @@
           </div>
         </div>
 
-        <!-- Junk Mat: garbage matte grow radius, 40–200 px (far-kill only). -->
+        <!-- Strap Bridge: connectivity bridge radius, 4–40 px. Raise if a dangling strap or prop gets cut. -->
         <div class="matte-fader" id="faderJunkMat" style="margin-top:12px">
           <div class="fader-head">
-            <span class="cell-title">Junk Mat</span>
-            <span class="fader-value" id="junkMatVal">80</span>
+            <span class="cell-title">Strap Bridge</span>
+            <span class="fader-value" id="junkMatVal">8</span>
           </div>
           <div class="fader-row">
             <div class="fader-track">
               <div class="fader-slot"></div>
-              <div class="fader-fill" id="junkMatFill" style="width:80%"></div>
+              <div class="fader-fill" id="junkMatFill" style="width:11%"></div>
               <div class="fader-ticks" id="junkMatTicks"></div>
-              <input type="range" class="fader" id="junkMat" min="40" max="200" value="80"
-                     aria-label="Junk mat grow, 40 to 200 px" />
-              <div class="fader-cap-lines" id="junkMatCap" style="left:80%"></div>
+              <input type="range" class="fader" id="junkMat" min="4" max="40" value="8"
+                     aria-label="Strap bridge, 4 to 40 px. Raise if a dangling strap or prop gets cut." />
+              <div class="fader-cap-lines" id="junkMatCap" style="left:11%"></div>
             </div>
-            <div class="fader-scale"><span>40</span><span>80</span><span>120</span><span>160</span><span>200</span></div>
+            <div class="fader-scale"><span>4</span><span>8</span><span>16</span><span>28</span><span>40</span></div>
           </div>
         </div>
 
@@ -2582,7 +2582,7 @@ function ckGetSettings() {
     const despillEl = document.getElementById('despill');
     const despill = despillEl ? (parseFloat(despillEl.value) / 100) : 0.0;
     const junkMatEl = document.getElementById('junkMat');
-    const garbage_grow_px = junkMatEl ? (parseInt(junkMatEl.value, 10) || 80) : 80;
+    const strap_bridge_px = junkMatEl ? (parseInt(junkMatEl.value, 10) || 8) : 8;
     const zoneEdgeEl = document.getElementById('zoneEdge');
     const _zeParsed = zoneEdgeEl ? parseInt(zoneEdgeEl.value, 10) : NaN;
     const zone_erode_px = isNaN(_zeParsed) ? 4 : _zeParsed;
@@ -2596,7 +2596,7 @@ function ckGetSettings() {
         sam2_margin: 0, sam_sidecar_margin: 10, sam2_soften: 0, fill_holes: 0,
         sam_erode_px: 0,
         sam_expand_px: 0,
-        garbage_grow_px: garbage_grow_px,
+        strap_bridge_px: strap_bridge_px,
         zone_erode_px: zone_erode_px
     };
     if (window.CK_ZONE) {
@@ -2631,7 +2631,7 @@ function ckSamPayload(anchorFrame) {
 // garbage-matte boundary (MAGENTA) on a transparent canvas over the keyed preview.
 // Fires after KEY (sam-apply is a subprocess; true per-click-live needs a persistent
 // worker — separate, later). Pure JS — no OpenCV, no markup changes.
-let SAM_OVERLAY_BUFFER_PX = 10;   // source-px grow for the magenta garbage edge (fixed)
+let SAM_OVERLAY_BUFFER_PX = 0;    // SAM outline hugs real edge; no fake buffer
 
 function ckDilate(bin, w, h, r) {
     if (r <= 0) return bin.slice();
