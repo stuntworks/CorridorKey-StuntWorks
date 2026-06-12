@@ -635,9 +635,8 @@ def apply_recipe_composite(alpha_raw, sam_soft, frame_w, settings):
         if comp_area <= junk_min_area:
             continue
         comp_px = labels == lbl
-        overlap_frac = float(np.logical_and(comp_px, attached).sum()) / comp_area
-        if overlap_frac < 0.05:
-            kill_mask[comp_px] = 255
+        # per-pixel kill: only pixels outside attached die; pixels inside attached survive
+        kill_mask[comp_px & (attached == 0)] = 255
     kill_f = cv2.GaussianBlur(kill_mask.astype(np.float32), (0, 0), max(0.5, 3.0 * scale)) / 255.0
     garbage_gate = 1.0 - kill_f
     # auto zone tightness: measure SAM looseness vs CK edge, drive zone erosion
