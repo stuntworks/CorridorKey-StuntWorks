@@ -599,11 +599,17 @@ def _zone_cut_from_sam(sam_bin, settings, w, h, scale, auto_offset=None):
 def apply_recipe_composite(alpha_raw, sam_soft, frame_w, settings):
     """Deterministic recipe: alpha_final = ck_alpha * keep_mask * zone_cut.
 
-    Judge-verdict connectivity composite: dilated CK alpha bridges nearby
-    blobs into a connectivity map; connected components are kept if they
-    overlap the binary SAM body or are tiny (< 0.5% of frame). Large blobs
-    that do not overlap SAM are killed. SAM never adds alpha CK did not
-    produce (base = CK only).
+    Thickness-based outside-body filter: CK pixels outside a body_buffer_px
+    halo around the SAM silhouette are killed when they form structures FATTER
+    than thick_px.  Thin objects (straps, wires, hair streaks) drop out of the
+    morphological opening and survive.  Fat fused junk (floors, cables, slabs)
+    is removed even when connected to the subject via the floor.
+
+    Pure-green shots: outside ≈ empty → kill ≈ empty → no-op.
+
+    strap_bridge_px slider repurposed as THICKNESS dial:
+        thick_px = settings.get('strap_bridge_px', 8) * 1.875 * scale
+        (default 8 → 15 px at 1920 width)
 
     keep_mask : float 0..1 (1 = keep). Returned so the caller can invert it
                 for the garbage sidecar (inverted keep_mask = true junk map).
@@ -623,20 +629,32 @@ def apply_recipe_composite(alpha_raw, sam_soft, frame_w, settings):
     if sam.shape[:2] != (h, w):
         sam = cv2.resize(sam, (w, h), interpolation=cv2.INTER_LINEAR)
     sam_solid = (sam > 0.5).astype(np.uint8)
-    # Connectivity map: dilated CK alpha OR binary SAM bridges nearby straps/props
-    bridge_px = max(1, int(round(float(settings.get('strap_bridge_px', 8)) * scale)))
-    k_b = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (bridge_px * 2 + 1, bridge_px * 2 + 1))
-    ck_dil = cv2.dilate((alpha_raw > 0.5).astype(np.uint8), k_b)
-    content = np.maximum(ck_dil, sam_solid).astype(np.uint8) * 255
-    junk_min_area = int(0.005 * h * w)
-    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(content, connectivity=8)
-    keep_bin = np.zeros((h, w), dtype=np.uint8)
-    for lbl in range(1, n_labels):
-        comp_area = int(stats[lbl, cv2.CC_STAT_AREA])
-        comp_px = labels == lbl
-        if np.any(sam_solid[comp_px]) or comp_area < junk_min_area:
-            keep_bin[comp_px] = 255
-    keep_mask = cv2.GaussianBlur(keep_bin.astype(np.float32), (0, 0), max(0.5, 2.0 * scale)) / 255.0
+    ck_solid  = (alpha_raw > 0.5).astype(np.uint8)
+
+    # Protected zone: SAM body expanded by body_buffer_px — spares thin attached
+    # and detached things that live close to the body
+    body_buffer_px = max(1, int(round(8 * scale)))
+    k_buf = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                      (body_buffer_px * 2 + 1, body_buffer_px * 2 + 1))
+    protected = cv2.dilate(sam_solid, k_buf)                    # uint8 0/1
+
+    # CK pixels strictly outside the protected zone
+    outside = (ck_solid & (protected == 0)).astype(np.uint8)   # uint8 0/1
+
+    # Opening removes everything FATTER than thick_px; thin structures survive.
+    # strap_bridge_px slider repurposed as thickness dial: value * 1.875 * scale
+    _sbpx = float(settings.get('strap_bridge_px', 8))
+    thick_px = max(1, int(round(_sbpx * 1.875 * scale)))       # 8 default → 15 px at 1920
+    k_thick = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                        (thick_px * 2 + 1, thick_px * 2 + 1))
+    kill = cv2.morphologyEx(outside, cv2.MORPH_OPEN, k_thick)  # uint8 0/1
+
+    # Dilation closes the thin-survivor halo; Gaussian feathers the kill edge
+    k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))  # 3 px radius
+    kill = cv2.dilate(kill, k3)
+    kill_f = cv2.GaussianBlur(kill.astype(np.float32), (0, 0), max(0.5, 2.0 * scale))
+
+    keep_mask = np.clip(1.0 - kill_f, 0.0, 1.0)
     # auto zone tightness: measure SAM looseness vs CK edge, drive zone erosion
     global _auto_zone_logged
     auto_offset = _measure_sam_offset(alpha_raw, sam_solid, None, scale)
