@@ -367,9 +367,7 @@ def sam_garbage_merge(alpha, sam_soft, source_rgb, settings, screen_type="green"
         # kill-zone (generous dilation + chroma-escape radius). Before 2026-06-06 the
         # fader only inflated the exported SAM matte layer — the merge silently ran on
         # edge_guard_px (default 7) and the operator's buffer setting did nothing here.
-        _buffer_px = settings.get("sam2_margin", None)   # panel fader key (ckGetSettings)
-        if _buffer_px is None:
-            _buffer_px = settings.get("edge_guard_px", 7)
+        _buffer_px = settings.get("sam2_margin", settings.get("edge_guard_px", 0))
         return merge_ck_with_sam_active(
             alpha, binarize_sam_silhouette(sg), source_rgb=source_rgb,
             screen_type=screen_type, proximity_px=int(_buffer_px),
@@ -599,20 +597,23 @@ def _zone_cut_from_sam(sam_bin, settings, w, h, scale, auto_offset=None):
 def apply_recipe_composite(alpha_raw, sam_soft, frame_w, settings):
     """Deterministic recipe: alpha_final = ck_alpha * keep_mask * zone_cut.
 
-    Thickness-based outside-body filter: CK pixels outside a body_buffer_px
-    halo around the SAM silhouette are killed when they form structures FATTER
-    than thick_px.  Thin objects (straps, wires, hair streaks) drop out of the
-    morphological opening and survive.  Fat fused junk (floors, cables, slabs)
-    is removed even when connected to the subject via the floor.
+    Unified keep rule (two-stage filter):
+      1. Fat kill: morphological opening on (ck_solid AND NOT protected) kills
+         structures fatter than thick_px — slabs, cables, fused floors.
+      2. Connectivity filter on remainder (body + surviving thin junk):
+         keep only connected components that OVERLAP the SAM protected zone.
+         Thin straps/wires attached to body survive; disconnected thin outlines
+         (junk rim spiderwebs) die even though their width survived the opening.
+      3. Feather keep mask with sigma=2*scale.
 
-    Pure-green shots: outside ≈ empty → kill ≈ empty → no-op.
+    Pure-green shots: outside ≈ empty → no-op.
 
-    strap_bridge_px slider repurposed as THICKNESS dial:
+    strap_bridge_px slider drives thick_px as before:
         thick_px = settings.get('strap_bridge_px', 8) * 1.875 * scale
         (default 8 → 15 px at 1920 width)
 
     keep_mask : float 0..1 (1 = keep). Returned so the caller can invert it
-                for the garbage sidecar (inverted keep_mask = true junk map).
+                for the garbage sidecar.
     zone_cut  : 1 everywhere; inside user zone = tight SAM clip (unchanged).
 
     Returns (alpha_final float32, keep_mask float32|None).
@@ -631,30 +632,34 @@ def apply_recipe_composite(alpha_raw, sam_soft, frame_w, settings):
     sam_solid = (sam > 0.5).astype(np.uint8)
     ck_solid  = (alpha_raw > 0.5).astype(np.uint8)
 
-    # Protected zone: SAM body expanded by body_buffer_px — spares thin attached
-    # and detached things that live close to the body
-    body_buffer_px = max(1, int(round(8 * scale)))
+    # Protected zone: SAM body expanded by 3*scale px
+    body_buffer_px = max(1, int(round(3 * scale)))
     k_buf = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
                                       (body_buffer_px * 2 + 1, body_buffer_px * 2 + 1))
     protected = cv2.dilate(sam_solid, k_buf)                    # uint8 0/1
 
-    # CK pixels strictly outside the protected zone
-    outside = (ck_solid & (protected == 0)).astype(np.uint8)   # uint8 0/1
-
-    # Opening removes everything FATTER than thick_px; thin structures survive.
-    # strap_bridge_px slider repurposed as thickness dial: value * 1.875 * scale
+    # Fat kill: opening on (ck_solid AND NOT protected)
     _sbpx = float(settings.get('strap_bridge_px', 8))
     thick_px = max(1, int(round(_sbpx * 1.875 * scale)))       # 8 default → 15 px at 1920
     k_thick = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
                                         (thick_px * 2 + 1, thick_px * 2 + 1))
-    kill = cv2.morphologyEx(outside, cv2.MORPH_OPEN, k_thick)  # uint8 0/1
+    outside  = (ck_solid & (protected == 0)).astype(np.uint8)
+    fat_kill = cv2.morphologyEx(outside, cv2.MORPH_OPEN, k_thick)  # uint8 0/1
 
-    # Dilation closes the thin-survivor halo; Gaussian feathers the kill edge
-    k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))  # 3 px radius
-    kill = cv2.dilate(kill, k3)
-    kill_f = cv2.GaussianBlur(kill.astype(np.float32), (0, 0), max(0.5, 2.0 * scale))
+    # Connectivity filter: thin junk rims die if disconnected from SAM body
+    remainder = np.clip(ck_solid.astype(np.int32) - fat_kill.astype(np.int32),
+                        0, 1).astype(np.uint8)
+    _, labels = cv2.connectedComponents(remainder, connectivity=8)
+    overlap_labels = np.unique(labels[protected > 0])
+    overlap_labels = overlap_labels[overlap_labels > 0]
+    if len(overlap_labels) > 0:
+        keep_bin = np.isin(labels, overlap_labels).astype(np.uint8)
+    else:
+        keep_bin = np.zeros_like(remainder)
 
-    keep_mask = np.clip(1.0 - kill_f, 0.0, 1.0)
+    # Feather keep mask
+    keep_f = cv2.GaussianBlur(keep_bin.astype(np.float32), (0, 0), max(0.5, 2.0 * scale))
+    keep_mask = np.clip(keep_f, 0.0, 1.0)
     # auto zone tightness: measure SAM looseness vs CK edge, drive zone erosion
     global _auto_zone_logged
     auto_offset = _measure_sam_offset(alpha_raw, sam_solid, None, scale)
@@ -1258,16 +1263,31 @@ def cmd_batch(source_video, output_folder, settings,
                     continue
                 if len(alpha.shape) == 3:
                     alpha = alpha[:, :, 0]
-                # RAW CK alpha — snapshot BEFORE recipe mutates it. CK_ALPHA sidecar
-                # and matte_ write both need the un-merged matte.
+                # RAW CK alpha — snapshot BEFORE choke/merge mutate it. The merge and
+                # (later) the CK_ALPHA sidecar both need the un-choked matte.
                 alpha_raw = alpha.copy()
-                # Deterministic recipe: alpha_final = alpha_raw * garbage_gate * zone_cut.
-                # garbage_gate kills slabs/cables far from the SAM body; zone_cut applies
-                # a tighter SAM clip inside the user-defined zone. Same helper used by
-                # cmd_postproc so preview == render by construction.
                 _sam_frame = sam_video_masks.get(seq_num)
-                alpha, _garbage_gate = apply_recipe_composite(
-                    alpha_raw, _sam_frame, alpha.shape[1], settings)
+                if settings.get('experimental_recipe'):
+                    alpha, _garbage_gate = apply_recipe_composite(
+                        alpha_raw, _sam_frame, alpha.shape[1], settings)
+                else:
+                    # Default: 06-10 proven merge chain
+                    alpha = sam_garbage_merge(
+                        alpha_raw, _sam_frame, img_rgb, settings,
+                        settings["screenType"])
+                    _sam_for_rescue = _sam_frame
+                    if _sam_for_rescue is not None and _sam_for_rescue.shape[:2] != alpha.shape[:2]:
+                        _sam_for_rescue = cv2.resize(
+                            _sam_for_rescue, (alpha.shape[1], alpha.shape[0]),
+                            interpolation=cv2.INTER_LINEAR)
+                    alpha = apply_shirt_rescue(alpha, _sam_for_rescue, img_rgb, settings)
+                    if settings.get('zone') and _sam_frame is not None:
+                        _h_z, _w_z = alpha.shape[:2]
+                        _sz = _sam_frame if _sam_frame.shape[:2] == (_h_z, _w_z) else cv2.resize(
+                            _sam_frame, (_w_z, _h_z), interpolation=cv2.INTER_LINEAR)
+                        _zone_mask = _zone_cut_from_sam(
+                            (_sz > 0.5).astype(np.uint8), settings, _w_z, _h_z, _w_z / 1920.0)
+                        alpha = np.clip(alpha * _zone_mask, 0.0, 1.0)
                 alpha_combined = alpha.copy()
                 alpha = apply_choke(alpha, settings)
                 alpha = apply_despeckle(alpha, settings)
@@ -1964,15 +1984,28 @@ def cmd_postproc(session_dir, output_path, settings, background="checker", v1_pa
         if _plate_raw is not None else None
     )
 
-    # Recipe composite (same math as cmd_batch) so preview == render.
-    # matte-ck / matte-sam diagnostic views returned early above; this path
-    # is the RESULT view only.
+    # cu is also used by the background/composite section below.
     from CorridorKeyModule.core import color_utils as cu
-    if sam_soft is not None and not bool(settings.get("sam2_bypass", False)):
-        alpha, _ = apply_recipe_composite(alpha, sam_soft, fg_rgb.shape[1], settings)
-    alpha = apply_choke(alpha, settings)
-    alpha = apply_despeckle(alpha, settings)
-    fg_rgb = apply_despill(fg_rgb, settings)
+    if settings.get('experimental_recipe'):
+        if sam_soft is not None and not bool(settings.get("sam2_bypass", False)):
+            alpha, _ = apply_recipe_composite(alpha, sam_soft, fg_rgb.shape[1], settings)
+        alpha = apply_choke(alpha, settings)
+        alpha = apply_despeckle(alpha, settings)
+        fg_rgb = apply_despill(fg_rgb, settings)
+    else:
+        fg_rgb, alpha = apply_matte_postproc(
+            fg_rgb, alpha, settings, sam_soft=sam_soft, source_rgb=_source_rgb,
+            screen_type=settings.get("screenType", "green"))
+        if settings.get('zone') and sam_soft is not None:
+            _h_z, _w_z = alpha.shape[:2]
+            _sz = np.asarray(sam_soft, dtype=np.float32)
+            if _sz.ndim == 3:
+                _sz = _sz[..., 0]
+            if _sz.shape[:2] != (_h_z, _w_z):
+                _sz = cv2.resize(_sz, (_w_z, _h_z), interpolation=cv2.INTER_LINEAR)
+            _zone_mask = _zone_cut_from_sam(
+                (_sz > 0.5).astype(np.uint8), settings, _w_z, _h_z, _w_z / 1920.0)
+            alpha = np.clip(alpha * _zone_mask, 0.0, 1.0)
 
     # Build background buffer
     h, w = fg_rgb.shape[:2]
