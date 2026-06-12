@@ -266,7 +266,10 @@ def _build_contact_sheet(rows_data, out_path):
 
             # Label bar (colored by OLD/NEW)
             bar = np.zeros((LABEL_H, TILE_W, 3), np.uint8)
-            if "NEW" in label:
+            if "SRC" in label:
+                bar[:, :] = (30, 20, 0)
+                tc = (0, 200, 255)   # cyan = source frame
+            elif "NEW" in label:
                 bar[:, :] = (0, 30, 0)
                 tc = CLR_NEW
             elif "OLD" in label:
@@ -342,6 +345,7 @@ def _run_frame(clip_id, clip_path, time_sec, frame_label, sess_dir, need_downsca
         result["error"] = "extract failed"
         return result
     _log(f"  extract OK  ({time_sec:.1f}s)  -> {frame_png.name}")
+    result["frame_png"] = str(frame_png)
 
     # ---- 1b. Downscale if 6K ----
     if need_downscale:
@@ -513,11 +517,10 @@ def run_gauntlet():
 
             clip_results.append(r)
 
-            # Add to sheet tiles (OLD then NEW per frame)
-            old_label = f"{clip_id} {label} OLD"
-            new_label = f"{clip_id} {label} NEW"
-            clip_tiles.append((old_label, r.get("matte_old")))
-            clip_tiles.append((new_label, r.get("matte_new")))
+            # Add to sheet tiles: SOURCE | OLD | NEW per frame
+            clip_tiles.append((f"{clip_id} {label} SRC", r.get("frame_png")))
+            clip_tiles.append((f"{clip_id} {label} OLD", r.get("matte_old")))
+            clip_tiles.append((f"{clip_id} {label} NEW", r.get("matte_new")))
 
         all_results.append({"clip_id": clip_id, "frames": clip_results})
         sheet_rows.append((clip_id, clip_tiles))
