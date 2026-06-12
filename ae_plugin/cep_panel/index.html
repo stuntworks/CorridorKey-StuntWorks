@@ -396,6 +396,34 @@
     backdrop-filter: blur(1px);
   }
   .vw-proc.show { display: grid; }
+
+  /* ============ BIG BUSY STRIP ============
+     Full-panel-width bar — visible across the room. Mirrors vwProc + setBusy state.
+     z-index 9000 keeps it above all panel chrome. display:none when idle. */
+  #ck-busy-strip {
+    display: none;
+    position: fixed; left: 0; right: 0; top: 0; z-index: 9000;
+    align-items: center; justify-content: center; gap: 16px;
+    padding: 16px 24px;
+    background: rgba(6, 8, 10, 0.96);
+    border-bottom: 3px solid var(--cyan);
+    box-shadow: 0 0 40px rgba(40,220,228,0.4), 0 4px 24px rgba(0,0,0,0.8);
+  }
+  #ck-busy-strip.show { display: flex; }
+  #ck-busy-strip .bs-scan {
+    width: 18px; height: 18px; border-radius: 50%;
+    border: 2.5px solid rgba(40,220,228,0.25);
+    border-top-color: var(--cyan);
+    animation: bsSpin 0.75s linear infinite;
+    flex-shrink: 0;
+  }
+  @keyframes bsSpin { to { transform: rotate(360deg); } }
+  #ck-busy-msg {
+    font-size: 20px; font-weight: 800; letter-spacing: 0.28em;
+    text-transform: uppercase; color: var(--cyan);
+    text-shadow: 0 0 22px rgba(40,220,228,0.85);
+  }
+
   .vw-proc .scan {
     position: absolute; left: 0; right: 0; top: 0; height: 30%;
     background: linear-gradient(180deg, rgba(40,220,228,0) 0%, rgba(40,220,228,0.22) 70%, rgba(40,220,228,0.5) 100%);
@@ -1333,6 +1361,14 @@
       </div>
     </div>
 
+    <!-- ============ BIG BUSY STRIP ============
+         Full-panel-width bar. Mirrors setBusy + vwProc state — text driven by
+         ckStatus / procLabel / PROGRESS lines. Hidden when idle. -->
+    <div id="ck-busy-strip">
+      <span class="bs-scan"></span>
+      <span id="ck-busy-msg">WORKING&hellip;</span>
+    </div>
+
     <!-- ============ VIEWER MODULE ============ -->
     <section class="module viewer-module" aria-label="Viewer">
       <div class="module-head">
@@ -1644,6 +1680,21 @@
                 <span class="w-row"><b>Why.</b> Small is quick for previz. Large catches finer detail but takes longer.</span>
               </div>
             </div>
+
+            <div class="cell">
+              <div class="cell-top">
+                <span class="cell-title">Fusion V2</span>
+                <div class="cell-control">
+                  <button class="pswitch" id="fusionV2" type="button" aria-pressed="false" aria-label="Fusion V2 — trimap hybrid matting solve">
+                    <span class="knob"></span>
+                  </button>
+                </div>
+              </div>
+              <div class="ww">
+                <span class="w-row"><b>What.</b> Routes the key through trimap + hybrid ViTMatte solve instead of the default merge chain.</span>
+                <span class="w-row"><b>Why.</b> Cleaner hair and semitransparent edges on mixed-light green screens. Requires SAM. Default OFF.</span>
+              </div>
+            </div>
           </div>
 
         </div>
@@ -1794,6 +1845,15 @@
     samFlow.classList.toggle('show', !on);
     syncStageSamMode();
   });
+
+  const fusionV2Btn = document.getElementById('fusionV2');
+  if (fusionV2Btn) {
+    fusionV2Btn.addEventListener('click', () => {
+      const fOn = fusionV2Btn.getAttribute('aria-pressed') === 'true';
+      fusionV2Btn.setAttribute('aria-pressed', fOn ? 'false' : 'true');
+      ckLog('fusion_v2 toggle: ' + (fOn ? 'off' : 'on'));
+    });
+  }
 
   // ---- Advanced = EXPAND TO COCKPIT (not an accordion) ----
   const unit = document.querySelector('.unit');
@@ -2514,6 +2574,62 @@ function ckLog(msg, isErr) {
     if (isErr) { try { console.error(msg); } catch (_) {} }
 }
 function ckStatus(msg) { try { const g = document.getElementById('gateStatus'); if (g) g.textContent = msg; const p = document.getElementById('podStatus'); if (p) p.textContent = msg; } catch (_) {} }
+
+// ============ BIG BUSY STRIP — mirrors all busy state to a panel-wide bar ============
+// Berto UX: the existing busy indicators (10px procLabel, tiny armLed) are invisible
+// across the room. This strip shows the same state at 20px in StuntWorks cyan.
+// Strategy: patch setBusy + ckStatus; observe procLabel mutations; hook ckVwRenderProgress.
+// Never invents state — every show/hide is triggered by an existing call.
+(function () {
+    var _strip = document.getElementById('ck-busy-strip');
+    var _msg = document.getElementById('ck-busy-msg');
+    var _active = false;
+
+    function _show(text) {
+        _active = true;
+        if (_msg) _msg.textContent = (text || 'WORKING…').toUpperCase();
+        if (_strip) _strip.classList.add('show');
+    }
+    function _hide() {
+        _active = false;
+        if (_strip) _strip.classList.remove('show');
+    }
+    // Expose for autoPreCache (no setBusy call there)
+    window._ckBigShow = _show;
+    window._ckBigHide = _hide;
+
+    // Patch setBusy — runs for doKey, autoKeyAsync, doCommit, doSamCommit, scrub
+    var _origSetBusy = (typeof setBusy === 'function') ? setBusy : null;
+    setBusy = function (on) {
+        if (_origSetBusy) _origSetBusy(on);
+        if (on) {
+            var pl = document.getElementById('procLabel');
+            _show(pl && pl.textContent ? pl.textContent : 'WORKING…');
+        } else {
+            _hide();
+        }
+    };
+
+    // Patch ckStatus — catches Neural key / Running SAM / Compositing / progress text
+    var _origCkStatus = (typeof ckStatus === 'function') ? ckStatus : null;
+    ckStatus = function (msg) {
+        if (_origCkStatus) _origCkStatus(msg);
+        if (_active && _strip && _msg) _msg.textContent = (msg || '').toUpperCase();
+    };
+
+    // Mirror procLabel text changes (doKey sets this for initial 'Keying frame' state)
+    var _pl = document.getElementById('procLabel');
+    if (_pl) {
+        new MutationObserver(function () {
+            if (_active && _msg) _msg.textContent = _pl.textContent.toUpperCase();
+        }).observe(_pl, { childList: true, characterData: true, subtree: true });
+    }
+
+    // PROGRESS n/m hook — called by both batch render paths
+    window.ckVwRenderProgress = function (n, tot) {
+        _show('KEYING ' + n + ' / ' + tot);
+    };
+})();
 // All CK scratch lives on D: — never the C: system temp (Berto 2026-06-10).
 const CK_SCRATCH_ROOT = 'D:\\CK_SCRATCH';
 function randomTempPath(prefix, ext) {
@@ -2586,6 +2702,8 @@ function ckGetSettings() {
     const zoneEdgeEl = document.getElementById('zoneEdge');
     const _zeParsed = zoneEdgeEl ? parseInt(zoneEdgeEl.value, 10) : NaN;
     const zone_erode_px = isNaN(_zeParsed) ? 4 : _zeParsed;
+    const fusionV2El = document.getElementById('fusionV2');
+    const fusion_v2 = fusionV2El ? (fusionV2El.getAttribute('aria-pressed') === 'true') : false;
     const settings = {
         screenType: screenType,
         despill: despill,
@@ -2597,8 +2715,10 @@ function ckGetSettings() {
         sam_erode_px: 0,
         sam_expand_px: 0,
         strap_bridge_px: strap_bridge_px,
-        zone_erode_px: zone_erode_px
+        zone_erode_px: zone_erode_px,
+        fusion_v2: fusion_v2
     };
+    ckLog('fusion_v2: ' + (fusion_v2 ? 'on' : 'off') + ' at settings build');
     if (window.CK_ZONE) {
         settings.zone = window.CK_ZONE;
         if (window.CK_ZONE_ANCHOR_FRAME != null) settings.zone_anchor_frame = window.CK_ZONE_ANCHOR_FRAME;
@@ -3098,6 +3218,7 @@ function autoPreCache(info) {
     }
     tag.textContent = 'Pre-caching…';
     tag.style.display = 'block';
+    try { if (typeof window._ckBigShow === 'function') window._ckBigShow('PRE-CACHING…'); } catch (_) {}
     if (window.CK_SCRUB) window.CK_SCRUB.busy = true;
     var scrubDir = randomTempPath('scrub');
     var pp = writeParamsFile(settings);
@@ -3107,12 +3228,14 @@ function autoPreCache(info) {
         function () {
             try { fs.unlinkSync(pp); } catch (_) {}
             tag.style.display = 'none';
+            try { if (typeof window._ckBigHide === 'function') window._ckBigHide(); } catch (_) {}
             if (window.CK_SCRUB) { window.CK_SCRUB.busy = false; window.CK_SCRUB.dir = scrubDir; window.CK_SCRUB.count = count; }
             ckLog('auto-precache: ' + count + ' frames ready');
         },
         function (e) {
             try { fs.unlinkSync(pp); } catch (_) {}
             tag.style.display = 'none';
+            try { if (typeof window._ckBigHide === 'function') window._ckBigHide(); } catch (_) {}
             if (window.CK_SCRUB) window.CK_SCRUB.busy = false;
             ckLog('auto-precache failed: ' + e.message, true);
         }

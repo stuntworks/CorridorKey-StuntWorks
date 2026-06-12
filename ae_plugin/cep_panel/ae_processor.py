@@ -1271,23 +1271,57 @@ def cmd_batch(source_video, output_folder, settings,
                     alpha, _garbage_gate = apply_recipe_composite(
                         alpha_raw, _sam_frame, alpha.shape[1], settings)
                 else:
-                    # Default: 06-10 proven merge chain
-                    alpha = sam_garbage_merge(
-                        alpha_raw, _sam_frame, img_rgb, settings,
-                        settings["screenType"])
-                    _sam_for_rescue = _sam_frame
-                    if _sam_for_rescue is not None and _sam_for_rescue.shape[:2] != alpha.shape[:2]:
-                        _sam_for_rescue = cv2.resize(
-                            _sam_for_rescue, (alpha.shape[1], alpha.shape[0]),
-                            interpolation=cv2.INTER_LINEAR)
-                    alpha = apply_shirt_rescue(alpha, _sam_for_rescue, img_rgb, settings)
-                    if settings.get('zone') and _sam_frame is not None:
-                        _h_z, _w_z = alpha.shape[:2]
-                        _sz = _sam_frame if _sam_frame.shape[:2] == (_h_z, _w_z) else cv2.resize(
-                            _sam_frame, (_w_z, _h_z), interpolation=cv2.INTER_LINEAR)
-                        _zone_mask = _zone_cut_from_sam(
-                            (_sz > 0.5).astype(np.uint8), settings, _w_z, _h_z, _w_z / 1920.0)
-                        alpha = np.clip(alpha * _zone_mask, 0.0, 1.0)
+                    # FUSION V2 branch — trimap + hybrid solve replaces garbage-matte leg.
+                    # choke / despeckle / despill run AFTER this block (lines below) — NOT here.
+                    # DEPENDS-ON: fusion_v2 package (lazy import; torch-free at cold start)
+                    # ISOLATED: guarded by settings.get('fusion_v2') AND _sam_frame is not None
+                    if settings.get('fusion_v2') and _sam_frame is not None:
+                        import sys as _sys
+                        _fv2_root = str(Path(__file__).resolve().parent.parent.parent)
+                        if _fv2_root not in _sys.path:
+                            _sys.path.insert(0, _fv2_root)
+                        from fusion_v2.trimap_builder import build_trimap as _build_trimap
+                        import fusion_v2.solver_guided    # noqa: F401 — self-registers 'guided'
+                        import fusion_v2.solver_vitmatte  # noqa: F401 — self-registers 'vitmatte' (torch loaded lazily inside solve)
+                        import fusion_v2.solver_hybrid    # noqa: F401 — self-registers 'hybrid'
+                        from fusion_v2.solver_interface import solve_matte as _solve_matte
+                        _sf_b = (_sam_frame if _sam_frame.shape[:2] == alpha_raw.shape[:2]
+                                 else cv2.resize(_sam_frame,
+                                                 (alpha_raw.shape[1], alpha_raw.shape[0]),
+                                                 interpolation=cv2.INTER_LINEAR))
+                        _sf_2d = _sf_b if _sf_b.ndim == 2 else _sf_b[..., 0]
+                        _sam_bin_b = (np.clip(_sf_2d, 0, 1) > 0.5).astype(np.uint8) * 255
+                        _frame_u8_b = (img_rgb if img_rgb.dtype == np.uint8
+                                       else (np.clip(img_rgb, 0, 1) * 255).astype(np.uint8))
+                        _trimap_b = _build_trimap(_sam_bin_b, alpha_raw)
+                        alpha = _solve_matte(_frame_u8_b, _trimap_b, alpha_raw, solver='hybrid')
+                        if settings.get('zone') and _sam_frame is not None:
+                            _h_z, _w_z = alpha.shape[:2]
+                            _sz = (_sam_frame if _sam_frame.shape[:2] == (_h_z, _w_z)
+                                   else cv2.resize(_sam_frame, (_w_z, _h_z),
+                                                   interpolation=cv2.INTER_LINEAR))
+                            _zone_mask = _zone_cut_from_sam(
+                                (_sz > 0.5).astype(np.uint8), settings, _w_z, _h_z, _w_z / 1920.0)
+                            alpha = np.clip(alpha * _zone_mask, 0.0, 1.0)
+                        log.info(f'fusion_v2 batch frame {frame_idx}: hybrid solve done')
+                    else:
+                        # Default: 06-10 proven merge chain
+                        alpha = sam_garbage_merge(
+                            alpha_raw, _sam_frame, img_rgb, settings,
+                            settings["screenType"])
+                        _sam_for_rescue = _sam_frame
+                        if _sam_for_rescue is not None and _sam_for_rescue.shape[:2] != alpha.shape[:2]:
+                            _sam_for_rescue = cv2.resize(
+                                _sam_for_rescue, (alpha.shape[1], alpha.shape[0]),
+                                interpolation=cv2.INTER_LINEAR)
+                        alpha = apply_shirt_rescue(alpha, _sam_for_rescue, img_rgb, settings)
+                        if settings.get('zone') and _sam_frame is not None:
+                            _h_z, _w_z = alpha.shape[:2]
+                            _sz = _sam_frame if _sam_frame.shape[:2] == (_h_z, _w_z) else cv2.resize(
+                                _sam_frame, (_w_z, _h_z), interpolation=cv2.INTER_LINEAR)
+                            _zone_mask = _zone_cut_from_sam(
+                                (_sz > 0.5).astype(np.uint8), settings, _w_z, _h_z, _w_z / 1920.0)
+                            alpha = np.clip(alpha * _zone_mask, 0.0, 1.0)
                 alpha_combined = alpha.copy()
                 alpha = apply_choke(alpha, settings)
                 alpha = apply_despeckle(alpha, settings)
@@ -1993,9 +2027,39 @@ def cmd_postproc(session_dir, output_path, settings, background="checker", v1_pa
         alpha = apply_despeckle(alpha, settings)
         fg_rgb = apply_despill(fg_rgb, settings)
     else:
-        fg_rgb, alpha = apply_matte_postproc(
-            fg_rgb, alpha, settings, sam_soft=sam_soft, source_rgb=_source_rgb,
-            screen_type=settings.get("screenType", "green"))
+        # FUSION V2 branch — trimap + hybrid solve replaces apply_matte_postproc.
+        # choke / despeckle / despill MUST run inside this branch (not handled after).
+        # DEPENDS-ON: fusion_v2 package (lazy import; torch-free at cold start)
+        # ISOLATED: guarded by settings.get('fusion_v2') AND sam_soft and _source_rgb present
+        if settings.get('fusion_v2') and sam_soft is not None and _source_rgb is not None:
+            import sys as _sys
+            _fv2_root = str(Path(__file__).resolve().parent.parent.parent)
+            if _fv2_root not in _sys.path:
+                _sys.path.insert(0, _fv2_root)
+            from fusion_v2.trimap_builder import build_trimap as _build_trimap
+            import fusion_v2.solver_guided    # noqa: F401 — self-registers 'guided'
+            import fusion_v2.solver_vitmatte  # noqa: F401 — self-registers 'vitmatte' (torch loaded lazily inside solve)
+            import fusion_v2.solver_hybrid    # noqa: F401 — self-registers 'hybrid'
+            from fusion_v2.solver_interface import solve_matte as _solve_matte
+            _sf_pp = np.asarray(sam_soft, dtype=np.float32)
+            if _sf_pp.ndim == 3:
+                _sf_pp = _sf_pp[..., 0]
+            if _sf_pp.shape[:2] != alpha.shape[:2]:
+                _sf_pp = cv2.resize(_sf_pp, (alpha.shape[1], alpha.shape[0]),
+                                    interpolation=cv2.INTER_LINEAR)
+            _sam_bin_pp = (np.clip(_sf_pp, 0, 1) > 0.5).astype(np.uint8) * 255
+            _src_u8_pp = (np.clip(_source_rgb, 0, 1) * 255).astype(np.uint8)
+            _trimap_pp = _build_trimap(_sam_bin_pp, alpha)
+            alpha = _solve_matte(_src_u8_pp, _trimap_pp, alpha, solver='hybrid')
+            alpha = apply_choke(alpha, settings)
+            alpha = apply_despeckle(alpha, settings)
+            fg_rgb = apply_despill(fg_rgb, settings)
+            log.info('fusion_v2 postproc: hybrid solve done')
+        else:
+            fg_rgb, alpha = apply_matte_postproc(
+                fg_rgb, alpha, settings, sam_soft=sam_soft, source_rgb=_source_rgb,
+                screen_type=settings.get("screenType", "green"))
+        # Zone cut applies to both fusion_v2 and default paths (Berto's hand tool).
         if settings.get('zone') and sam_soft is not None:
             _h_z, _w_z = alpha.shape[:2]
             _sz = np.asarray(sam_soft, dtype=np.float32)
