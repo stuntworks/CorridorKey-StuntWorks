@@ -1,24 +1,31 @@
-# Last modified: 2026-06-12 | Change: Phase 3b — hybrid band combiner (Berto's law)
+# Last modified: 2026-06-12 | Change: fix W map — k-means green components, mixed-bg blind spot
 #
 # WHAT IT DOES:
 #   Hybrid matting solver.  Inside the unknown band ONLY:
 #     alpha = W * nn_alpha + (1 - W) * vitmatte_alpha
-#   W is a per-pixel green-backing confidence map [0, 1] built from per-shot
-#   screen-color statistics (Mahalanobis distance in LAB chroma space).
-#   W=1 means the local background is screen-colored → CK/NN alpha is accurate.
-#   W=0 means the local background is NOT screen-colored → trust ViTMatte.
-#   Feet zone (bottom 12% of bbox) hard-overrides W=0 unconditionally.
-#   Registers as 'hybrid' in the shared solver interface.
+#   W is a per-pixel green-backing confidence map [0, 1].
 #
-#   LAB COLORSPACE: a* axis cleanly separates green from non-green.
-#   uint8 LAB: a*_uint8 < 128  →  a* < 0 (float)  →  green side.
+#   W CONSTRUCTION (k-means fix):
+#     1. K-means (k=3, fixed seed, subsampled to 5000 px for speed) on the
+#        full 3-channel LAB values of all definite-BG pixels.
+#     2. Each centroid is tested: convert to BGR, check G > R AND G > B.
+#        Components that pass are 'screen-colored'; others are discarded.
+#        This handles mixed backgrounds (green screen + dark set walls, lit + shadow
+#        green regions, etc.) — the single-Gaussian approach was blind to this.
+#     3. W per band pixel = max over all green components of the Mahalanobis
+#        likelihood: exp(-d_mahal² / scale) against that component's (a*, b*) stats.
+#     4. Junk components (walls, floors, dark set) contribute nothing to W.
+#     5. If no component is green (fully off-green shot), W=0 everywhere;
+#        ViTMatte rules and a warning is emitted.
 #
 #   BG CHROMA PROPAGATION: cv2.inpaint(INPAINT_TELEA) fills the unknown band
 #   from the surrounding definite-BG ring pixels.  Each unknown-band pixel gets
-#   an estimate of its nearest background color without scipy dependency.
+#   an estimate of its nearest background color.
 #
-#   FALLBACK: if 'vitmatte' is not registered, falls back to 'guided'.
-#   Torch is never imported at module level — only inside the called solver.
+#   FEET ZONE: bottom 12% of bbox forced W=0 (ViTMatte unconditionally).
+#   FG/BG: passthrough exact 1.0/0.0.
+#   FALLBACK: 'guided' if 'vitmatte' not registered, with warning.
+#   TORCH: never imported at module level.
 #
 # DEPENDS ON: fusion_v2.solver_interface, numpy, cv2
 # AFFECTS: callers of solve_matte(solver='hybrid')
@@ -40,74 +47,94 @@ _UNKNOWN = np.uint8(128)
 _FG      = np.uint8(255)
 _EPSILON = 1e-7
 
-# Minimum green-BG pixels required to fit screen-color statistics.
-# Below this, W=0 everywhere (ViTMatte rules all).
-_MIN_GREEN_PIXELS = 100
-
-# Mahalanobis distance falloff: W = exp(-d_sq / _FALLOFF_SCALE).
-# Scale=2.0 → W drops to ~0.6 at 1 sigma, ~0.01 at 3 sigma.
-_FALLOFF_SCALE = 2.0
-
-# Trimming percentile for robust statistics (5th–95th).
-_TRIM_PCT = 5.0
-
-# cv2.inpaint neighbourhood radius (pixels).  Controls estimation quality,
-# not fill reach — TELEA fast-marching fills the full mask regardless.
-_INPAINT_RADIUS = 5
+_KMEANS_K             = 3      # BG colour components
+_MAX_BG_SAMPLES       = 5000   # subsample cap for k-means speed
+_MIN_COMPONENT_PIXELS = 20     # min pixels per cluster to fit covariance
+_FALLOFF_SCALE        = 2.0    # W = exp(-d_sq / scale): ~0.6 at 1σ, ~0.01 at 3σ
+_INPAINT_RADIUS       = 5
 
 
 # ---------------------------------------------------------------------------
-# Screen-color statistics fitting
+# Green-component detection
 # ---------------------------------------------------------------------------
 
-def _fit_screen_stats(frame_lab_u8: np.ndarray, bg_mask: np.ndarray):
+def _is_green_centroid(centroid_lab_u8_float: np.ndarray) -> bool:
     """
-    Fit a 2D Gaussian to the green-side chroma (a*, b*) of definite-BG pixels.
+    True if this LAB centroid (uint8 scale: L∈[0,255], a*∈[0,255], b*∈[0,255])
+    represents a green-dominant colour.
 
-    Returns (mu, cov_inv) as float32 arrays, or None if not enough green pixels.
-
-    Parameters
-    ----------
-    frame_lab_u8 : uint8 (H, W, 3) LAB image (OpenCV encoding)
-    bg_mask      : bool (H, W) — True where trimap == BG
+    Rule (derived from physical colour): convert centroid to BGR via
+    cv2.COLOR_LAB2BGR; accept if G > R AND G > B.  Handles both lit and
+    shadowed green screen regions that have different luminance.
     """
-    ab = frame_lab_u8[:, :, 1:3].astype(np.float32)  # a*, b* in [0, 255]
-    bg_chroma = ab[bg_mask]  # (N, 2)
+    lab_px = centroid_lab_u8_float.clip(0, 255).astype(np.uint8).reshape(1, 1, 3)
+    bgr = cv2.cvtColor(lab_px, cv2.COLOR_LAB2BGR)
+    B, G, R = int(bgr[0, 0, 0]), int(bgr[0, 0, 1]), int(bgr[0, 0, 2])
+    return bool(G > R and G > B)
 
-    if bg_chroma.shape[0] == 0:
-        return None
 
-    # Pre-filter: a*_uint8 < 128  →  green side in float LAB
-    green_idx = bg_chroma[:, 0] < 128.0
-    green_chroma = bg_chroma[green_idx]
+def _fit_green_components(
+    frame_lab_u8: np.ndarray,
+    bg_mask: np.ndarray,
+    k: int = _KMEANS_K,
+    max_samples: int = _MAX_BG_SAMPLES,
+    seed: int = 42,
+):
+    """
+    K-means (k=3) on definite-BG LAB pixels; returns per-green-component stats.
 
-    if green_chroma.shape[0] < _MIN_GREEN_PIXELS:
-        return None
+    Subsamples to max_samples pixels with a fixed seed for determinism.
+    For each cluster whose centroid is green (G > R AND G > B), fits a
+    2D Gaussian in (a*, b*) space.
 
-    # Robust trim at 5th–95th percentile per axis
-    lo_a = float(np.percentile(green_chroma[:, 0], _TRIM_PCT))
-    hi_a = float(np.percentile(green_chroma[:, 0], 100.0 - _TRIM_PCT))
-    lo_b = float(np.percentile(green_chroma[:, 1], _TRIM_PCT))
-    hi_b = float(np.percentile(green_chroma[:, 1], 100.0 - _TRIM_PCT))
+    Returns list of (mu_ab, cov_inv_ab) as float32.  Empty list if no green
+    components are found (off-green shot).
+    """
+    lab_all = frame_lab_u8[bg_mask].astype(np.float32)   # (N, 3)
+    N = len(lab_all)
+    if N < k * _MIN_COMPONENT_PIXELS:
+        return []
 
-    keep = (
-        (green_chroma[:, 0] >= lo_a) & (green_chroma[:, 0] <= hi_a) &
-        (green_chroma[:, 1] >= lo_b) & (green_chroma[:, 1] <= hi_b)
+    # Fixed-seed subsample
+    if N > max_samples:
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(N, size=max_samples, replace=False)
+        lab_sample = lab_all[idx]
+    else:
+        lab_sample = lab_all
+
+    # K-means on 3-channel LAB
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 50, 1.0)
+    _, labels_raw, centroids = cv2.kmeans(
+        lab_sample.astype(np.float32), k, None, criteria,
+        attempts=5, flags=cv2.KMEANS_PP_CENTERS,
     )
-    trimmed = green_chroma[keep]
+    labels = labels_raw.flatten().astype(np.int32)   # (n_sample,)
+    # centroids: (k, 3) float32, uint8 LAB scale
 
-    if trimmed.shape[0] < 50:
-        trimmed = green_chroma
+    green_stats = []
+    for i in range(k):
+        if not _is_green_centroid(centroids[i]):
+            continue  # non-green component (wall, floor, etc.) — skip
 
-    mu  = trimmed.mean(axis=0)                                     # (2,)
-    cov = np.cov(trimmed.T) + _EPSILON * np.eye(2, dtype=np.float32)  # (2, 2)
+        component_ab = lab_sample[labels == i, 1:3]   # a* and b* of cluster i
+        if len(component_ab) < _MIN_COMPONENT_PIXELS:
+            continue
 
-    try:
-        cov_inv = np.linalg.inv(cov).astype(np.float32)
-    except np.linalg.LinAlgError:
-        return None
+        mu  = component_ab.mean(axis=0)                                      # (2,)
+        cov = np.cov(component_ab.T) + _EPSILON * np.eye(2, dtype=np.float32)
 
-    return mu.astype(np.float32), cov_inv
+        if np.ndim(cov) != 2 or cov.shape != (2, 2):
+            continue   # degenerate (shouldn't happen after min-size guard)
+
+        try:
+            cov_inv = np.linalg.inv(cov).astype(np.float32)
+        except np.linalg.LinAlgError:
+            continue
+
+        green_stats.append((mu.astype(np.float32), cov_inv))
+
+    return green_stats
 
 
 # ---------------------------------------------------------------------------
@@ -120,21 +147,18 @@ def _inpaint_bg_chroma(
 ) -> np.ndarray:
     """
     Estimate local background chroma (a*, b*) at each unknown-band pixel by
-    inpainting the BG ring colors inward via cv2.inpaint(INPAINT_TELEA).
+    inpainting the surrounding definite-BG ring colors inward via INPAINT_TELEA.
 
-    Crops to the non-BG bounding box for efficiency.
-
+    Crops to non-BG bounding box for efficiency.
     Returns float32 (H, W, 2); meaningful only where trimap == _UNKNOWN.
     """
     H, W = trimap.shape
-    ab = frame_lab_u8[:, :, 1:3]  # uint8 a*, b*
-
+    ab = frame_lab_u8[:, :, 1:3]   # uint8 a*, b*
     inpaint_mask = (trimap == _UNKNOWN).astype(np.uint8)
 
     if inpaint_mask.sum() == 0:
         return ab.astype(np.float32)
 
-    # Crop to bbox of non-BG region + small margin for efficiency
     rows = np.any(trimap != _BG, axis=1)
     cols = np.any(trimap != _BG, axis=0)
     y0 = max(0, int(np.argmax(rows)) - 8)
@@ -145,18 +169,12 @@ def _inpaint_bg_chroma(
     ab_crop   = ab[y0:y1, x0:x1]
     mask_crop = inpaint_mask[y0:y1, x0:x1]
 
-    # Inpaint each chroma channel separately (cv2.inpaint needs 1- or 3-ch)
-    a_filled = cv2.inpaint(
-        ab_crop[:, :, 0], mask_crop, _INPAINT_RADIUS, cv2.INPAINT_TELEA
-    )
-    b_filled = cv2.inpaint(
-        ab_crop[:, :, 1], mask_crop, _INPAINT_RADIUS, cv2.INPAINT_TELEA
-    )
+    a_filled = cv2.inpaint(ab_crop[:, :, 0], mask_crop, _INPAINT_RADIUS, cv2.INPAINT_TELEA)
+    b_filled = cv2.inpaint(ab_crop[:, :, 1], mask_crop, _INPAINT_RADIUS, cv2.INPAINT_TELEA)
 
     result = ab.astype(np.float32).copy()
     result[y0:y1, x0:x1, 0] = a_filled.astype(np.float32)
     result[y0:y1, x0:x1, 1] = b_filled.astype(np.float32)
-
     return result
 
 
@@ -170,62 +188,50 @@ def _build_green_confidence_map(
     feet_zone_pct: float,
 ) -> np.ndarray:
     """
-    Build per-pixel green-backing confidence W [0, 1].
+    Per-pixel green-backing confidence W [0, 1], non-zero only inside unknown band.
 
-    W is non-zero only inside the unknown band (trimap == 128).
-    Feet zone gets W = 0 unconditionally.
-
-    Parameters
-    ----------
-    frame_rgb     : uint8 (H, W, 3) RGB
-    trimap        : uint8 (H, W)
-    feet_zone_pct : fraction of bbox height that is the feet zone (0.12)
-
-    Returns
-    -------
-    float32 (H, W) W map
+    K-means separates BG into k=3 components; green components are those whose
+    centroid satisfies G > R AND G > B in BGR space.
+    W = max Mahalanobis likelihood over all green components.
+    Feet zone (bottom feet_zone_pct of bbox) forced to W=0.
     """
     H, W = trimap.shape
-
-    # Convert to LAB (uint8 encoding: L in [0,255], a*/b* in [0,255])
     frame_lab = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2LAB)
-
     bg_mask = (trimap == _BG)
 
-    # Fit screen-color statistics from definite-BG green pixels
-    stats = _fit_screen_stats(frame_lab, bg_mask)
-    if stats is None:
-        # No green backing detected — ViTMatte rules everywhere
+    green_stats = _fit_green_components(frame_lab, bg_mask)
+    if not green_stats:
+        warnings.warn(
+            "solver_hybrid: no green components found in definite-BG. "
+            "W=0 everywhere — off-green shot or trimap has no BG pixels.",
+            stacklevel=3,
+        )
         return np.zeros((H, W), dtype=np.float32)
 
-    mu, cov_inv = stats
+    ab_bg_est = _inpaint_bg_chroma(frame_lab, trimap)   # float32 (H, W, 2)
+    flat_ab   = ab_bg_est.reshape(-1, 2)                # (H*W, 2)
 
-    # Estimate local background chroma at each unknown-band pixel
-    ab_bg_est = _inpaint_bg_chroma(frame_lab, trimap)  # float32 (H, W, 2)
+    # W = max over green components of Mahalanobis likelihood
+    W_map = np.zeros(H * W, dtype=np.float32)
+    for mu, cov_inv in green_stats:
+        diff  = flat_ab - mu[np.newaxis, :]             # (H*W, 2)
+        d_sq  = np.sum((diff @ cov_inv) * diff, axis=1) # (H*W,)
+        w_comp = np.exp(-np.clip(d_sq, 0.0, None) / _FALLOFF_SCALE)
+        W_map  = np.maximum(W_map, w_comp)
 
-    # Mahalanobis distance squared at every pixel
-    diff = ab_bg_est - mu[np.newaxis, np.newaxis, :]   # (H, W, 2)
-    flat = diff.reshape(-1, 2)                          # (H*W, 2)
-    d_sq = np.sum((flat @ cov_inv) * flat, axis=1)     # (H*W,)
-    d_sq = d_sq.reshape(H, W).astype(np.float32)
-
-    # W = exp(-d_sq / scale); large d → small W → ViTMatte preferred
-    W_map = np.exp(-np.clip(d_sq, 0.0, None) / _FALLOFF_SCALE)
-
-    # Only meaningful inside the unknown band
+    W_map = W_map.reshape(H, W).astype(np.float32)
     W_map[trimap != _UNKNOWN] = 0.0
 
-    # Feet zone override: W = 0 (ViTMatte unconditionally)
-    # Feet zone = bottom feet_zone_pct of bbox height, same definition as Phase 1
+    # Feet zone: W = 0, ViTMatte unconditionally (same bbox definition as Phase 1)
     non_bg_rows = np.any(trimap != _BG, axis=1)
     if non_bg_rows.any():
-        y_min = int(np.argmax(non_bg_rows))
-        y_max = int(H - 1 - np.argmax(non_bg_rows[::-1]))
-        bh    = max(y_max - y_min + 1, 1)
+        y_min    = int(np.argmax(non_bg_rows))
+        y_max    = int(H - 1 - np.argmax(non_bg_rows[::-1]))
+        bh       = max(y_max - y_min + 1, 1)
         feet_top = int(y_min + bh * (1.0 - feet_zone_pct))
         W_map[feet_top:, :] = 0.0
 
-    return W_map.astype(np.float32)
+    return W_map
 
 
 # ---------------------------------------------------------------------------
@@ -245,26 +251,13 @@ def _hybrid_solve(
     Inside the unknown band:
         alpha = W * nn_alpha + (1 - W) * vitmatte_alpha
 
-    W = green-backing confidence (per-shot Mahalanobis, LAB chroma).
-    Feet zone: W = 0 unconditionally — ViTMatte only.
-    FG / BG pixels pass through as exact 1.0 / 0.0.
-
-    Falls back to 'guided' if 'vitmatte' is not registered.
-
-    Parameters
-    ----------
-    frame_rgb     : uint8 (H, W, 3) RGB
-    trimap        : uint8 (H, W) — 0=BG / 128=unknown / 255=FG
-    nn_alpha      : float32 (H, W) — raw CK/NN alpha [0, 1]
-    feet_zone_pct : fraction of bbox height for hard ViTMatte override (default 0.12)
-
-    Returns
-    -------
-    float32 (H, W) hybrid alpha, clamped [0, 1]
+    W = green-backing confidence (k-means, per-shot, LAB chroma).
+    Feet zone: W=0 unconditionally (ViTMatte only).
+    FG/BG: passthrough exact 1.0/0.0.
+    Falls back to 'guided' with a warning if 'vitmatte' is not registered.
     """
     from fusion_v2.solver_interface import available_solvers, solve_matte
 
-    # Resolve which base solver to call for the ViTMatte leg
     solvers = available_solvers()
     if "vitmatte" in solvers:
         base_solver = "vitmatte"
@@ -283,10 +276,8 @@ def _hybrid_solve(
         base_solver = None
 
     H, W = trimap.shape
-
-    # Seed result with trimap hard values
-    result = np.where(trimap == _FG, 1.0,
-             np.where(trimap == _BG, 0.0, nn_alpha)).astype(np.float32)
+    result = np.where(trimap == _FG,  1.0,
+             np.where(trimap == _BG,  0.0, nn_alpha)).astype(np.float32)
 
     unknown_mask = (trimap == _UNKNOWN)
     if not unknown_mask.any():
@@ -294,30 +285,19 @@ def _hybrid_solve(
         result[trimap == _BG] = 0.0
         return result
 
-    # Get base solver alpha (ViTMatte or guided)
     if base_solver is not None:
-        base_alpha = solve_matte(
-            frame_rgb, trimap, nn_alpha, solver=base_solver, **kwargs
-        )
+        base_alpha = solve_matte(frame_rgb, trimap, nn_alpha, solver=base_solver, **kwargs)
     else:
         base_alpha = nn_alpha.copy()
 
-    # Build green confidence map W
-    W_map = _build_green_confidence_map(frame_rgb, trimap, feet_zone_pct)
-
-    # Blend inside unknown band only
-    # alpha = W * nn_alpha + (1 - W) * base_alpha
+    W_map    = _build_green_confidence_map(frame_rgb, trimap, feet_zone_pct)
     nn_f32   = nn_alpha.astype(np.float32)
     base_f32 = base_alpha.astype(np.float32)
-
-    blended = W_map * nn_f32 + (1.0 - W_map) * base_f32
+    blended  = W_map * nn_f32 + (1.0 - W_map) * base_f32
 
     result[unknown_mask] = blended[unknown_mask]
-
-    # Re-enforce hard constraints
     result[trimap == _FG] = 1.0
     result[trimap == _BG] = 0.0
-
     return np.clip(result, 0.0, 1.0).astype(np.float32)
 
 
