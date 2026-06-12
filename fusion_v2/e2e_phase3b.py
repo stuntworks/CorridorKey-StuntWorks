@@ -33,7 +33,7 @@ import fusion_v2.solver_hybrid    # self-registers 'hybrid'
 
 from fusion_v2.trimap_builder import build_trimap
 from fusion_v2.solver_interface import solve_matte
-from fusion_v2.solver_hybrid import _build_geometric_band_map
+from fusion_v2.solver_hybrid import _build_ck_green_band_map
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -130,7 +130,7 @@ print(f"  {(t6-t5)*1000:.0f}ms (warm)")
 # ---------------------------------------------------------------------------
 
 print("Building W map visualisation...")
-W_map = _build_geometric_band_map(trimap, sam_mask, feet_zone_pct=0.12)
+W_map = _build_ck_green_band_map(trimap, sam_mask, source_rgb, feet_zone_pct=0.12)
 W_vis = (W_map * 255.0).clip(0, 255).astype(np.uint8)
 print(f"  W range in unknown band: [{W_map[trimap==128].min():.4f}, "
       f"{W_map[trimap==128].max():.4f}]  "

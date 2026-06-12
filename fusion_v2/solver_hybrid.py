@@ -1,4 +1,4 @@
-# Last modified: 2026-06-12 | Change: geometric band -- CK outer edge, ViTMatte interior + feet
+# Last modified: 2026-06-12 | Change: ck-green band -- CK rules all green + interior, solver only junk-backed edge + feet
 #
 # WHAT IT DOES:
 #   Hybrid matting solver.  Inside the unknown band ONLY:
@@ -42,19 +42,21 @@ _UNKNOWN = np.uint8(128)
 _FG      = np.uint8(255)
 _EPSILON = 1e-7
 
-# Active band mode.  'geometric' is Berto's law since 2026-06-12.
-# Flip to 'green-confidence' to restore k-means W map for gauntlet eval.
-BAND_MODE = 'geometric'
+# Active band mode.  'ck-green' is Berto law v2 since 2026-06-12.
+# 'geometric': parked -- interior=ViTMatte was eating the butt (Berto, 2026-06-12).
+# 'green-confidence': parked -- too much CK detail lost (Berto, 2026-06-12).
+BAND_MODE = 'ck-green'
 
 _KMEANS_K             = 3      # BG colour components (green-confidence mode)
 _MAX_BG_SAMPLES       = 5000   # subsample cap for k-means speed
 _MIN_COMPONENT_PIXELS = 20     # min pixels per cluster to fit covariance
 _FALLOFF_SCALE        = 2.0    # W = exp(-d_sq / scale): ~0.6 at 1sigma
 _INPAINT_RADIUS       = 5
+_FEATHER_SIGMA_PCT    = 0.005  # 0.5% of bbox height (~10 px at 2160); smooths interior/outer seam
 
 
 # ---------------------------------------------------------------------------
-# Geometric W map (ACTIVE -- BAND_MODE = 'geometric')
+# Geometric W map (PARKED -- BAND_MODE = 'geometric' -- interior=ViTMatte ate the butt)
 # ---------------------------------------------------------------------------
 
 def _build_geometric_band_map(
@@ -97,6 +99,104 @@ def _build_geometric_band_map(
         bh       = max(y_max - y_min + 1, 1)
         feet_top = int(y_min + bh * (1.0 - feet_zone_pct))
         W_map[feet_top:, :] = 0.0
+
+    return W_map
+
+
+
+# ---------------------------------------------------------------------------
+# CK-GREEN W map (ACTIVE -- BAND_MODE = 'ck-green', Berto law v2 2026-06-12)
+# ---------------------------------------------------------------------------
+
+def _build_ck_green_band_map(
+    trimap: np.ndarray,
+    sam_binary,
+    frame_rgb: np.ndarray,
+    feet_zone_pct: float,
+    feather_sigma_pct: float = _FEATHER_SIGMA_PCT,
+) -> np.ndarray:
+    """
+    CK-GREEN W map -- CK rules wherever it can see green.  Solver covers blind spots only.
+
+    RULE 1 -- Interior unknown (trimap==128 AND inside SAM silhouette): W=1 always.
+      CK is correct here -- the body IS on the green screen and CK already keyed it.
+      ViTMatte was eating the butt; this stops it.  Also preserves fence/see-through
+      holes (Berto's fence rule: CK owns transparency inside the body).
+
+    RULE 2 -- Outer unknown (trimap==128 AND outside SAM silhouette): per-pixel
+      green-backed test on ACTUAL frame colors (no inpainting -- hair over green is
+      already green-shifted in LAB and passes naturally).
+        Green-backed -> W=1 (CK, full hair detail).
+        Junk-backed  -> W=0 (ViTMatte kills / solves the dirty wall/floor edge).
+      Uses the PARKED k-means green-component fit from definite-BG pixels.
+
+    RULE 3 -- Feet zone (bottom feet_zone_pct of bbox): W=0, ViTMatte unconditional
+      (same bbox definition as Phase 1 trimap).
+
+    Feathering: small Gaussian blur at interior/outer seam (feather_sigma_pct * bbox_height)
+      prevents a hard switch line.  Pass feather_sigma_pct=0.0 to get exact binary W
+      (useful for tests verifying RULE 1 and RULE 2).
+
+    sam_binary: uint8 0/255, same pixel space as trimap.
+                None -> all unknown treated as interior (full CK fallback).
+    """
+    H, W = trimap.shape
+    W_map = np.zeros((H, W), dtype=np.float32)
+    unknown_mask = (trimap == _UNKNOWN)
+
+    non_bg_rows = np.any(trimap != _BG, axis=1)
+    has_bbox = bool(non_bg_rows.any())
+    if has_bbox:
+        y_min    = int(np.argmax(non_bg_rows))
+        y_max    = int(H - 1 - np.argmax(non_bg_rows[::-1]))
+        bh       = max(y_max - y_min + 1, 1)
+        feet_top = int(y_min + bh * (1.0 - feet_zone_pct))
+    else:
+        bh       = H
+        feet_top = H   # no-op slice
+
+    if sam_binary is not None:
+        sam = sam_binary
+        if sam.ndim == 3:
+            sam = sam[..., 0]
+        if sam.shape[:2] != (H, W):
+            sam = cv2.resize(sam.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST)
+
+        interior = unknown_mask & (sam > 0)
+        outer    = unknown_mask & (sam == 0)
+
+        # RULE 1: Interior -> W=1 (CK verbatim, no solver inside the body)
+        W_map[interior] = 1.0
+
+        # RULE 2: Outer -> per-pixel green-backed test on actual frame colors
+        if outer.any():
+            frame_lab    = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2LAB)
+            bg_mask      = (trimap == _BG)
+            green_stats  = _fit_green_components(frame_lab, bg_mask)
+            if green_stats:
+                flat_ab = frame_lab[:, :, 1:3].reshape(-1, 2).astype(np.float32)
+                W_outer_flat = np.zeros(H * W, dtype=np.float32)
+                for mu, cov_inv in green_stats:
+                    diff   = flat_ab - mu[np.newaxis, :]
+                    d_sq   = np.sum((diff @ cov_inv) * diff, axis=1)
+                    w_comp = np.exp(-np.clip(d_sq, 0.0, None) / _FALLOFF_SCALE)
+                    W_outer_flat = np.maximum(W_outer_flat, w_comp)
+                W_outer = W_outer_flat.reshape(H, W)
+                W_map[outer] = W_outer[outer]
+            # else: no green BG components found -> W_map[outer] stays 0 (ViTMatte edge)
+    else:
+        # No SAM binary: CK everywhere in unknown band (safe fallback)
+        W_map[unknown_mask] = 1.0
+
+    # RULE 3: Feet zone -> W=0 (ViTMatte unconditional, same as Phase 1 trimap bbox)
+    W_map[feet_top:, :] = 0.0
+
+    # Feather the interior/outer seam to prevent a hard switch line
+    if feather_sigma_pct > 0 and has_bbox:
+        sigma_px = max(1.0, bh * feather_sigma_pct)
+        ksize    = int(sigma_px * 6) | 1   # odd, ~99% Gaussian coverage
+        W_map    = cv2.GaussianBlur(W_map, (ksize, ksize), sigma_px)
+        W_map    = np.clip(W_map, 0.0, 1.0)
 
     return W_map
 
@@ -239,16 +339,20 @@ def _hybrid_solve(
     """
     Hybrid band combiner.  alpha = W * nn_alpha + (1 - W) * vitmatte_alpha.
 
-    BAND_MODE='geometric' (active -- Berto verdict 2026-06-12):
-      Outer ring (unknown AND outside SAM) -> W=1 -> CK rules (hair/wisps/detail).
-      Inner ring (unknown AND inside SAM)  -> W=0 -> ViTMatte (fills body holes).
-      Feet zone                            -> W=0 -> ViTMatte unconditionally.
+    BAND_MODE='ck-green' (active -- Berto law v2 2026-06-12):
+      Interior unknown (inside SAM)      -> W=1 -> CK verbatim (butt intact, fence rule).
+      Outer unknown + green-backed pixel -> W=1 -> CK (hair/wisps/detail).
+      Outer unknown + junk-backed pixel  -> W=0 -> ViTMatte (dirty wall/floor edge).
+      Feet zone                          -> W=0 -> ViTMatte unconditionally.
 
-    BAND_MODE='green-confidence' (parked -- rejected 2026-06-12):
-      W is a k-means LAB chroma map. Too much CK detail lost.
+    BAND_MODE='geometric' (parked -- interior=ViTMatte was eating the butt):
+      Outer ring -> CK.  Inner ring -> ViTMatte.  Feet -> ViTMatte.
+
+    BAND_MODE='green-confidence' (parked -- too much CK detail lost):
+      k-means LAB chroma W map.
 
     sam_binary: uint8 0/255 mask (same pixel space as trimap).
-                Required for geometric mode. None -> W=1 fallback (all CK).
+                Required for ck-green / geometric modes. None -> W=1 fallback (all CK).
     """
     from fusion_v2.solver_interface import available_solvers, solve_matte
 
@@ -284,7 +388,9 @@ def _hybrid_solve(
     else:
         base_alpha = nn_alpha.copy()
 
-    if BAND_MODE == 'geometric':
+    if BAND_MODE == 'ck-green':
+        W_map = _build_ck_green_band_map(trimap, sam_binary, frame_rgb, feet_zone_pct)
+    elif BAND_MODE == 'geometric':
         W_map = _build_geometric_band_map(trimap, sam_binary, feet_zone_pct)
     else:
         W_map = _build_green_confidence_map(frame_rgb, trimap, feet_zone_pct)
