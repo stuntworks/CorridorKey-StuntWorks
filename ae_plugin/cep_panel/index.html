@@ -3348,7 +3348,7 @@ function ckExitWorking() {
     ckResizePanel(CK_STD_W, CK_STD_H);
 }
 (function () {
-    // 1) Build unified two-tier top bar: LEFT (SCREEN + SUBJECT POINTS) | MID (DESPILL) | RIGHT (FRAMES + VIEWS)
+    // 1) Build top bar: LEFT (SCREEN + SUBJECT POINTS) | spacer | RIGHT (FRAMES + VIEWS)
     var topbar = document.getElementById('workTopBar');
     if (topbar) {
         // Left cluster — SCREEN + SUBJECT POINTS
@@ -3357,75 +3357,10 @@ function ckExitWorking() {
         topbar.appendChild(ckBarLeft);
         ['cellScreen', 'cellSam'].forEach(function (id) { var n = document.getElementById(id); if (n) ckBarLeft.appendChild(n); });
 
-        // Middle — DESPILL group (header + fader)
-        var despillGrp = document.createElement('div');
-        despillGrp.className = 'ck-grp';
-        despillGrp.style.cssText = 'flex:1;min-width:120px;max-width:220px;';
-        var despillLbl = document.createElement('span');
-        despillLbl.className = 'cell-title';
-        despillLbl.textContent = 'DESPILL';
-        despillGrp.appendChild(despillLbl);
-        var de = document.getElementById('faderDespill');
-        if (de) {
-            de.style.cssText = 'display:flex;align-items:center;gap:6px;width:100%;margin-top:0;';
-            var deHead = de.querySelector('.fader-head'); if (deHead) deHead.style.display = 'none';
-            var deFrow = de.querySelector('.fader-row');
-            if (deFrow) deFrow.style.cssText = 'display:flex;align-items:center;flex:1;min-width:0;margin-top:0;';
-            var deTrack = de.querySelector('.fader-track');
-            if (deTrack) deTrack.style.cssText = 'flex:1;position:relative;height:30px;min-width:0;display:flex;align-items:center;';
-            // Relocate value readout from hidden .fader-head to sit beside the slider
-            var deVal = document.getElementById('despillVal');
-            if (deFrow && deVal) deFrow.appendChild(deVal);
-            var deScale = de.querySelector('.fader-scale'); if (deScale) deScale.style.display = 'none';
-            despillGrp.appendChild(de);
-        }
-        topbar.appendChild(despillGrp);
-
-        // JUNK MAT group (header + fader) — next to DESPILL
-        var junkMatGrp = document.createElement('div');
-        junkMatGrp.className = 'ck-grp';
-        junkMatGrp.style.cssText = 'flex:1;min-width:120px;max-width:220px;';
-        var junkMatLbl = document.createElement('span');
-        junkMatLbl.className = 'cell-title';
-        junkMatLbl.textContent = 'JUNK MAT';
-        junkMatGrp.appendChild(junkMatLbl);
-        var jm = document.getElementById('faderJunkMat');
-        if (jm) {
-            jm.style.cssText = 'display:flex;align-items:center;gap:6px;width:100%;margin-top:0;';
-            var jmHead = jm.querySelector('.fader-head'); if (jmHead) jmHead.style.display = 'none';
-            var jmFrow = jm.querySelector('.fader-row');
-            if (jmFrow) jmFrow.style.cssText = 'display:flex;align-items:center;flex:1;min-width:0;margin-top:0;';
-            var jmTrack = jm.querySelector('.fader-track');
-            if (jmTrack) jmTrack.style.cssText = 'flex:1;position:relative;height:30px;min-width:0;display:flex;align-items:center;';
-            var jmVal = document.getElementById('junkMatVal');
-            if (jmFrow && jmVal) jmFrow.appendChild(jmVal);
-            var jmScale = jm.querySelector('.fader-scale'); if (jmScale) jmScale.style.display = 'none';
-            junkMatGrp.appendChild(jm);
-        }
-        topbar.appendChild(junkMatGrp);
-
-        // ZONE EDGE group (header + fader) — next to JUNK MAT
-        var zoneEdgeGrp = document.createElement('div');
-        zoneEdgeGrp.className = 'ck-grp';
-        zoneEdgeGrp.style.cssText = 'flex:1;min-width:120px;max-width:220px;';
-        var zoneEdgeLbl = document.createElement('span');
-        zoneEdgeLbl.className = 'cell-title';
-        zoneEdgeLbl.textContent = 'ZONE EDGE';
-        zoneEdgeGrp.appendChild(zoneEdgeLbl);
-        var ze = document.getElementById('faderZoneEdge');
-        if (ze) {
-            ze.style.cssText = 'display:flex;align-items:center;gap:6px;width:100%;margin-top:0;';
-            var zeHead = ze.querySelector('.fader-head'); if (zeHead) zeHead.style.display = 'none';
-            var zeFrow = ze.querySelector('.fader-row');
-            if (zeFrow) zeFrow.style.cssText = 'display:flex;align-items:center;flex:1;min-width:0;margin-top:0;';
-            var zeTrack = ze.querySelector('.fader-track');
-            if (zeTrack) zeTrack.style.cssText = 'flex:1;position:relative;height:30px;min-width:0;display:flex;align-items:center;';
-            var zeVal = document.getElementById('zoneEdgeVal');
-            if (zeFrow && zeVal) zeFrow.appendChild(zeVal);
-            var zeScale = ze.querySelector('.fader-scale'); if (zeScale) zeScale.style.display = 'none';
-            zoneEdgeGrp.appendChild(ze);
-        }
-        topbar.appendChild(zoneEdgeGrp);
+        // Flexible spacer — pushes FRAMES + VIEWS to the right
+        var _tbSpacer = document.createElement('div');
+        _tbSpacer.style.cssText = 'flex:1;';
+        topbar.appendChild(_tbSpacer);
 
         // Right cluster — FRAMES group + VIEWS group
         var ckBarRight = document.createElement('div');
@@ -3447,7 +3382,7 @@ function ckExitWorking() {
         framesGrp.appendChild(framesInp);
         ckBarRight.appendChild(framesGrp);
 
-        // VIEWS group — chrome buttons (SCRUB/RESULT/CK/RESET) appended here by startup IIFE
+        // VIEWS group — chrome buttons (SCRUB/RESULT/CK/SAM/RESET) appended here by startup IIFE
         var viewsGrp = document.createElement('div');
         viewsGrp.className = 'ck-grp';
         var viewsLbl = document.createElement('span');
@@ -3462,6 +3397,26 @@ function ckExitWorking() {
         viewsGrp.appendChild(viewsLbl);
         viewsGrp.appendChild(viewsCtrl);
         ckBarRight.appendChild(viewsGrp);
+    }
+
+    // Move faders to pod body as full-style slider row (ABOVE the button row)
+    var podBody = document.getElementById('workPodBody');
+    if (podBody) {
+        ['faderDespill', 'faderJunkMat', 'faderZoneEdge'].forEach(function (id) {
+            var f = document.getElementById(id);
+            if (!f) return;
+            // Restore full-style — clear any compact inline overrides from prior top-bar placement
+            f.style.cssText = 'margin-top:0;';
+            var head = f.querySelector('.fader-head'); if (head) head.style.display = '';
+            var frow = f.querySelector('.fader-row'); if (frow) frow.style.cssText = '';
+            var track = f.querySelector('.fader-track'); if (track) track.style.cssText = '';
+            var scale = f.querySelector('.fader-scale'); if (scale) scale.style.display = '';
+            // Move value readout back to fader-head if it was relocated to fader-row
+            var valEl = f.querySelector('.fader-value');
+            var headEl = f.querySelector('.fader-head');
+            if (valEl && headEl && valEl.parentNode !== headEl) headEl.appendChild(valEl);
+            podBody.appendChild(f);
+        });
     }
 
     // 2) pod KEY = PREVIEW this frame (+ SAM mask); COMMIT = render whole clip; Done = exit
