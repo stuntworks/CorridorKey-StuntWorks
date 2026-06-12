@@ -515,12 +515,45 @@ def _hybrid_solve(
             y_max     = int(H - 1 - np.argmax(non_bg_rows[::-1]))
             bh        = max(y_max - y_min + 1, 1)
             hair_line = int(y_min + bh * 0.35)
+            # BUTT MARGIN (Berto 2026-06-12): SAM under-cuts on black pants +
+            # harness straps. Clip CK to SAM dilated ~2.5% bh, not raw SAM —
+            # SAM stays the ruler, CK gets room for what SAM misjudged.
+            margin_r  = max(1, int(round(bh * 0.025)))
+            mk        = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (margin_r * 2 + 1, margin_r * 2 + 1))
+            sam_room  = cv2.dilate((sam_f > 0).astype(np.uint8), mk)
             sigma_px  = max(1.0, bh * 0.004)   # ~8px at a 2000px body: soft edge
             ksize     = int(sigma_px * 6) | 1
-            sam_soft = cv2.GaussianBlur((sam_f > 0).astype(np.float32), (ksize, ksize), sigma_px)
+            soft_margin = cv2.GaussianBlur(sam_room.astype(np.float32), (ksize, ksize), sigma_px)
+            soft_raw    = cv2.GaussianBlur((sam_f > 0).astype(np.float32), (ksize, ksize), sigma_px)
+            # Three-zone clip: body rows get the margin (butt/strap room),
+            # feet rows clip to RAW SAM — floor junk gets zero breathing room.
+            # Feet zone = bottom 30% of bbox (DaVinci-proven constant, not
+            # tuned to this shot) with a 5%-bh vertical ramp so the zone
+            # switch never prints a hard line (rectangles bug, 2026-06-12).
+            clip_feet_top = int(y_min + bh * 0.70)
+            ramp_px = max(1, int(round(bh * 0.05)))
+            w_col = np.ones((H, 1), dtype=np.float32)
+            r0 = max(0, clip_feet_top - ramp_px)
+            w_col[clip_feet_top:, 0] = 0.0
+            if clip_feet_top > r0:
+                w_col[r0:clip_feet_top, 0] = np.linspace(1.0, 0.0, clip_feet_top - r0, dtype=np.float32)
+            sam_soft = soft_margin * w_col + soft_raw * (1.0 - w_col)
             below = unknown_mask.copy()
             below[:hair_line, :] = False
             blended[below] = (nn_f32 * sam_soft)[below]
+
+            # SPECKLE KILL (Berto 2026-06-12): floating white chunks in the band
+            # that do not touch the body die. Hair survives — it grows from the
+            # head mass. Connected-components on the assembled matte; any blob
+            # with zero overlap with SAM's body gets zeroed in the unknown band.
+            blob_bin = (blended > 0.05).astype(np.uint8)
+            blob_bin[trimap == _FG] = 1   # body core always present
+            n_lbl, labels = cv2.connectedComponents(blob_bin, connectivity=8)
+            if n_lbl > 1:
+                body_labels = np.unique(labels[(sam_f > 0) & (labels > 0)])
+                keep = np.isin(labels, body_labels)
+                kill = unknown_mask & (~keep) & (blob_bin > 0)
+                blended[kill] = 0.0
 
     result[unknown_mask] = blended[unknown_mask]
     result[trimap == _FG] = 1.0
