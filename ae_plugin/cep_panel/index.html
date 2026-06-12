@@ -1548,6 +1548,25 @@
           </div>
         </div>
 
+        <!-- Expand: band-room knob for Fusion V2 (shown when fusion toggle ON, Strap Bridge hidden) -->
+        <div class="matte-fader" id="faderFusionExpand" style="margin-top:12px;display:none">
+          <div class="fader-head">
+            <span class="cell-title">Expand</span>
+            <span class="fader-value" id="fusionExpandVal">6</span>
+          </div>
+          <div class="fader-row">
+            <div class="fader-track">
+              <div class="fader-slot"></div>
+              <div class="fader-fill" id="fusionExpandFill" style="width:40%"></div>
+              <div class="fader-ticks" id="fusionExpandTicks"></div>
+              <input type="range" class="fader" id="fusionExpand" min="0" max="15" value="6"
+                     aria-label="Fusion band expand, 0 to 15. Widens unknown-band room around SAM silhouette." />
+              <div class="fader-cap-lines" id="fusionExpandCap" style="left:40%"></div>
+            </div>
+            <div class="fader-scale"><span>0</span><span>4</span><span>8</span><span>12</span><span>15</span></div>
+          </div>
+        </div>
+
         <div style="margin-top:8px;text-align:right">
           <button type="button" id="samOverlayToggle"
             style="font:inherit;font-size:8.5px;letter-spacing:0.16em;text-transform:uppercase;
@@ -1848,11 +1867,20 @@
 
   const fusionV2Btn = document.getElementById('fusionV2');
   if (fusionV2Btn) {
+    function _ckApplyFusionFaderState() {
+      var isOn = fusionV2Btn.getAttribute('aria-pressed') === 'true';
+      var fExp = document.getElementById('faderFusionExpand');
+      var fStr = document.getElementById('faderJunkMat');
+      if (fExp) fExp.style.display = isOn ? '' : 'none';
+      if (fStr) fStr.style.display = isOn ? 'none' : '';
+    }
     fusionV2Btn.addEventListener('click', () => {
       const fOn = fusionV2Btn.getAttribute('aria-pressed') === 'true';
       fusionV2Btn.setAttribute('aria-pressed', fOn ? 'false' : 'true');
       ckLog('fusion_v2 toggle: ' + (fOn ? 'off' : 'on'));
+      _ckApplyFusionFaderState();
     });
+    _ckApplyFusionFaderState();  // apply correct state on load
   }
 
   // ---- Advanced = EXPAND TO COCKPIT (not an accordion) ----
@@ -1900,8 +1928,9 @@
   wireFader('despill');
   wireFader('junkMat');
   wireFader('zoneEdge');
+  wireFader('fusionExpand');
   (function () {
-    ['despill', 'junkMat', 'zoneEdge'].forEach(function (id) {
+    ['despill', 'junkMat', 'zoneEdge', 'fusionExpand'].forEach(function (id) {
       const el = document.getElementById(id);
       if (el) el.addEventListener('change', function () { if (typeof ckScheduleRepreview === 'function') ckScheduleRepreview(); });
     });
@@ -2716,7 +2745,8 @@ function ckGetSettings() {
         sam_expand_px: 0,
         strap_bridge_px: strap_bridge_px,
         zone_erode_px: zone_erode_px,
-        fusion_v2: fusion_v2
+        fusion_v2: fusion_v2,
+        fusion_expand: (function(){ var e=document.getElementById('fusionExpand'); return e ? (parseInt(e.value,10)||6) : 6; })()
     };
     ckLog('fusion_v2: ' + (fusion_v2 ? 'on' : 'off') + ' at settings build');
     if (window.CK_ZONE) {
@@ -2956,7 +2986,7 @@ function doKey(auto) {
                 CK_SESSION_DIR = sess;
                 const settings = ckGetSettings();
                 const cacheParams = writeParamsFile(Object.assign({}, settings, { sourceFrame: info.sourceFrame }));
-                ckStatus('Neural key...');
+                ckStatus('CorridorKey...');
                 runPython(['cache', src, sess, '--params', cacheParams]);
                 try { fs.unlinkSync(cacheParams); } catch (_) {}
                 try { const meta = JSON.parse(fs.readFileSync(path.join(sess, 'meta.json'), 'utf8')); CK_SRC_W = meta.width; CK_SRC_H = meta.height; } catch (_) {}
@@ -3166,7 +3196,7 @@ function autoKeyAsync() {
                 CK_SESSION_DIR = sess;
             } catch (e) { return done('Error: ' + e.message, true); }
             const cacheParams = writeParamsFile(Object.assign({}, settings, { sourceFrame: info.sourceFrame }));
-            ckStatus('Neural key...');
+            ckStatus('CorridorKey...');
             runPythonAsync(['cache', src, sess, '--params', cacheParams], () => {
                 try { fs.unlinkSync(cacheParams); } catch (_) {}
                 try { const meta = JSON.parse(fs.readFileSync(path.join(sess, 'meta.json'), 'utf8')); CK_SRC_W = meta.width; CK_SRC_H = meta.height; } catch (_) {}
@@ -3607,7 +3637,7 @@ function ckExitWorking() {
     // Move faders to pod body as full-style slider row (ABOVE the button row)
     var podBody = document.getElementById('workPodBody');
     if (podBody) {
-        ['faderDespill', 'faderJunkMat', 'faderZoneEdge'].forEach(function (id) {
+        ['faderDespill', 'faderJunkMat', 'faderZoneEdge', 'faderFusionExpand'].forEach(function (id) {
             var f = document.getElementById(id);
             if (!f) return;
             // Restore full-style — clear any compact inline overrides from prior top-bar placement

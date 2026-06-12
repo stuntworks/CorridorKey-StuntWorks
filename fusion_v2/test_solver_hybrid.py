@@ -129,9 +129,10 @@ def test_ck_green_interior_is_ck_always():
     Calls _build_ck_green_band_map directly with feather=0 for exact assertion.
     """
     import fusion_v2.solver_hybrid
-    from fusion_v2.solver_hybrid import _build_ck_green_band_map, BAND_MODE
+    from fusion_v2.solver_hybrid import _build_ck_green_band_map
 
-    assert BAND_MODE == 'ck-green', f"Expected BAND_MODE='ck-green', got '{BAND_MODE}'"
+    # _build_ck_green_band_map is parked (BAND_MODE='ck-only' since overseer 2026-06-12)
+    # but function logic must stay correct for gauntlet re-evaluation.  Test it directly.
 
     frame, trimap, nn, mask = _gray_scene()
     mask_bin = (mask > 0).astype(np.uint8) * 255

@@ -1293,7 +1293,8 @@ def cmd_batch(source_video, output_folder, settings,
                         _sam_bin_b = (np.clip(_sf_2d, 0, 1) > 0.5).astype(np.uint8) * 255
                         _frame_u8_b = (img_rgb if img_rgb.dtype == np.uint8
                                        else (np.clip(img_rgb, 0, 1) * 255).astype(np.uint8))
-                        _trimap_b = _build_trimap(_sam_bin_b, alpha_raw)
+                        _expand = int(settings.get("fusion_expand", 6))
+                        _trimap_b = _build_trimap(_sam_bin_b, alpha_raw, dilate_pct=_expand / 100.0)
                         alpha = _solve_matte(_frame_u8_b, _trimap_b, alpha_raw, solver='hybrid', sam_binary=_sam_bin_b)
                         if settings.get('zone') and _sam_frame is not None:
                             _h_z, _w_z = alpha.shape[:2]
@@ -2049,7 +2050,8 @@ def cmd_postproc(session_dir, output_path, settings, background="checker", v1_pa
                                     interpolation=cv2.INTER_LINEAR)
             _sam_bin_pp = (np.clip(_sf_pp, 0, 1) > 0.5).astype(np.uint8) * 255
             _src_u8_pp = (np.clip(_source_rgb, 0, 1) * 255).astype(np.uint8)
-            _trimap_pp = _build_trimap(_sam_bin_pp, alpha)
+            _expand = int(settings.get("fusion_expand", 6))
+            _trimap_pp = _build_trimap(_sam_bin_pp, alpha, dilate_pct=_expand / 100.0)
             alpha = _solve_matte(_src_u8_pp, _trimap_pp, alpha, solver='hybrid', sam_binary=_sam_bin_pp)
             alpha = apply_choke(alpha, settings)
             alpha = apply_despeckle(alpha, settings)

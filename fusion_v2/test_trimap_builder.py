@@ -171,11 +171,12 @@ def test_outside_dilated_always_zero():
     trimap = build_trimap(mask, nn_ones, erode_pct=0.03, dilate_pct=0.06)
 
     # Pixels far enough from the mask edge are outside any dilation.
-    # bbox_h ≈ 180, dilate_radius ≈ 10.8 → r=11, so 30px is safely outside.
+    # bbox_h ≈ 180, dilate_radius ≈ 10.8, hair-zone 3x dilation → r≈33 px.
+    # Use dist > 40 to stay safely outside even the 3x hair-zone kernel.
     dist = cv2.distanceTransform(
         (1 - (mask > 0).astype(np.uint8)), cv2.DIST_L2, 5
     )
-    far_outside = dist > 30
+    far_outside = dist > 40
     outside_values = np.unique(trimap[far_outside])
     assert list(outside_values) == [0], (
         f"Far-outside pixels with nn_alpha=1.0 must be 0, got {outside_values} "
@@ -189,7 +190,7 @@ def test_outside_dilated_always_zero():
     dist_sf = cv2.distanceTransform(
         (1 - (sf_mask > 0).astype(np.uint8)), cv2.DIST_L2, 5
     )
-    far_outside_sf = dist_sf > 40  # bbox_h ≈ 260, dilate ≈ 15px → 40px is safe
+    far_outside_sf = dist_sf > 60  # bbox_h ≈ 260, 3x hair dilation ≈ 48px → 60px safely outside
     sf_outside_values = np.unique(sf_trimap[far_outside_sf])
     assert list(sf_outside_values) == [0], (
         f"Far-outside stick-figure pixels must be 0, got {sf_outside_values}"
