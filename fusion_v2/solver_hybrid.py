@@ -521,7 +521,7 @@ def _hybrid_solve(
             margin_r  = max(1, int(round(bh * 0.055)))   # Berto's pick 2026-06-12 (sweep 2.5/4/5.5)
             mk        = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (margin_r * 2 + 1, margin_r * 2 + 1))
             sam_room  = cv2.dilate((sam_f > 0).astype(np.uint8), mk)
-            sigma_px  = max(1.0, bh * 0.004)   # ~8px at a 2000px body: soft body edge
+            sigma_px  = max(1.0, bh * 0.002)   # ~4px at a 2000px body (Berto 2026-06-12: SAM cut edges read fuzzy at 8px)
             ksize     = int(sigma_px * 6) | 1
             soft_margin = cv2.GaussianBlur(sam_room.astype(np.float32), (ksize, ksize), sigma_px)
             # Feet feather TIGHT (Berto 2026-06-12 "why do the feet look so fuzzy"):
