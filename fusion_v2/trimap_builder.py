@@ -107,12 +107,18 @@ def build_trimap(
     eroded       = cv2.erode(sam_bin,  _make_ellipse_kernel(erode_radius))
     dilated_full = cv2.dilate(sam_bin, _make_ellipse_kernel(dilate_radius))
     dilated_half = cv2.dilate(sam_bin, _make_ellipse_kernel(dilate_radius * 0.5))
+    # Hair zone (Berto 2026-06-12, "CK is not shining through"): flying hair
+    # reaches ~3x the standard band past SAM's scalp edge.  Top 35% of bbox
+    # gets a 3x-radius band so CK's full hair mass survives the BG kill.
+    dilated_hair = cv2.dilate(sam_bin, _make_ellipse_kernel(dilate_radius * 3.0))
 
-    # Feet zone: bottom feet_zone_pct of bbox rows get half-radius dilation,
-    # producing a tighter unknown band near the floor (one zone only — spec rule).
-    feet_top = int(by + bh * (1.0 - feet_zone_pct))
+    # Zoned dilation: head = high recall (3x band, hair lives), feet = high
+    # precision (half band, floor junk dies), body = standard.
+    feet_top  = int(by + bh * (1.0 - feet_zone_pct))
+    hair_line = int(by + bh * 0.35)
     dilated = dilated_full.copy()
-    dilated[max(0, feet_top):, :] = dilated_half[max(0, feet_top):, :]
+    dilated[:max(0, hair_line), :] = dilated_hair[:max(0, hair_line), :]
+    dilated[max(0, feet_top):, :]  = dilated_half[max(0, feet_top):, :]
 
     # Build trimap — start as all-unknown, then carve BG and FG
     trimap = np.full((H, W), TRIMAP_UNKNOWN, dtype=np.uint8)

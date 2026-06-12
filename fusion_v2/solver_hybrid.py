@@ -45,7 +45,7 @@ _EPSILON = 1e-7
 # Active band mode.  'ck-green' is Berto law v2 since 2026-06-12.
 # 'geometric': parked -- interior=ViTMatte was eating the butt (Berto, 2026-06-12).
 # 'green-confidence': parked -- too much CK detail lost (Berto, 2026-06-12).
-BAND_MODE = 'ck-green'
+BAND_MODE = 'ck-only'     # Berto law FINAL 2026-06-12: "keep CK, SAM kills junk, SAM feet. We don't need the rest."
 
 _KMEANS_K             = 3      # BG colour components (green-confidence mode)
 _MAX_BG_SAMPLES       = 5000   # subsample cap for k-means speed
@@ -195,6 +195,96 @@ def _build_ck_green_band_map(
     if feather_sigma_pct > 0 and has_bbox:
         sigma_px = max(1.0, bh * feather_sigma_pct)
         ksize    = int(sigma_px * 6) | 1   # odd, ~99% Gaussian coverage
+        W_map    = cv2.GaussianBlur(W_map, (ksize, ksize), sigma_px)
+        W_map    = np.clip(W_map, 0.0, 1.0)
+
+    return W_map
+
+
+# ---------------------------------------------------------------------------
+# CK-REGION W map (ACTIVE -- BAND_MODE = 'ck-region', Berto law v3 2026-06-12)
+# ---------------------------------------------------------------------------
+
+def _build_ck_region_band_map(
+    trimap: np.ndarray,
+    sam_binary,
+    frame_rgb: np.ndarray,
+    feet_zone_pct: float,
+    feather_sigma_pct: float = _FEATHER_SIGMA_PCT,
+) -> np.ndarray:
+    """
+    CK-REGION W map -- the split follows WHERE THE SCREEN IS, not what color
+    the actor is.  Berto law v3 (2026-06-12): the ck-green per-pixel test read
+    the ACTOR's colors (black pants -> "junk-backed" -> solver carved the butt).
+    Wrong signal.  The actor stands IN FRONT of the screen; the screen's
+    geography decides, and she is inside it.
+
+    RULE 1 -- Build the GREEN-SCREEN REGION:
+      visible green (k-means green components from definite-BG pixels, scored
+      over the whole frame) -> binary map -> MORPH_CLOSE with a kernel scaled
+      to the SAM bbox height, computed at 8x downscale.  The close bridges
+      ACROSS the actor, so the region covers her even where she occludes it.
+
+    RULE 2 -- Unknown band inside the region: W=1.  CK verbatim -- interior,
+      edges, hair, black pants, everything.  The screen is behind it; CK sees.
+
+    RULE 3 -- Unknown band outside the region: W=0.  Solver rules (dark set,
+      walls, junk land -- CK is blind there).
+
+    RULE 4 -- Feet zone (bottom feet_zone_pct of bbox): W=0 unconditional
+      (Berto: "the feet are good, that is what we need").
+
+    sam_binary accepted for signature compatibility; the region itself does
+    not need it (bbox comes from the trimap).  None is fine.
+    """
+    H, W = trimap.shape
+    W_map = np.zeros((H, W), dtype=np.float32)
+    unknown_mask = (trimap == _UNKNOWN)
+
+    non_bg_rows = np.any(trimap != _BG, axis=1)
+    has_bbox = bool(non_bg_rows.any())
+    if has_bbox:
+        y_min    = int(np.argmax(non_bg_rows))
+        y_max    = int(H - 1 - np.argmax(non_bg_rows[::-1]))
+        bh       = max(y_max - y_min + 1, 1)
+        feet_top = int(y_min + bh * (1.0 - feet_zone_pct))
+    else:
+        bh       = H
+        feet_top = H
+
+    # RULE 1: visible green scored everywhere, then closed across the actor.
+    frame_lab   = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2LAB)
+    bg_mask     = (trimap == _BG)
+    green_stats = _fit_green_components(frame_lab, bg_mask)
+    if green_stats:
+        ds = 8  # 8x downscale: region is geography, not edge detail
+        small_lab = cv2.resize(frame_lab, (max(1, W // ds), max(1, H // ds)),
+                               interpolation=cv2.INTER_AREA)
+        flat_ab = small_lab[:, :, 1:3].reshape(-1, 2).astype(np.float32)
+        score = np.zeros(flat_ab.shape[0], dtype=np.float32)
+        for mu, cov_inv in green_stats:
+            diff = flat_ab - mu[np.newaxis, :]
+            d_sq = np.sum((diff @ cov_inv) * diff, axis=1)
+            score = np.maximum(score, np.exp(-np.clip(d_sq, 0.0, None) / _FALLOFF_SCALE))
+        green_small = (score.reshape(small_lab.shape[:2]) > 0.5).astype(np.uint8)
+        # Close across the actor: kernel ~60% of bbox height in source px.
+        k_px = max(3, int(round((bh * 0.6) / ds)) | 1)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_px, k_px))
+        region_small = cv2.morphologyEx(green_small, cv2.MORPH_CLOSE, kernel)
+        region = cv2.resize(region_small, (W, H), interpolation=cv2.INTER_NEAREST)
+    else:
+        # No green found at all (fully off-green shot): region empty -> solver rules.
+        region = np.zeros((H, W), dtype=np.uint8)
+
+    # RULE 2 + 3: region decides the band.
+    W_map[unknown_mask & (region > 0)] = 1.0
+
+    # RULE 4: feet zone -> solver, always.
+    W_map[feet_top:, :] = 0.0
+
+    if feather_sigma_pct > 0 and has_bbox:
+        sigma_px = max(1.0, bh * feather_sigma_pct)
+        ksize    = int(sigma_px * 6) | 1
         W_map    = cv2.GaussianBlur(W_map, (ksize, ksize), sigma_px)
         W_map    = np.clip(W_map, 0.0, 1.0)
 
@@ -383,12 +473,21 @@ def _hybrid_solve(
         result[trimap == _BG] = 0.0
         return result
 
-    if base_solver is not None:
+    if BAND_MODE == 'ck-only':
+        # Berto law FINAL: CK verbatim across the whole band, no solver at all.
+        # Junk dies via trimap BG (outside dilated SAM). Feet handled below.
+        base_alpha = nn_alpha.copy()
+        base_solver = None
+    elif base_solver is not None:
         base_alpha = solve_matte(frame_rgb, trimap, nn_alpha, solver=base_solver, **kwargs)
     else:
         base_alpha = nn_alpha.copy()
 
-    if BAND_MODE == 'ck-green':
+    if BAND_MODE == 'ck-only':
+        W_map = np.ones((H, W), dtype=np.float32)
+    elif BAND_MODE == 'ck-region':
+        W_map = _build_ck_region_band_map(trimap, sam_binary, frame_rgb, feet_zone_pct)
+    elif BAND_MODE == 'ck-green':
         W_map = _build_ck_green_band_map(trimap, sam_binary, frame_rgb, feet_zone_pct)
     elif BAND_MODE == 'geometric':
         W_map = _build_geometric_band_map(trimap, sam_binary, feet_zone_pct)
@@ -398,6 +497,30 @@ def _hybrid_solve(
     nn_f32   = nn_alpha.astype(np.float32)
     base_f32 = base_alpha.astype(np.float32)
     blended  = W_map * nn_f32 + (1.0 - W_map) * base_f32
+
+    # BELOW-HAIRLINE SAM CLIP (Berto law FINAL, measured 2026-06-12): floor junk
+    # in CK reaches the knees/waist, not just the feet zone. One rule:
+    #   above the hairline (top 35% of body bbox): CK free -- hair/wisps untouched.
+    #   below the hairline: CK clipped to SAM's softly-feathered silhouette --
+    #   inside the body sam_soft=1 so CK passes verbatim; outside, junk dies.
+    if BAND_MODE in ('ck-region', 'ck-only') and sam_binary is not None:
+        sam_f = sam_binary
+        if sam_f.ndim == 3:
+            sam_f = sam_f[..., 0]
+        if sam_f.shape[:2] != (H, W):
+            sam_f = cv2.resize(sam_f.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST)
+        non_bg_rows = np.any(trimap != _BG, axis=1)
+        if non_bg_rows.any():
+            y_min     = int(np.argmax(non_bg_rows))
+            y_max     = int(H - 1 - np.argmax(non_bg_rows[::-1]))
+            bh        = max(y_max - y_min + 1, 1)
+            hair_line = int(y_min + bh * 0.35)
+            sigma_px  = max(1.0, bh * 0.004)   # ~8px at a 2000px body: soft edge
+            ksize     = int(sigma_px * 6) | 1
+            sam_soft = cv2.GaussianBlur((sam_f > 0).astype(np.float32), (ksize, ksize), sigma_px)
+            below = unknown_mask.copy()
+            below[:hair_line, :] = False
+            blended[below] = (nn_f32 * sam_soft)[below]
 
     result[unknown_mask] = blended[unknown_mask]
     result[trimap == _FG] = 1.0
