@@ -1642,6 +1642,7 @@
                   </button>
                   <button class="clear-btn" id="zoneModeBtn" type="button" aria-pressed="false" title="ZONE: drag an ellipse around any body part that leaves the green screen (feet, hands). SAM cuts only inside it.">Zone</button>
                   <button class="clear-btn" id="clearSam" type="button">Clear</button>
+                  <button class="clear-btn" id="fusionV2Main" type="button" aria-pressed="false" title="FUSION V2: new keying engine — CK untouched on green, SAM kills junk, zoned hair/feet room. Click to switch engines.">Fusion V2</button>
                 </div>
               </div>
               <div class="ww">
@@ -1890,14 +1891,30 @@
       if (fExp) fExp.style.display = isOn ? '' : 'none';
       if (fStr) fStr.style.display = isOn ? 'none' : '';
     }
-    fusionV2Btn.addEventListener('click', () => {
+    // Main-toolbar twin button (Berto 2026-06-12: the drawer toggle was invisible —
+    // he ran the old engine all day thinking he was testing the new one). Both
+    // buttons share ONE state: fusionV2Btn's aria-pressed + localStorage.
+    var fusionV2Main = document.getElementById('fusionV2Main');
+    function _ckSyncFusionMain() {
+      if (!fusionV2Main) return;
+      var on = fusionV2Btn.getAttribute('aria-pressed') === 'true';
+      fusionV2Main.setAttribute('aria-pressed', on ? 'true' : 'false');
+      fusionV2Main.style.borderColor = on ? '#4dd8e6' : '';
+      fusionV2Main.style.color = on ? '#4dd8e6' : '';
+      fusionV2Main.style.boxShadow = on ? '0 0 8px rgba(77,216,230,.5)' : '';
+    }
+    function _ckFlipFusion() {
       const fOn = fusionV2Btn.getAttribute('aria-pressed') === 'true';
       fusionV2Btn.setAttribute('aria-pressed', fOn ? 'false' : 'true');
       localStorage.setItem('ck_global_fusion_v2', fOn ? 'false' : 'true');
       ckLog('fusion_v2 toggle: ' + (fOn ? 'off' : 'on'));
       _ckApplyFusionFaderState();
-    });
+      _ckSyncFusionMain();
+    }
+    fusionV2Btn.addEventListener('click', _ckFlipFusion);
+    if (fusionV2Main) fusionV2Main.addEventListener('click', _ckFlipFusion);
     _ckApplyFusionFaderState();  // apply restored state on load
+    _ckSyncFusionMain();
   }
 
   // ---- Advanced = EXPAND TO COCKPIT (not an accordion) ----
