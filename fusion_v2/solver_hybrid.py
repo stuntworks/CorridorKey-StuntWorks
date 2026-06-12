@@ -509,8 +509,30 @@ def _hybrid_solve(
             sam_f = sam_f[..., 0]
         if sam_f.shape[:2] != (H, W):
             sam_f = cv2.resize(sam_f.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST)
+
+        # SAM SANITY VALVE (Berto 2026-06-12, gauntlet run2 verdict: "CK would
+        # have no problem here" — bad SAM amputated clean CK on every easy clip).
+        # SAM only keeps its knife when it roughly agrees with CK about the body:
+        # compare SAM against CK's dominant solid blob. If SAM covers less than
+        # half of CK's main figure, SAM's gate is junk (bad dots, lost tracking)
+        # — skip ALL SAM-based clipping and let CK pass whole. Junk-kill via the
+        # trimap BG still applies (it derives from the same SAM, so when SAM is
+        # garbage the dilated band is generous and CK survives).
+        _ck_solid = (nn_alpha > 0.7).astype(np.uint8)
+        _n, _lbl, _stats, _ = cv2.connectedComponentsWithStats(_ck_solid, connectivity=8)
+        _sam_trust = True
+        if _n > 1:
+            _main = 1 + int(np.argmax(_stats[1:, cv2.CC_STAT_AREA]))
+            _main_mask = (_lbl == _main)
+            _main_area = float(_main_mask.sum())
+            if _main_area > 0:
+                _cover = float(((sam_f > 0) & _main_mask).sum()) / _main_area
+                _sam_trust = _cover >= 0.5
+        if not _sam_trust:
+            warnings.warn("fusion_v2: SAM gate fails sanity vs CK main figure -- "
+                          "SAM clipping skipped, CK passes whole", stacklevel=2)
         non_bg_rows = np.any(trimap != _BG, axis=1)
-        if non_bg_rows.any():
+        if _sam_trust and non_bg_rows.any():
             y_min     = int(np.argmax(non_bg_rows))
             y_max     = int(H - 1 - np.argmax(non_bg_rows[::-1]))
             bh        = max(y_max - y_min + 1, 1)
