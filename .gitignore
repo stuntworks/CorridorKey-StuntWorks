@@ -11,3 +11,4 @@ __pycache__/
 _backup_working/
 .deploy_backups/
 .env
+fusion_v2_weights/
