@@ -1,0 +1,35 @@
+{
+  "_comment": "THE GAUNTLET — fixed clip set for Matte Fusion v2 validation (MATTE_FUSION_V2_SPEC.md). Picked by Berto 2026-06-12 from a 15-candidate greenscreen scan of F: and K:. A change PASSES only if NO clip regresses. Do not add or remove clips without Berto's say-so.",
+  "clips": [
+    {
+      "id": "clean-roll",
+      "path": "F:\\stuntworks training files\\Stuntworks training\\1-22 greenscreen test folder\\1-22-20 folder\\(Footage)\\1-22-20\\IMG_9379.MOV",
+      "why": "Actor rolling on full green floor — clean-green baseline, soft-edge preservation test"
+    },
+    {
+      "id": "clean-standing",
+      "path": "F:\\stuntworks training files\\Stuntworks training\\1-22 greenscreen test folder\\1-22-20 folder\\(Footage)\\1-22-20\\IMG_9390.MOV",
+      "why": "Actor standing on full green — second clean baseline, different wardrobe"
+    },
+    {
+      "id": "walking-intersect",
+      "path": "F:\\stuntworks training files\\Stuntworks training\\Greenscreen test 2-9-20 footage\\Greenscreen test footage\\A001_02091926_C007 proress.mov",
+      "why": "The clip that exposed everything 2026-06-12: actor crosses green/non-green boundary, eaten face + feet ring history. 4096x2160."
+    },
+    {
+      "id": "truck-hit",
+      "path": "F:\\stuntworks training files\\Stuntworks training\\Greenscreen test 2-9-20 footage\\test fiver folder\\Truck hit test greenscreen.mov",
+      "why": "Green tent + gray floor + actor impact — the intersect nightmare, Berto's reference shot. 6K."
+    },
+    {
+      "id": "van-window-1",
+      "path": "K:\\Bodi stuntworks training\\Argus_VanFight Stephen Bodi\\SBV_1543.MOV",
+      "why": "Van interior, green only outside the window — partial-green worst case"
+    },
+    {
+      "id": "van-window-2",
+      "path": "K:\\Bodi stuntworks training\\Argus_VanFight Stephen Bodi\\SBV_1542.MOV",
+      "why": "Van interior, actor reaching through window into green — limb crossing the boundary"
+    }
+  ]
+}
