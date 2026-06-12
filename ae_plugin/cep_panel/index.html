@@ -2173,6 +2173,10 @@
   const zoneModeBtn = document.getElementById('zoneModeBtn');
 
   function zoneClear() {
+    try {
+      const _src = (typeof CK_LAST_SOURCE !== 'undefined' && CK_LAST_SOURCE) ? CK_LAST_SOURCE : null;
+      if (_src) localStorage.removeItem('ck_zone_' + _src);
+    } catch (_) {}
     window.CK_ZONE = null;
     window.CK_ZONE_ANCHOR_FRAME = null;
     _zoneArmed = false;
@@ -2202,6 +2206,30 @@
       zoneClearChip.style.top = top + 'px';
     }
   }
+
+  function ckZoneRenderOverlay() {
+    if (!window.CK_ZONE || !zoneOverlay) return;
+    const z = window.CK_ZONE;
+    const r = vwZoom.getBoundingClientRect();
+    if (!r.width) return;
+    const W = r.width / vwScale, H = r.height / vwScale;
+    let rw = W, rh = H, ox = 0, oy = 0;
+    const sw = (typeof CK_SRC_W !== 'undefined' && CK_SRC_W) ? CK_SRC_W : 1;
+    const sh = (typeof CK_SRC_H !== 'undefined' && CK_SRC_H) ? CK_SRC_H : 1;
+    if (sw > 1 && sh > 1) {
+      const ar = sw / sh;
+      rw = W; rh = W / ar;
+      if (rh > H) { rh = H; rw = H * ar; }
+      ox = (W - rw) / 2; oy = (H - rh) / 2;
+    }
+    const x0 = z.x / sw * rw + ox;
+    const y0 = z.y / sh * rh + oy;
+    const x1 = (z.x + z.w) / sw * rw + ox;
+    const y1 = (z.y + z.h) / sh * rh + oy;
+    _zoneUpdateOverlay(x0, y0, x1, y1);
+    if (zoneClearChip) zoneClearChip.classList.add('show');
+  }
+  window.ckZoneRenderOverlay = ckZoneRenderOverlay;
 
   function _zoneContentToSource(x0, y0, x1, y1) {
     const r = vwZoom.getBoundingClientRect();
@@ -2250,6 +2278,10 @@
     if (zoneClearChip) zoneClearChip.classList.add('show');
     window.CK_ZONE = _zoneContentToSource(_zoneX0, _zoneY0, _zoneX1, _zoneY1);
     try { window.CK_ZONE_ANCHOR_FRAME = (typeof CK_ANCHOR_FRAME !== 'undefined') ? CK_ANCHOR_FRAME : null; } catch (_) {}
+    try {
+      const _src = (typeof CK_LAST_SOURCE !== 'undefined' && CK_LAST_SOURCE) ? CK_LAST_SOURCE : null;
+      if (_src) localStorage.setItem('ck_zone_' + _src, JSON.stringify({zone: window.CK_ZONE, anchorFrame: window.CK_ZONE_ANCHOR_FRAME}));
+    } catch (_) {}
     _zoneArmed = false;
     _zoneDrew = true;
     if (zoneModeBtn) zoneModeBtn.setAttribute('aria-pressed', 'false');
@@ -2756,7 +2788,18 @@ function doKey(auto) {
                 if (!info.ok) throw new Error(info.error || 'Select a clip first');
                 if (info.sourceFile && info.sourceFile !== CK_LAST_SOURCE) {
                     CK_LAST_SOURCE = info.sourceFile;
-                    if (typeof window.ckZoneClear === 'function') window.ckZoneClear();
+                    try {
+                        const _saved = localStorage.getItem('ck_zone_' + info.sourceFile);
+                        if (_saved) {
+                            const _d = JSON.parse(_saved);
+                            window.CK_ZONE = _d.zone || null;
+                            window.CK_ZONE_ANCHOR_FRAME = (_d.anchorFrame !== undefined) ? _d.anchorFrame : null;
+                        } else {
+                            if (typeof window.ckZoneClear === 'function') window.ckZoneClear();
+                        }
+                    } catch (_) {
+                        if (typeof window.ckZoneClear === 'function') window.ckZoneClear();
+                    }
                 }
                 const framePng = randomTempPath('extract', '.png');
                 const ea = (typeof info.sourceTimeSeconds === 'number')
@@ -2776,6 +2819,7 @@ function doKey(auto) {
                 runPython(['cache', src, sess, '--params', cacheParams]);
                 try { fs.unlinkSync(cacheParams); } catch (_) {}
                 try { const meta = JSON.parse(fs.readFileSync(path.join(sess, 'meta.json'), 'utf8')); CK_SRC_W = meta.width; CK_SRC_H = meta.height; } catch (_) {}
+                if (window.CK_ZONE && typeof window.ckZoneRenderOverlay === 'function') window.ckZoneRenderOverlay();
                 CK_ANCHOR_FRAME = info.sourceFrame;
 
                 // SAM (separate process) only when SAM is on and points exist.
@@ -2945,6 +2989,21 @@ function autoKeyAsync() {
     jsxCall(infoFn, [], (info) => {
         if (!info || !info.ok) { ckStatus(info && info.error ? info.error : 'Select a clip to auto-key'); return; }
         if (typeof ckExitScrubView === 'function') ckExitScrubView();
+        if (info.sourceFile && info.sourceFile !== CK_LAST_SOURCE) {
+            CK_LAST_SOURCE = info.sourceFile;
+            try {
+                const _saved = localStorage.getItem('ck_zone_' + info.sourceFile);
+                if (_saved) {
+                    const _d = JSON.parse(_saved);
+                    window.CK_ZONE = _d.zone || null;
+                    window.CK_ZONE_ANCHOR_FRAME = (_d.anchorFrame !== undefined) ? _d.anchorFrame : null;
+                } else {
+                    if (typeof window.ckZoneClear === 'function') window.ckZoneClear();
+                }
+            } catch (_) {
+                if (typeof window.ckZoneClear === 'function') window.ckZoneClear();
+            }
+        }
         if (keyBtn) keyBtn.dataset.busy = '1';
         try { setBusy(true); } catch (_) {}
         if (vwProc) vwProc.classList.add('show');
@@ -2969,6 +3028,7 @@ function autoKeyAsync() {
             runPythonAsync(['cache', src, sess, '--params', cacheParams], () => {
                 try { fs.unlinkSync(cacheParams); } catch (_) {}
                 try { const meta = JSON.parse(fs.readFileSync(path.join(sess, 'meta.json'), 'utf8')); CK_SRC_W = meta.width; CK_SRC_H = meta.height; } catch (_) {}
+                if (window.CK_ZONE && typeof window.ckZoneRenderOverlay === 'function') window.ckZoneRenderOverlay();
                 CK_ANCHOR_FRAME = info.sourceFrame;
                 const prev = path.join(sess, 'preview.png');
                 const ppParams = writeParamsFile(settings);
