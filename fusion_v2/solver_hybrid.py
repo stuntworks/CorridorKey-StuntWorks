@@ -518,13 +518,18 @@ def _hybrid_solve(
             # BUTT MARGIN (Berto 2026-06-12): SAM under-cuts on black pants +
             # harness straps. Clip CK to SAM dilated ~2.5% bh, not raw SAM —
             # SAM stays the ruler, CK gets room for what SAM misjudged.
-            margin_r  = max(1, int(round(bh * 0.025)))
+            margin_r  = max(1, int(round(bh * 0.055)))   # Berto's pick 2026-06-12 (sweep 2.5/4/5.5)
             mk        = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (margin_r * 2 + 1, margin_r * 2 + 1))
             sam_room  = cv2.dilate((sam_f > 0).astype(np.uint8), mk)
-            sigma_px  = max(1.0, bh * 0.004)   # ~8px at a 2000px body: soft edge
+            sigma_px  = max(1.0, bh * 0.004)   # ~8px at a 2000px body: soft body edge
             ksize     = int(sigma_px * 6) | 1
             soft_margin = cv2.GaussianBlur(sam_room.astype(np.float32), (ksize, ksize), sigma_px)
-            soft_raw    = cv2.GaussianBlur((sam_f > 0).astype(np.float32), (ksize, ksize), sigma_px)
+            # Feet feather TIGHT (Berto 2026-06-12 "why do the feet look so fuzzy"):
+            # shoes are solid objects — wide feather multiplies a gray halo onto
+            # CK's crisp boot edge. ~2px at a 2000px body.
+            sigma_ft  = max(1.0, bh * 0.0015)
+            kft       = int(sigma_ft * 6) | 1
+            soft_raw  = cv2.GaussianBlur((sam_f > 0).astype(np.float32), (kft, kft), sigma_ft)
             # Three-zone clip: body rows get the margin (butt/strap room),
             # feet rows clip to RAW SAM — floor junk gets zero breathing room.
             # Feet zone = bottom 30% of bbox (DaVinci-proven constant, not
