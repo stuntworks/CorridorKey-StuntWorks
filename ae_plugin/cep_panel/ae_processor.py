@@ -599,9 +599,10 @@ def _zone_cut_from_sam(sam_bin, settings, w, h, scale, auto_offset=None):
 def apply_recipe_composite(alpha_raw, sam_soft, frame_w, settings):
     """Deterministic recipe: alpha_final = alpha_raw * garbage_gate * zone_cut.
 
-    garbage_gate : grown + feathered binary SAM (1 = subject region, 0 = junk far outside).
-                   grow radius = garbage_grow_px (settings, default 40) scaled by frame_w/1920.
-                   Gaussian feather sigma = 3 * scale.
+    garbage_gate : blob-based junk mat v2 (1 = keep, 0 = junk blob).
+                   attached = dilate SAM by garbage_grow_px (default 40) scaled by frame_w/1920.
+                   junk = blob > junk_min_area (0.5% of frame) with <5% overlap with attached.
+                   Gaussian feather sigma = 3 * scale on kill mask.
     zone_cut     : 1 everywhere; inside user zone (settings key 'zone') = tight SAM so
                    cables/slabs near the body are removed with a tighter mask.
     Zone absent or SAM None -> falls back cleanly (garbage_gate=ones or skip).
@@ -620,12 +621,25 @@ def apply_recipe_composite(alpha_raw, sam_soft, frame_w, settings):
     if sam.shape[:2] != (h, w):
         sam = cv2.resize(sam, (w, h), interpolation=cv2.INTER_LINEAR)
     sam_bin = (sam > 0.5).astype(np.uint8)
-    # garbage_gate: dilate binary SAM by garbage_grow_px (scaled), feather sigma 3*scale
+    # junk mat v2: blob-based, no color detection
     grow_px = max(1, int(round(float(settings.get('garbage_grow_px', 40)) * scale)))
     k_size = grow_px * 2 + 1
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
-    g_grown = cv2.dilate(sam_bin, k)
-    garbage_gate = cv2.GaussianBlur(g_grown.astype(np.float32), (0, 0), max(0.5, 3.0 * scale))
+    attached = cv2.dilate(sam_bin, k)
+    ck_solid = (alpha_raw > 0.5).astype(np.uint8) * 255
+    junk_min_area = int(0.005 * h * w)
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(ck_solid, connectivity=8)
+    kill_mask = np.zeros((h, w), dtype=np.uint8)
+    for lbl in range(1, n_labels):
+        comp_area = int(stats[lbl, cv2.CC_STAT_AREA])
+        if comp_area <= junk_min_area:
+            continue
+        comp_px = labels == lbl
+        overlap_frac = float(np.logical_and(comp_px, attached).sum()) / comp_area
+        if overlap_frac < 0.05:
+            kill_mask[comp_px] = 255
+    kill_f = cv2.GaussianBlur(kill_mask.astype(np.float32), (0, 0), max(0.5, 3.0 * scale)) / 255.0
+    garbage_gate = 1.0 - kill_f
     # auto zone tightness: measure SAM looseness vs CK edge, drive zone erosion
     global _auto_zone_logged
     auto_offset = _measure_sam_offset(alpha_raw, sam_bin, None, scale)

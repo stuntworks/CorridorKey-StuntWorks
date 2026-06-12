@@ -1460,22 +1460,22 @@
           </div>
         </div>
 
-        <!-- Junk Mat: garbage matte grow radius, 10–120 px. -->
+        <!-- Junk Mat: garbage matte grow radius, 40–200 px (far-kill only). -->
         <div class="matte-fader" id="faderJunkMat" style="margin-top:12px">
           <div class="fader-head">
             <span class="cell-title">Junk Mat</span>
-            <span class="fader-value" id="junkMatVal">40</span>
+            <span class="fader-value" id="junkMatVal">80</span>
           </div>
           <div class="fader-row">
             <div class="fader-track">
               <div class="fader-slot"></div>
-              <div class="fader-fill" id="junkMatFill" style="width:50%"></div>
+              <div class="fader-fill" id="junkMatFill" style="width:80%"></div>
               <div class="fader-ticks" id="junkMatTicks"></div>
-              <input type="range" class="fader" id="junkMat" min="10" max="120" value="40"
-                     aria-label="Junk mat grow, 10 to 120 px" />
-              <div class="fader-cap-lines" id="junkMatCap" style="left:50%"></div>
+              <input type="range" class="fader" id="junkMat" min="40" max="200" value="80"
+                     aria-label="Junk mat grow, 40 to 200 px" />
+              <div class="fader-cap-lines" id="junkMatCap" style="left:80%"></div>
             </div>
-            <div class="fader-scale"><span>Tight</span><span>40</span><span>80</span><span>Wide</span></div>
+            <div class="fader-scale"><span>40</span><span>80</span><span>120</span><span>160</span><span>200</span></div>
           </div>
         </div>
 
@@ -2280,7 +2280,7 @@
     try { window.CK_ZONE_ANCHOR_FRAME = (typeof CK_ANCHOR_FRAME !== 'undefined') ? CK_ANCHOR_FRAME : null; } catch (_) {}
     try {
       const _src = (typeof CK_LAST_SOURCE !== 'undefined' && CK_LAST_SOURCE) ? CK_LAST_SOURCE : null;
-      if (_src) localStorage.setItem('ck_zone_' + _src, JSON.stringify({zone: window.CK_ZONE, anchorFrame: window.CK_ZONE_ANCHOR_FRAME}));
+      if (_src) { localStorage.setItem('ck_zone_' + _src, JSON.stringify({zone: window.CK_ZONE, anchorFrame: window.CK_ZONE_ANCHOR_FRAME})); ckLog('zone saved ' + _src); }
     } catch (_) {}
     _zoneArmed = false;
     _zoneDrew = true;
@@ -2565,7 +2565,7 @@ function ckGetSettings() {
     const despillEl = document.getElementById('despill');
     const despill = despillEl ? (parseFloat(despillEl.value) / 100) : 0.0;
     const junkMatEl = document.getElementById('junkMat');
-    const garbage_grow_px = junkMatEl ? (parseInt(junkMatEl.value, 10) || 40) : 40;
+    const garbage_grow_px = junkMatEl ? (parseInt(junkMatEl.value, 10) || 80) : 80;
     const zoneEdgeEl = document.getElementById('zoneEdge');
     const _zeParsed = zoneEdgeEl ? parseInt(zoneEdgeEl.value, 10) : NaN;
     const zone_erode_px = isNaN(_zeParsed) ? 4 : _zeParsed;
@@ -2585,6 +2585,9 @@ function ckGetSettings() {
     if (window.CK_ZONE) {
         settings.zone = window.CK_ZONE;
         if (window.CK_ZONE_ANCHOR_FRAME != null) settings.zone_anchor_frame = window.CK_ZONE_ANCHOR_FRAME;
+        ckLog('zone -> settings');
+    } else {
+        try { if ((typeof samPoints !== 'undefined') && samPoints.length > 0) ckLog('zone absent at settings build'); } catch (_) {}
     }
     return settings;
 }
@@ -2794,6 +2797,7 @@ function doKey(auto) {
                             const _d = JSON.parse(_saved);
                             window.CK_ZONE = _d.zone || null;
                             window.CK_ZONE_ANCHOR_FRAME = (_d.anchorFrame !== undefined) ? _d.anchorFrame : null;
+                            ckLog('zone restored ' + info.sourceFile);
                         } else {
                             if (typeof window.ckZoneClear === 'function') window.ckZoneClear();
                         }
@@ -2997,6 +3001,7 @@ function autoKeyAsync() {
                     const _d = JSON.parse(_saved);
                     window.CK_ZONE = _d.zone || null;
                     window.CK_ZONE_ANCHOR_FRAME = (_d.anchorFrame !== undefined) ? _d.anchorFrame : null;
+                    ckLog('zone restored ' + info.sourceFile);
                 } else {
                     if (typeof window.ckZoneClear === 'function') window.ckZoneClear();
                 }
@@ -3550,6 +3555,28 @@ function ckExitWorking() {
 })();
 
 setTimeout(() => { try { autoKeyAsync(); } catch (_) {} }, 700);
+// Init-time zone restore: establish CK_LAST_SOURCE at 200ms so zone draws before auto-key
+// save to localStorage (draw path guards on CK_LAST_SOURCE being set).
+setTimeout(function() {
+    try {
+        var _eiFn = HOST_APP === 'ppro' ? 'ppro_getFrameInfo' : 'ae_getFrameInfo';
+        jsxCall(_eiFn, [], function(info) {
+            if (info && info.ok && info.sourceFile && !CK_LAST_SOURCE) {
+                CK_LAST_SOURCE = info.sourceFile;
+                try {
+                    var _saved = localStorage.getItem('ck_zone_' + info.sourceFile);
+                    if (_saved) {
+                        var _d = JSON.parse(_saved);
+                        window.CK_ZONE = _d.zone || null;
+                        window.CK_ZONE_ANCHOR_FRAME = (_d.anchorFrame !== undefined) ? _d.anchorFrame : null;
+                        ckLog('zone restored ' + info.sourceFile);
+                        if (window.CK_ZONE && typeof window.ckZoneRenderOverlay === 'function') window.ckZoneRenderOverlay();
+                    }
+                } catch (_) {}
+            }
+        });
+    } catch (_) {}
+}, 200);
 try { ckUpdateSamDependentFaders(); } catch (_) {}
 
 // ---- Layout reflow fix (CEP/CEF surface-resize lag) ----------------------
