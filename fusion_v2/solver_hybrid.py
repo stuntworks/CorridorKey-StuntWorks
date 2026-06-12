@@ -1,28 +1,23 @@
-# Last modified: 2026-06-12 | Change: fix W map — k-means green components, mixed-bg blind spot
+# Last modified: 2026-06-12 | Change: geometric band -- CK outer edge, ViTMatte interior + feet
 #
 # WHAT IT DOES:
 #   Hybrid matting solver.  Inside the unknown band ONLY:
 #     alpha = W * nn_alpha + (1 - W) * vitmatte_alpha
-#   W is a per-pixel green-backing confidence map [0, 1].
+#   W is a per-pixel binary map derived from BAND_MODE (see constant below).
 #
-#   W CONSTRUCTION (k-means fix):
-#     1. K-means (k=3, fixed seed, subsampled to 5000 px for speed) on the
-#        full 3-channel LAB values of all definite-BG pixels.
-#     2. Each centroid is tested: convert to BGR, check G > R AND G > B.
-#        Components that pass are 'screen-colored'; others are discarded.
-#        This handles mixed backgrounds (green screen + dark set walls, lit + shadow
-#        green regions, etc.) — the single-Gaussian approach was blind to this.
-#     3. W per band pixel = max over all green components of the Mahalanobis
-#        likelihood: exp(-d_mahal² / scale) against that component's (a*, b*) stats.
-#     4. Junk components (walls, floors, dark set) contribute nothing to W.
-#     5. If no component is green (fully off-green shot), W=0 everywhere;
-#        ViTMatte rules and a warning is emitted.
+#   BAND_MODE = 'geometric'  (ACTIVE -- Berto verdict 2026-06-12):
+#     W=1 (CK rules)  -- unknown pixel OUTSIDE the SAM binary silhouette.
+#                        Outer edge ring: hair, wisps, fine detail. CK owns it.
+#     W=0 (ViTMatte)  -- unknown pixel INSIDE the SAM binary silhouette.
+#                        Interior holes (eaten-butt class). ViTMatte fills solid.
+#     W=0 (ViTMatte)  -- FEET ZONE (bottom 12% bbox), inner AND outer band.
+#                        Berto: "SAM feet look okay, just combine it with CK."
 #
-#   BG CHROMA PROPAGATION: cv2.inpaint(INPAINT_TELEA) fills the unknown band
-#   from the surrounding definite-BG ring pixels.  Each unknown-band pixel gets
-#   an estimate of its nearest background color.
+#   BAND_MODE = 'green-confidence'  (PARKED -- rejected 2026-06-12):
+#     k-means LAB chroma W map. Rejected: too much CK detail lost. Code kept
+#     (_is_green_centroid, _fit_green_components, _inpaint_bg_chroma,
+#     _build_green_confidence_map) for the gauntlet comparative evaluation.
 #
-#   FEET ZONE: bottom 12% of bbox forced W=0 (ViTMatte unconditionally).
 #   FG/BG: passthrough exact 1.0/0.0.
 #   FALLBACK: 'guided' if 'vitmatte' not registered, with warning.
 #   TORCH: never imported at module level.
@@ -47,26 +42,71 @@ _UNKNOWN = np.uint8(128)
 _FG      = np.uint8(255)
 _EPSILON = 1e-7
 
-_KMEANS_K             = 3      # BG colour components
+# Active band mode.  'geometric' is Berto's law since 2026-06-12.
+# Flip to 'green-confidence' to restore k-means W map for gauntlet eval.
+BAND_MODE = 'geometric'
+
+_KMEANS_K             = 3      # BG colour components (green-confidence mode)
 _MAX_BG_SAMPLES       = 5000   # subsample cap for k-means speed
 _MIN_COMPONENT_PIXELS = 20     # min pixels per cluster to fit covariance
-_FALLOFF_SCALE        = 2.0    # W = exp(-d_sq / scale): ~0.6 at 1σ, ~0.01 at 3σ
+_FALLOFF_SCALE        = 2.0    # W = exp(-d_sq / scale): ~0.6 at 1sigma
 _INPAINT_RADIUS       = 5
 
 
 # ---------------------------------------------------------------------------
-# Green-component detection
+# Geometric W map (ACTIVE -- BAND_MODE = 'geometric')
+# ---------------------------------------------------------------------------
+
+def _build_geometric_band_map(
+    trimap: np.ndarray,
+    sam_binary,
+    feet_zone_pct: float,
+) -> np.ndarray:
+    """
+    Pure-geometry W map -- no color statistics.
+
+    W=1 (CK rules): unknown AND outside SAM silhouette (outer ring -- hair, wisps).
+    W=0 (ViTMatte): unknown AND inside SAM silhouette (inner holes -- body bites).
+    W=0 (ViTMatte): feet zone (bottom feet_zone_pct of bbox) inner AND outer.
+
+    sam_binary: uint8 0/255, same shape as trimap or resized NEAREST.
+                None -> all unknown treated as outer band (W=1 fallback).
+    """
+    H, W = trimap.shape
+    W_map = np.zeros((H, W), dtype=np.float32)
+    unknown_mask = (trimap == _UNKNOWN)
+
+    if sam_binary is not None:
+        sam = sam_binary
+        if sam.ndim == 3:
+            sam = sam[..., 0]
+        if sam.shape[:2] != (H, W):
+            sam = cv2.resize(sam.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST)
+        # Outer ring: unknown AND outside SAM -> CK rules (W=1)
+        outer_band = unknown_mask & (sam == 0)
+        W_map[outer_band] = 1.0
+        # Inner ring: unknown AND inside SAM -> ViTMatte rules (W stays 0)
+    else:
+        W_map[unknown_mask] = 1.0   # no SAM binary: full CK fallback
+
+    # Feet zone override: W=0 entire band, inner and outer (same bbox def as Phase 1)
+    non_bg_rows = np.any(trimap != _BG, axis=1)
+    if non_bg_rows.any():
+        y_min    = int(np.argmax(non_bg_rows))
+        y_max    = int(H - 1 - np.argmax(non_bg_rows[::-1]))
+        bh       = max(y_max - y_min + 1, 1)
+        feet_top = int(y_min + bh * (1.0 - feet_zone_pct))
+        W_map[feet_top:, :] = 0.0
+
+    return W_map
+
+
+# ---------------------------------------------------------------------------
+# Green-component detection (PARKED -- green-confidence mode only)
 # ---------------------------------------------------------------------------
 
 def _is_green_centroid(centroid_lab_u8_float: np.ndarray) -> bool:
-    """
-    True if this LAB centroid (uint8 scale: L∈[0,255], a*∈[0,255], b*∈[0,255])
-    represents a green-dominant colour.
-
-    Rule (derived from physical colour): convert centroid to BGR via
-    cv2.COLOR_LAB2BGR; accept if G > R AND G > B.  Handles both lit and
-    shadowed green screen regions that have different luminance.
-    """
+    """True if LAB centroid is green-dominant: G > R AND G > B after BGR conversion."""
     lab_px = centroid_lab_u8_float.clip(0, 255).astype(np.uint8).reshape(1, 1, 3)
     bgr = cv2.cvtColor(lab_px, cv2.COLOR_LAB2BGR)
     B, G, R = int(bgr[0, 0, 0]), int(bgr[0, 0, 1]), int(bgr[0, 0, 2])
@@ -80,98 +120,63 @@ def _fit_green_components(
     max_samples: int = _MAX_BG_SAMPLES,
     seed: int = 42,
 ):
-    """
-    K-means (k=3) on definite-BG LAB pixels; returns per-green-component stats.
-
-    Subsamples to max_samples pixels with a fixed seed for determinism.
-    For each cluster whose centroid is green (G > R AND G > B), fits a
-    2D Gaussian in (a*, b*) space.
-
-    Returns list of (mu_ab, cov_inv_ab) as float32.  Empty list if no green
-    components are found (off-green shot).
-    """
-    lab_all = frame_lab_u8[bg_mask].astype(np.float32)   # (N, 3)
+    """K-means on definite-BG LAB pixels; returns (mu_ab, cov_inv_ab) for green clusters."""
+    lab_all = frame_lab_u8[bg_mask].astype(np.float32)
     N = len(lab_all)
     if N < k * _MIN_COMPONENT_PIXELS:
         return []
-
-    # Fixed-seed subsample
     if N > max_samples:
         rng = np.random.default_rng(seed)
         idx = rng.choice(N, size=max_samples, replace=False)
         lab_sample = lab_all[idx]
     else:
         lab_sample = lab_all
-
-    # K-means on 3-channel LAB
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 50, 1.0)
     _, labels_raw, centroids = cv2.kmeans(
         lab_sample.astype(np.float32), k, None, criteria,
         attempts=5, flags=cv2.KMEANS_PP_CENTERS,
     )
-    labels = labels_raw.flatten().astype(np.int32)   # (n_sample,)
-    # centroids: (k, 3) float32, uint8 LAB scale
-
+    labels = labels_raw.flatten().astype(np.int32)
     green_stats = []
     for i in range(k):
         if not _is_green_centroid(centroids[i]):
-            continue  # non-green component (wall, floor, etc.) — skip
-
-        component_ab = lab_sample[labels == i, 1:3]   # a* and b* of cluster i
+            continue
+        component_ab = lab_sample[labels == i, 1:3]
         if len(component_ab) < _MIN_COMPONENT_PIXELS:
             continue
-
-        mu  = component_ab.mean(axis=0)                                      # (2,)
+        mu  = component_ab.mean(axis=0)
         cov = np.cov(component_ab.T) + _EPSILON * np.eye(2, dtype=np.float32)
-
         if np.ndim(cov) != 2 or cov.shape != (2, 2):
-            continue   # degenerate (shouldn't happen after min-size guard)
-
+            continue
         try:
             cov_inv = np.linalg.inv(cov).astype(np.float32)
         except np.linalg.LinAlgError:
             continue
-
         green_stats.append((mu.astype(np.float32), cov_inv))
-
     return green_stats
 
 
 # ---------------------------------------------------------------------------
-# Background chroma inpainting
+# Background chroma inpainting (PARKED -- green-confidence mode only)
 # ---------------------------------------------------------------------------
 
-def _inpaint_bg_chroma(
-    frame_lab_u8: np.ndarray,
-    trimap: np.ndarray,
-) -> np.ndarray:
-    """
-    Estimate local background chroma (a*, b*) at each unknown-band pixel by
-    inpainting the surrounding definite-BG ring colors inward via INPAINT_TELEA.
-
-    Crops to non-BG bounding box for efficiency.
-    Returns float32 (H, W, 2); meaningful only where trimap == _UNKNOWN.
-    """
+def _inpaint_bg_chroma(frame_lab_u8: np.ndarray, trimap: np.ndarray) -> np.ndarray:
+    """Inpaint BG chroma (a*, b*) into unknown band from surrounding BG ring."""
     H, W = trimap.shape
-    ab = frame_lab_u8[:, :, 1:3]   # uint8 a*, b*
+    ab = frame_lab_u8[:, :, 1:3]
     inpaint_mask = (trimap == _UNKNOWN).astype(np.uint8)
-
     if inpaint_mask.sum() == 0:
         return ab.astype(np.float32)
-
     rows = np.any(trimap != _BG, axis=1)
     cols = np.any(trimap != _BG, axis=0)
     y0 = max(0, int(np.argmax(rows)) - 8)
     y1 = min(H, int(H - 1 - np.argmax(rows[::-1])) + 9)
     x0 = max(0, int(np.argmax(cols)) - 8)
     x1 = min(W, int(W - 1 - np.argmax(cols[::-1])) + 9)
-
     ab_crop   = ab[y0:y1, x0:x1]
     mask_crop = inpaint_mask[y0:y1, x0:x1]
-
     a_filled = cv2.inpaint(ab_crop[:, :, 0], mask_crop, _INPAINT_RADIUS, cv2.INPAINT_TELEA)
     b_filled = cv2.inpaint(ab_crop[:, :, 1], mask_crop, _INPAINT_RADIUS, cv2.INPAINT_TELEA)
-
     result = ab.astype(np.float32).copy()
     result[y0:y1, x0:x1, 0] = a_filled.astype(np.float32)
     result[y0:y1, x0:x1, 1] = b_filled.astype(np.float32)
@@ -179,7 +184,7 @@ def _inpaint_bg_chroma(
 
 
 # ---------------------------------------------------------------------------
-# Green confidence map
+# Green confidence map (PARKED -- green-confidence mode only)
 # ---------------------------------------------------------------------------
 
 def _build_green_confidence_map(
@@ -187,42 +192,28 @@ def _build_green_confidence_map(
     trimap: np.ndarray,
     feet_zone_pct: float,
 ) -> np.ndarray:
-    """
-    Per-pixel green-backing confidence W [0, 1], non-zero only inside unknown band.
-
-    K-means separates BG into k=3 components; green components are those whose
-    centroid satisfies G > R AND G > B in BGR space.
-    W = max Mahalanobis likelihood over all green components.
-    Feet zone (bottom feet_zone_pct of bbox) forced to W=0.
-    """
+    """W = max Mahalanobis likelihood over k-means green components. PARKED 2026-06-12."""
     H, W = trimap.shape
     frame_lab = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2LAB)
     bg_mask = (trimap == _BG)
-
     green_stats = _fit_green_components(frame_lab, bg_mask)
     if not green_stats:
         warnings.warn(
             "solver_hybrid: no green components found in definite-BG. "
-            "W=0 everywhere — off-green shot or trimap has no BG pixels.",
+            "W=0 everywhere -- off-green shot or trimap has no BG pixels.",
             stacklevel=3,
         )
         return np.zeros((H, W), dtype=np.float32)
-
-    ab_bg_est = _inpaint_bg_chroma(frame_lab, trimap)   # float32 (H, W, 2)
-    flat_ab   = ab_bg_est.reshape(-1, 2)                # (H*W, 2)
-
-    # W = max over green components of Mahalanobis likelihood
+    ab_bg_est = _inpaint_bg_chroma(frame_lab, trimap)
+    flat_ab   = ab_bg_est.reshape(-1, 2)
     W_map = np.zeros(H * W, dtype=np.float32)
     for mu, cov_inv in green_stats:
-        diff  = flat_ab - mu[np.newaxis, :]             # (H*W, 2)
-        d_sq  = np.sum((diff @ cov_inv) * diff, axis=1) # (H*W,)
+        diff  = flat_ab - mu[np.newaxis, :]
+        d_sq  = np.sum((diff @ cov_inv) * diff, axis=1)
         w_comp = np.exp(-np.clip(d_sq, 0.0, None) / _FALLOFF_SCALE)
         W_map  = np.maximum(W_map, w_comp)
-
     W_map = W_map.reshape(H, W).astype(np.float32)
     W_map[trimap != _UNKNOWN] = 0.0
-
-    # Feet zone: W = 0, ViTMatte unconditionally (same bbox definition as Phase 1)
     non_bg_rows = np.any(trimap != _BG, axis=1)
     if non_bg_rows.any():
         y_min    = int(np.argmax(non_bg_rows))
@@ -230,7 +221,6 @@ def _build_green_confidence_map(
         bh       = max(y_max - y_min + 1, 1)
         feet_top = int(y_min + bh * (1.0 - feet_zone_pct))
         W_map[feet_top:, :] = 0.0
-
     return W_map
 
 
@@ -242,19 +232,23 @@ def _hybrid_solve(
     frame_rgb: np.ndarray,
     trimap: np.ndarray,
     nn_alpha: np.ndarray,
+    sam_binary=None,
     feet_zone_pct: float = 0.12,
     **kwargs,
 ) -> np.ndarray:
     """
-    Hybrid band combiner.
+    Hybrid band combiner.  alpha = W * nn_alpha + (1 - W) * vitmatte_alpha.
 
-    Inside the unknown band:
-        alpha = W * nn_alpha + (1 - W) * vitmatte_alpha
+    BAND_MODE='geometric' (active -- Berto verdict 2026-06-12):
+      Outer ring (unknown AND outside SAM) -> W=1 -> CK rules (hair/wisps/detail).
+      Inner ring (unknown AND inside SAM)  -> W=0 -> ViTMatte (fills body holes).
+      Feet zone                            -> W=0 -> ViTMatte unconditionally.
 
-    W = green-backing confidence (k-means, per-shot, LAB chroma).
-    Feet zone: W=0 unconditionally (ViTMatte only).
-    FG/BG: passthrough exact 1.0/0.0.
-    Falls back to 'guided' with a warning if 'vitmatte' is not registered.
+    BAND_MODE='green-confidence' (parked -- rejected 2026-06-12):
+      W is a k-means LAB chroma map. Too much CK detail lost.
+
+    sam_binary: uint8 0/255 mask (same pixel space as trimap).
+                Required for geometric mode. None -> W=1 fallback (all CK).
     """
     from fusion_v2.solver_interface import available_solvers, solve_matte
 
@@ -263,14 +257,14 @@ def _hybrid_solve(
         base_solver = "vitmatte"
     elif "guided" in solvers:
         warnings.warn(
-            "'vitmatte' not registered — hybrid falling back to 'guided'. "
+            "'vitmatte' not registered -- hybrid falling back to 'guided'. "
             "Import fusion_v2.solver_vitmatte before calling hybrid for full quality.",
             stacklevel=2,
         )
         base_solver = "guided"
     else:
         warnings.warn(
-            "Neither 'vitmatte' nor 'guided' registered — hybrid using nn_alpha only.",
+            "Neither 'vitmatte' nor 'guided' registered -- hybrid using nn_alpha only.",
             stacklevel=2,
         )
         base_solver = None
@@ -290,7 +284,11 @@ def _hybrid_solve(
     else:
         base_alpha = nn_alpha.copy()
 
-    W_map    = _build_green_confidence_map(frame_rgb, trimap, feet_zone_pct)
+    if BAND_MODE == 'geometric':
+        W_map = _build_geometric_band_map(trimap, sam_binary, feet_zone_pct)
+    else:
+        W_map = _build_green_confidence_map(frame_rgb, trimap, feet_zone_pct)
+
     nn_f32   = nn_alpha.astype(np.float32)
     base_f32 = base_alpha.astype(np.float32)
     blended  = W_map * nn_f32 + (1.0 - W_map) * base_f32

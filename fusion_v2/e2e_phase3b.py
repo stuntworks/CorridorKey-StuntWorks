@@ -33,7 +33,7 @@ import fusion_v2.solver_hybrid    # self-registers 'hybrid'
 
 from fusion_v2.trimap_builder import build_trimap
 from fusion_v2.solver_interface import solve_matte
-from fusion_v2.solver_hybrid import _build_green_confidence_map
+from fusion_v2.solver_hybrid import _build_geometric_band_map
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -113,14 +113,14 @@ print(f"  {(t2-t1)*1000:.0f}ms  "
 
 print("Phase 3b — hybrid solve (first call loads ViTMatte model)...")
 t3 = time.perf_counter()
-alpha_hybrid = solve_matte(source_rgb, trimap, nn_alpha, solver="hybrid")
+alpha_hybrid = solve_matte(source_rgb, trimap, nn_alpha, solver="hybrid", sam_binary=sam_mask)
 t4 = time.perf_counter()
 print(f"  {(t4-t3)*1000:.0f}ms total (includes model load)")
 print(f"  alpha range: [{alpha_hybrid.min():.4f}, {alpha_hybrid.max():.4f}]")
 
 print("Phase 3b — warm run (model already loaded)...")
 t5 = time.perf_counter()
-alpha_hybrid = solve_matte(source_rgb, trimap, nn_alpha, solver="hybrid")
+alpha_hybrid = solve_matte(source_rgb, trimap, nn_alpha, solver="hybrid", sam_binary=sam_mask)
 t6 = time.perf_counter()
 print(f"  {(t6-t5)*1000:.0f}ms (warm)")
 
@@ -130,7 +130,7 @@ print(f"  {(t6-t5)*1000:.0f}ms (warm)")
 # ---------------------------------------------------------------------------
 
 print("Building W map visualisation...")
-W_map = _build_green_confidence_map(source_rgb, trimap, feet_zone_pct=0.12)
+W_map = _build_geometric_band_map(trimap, sam_mask, feet_zone_pct=0.12)
 W_vis = (W_map * 255.0).clip(0, 255).astype(np.uint8)
 print(f"  W range in unknown band: [{W_map[trimap==128].min():.4f}, "
       f"{W_map[trimap==128].max():.4f}]  "
