@@ -550,26 +550,6 @@
   #zoneClearChip.show { display: block; }
   .viewer.scrub #zoneClearChip,
   .viewer.batch #zoneClearChip { display: none !important; }
-  /* Zone btn: cyan chassis so it reads as a button and stands apart from CLEAR */
-  #zoneModeBtn {
-    border: 1px solid var(--cyan) !important;
-    color: var(--cyan) !important;
-    font-size: 9.5px !important;
-    text-shadow: 0 0 5px rgba(40,220,228,0.25);
-  }
-  #zoneModeBtn[aria-pressed="true"] {
-    background: var(--cyan) !important;
-    color: #06231f !important;
-    box-shadow: 0 0 0 1px var(--cyan) inset, 0 0 14px rgba(40,220,228,0.6), 0 1px 2px rgba(0,0,0,0.55) !important;
-    text-shadow: none !important;
-  }
-  @keyframes ck-zone-pulse {
-    0%, 100% { box-shadow: 0 0 0 1px var(--cyan) inset, 0 0 4px rgba(40,220,228,0.25); opacity: 1; }
-    50%       { box-shadow: 0 0 0 1px var(--cyan) inset, 0 0 14px rgba(40,220,228,0.75); opacity: 0.8; }
-  }
-  #zoneModeBtn.zone-pulse {
-    animation: ck-zone-pulse 2s ease-in-out infinite;
-  }
   /* render progress chip, top-center, above everything; not zoomed, click-through */
   #vwRenderBadge {
     position: absolute; top: 8px; left: 50%; transform: translateX(-50%); z-index: 8; display: none;
@@ -1640,13 +1620,12 @@
                     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M21 16v3a2 2 0 0 1-2 2h-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>
                     <span>Expand</span>
                   </button>
-                  <button class="clear-btn" id="zoneModeBtn" type="button" aria-pressed="false" title="ZONE: drag an ellipse around any body part that leaves the green screen (feet, hands). SAM cuts only inside it.">Zone</button>
                   <button class="clear-btn" id="clearSam" type="button">Clear</button>
                   <button class="clear-btn" id="fusionV2Main" type="button" aria-pressed="false" title="FUSION V2: new keying engine — CK untouched on green, SAM kills junk, zoned hair/feet room. Click to switch engines.">Fusion V2</button>
                 </div>
               </div>
               <div class="ww">
-                <span class="w-row" id="samHowRow"><b>How.</b> Hit Expand for a full-size view, then click your subject (and fine detail like hair or ropes) to guide the AI.</span>
+                <span class="w-row" id="samHowRow"><b>How.</b> Hit Expand for a full-size view, then click your subject (and fine detail like hair or ropes) to guide the AI. Drag on the picture to draw a zone around junk.</span>
               </div>
             </div>
           </div>
@@ -2028,11 +2007,6 @@
     if (stageCount) stageCount.textContent = points + (points === 1 ? ' point' : ' points');
     // include/exclude breakdown beside the total (item 4)
     if (stageBreak) stageBreak.textContent = incl + ' incl . ' + excl + ' excl';
-    // pulse zone btn when SAM dots exist but no zone drawn yet
-    if (zoneModeBtn) {
-      if (points > 0 && !window.CK_ZONE) zoneModeBtn.classList.add('zone-pulse');
-      else zoneModeBtn.classList.remove('zone-pulse');
-    }
     ckUpdateSamDependentFaders();
   }
 
@@ -2040,13 +2014,13 @@
     var hasPosPoints = (typeof samPoints !== 'undefined') && samPoints.filter(function(p) { return p.label === 1; }).length > 0;
     var jm = document.getElementById('faderJunkMat');
     var ze = document.getElementById('faderZoneEdge');
-    var tip = hasPosPoints ? '' : 'Needs SAM dots — place dots on the subject first';
-    [jm, ze].forEach(function(el) {
-      if (!el) return;
-      el.style.opacity = hasPosPoints ? '' : '0.35';
-      el.style.pointerEvents = hasPosPoints ? '' : 'none';
-      el.title = tip;
-    });
+    if (jm) {
+      jm.style.opacity = hasPosPoints ? '' : '0.35';
+      jm.style.pointerEvents = hasPosPoints ? '' : 'none';
+      jm.title = hasPosPoints ? '' : 'Needs SAM dots — place dots on the subject first';
+    }
+    // ZoneEdge fader: hidden when no zone exists, visible when zone drawn/restored.
+    if (ze) ze.style.display = window.CK_ZONE ? '' : 'none';
   }
 
   // place a dot at the given screen position on a host element, recording its
@@ -2275,7 +2249,7 @@
   let _vwClickT = null;
   viewer.addEventListener('click', (e) => {
     if (_zoneDrew) { _zoneDrew = false; return; }   // absorb click that ended a zone drag
-    if (!viewerTakesPoints() || _zoneArmed) return;
+    if (!viewerTakesPoints()) return;
     if (e.button !== 0) return;
     if (vwPanning || vwMoved) return;            // click belongs to a pan, not a placement
     if (e.detail > 1) return;                    // 2nd+ click of a multi-click: skip
@@ -2313,11 +2287,10 @@
   // ===== ZONE overlay (rough ellipse around overlap areas like feet) =====
   window.CK_ZONE = null;
   window.CK_ZONE_ANCHOR_FRAME = null;
-  let _zoneArmed = false, _zoneDragging = false, _zoneDrew = false;
+  let _zoneDragging = false, _zoneDrew = false;
   let _zoneX0 = 0, _zoneY0 = 0, _zoneX1 = 0, _zoneY1 = 0;
   const zoneOverlay = document.getElementById('zoneOverlay');
   const zoneClearChip = document.getElementById('zoneClearChip');
-  const zoneModeBtn = document.getElementById('zoneModeBtn');
 
   function zoneClear() {
     try {
@@ -2326,8 +2299,6 @@
     } catch (_) {}
     window.CK_ZONE = null;
     window.CK_ZONE_ANCHOR_FRAME = null;
-    _zoneArmed = false;
-    if (zoneModeBtn) { zoneModeBtn.setAttribute('aria-pressed', 'false'); zoneModeBtn.classList.remove('zone-pulse'); }
     if (zoneOverlay) zoneOverlay.classList.remove('show');
     if (zoneClearChip) zoneClearChip.classList.remove('show');
     ckUpdateSamDependentFaders();
@@ -2375,6 +2346,7 @@
     const y1 = (z.y + z.h) / sh * rh + oy;
     _zoneUpdateOverlay(x0, y0, x1, y1);
     if (zoneClearChip) zoneClearChip.classList.add('show');
+    ckUpdateSamDependentFaders();  // sync ZoneEdge fader visibility on every render
   }
   window.ckZoneRenderOverlay = ckZoneRenderOverlay;
 
@@ -2396,31 +2368,40 @@
     return { x: Math.round(nx0 * sw), y: Math.round(ny0 * sh), w: Math.round((nx1 - nx0) * sw), h: Math.round((ny1 - ny0) * sh), shape: 'ellipse', feather_px: 8 };
   }
 
-  if (zoneModeBtn) zoneModeBtn.addEventListener('click', () => {
-    _zoneArmed = !_zoneArmed;
-    zoneModeBtn.setAttribute('aria-pressed', _zoneArmed ? 'true' : 'false');
-  });
-
-  // Zone drag: left button down while armed starts ellipse draw
+  // Gesture zone drag: left-button drag >= 7px draws zone, quick click places SAM dot.
+  let _gDownX = 0, _gDownY = 0, _gestureTracking = false;
   viewer.addEventListener('pointerdown', (e) => {
-    if (e.button !== 0 || !_zoneArmed) return;
-    e.preventDefault();
-    _zoneDragging = true;
+    if (e.button !== 0) return;
+    _gDownX = e.clientX; _gDownY = e.clientY;
+    _gestureTracking = true;
     [_zoneX0, _zoneY0] = _zoneContentCoords(e);
     _zoneX1 = _zoneX0; _zoneY1 = _zoneY0;
-    try { viewer.setPointerCapture(e.pointerId); } catch (_) {}
   });
   viewer.addEventListener('pointermove', (e) => {
-    if (!_zoneDragging) return;
-    [_zoneX1, _zoneY1] = _zoneContentCoords(e);
-    _zoneUpdateOverlay(_zoneX0, _zoneY0, _zoneX1, _zoneY1);
+    if (!_gestureTracking || vwPanning) return;
+    const dx = e.clientX - _gDownX, dy = e.clientY - _gDownY;
+    if (!_zoneDragging && Math.sqrt(dx * dx + dy * dy) >= 7) {
+      if (!viewerTakesPoints()) { _gestureTracking = false; return; }
+      _zoneDragging = true;
+      try { viewer.setPointerCapture(e.pointerId); } catch (_) {}
+    }
+    if (_zoneDragging) {
+      [_zoneX1, _zoneY1] = _zoneContentCoords(e);
+      _zoneUpdateOverlay(_zoneX0, _zoneY0, _zoneX1, _zoneY1);
+    }
   });
   viewer.addEventListener('pointerup', (e) => {
+    if (e.button === 1) return;   // pan handled by vwEndPan
+    _gestureTracking = false;
     if (!_zoneDragging) return;
     _zoneDragging = false;
     [_zoneX1, _zoneY1] = _zoneContentCoords(e);
     const w = Math.abs(_zoneX1 - _zoneX0), h = Math.abs(_zoneY1 - _zoneY0);
-    if (w < 5 || h < 5) { if (zoneOverlay) zoneOverlay.classList.remove('show'); return; }
+    if (w < 5 || h < 5) {
+      if (zoneOverlay) zoneOverlay.classList.remove('show');
+      _zoneDrew = true;  // suppress the post-drag click even on aborted gestures
+      return;
+    }
     _zoneUpdateOverlay(_zoneX0, _zoneY0, _zoneX1, _zoneY1);
     if (zoneClearChip) zoneClearChip.classList.add('show');
     window.CK_ZONE = _zoneContentToSource(_zoneX0, _zoneY0, _zoneX1, _zoneY1);
@@ -2429,9 +2410,7 @@
       const _src = (typeof CK_LAST_SOURCE !== 'undefined' && CK_LAST_SOURCE) ? CK_LAST_SOURCE : null;
       if (_src) { localStorage.setItem('ck_zone_' + _src, JSON.stringify({zone: window.CK_ZONE, anchorFrame: window.CK_ZONE_ANCHOR_FRAME})); ckLog('zone saved ' + _src); }
     } catch (_) {}
-    _zoneArmed = false;
     _zoneDrew = true;
-    if (zoneModeBtn) { zoneModeBtn.setAttribute('aria-pressed', 'false'); zoneModeBtn.classList.remove('zone-pulse'); }
     ckUpdateSamDependentFaders();
   });
 
@@ -2470,8 +2449,9 @@
     } catch (_) {}
     if (ckPrevShown && typeof doKey === 'function') doKey();
   }
-  bvClear.addEventListener('click', clearPoints);
-  clearSam.addEventListener('click', clearPoints);
+  function clearAll() { clearPoints(); if (typeof zoneClear === 'function') zoneClear(); }
+  bvClear.addEventListener('click', clearAll);
+  clearSam.addEventListener('click', clearAll);
 
   // Ctrl+Z removes the last placed SAM dot (panel undo — AE undo can't touch panel state)
   function undoLastDot() {
