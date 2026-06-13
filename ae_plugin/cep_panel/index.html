@@ -550,8 +550,9 @@
   #zoneClearChip.show { display: block; }
   .viewer.scrub #zoneClearChip,
   .viewer.batch #zoneClearChip { display: none !important; }
-  /* Feature A: SAM overlay (dots, canvas, zone) only visible in SAM view */
-  .viewer:not(.ck-view-sam) .sampt { display: none !important; }
+  /* Feature A: hide the SAM SILHOUETTE + zone clutter from RESULT/CK so the
+     matte reads clean — but DOTS (.sampt) stay visible in every view. You place
+     dots in the working view; hiding them broke placement (Berto 2026-06-12). */
   .viewer:not(.ck-view-sam) canvas.sam-overlay { display: none !important; }
   .viewer:not(.ck-view-sam) #zoneOverlay.show { display: none !important; }
   .viewer:not(.ck-view-sam) #zoneClearChip.show { display: none !important; }
