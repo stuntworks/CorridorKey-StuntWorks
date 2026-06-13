@@ -550,6 +550,33 @@
   #zoneClearChip.show { display: block; }
   .viewer.scrub #zoneClearChip,
   .viewer.batch #zoneClearChip { display: none !important; }
+  /* Feature A: SAM overlay (dots, canvas, zone) only visible in SAM view */
+  .viewer:not(.ck-view-sam) .sampt { display: none !important; }
+  .viewer:not(.ck-view-sam) canvas.sam-overlay { display: none !important; }
+  .viewer:not(.ck-view-sam) #zoneOverlay.show { display: none !important; }
+  .viewer:not(.ck-view-sam) #zoneClearChip.show { display: none !important; }
+  /* Feature B: QUAD 2x2 view grid */
+  #ckQuadGrid {
+    display: none; position: absolute; inset: 0;
+    grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr;
+    gap: 2px; background: #0a0c0e; z-index: 2;
+  }
+  .viewer.ck-quad-view #ckQuadGrid { display: grid; }
+  .viewer.ck-quad-view #vwZoom { opacity: 0; pointer-events: none; }
+  .viewer.ck-quad-view #zoneOverlay,
+  .viewer.ck-quad-view #zoneClearChip { display: none !important; }
+  .ck-qpane {
+    position: relative; overflow: hidden;
+    background-size: contain; background-position: center; background-repeat: no-repeat;
+    background-color: #0a0c0e; cursor: pointer;
+  }
+  .ck-qpane:hover { outline: 1px solid rgba(40,220,228,0.35); }
+  .ck-qpane-label {
+    position: absolute; bottom: 4px; left: 6px;
+    font: 700 8px system-ui; letter-spacing: .12em;
+    color: rgba(200,230,235,0.65); text-transform: uppercase;
+    text-shadow: 0 1px 3px rgba(0,0,0,.9); pointer-events: none;
+  }
   /* render progress chip, top-center, above everything; not zoomed, click-through */
   #vwRenderBadge {
     position: absolute; top: 8px; left: 50%; transform: translateX(-50%); z-index: 8; display: none;
@@ -2948,6 +2975,12 @@ function ckShowKeyed(png) {
     try {
         const dest = path.join(PANEL_DIR, '_ck_preview.png');
         fs.copyFileSync(png, dest);
+        try { if (window.CK_SESSION_DIR) {
+            var _qa = path.join(window.CK_SESSION_DIR, 'alpha.png');
+            if (fs.existsSync(_qa)) fs.copyFileSync(_qa, path.join(PANEL_DIR, '_ck_alpha.png'));
+            var _qg = path.join(window.CK_SESSION_DIR, 'sam2_gate_raw.png');
+            if (fs.existsSync(_qg)) fs.copyFileSync(_qg, path.join(PANEL_DIR, '_ck_gate.png'));
+        } } catch (_) {}
         const url = '_ck_preview.png?t=' + Date.now();
         // Preload BEFORE swapping the background — setting backgroundImage to a
         // not-yet-loaded URL blanks the viewer for a beat (the MATTE-toggle flicker).
@@ -2962,6 +2995,7 @@ function ckShowKeyed(png) {
                 el.style.backgroundPosition = 'center';
                 el.style.backgroundRepeat = 'no-repeat';
             });
+            if (typeof ckRefreshQuad === 'function') ckRefreshQuad();
         };
         pre.src = url;
         // hide the mock silhouette/checker so the real composite shows through
@@ -3957,8 +3991,12 @@ function ckResizePanel(w, h) {
             { id: 'ckViewComb', right: 126, bg: 'matte',     label: 'RESULT',
               tip: 'RESULT: the final combined matte/key this render will produce' }
         ];
+        var _ckQuadBtn = null;
         var _mvBtns = [];
         function ckSetMatteView(bg) {
+            var _vEl = document.getElementById('viewer');
+            if (_vEl) { _vEl.classList.remove('ck-quad-view'); _vEl.classList.toggle('ck-view-sam', bg === 'matte-sam'); }
+            if (_ckQuadBtn) { _ckQuadBtn.style.background = 'linear-gradient(180deg,#34383d,#222528)'; _ckQuadBtn.style.color = '#dfe3e8'; }
             CK_PREVIEW_BG = (bg || '').replace(/[^a-z0-9-]/g, '');
             for (var i = 0; i < _mvBtns.length; i++) {
                 var on = (_mvBtns[i]._bg === bg);
@@ -3984,6 +4022,60 @@ function ckResizePanel(w, h) {
                 _mvBtns.push(btn);
             })(CK_MATTE_BTNS[bi]);
         }
+        // QUAD view — 2x2 overview grid (source / SAM gate / CK alpha / combined result)
+        var quadSvg = '<svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="#7de8ec" stroke-width="1.3">'
+            + '<rect x="1" y="1" width="4.5" height="4.5" rx="0.5"/>'
+            + '<rect x="6.5" y="1" width="4.5" height="4.5" rx="0.5"/>'
+            + '<rect x="1" y="6.5" width="4.5" height="4.5" rx="0.5"/>'
+            + '<rect x="6.5" y="6.5" width="4.5" height="4.5" rx="0.5"/></svg>';
+        function ckEnterQuadView() {
+            var _vQ = document.getElementById('viewer');
+            if (!_vQ) return;
+            var _wasQuad = _vQ.classList.contains('ck-quad-view');
+            if (_wasQuad) {
+                _vQ.classList.remove('ck-quad-view');
+                if (_ckQuadBtn) { _ckQuadBtn.style.background = 'linear-gradient(180deg,#34383d,#222528)'; _ckQuadBtn.style.color = '#dfe3e8'; }
+                ckSetMatteView(CK_PREVIEW_BG || 'checker');
+                return;
+            }
+            _vQ.classList.remove('ck-view-sam');
+            _vQ.classList.add('ck-quad-view');
+            if (_ckQuadBtn) { _ckQuadBtn.style.background = 'linear-gradient(180deg,#fff8e6,#cdb87e)'; _ckQuadBtn.style.color = '#1c1303'; }
+            for (var _qi = 0; _qi < _mvBtns.length; _qi++) {
+                _mvBtns[_qi].style.background = 'linear-gradient(180deg,#34383d,#222528)';
+                _mvBtns[_qi].style.color = '#dfe3e8';
+            }
+            ckRefreshQuad();
+        }
+        function ckRefreshQuad() {
+            var _t = Date.now();
+            var _pm = { ckQpSrc: '_ck_source.png', ckQpSam: '_ck_gate.png', ckQpCk: '_ck_alpha.png', ckQpRes: '_ck_preview.png' };
+            Object.keys(_pm).forEach(function (id) {
+                var _p = document.getElementById(id);
+                if (_p) _p.style.backgroundImage = 'url("' + _pm[id] + '?t=' + _t + '")';
+            });
+        }
+        window.ckRefreshQuad = ckRefreshQuad;
+        _ckQuadBtn = ckChromeBtn('ckQuadBtn', 0, quadSvg, 'QUAD',
+            'QUAD: 2x2 overview — source / SAM gate / CK matte / combined result. Click pane to jump to that single view.',
+            ckEnterQuadView);
+        (function () {
+            var _v = document.getElementById('viewer');
+            if (!_v) return;
+            var _g = document.createElement('div'); _g.id = 'ckQuadGrid';
+            var _defs = [
+                { id: 'ckQpSrc', label: 'SOURCE',   fn: function () { ckSetMatteView('checker'); } },
+                { id: 'ckQpSam', label: 'SAM',      fn: function () { ckSetMatteView('matte-sam'); } },
+                { id: 'ckQpCk',  label: 'CK MATTE', fn: function () { ckSetMatteView('matte-ck'); } },
+                { id: 'ckQpRes', label: 'RESULT',   fn: function () { ckSetMatteView('matte'); } }
+            ];
+            _defs.forEach(function (d) {
+                var _pane = document.createElement('div'); _pane.className = 'ck-qpane'; _pane.id = d.id;
+                var _lbl = document.createElement('span'); _lbl.className = 'ck-qpane-label'; _lbl.textContent = d.label;
+                _pane.appendChild(_lbl); _pane.addEventListener('click', d.fn); _g.appendChild(_pane);
+            });
+            _v.appendChild(_g);
+        })();
         // ── SCRUB MODE (Berto 2026-06-06: "view the mattes before we render...we
         // already had this feature working before [in DaVinci]"). Python batch-scrub
         // survived the Qt-viewer retirement; this rebuilds the UI half panel-side.
