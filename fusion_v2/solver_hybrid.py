@@ -555,6 +555,55 @@ def _hybrid_solve(
             below[:hair_line, :] = False
             blended[below] = (nn_f32 * sam_soft)[below]
 
+            # HAIR ZONE GREEN GATE (Berto 2026-06-13): in the top-35% hair zone,
+            # trust CK only where the green-screen region is present OR the pixel
+            # is inside the SAM body+margin. Dark junk above the screen's top edge
+            # (ceiling, rigging wedge) has green_score~0 AND is outside the SAM
+            # margin -> SAM clips it even though it's above the hairline.
+            # Hair flying in front of green: green_score>0 -> CK kept intact.
+            # Actor body/dark clothes in hair zone: sam_room>0 -> CK kept intact.
+            #
+            # Green region at 8x downscale (same pipeline as _build_ck_region_band_map
+            # but with a SMALL close (~5% bbox) instead of 60%, so the close fills
+            # pixel-level noise without bridging upward into off-screen dark areas.
+            _hair_lab = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2LAB)
+            _hair_gs  = _fit_green_components(_hair_lab, trimap == _BG)
+            if _hair_gs:
+                _ds   = 8
+                _sm   = cv2.resize(_hair_lab, (max(1, W // _ds), max(1, H // _ds)),
+                                   interpolation=cv2.INTER_AREA)
+                _ab   = _sm[:, :, 1:3].reshape(-1, 2).astype(np.float32)
+                _sc   = np.zeros(_ab.shape[0], dtype=np.float32)
+                for _mu, _ci in _hair_gs:
+                    _d  = _ab - _mu[np.newaxis, :]
+                    _sc = np.maximum(
+                        _sc,
+                        np.exp(-np.clip(np.sum((_d @ _ci) * _d, axis=1),
+                                        0.0, None) / _FALLOFF_SCALE))
+                _g_sm = (_sc.reshape(_sm.shape[:2]) > 0.5).astype(np.uint8)
+                # Small close: ~5% bbox in source -> ~0.6% at 8x downscale.
+                # Fills pixel-level gaps in the green mask without bridging
+                # across the actor body (which would extend the region into the
+                # off-screen junk above the screen's top edge).
+                _k_s  = max(3, int(round((bh * 0.05) / _ds)) | 1)
+                _ke   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_k_s, _k_s))
+                _reg  = cv2.resize(cv2.morphologyEx(_g_sm, cv2.MORPH_CLOSE, _ke),
+                                   (W, H), interpolation=cv2.INTER_NEAREST)
+            else:
+                _reg  = np.ones((H, W), dtype=np.uint8)  # no green found: keep CK (safe fallback)
+            # Gate: only the narrow above-head zone (y < y_min + margin_r).
+            # This is where the dark junk wedge lives: within the trimap unknown band
+            # (dilated ~6% above y_min) but above where the actor's head begins.
+            # Do NOT extend to the full hair zone -- actor edge pixels at the
+            # shoulder/arm level (outside the 5.5% sam_room but inside the body
+            # zone) must not be killed.
+            _gate_top = min(hair_line, y_min + margin_r + 1)
+            _hgate = unknown_mask.copy()
+            _hgate[_gate_top:, :] = False    # only the above-head zone
+            _hgate[_reg > 0]      = False    # in green screen: trust CK (flying hair)
+            _hgate[sam_room > 0]  = False    # inside SAM head+margin: trust CK
+            blended[_hgate] = (nn_f32 * sam_soft)[_hgate]
+
             # SPECKLE KILL (Berto 2026-06-12): floating white chunks in the band
             # that do not touch the body die. Hair survives — it grows from the
             # head mass. Connected-components on the assembled matte; any blob
