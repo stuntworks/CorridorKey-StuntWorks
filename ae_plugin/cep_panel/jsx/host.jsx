@@ -445,8 +445,7 @@ function ae_importSequence(firstFramePath, fps, compStartTime, hideSource, lockH
                 // Simple Choker: negative choke spreads the junk mask inward by ~20px at 1080p.
                 try {
                     var sjChoker = sjLayer.property("ADBE Effect Parade").addProperty("ADBE Simple Choker");
-                    var sjChokeVal = -20 * (ckComp.height / 1080);
-                    sjChoker.property("Choke Matte").setValue(sjChokeVal);
+                    sjChoker.property("Choke Matte").setValue(0);
                 } catch (eChoker) { _warnings.push("SAM JUNK choker: " + String(eChoker)); }
             } catch (eSj) { _warnings.push("SAM JUNK MASK layer: " + String(eSj)); }
         }

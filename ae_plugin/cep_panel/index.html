@@ -3452,11 +3452,16 @@ function doCommit() {
                 // No result file at all = Python died before writing the summary — incomplete.
                 return finish('Render produced no completion record — not importing. Re-render.', true);
             }
-            const ckMatteFirst = path.join(outDir, 'CK_ALPHA', 'CK_ALPHA_00000.png');
-            const ckMatteSidecar = fs.existsSync(ckMatteFirst) ? ckMatteFirst : null;
+            // Find CK_ALPHA sequence: prefer _00000.png anchor; fallback to first file in folder.
+            const _ckAlphaDir = path.join(outDir, 'CK_ALPHA');
+            const ckMatteFirst = path.join(_ckAlphaDir, 'CK_ALPHA_00000.png');
+            const ckMatteSidecar = fs.existsSync(ckMatteFirst) ? ckMatteFirst
+                : (() => { try { const _ff = fs.readdirSync(_ckAlphaDir).filter(n => n.startsWith('CK_ALPHA_') && n.endsWith('.png')).sort(); return _ff.length ? path.join(_ckAlphaDir, _ff[0]) : null; } catch(_) { return null; } })();
             // SAM JUNK MASK sidecar — inverted SAM mask written by ae_processor when SAM active.
-            const samJunkFirst = path.join(outDir, 'SAM_JUNK', 'SAM_JUNK_00000.png');
-            const samJunkSidecar = fs.existsSync(samJunkFirst) ? samJunkFirst : null;
+            const _samJunkDir = path.join(outDir, 'SAM_JUNK');
+            const samJunkFirst = path.join(_samJunkDir, 'SAM_JUNK_00000.png');
+            const samJunkSidecar = fs.existsSync(samJunkFirst) ? samJunkFirst
+                : (() => { try { const _ff = fs.readdirSync(_samJunkDir).filter(n => n.startsWith('SAM_JUNK_') && n.endsWith('.png')).sort(); return _ff.length ? path.join(_samJunkDir, _ff[0]) : null; } catch(_) { return null; } })();
             const importFn = HOST_APP === 'ppro' ? 'ppro_importSequence' : 'ae_importSequence';
             const importArgs = HOST_APP === 'ppro'
                 ? [firstFrame, info.inPointSeconds, info.fps, info.sourceFrameRate || info.fps, null]
