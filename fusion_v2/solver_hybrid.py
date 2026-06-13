@@ -555,16 +555,23 @@ def _hybrid_solve(
             blob_bin[trimap == _FG] = 1   # body core always present
             n_lbl, labels = cv2.connectedComponents(blob_bin, connectivity=8)
             if n_lbl > 1:
-                # Include soft transition zone (soft_raw > 0.05) as body for
-                # connectivity detection. The feet feather gradient extends ~2-3px
-                # beyond the binary SAM edge; isolated near-edge blobs in this zone
-                # are legitimate edge detail, not floating junk.
-                # sam_f (binary) covers the interior; soft_raw > 0.05 adds the
-                # ~6px transition band where grain pixels live.
-                _body_mask = (sam_f > 0) | (soft_raw > 0.05)
+                # The kill's idea of "body" MUST match the region the recipe
+                # actually keeps (overnight review 2026-06-13, both models HIGH):
+                # the body zone keeps sam_soft (the 5.5%-bbox margin that saves
+                # under-cut butt/straps), NOT the tight soft_raw. Using soft_raw
+                # here made real body pixels inside the margin look disconnected
+                # and got them killed — deleting the exact safety margin Berto
+                # picked. sam_soft already blends margin (body rows) and tight
+                # (feet rows), so it is the correct keep-region by construction.
+                _body_mask = (sam_f > 0) | (sam_soft > 0.05)
                 body_labels = np.unique(labels[_body_mask & (labels > 0)])
                 keep = np.isin(labels, body_labels)
                 kill = unknown_mask & (~keep) & (blob_bin > 0)
+                # Never speckle-kill in the hair zone — it is CK-trusted, and a
+                # wind-blown wisp disconnected from the scalp is real hair, not
+                # junk (review HIGH). The hair zone was already exempt from the
+                # SAM clip (below[:hair_line]); exempt it from the kill too.
+                kill[:hair_line, :] = False
                 blended[kill] = 0.0
 
     result[unknown_mask] = blended[unknown_mask]
