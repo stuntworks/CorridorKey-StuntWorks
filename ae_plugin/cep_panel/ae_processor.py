@@ -836,6 +836,14 @@ def _write_fusion_sidecars(fg, ck_alpha, ck_combined, sam_union,
         if sam_union is not None:
             s = sam_union[:, :, 0] if sam_union.ndim == 3 else sam_union
             _write("SAM_ALPHA", "SAM_ALPHA", _to_3ch_16(s))
+
+        # 5. SAM_JUNK — inverted SAM mask (uint8 0/255, white=junk to discard, black=body).
+        #    AE layer named 'SAM JUNK MASK' with Simple Choker buffer — see host.jsx.
+        if sam_union is not None:
+            s_2d = sam_union[:, :, 0] if sam_union.ndim == 3 else sam_union
+            junk_u8 = ((1.0 - np.clip(s_2d, 0.0, 1.0)) * 255.0).astype(np.uint8)
+            junk_3ch = cv2.merge([junk_u8, junk_u8, junk_u8])
+            _write("SAM_JUNK", "SAM_JUNK", junk_3ch)
     except Exception as _sc_err:
         print(f"CK_WARN: named sidecar pass failed on frame {seq_num} "
               f"(main key unaffected): {_sc_err}", flush=True)

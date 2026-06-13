@@ -350,14 +350,14 @@ function ck_resolveLockedLayer(activeComp, lockHandleJson) {
     return { comp: comp, layer: null, via: "no-match" };
 }
 
-function ae_importSequence(firstFramePath, fps, compStartTime, hideSource, samFirstFramePath, lockHandleJson, ckMatteFirstFramePath, sourceFsName, finalMatteFirstFramePath, ckRgbFirstFramePath) {
+function ae_importSequence(firstFramePath, fps, compStartTime, hideSource, samFirstFramePath, lockHandleJson, ckMatteFirstFramePath, sourceFsName, finalMatteFirstFramePath, ckRgbFirstFramePath, samJunkFirstFramePath) {
     try {
         // GENERATION TRIPWIRE (2026-06-05): host.jsx loads ONCE per AE session while the
         // panel reloads per open — a stale engine silently drops trailing args (the lock
         // bug). Surface the arg count so version skew shows up as data, never silence.
         var _argc = arguments.length;
-        if (_argc < 10) return JSON.stringify({ ok: false,
-            error: "HOST SCRIPT STALE: ae_importSequence got " + _argc + "/10 args — restart After Effects fully (host.jsx engine is from an older session)." });
+        if (_argc < 11) return JSON.stringify({ ok: false,
+            error: "HOST SCRIPT STALE: ae_importSequence got " + _argc + "/11 args — restart After Effects fully (host.jsx engine is from an older session)." });
         // LAYER LOCK resolution: (a) handle index, (b) handle re-find by source, (c) selection,
         // (d) project-wide scan by source path — the render KNOWS which file it keyed, so even
         // with no lock handle and nothing selected/focused the import still finds its clip
@@ -409,6 +409,13 @@ function ae_importSequence(firstFramePath, fps, compStartTime, hideSource, samFi
                 if (ckmFirst.exists) { var ckmOpts = new ImportOptions(ckmFirst); ckmOpts.sequence = true; ckMatteImported = app.project.importFile(ckmOpts); }
             } catch (eCkm) {}
         }
+        var samJunkImported = null;
+        if (samJunkFirstFramePath) {
+            try {
+                var sjFirst = new File(String(samJunkFirstFramePath));
+                if (sjFirst.exists) { var sjOpts = new ImportOptions(sjFirst); sjOpts.sequence = true; samJunkImported = app.project.importFile(sjOpts); }
+            } catch (eSj) {}
+        }
         var fgSeq = null, fmSeq = null, pairImported = null;
         if (finalMatteFirstFramePath && ckRgbFirstFramePath) {
             try {
@@ -427,6 +434,7 @@ function ae_importSequence(firstFramePath, fps, compStartTime, hideSource, samFi
         if (ckMatteImported) ckMatteImported.mainSource.conformFrameRate = Number(fps);
         if (fgSeq) fgSeq.mainSource.conformFrameRate = Number(fps);
         if (fmSeq) fmSeq.mainSource.conformFrameRate = Number(fps);
+        if (samJunkImported) samJunkImported.mainSource.conformFrameRate = Number(fps);
 
         // Create a dedicated precomp for all CK layers so the main comp gets ONE
         // clean layer instead of 4-5 loose layers. Double-click the precomp to paint.
@@ -478,6 +486,35 @@ function ae_importSequence(firstFramePath, fps, compStartTime, hideSource, samFi
                 samLayer.startTime = 0;
             } catch (eSam) { _warnings.push("SAM layer: " + String(eSam)); }
         }
+        if (samJunkImported) {
+            try {
+                var sjLayer = ckComp.layers.add(samJunkImported);
+                sjLayer.name = "SAM JUNK MASK";
+                sjLayer.startTime = 0;
+                sjLayer.enabled = false;  // utility matte — off by default
+                // Simple Choker: negative choke spreads the junk mask inward by ~20px at 1080p.
+                try {
+                    var sjChoker = sjLayer.property("ADBE Effect Parade").addProperty("ADBE Simple Choker");
+                    var sjChokeVal = -20 * (ckComp.height / 1080);
+                    sjChoker.property("Choke Matte").setValue(sjChokeVal);
+                } catch (eChoker) { _warnings.push("SAM JUNK choker: " + String(eChoker)); }
+            } catch (eSj) { _warnings.push("SAM JUNK MASK layer: " + String(eSj)); }
+        }
+        if (samJunkImported) {
+            try {
+                var sjGuide = ckComp.layers.addText("JUNK MASK — adjust Simple Choker \"Choke Matte\" to taste (negative = spread)");
+                sjGuide.name = "JUNK MASK — adjust Simple Choker choke to taste";
+                sjGuide.locked = true;
+                sjGuide.guideLayer = true;
+                sjGuide.startTime = 0;
+                try {
+                    var sjTxt = sjGuide.property("ADBE Text Properties").property("ADBE Text Document").value;
+                    sjTxt.fontSize = 18;
+                    sjTxt.fillColor = [0.0, 0.78, 0.90];
+                    sjGuide.property("ADBE Text Properties").property("ADBE Text Document").setValue(sjTxt);
+                } catch (_) {}
+            } catch (eSjG) { _warnings.push("SAM JUNK guide text: " + String(eSjG)); }
+        }
 
         // Drop the precomp as a single layer in the main comp above the source clip.
         var ckPrecompLayer = comp.layers.add(ckComp);
@@ -489,7 +526,7 @@ function ae_importSequence(firstFramePath, fps, compStartTime, hideSource, samFi
         }
         app.endUndoGroup();
         comp.time = comp.time;
-        return JSON.stringify({ ok: true, samImported: !!samImported, ckMatteImported: !!ckMatteImported, pairImported: !!pairImported, via: via, warnings: _warnings.length ? _warnings : undefined });
+        return JSON.stringify({ ok: true, samImported: !!samImported, ckMatteImported: !!ckMatteImported, pairImported: !!pairImported, samJunkImported: !!samJunkImported, via: via, warnings: _warnings.length ? _warnings : undefined });
     } catch (e) { return JSON.stringify({ ok: false, error: String(e) }); }
 }
 

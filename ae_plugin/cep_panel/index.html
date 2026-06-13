@@ -3451,10 +3451,13 @@ function doCommit() {
             const finalMatteSidecar = fs.existsSync(finalMatteFirst) ? finalMatteFirst : null;
             const ckRgbFirst = path.join(outDir, 'CK_RGB', 'CK_RGB_00000.png');
             const ckRgbSidecar = fs.existsSync(ckRgbFirst) ? ckRgbFirst : null;
+            // SAM JUNK MASK sidecar — inverted SAM mask written by ae_processor when SAM active.
+            const samJunkFirst = path.join(outDir, 'SAM_JUNK', 'SAM_JUNK_00000.png');
+            const samJunkSidecar = fs.existsSync(samJunkFirst) ? samJunkFirst : null;
             const importFn = HOST_APP === 'ppro' ? 'ppro_importSequence' : 'ae_importSequence';
             const importArgs = HOST_APP === 'ppro'
                 ? [firstFrame, info.inPointSeconds, info.fps, info.sourceFrameRate || info.fps, samSidecar]
-                : [firstFrame, info.fps, info.compStartTime, true, samSidecar, ckLockJson, ckMatteSidecar, info.sourceFile, finalMatteSidecar, ckRgbSidecar];   // LAYER LOCK + CK matte + source-scan + paintable pair
+                : [firstFrame, info.fps, info.compStartTime, true, samSidecar, ckLockJson, ckMatteSidecar, info.sourceFile, finalMatteSidecar, ckRgbSidecar, samJunkSidecar];   // LAYER LOCK + CK matte + source-scan + paintable pair + SAM junk mask
             ckStatus('Placing on timeline...');
             jsxCall(importFn, importArgs, (imp) => {
                 if (!imp || !imp.ok) return finish('Import failed: ' + (imp && imp.error ? imp.error : 'unknown'), true);
@@ -3463,6 +3466,7 @@ function doCommit() {
                 if (samSidecar) extras.push('SAM matte');
                 if (imp.ckMatteImported) extras.push('CK matte');
                 if (imp.pairImported) extras.push('paint pair');
+                if (imp.samJunkImported) extras.push('SAM junk mask');
                 finish('Done. Keyed clip on your timeline' + (extras.length ? ' (+ ' + extras.join(' + ') + ')' : '') + '.');
             });
         }, e => finish('Key failed: ' + e.message, true),
