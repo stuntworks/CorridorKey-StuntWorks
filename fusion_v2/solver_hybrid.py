@@ -509,10 +509,18 @@ def _hybrid_solve(
             sam_f = sam_f[..., 0]
         if sam_f.shape[:2] != (H, W):
             sam_f = cv2.resize(sam_f.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST)
-        non_bg_rows = np.any(trimap != _BG, axis=1)
-        if non_bg_rows.any():
-            y_min     = int(np.argmax(non_bg_rows))
-            y_max     = int(H - 1 - np.argmax(non_bg_rows[::-1]))
+        # Body landmarks measure the RAW SAM silhouette, NOT the dilated trimap
+        # (overnight review 2026-06-13, both models HIGH). The trimap's non-BG
+        # region includes the 3x hair dilation, which inflates body height and
+        # shoves the 35%/70% lines off the real anatomy — on a big-hair shot the
+        # "feet zone" creeps up the shins. SAM's silhouette bbox is the true body
+        # (head-to-feet, no flying-hair dilation), so the zones track the actor at
+        # any hair length. Fall back to the trimap only if SAM is somehow empty.
+        _sam_rows = np.any(sam_f > 0, axis=1)
+        _src_rows = _sam_rows if _sam_rows.any() else np.any(trimap != _BG, axis=1)
+        if _src_rows.any():
+            y_min     = int(np.argmax(_src_rows))
+            y_max     = int(H - 1 - np.argmax(_src_rows[::-1]))
             bh        = max(y_max - y_min + 1, 1)
             hair_line = int(y_min + bh * 0.35)
             # BUTT MARGIN (Berto 2026-06-12): SAM under-cuts on black pants +
