@@ -575,11 +575,13 @@ def _hybrid_solve(
                 body_labels = np.unique(labels[_body_mask & (labels > 0)])
                 keep = np.isin(labels, body_labels)
                 kill = unknown_mask & (~keep) & (blob_bin > 0)
-                # Never speckle-kill in the hair zone — it is CK-trusted, and a
-                # wind-blown wisp disconnected from the scalp is real hair, not
-                # junk (review HIGH). The hair zone was already exempt from the
-                # SAM clip (below[:hair_line]); exempt it from the kill too.
-                kill[:hair_line, :] = False
+                # NOTE (Berto 2026-06-13): a blanket hair-zone kill-exemption was
+                # tried here to save theoretical wind-blown wisps — it REGRESSED a
+                # working behavior, letting a dark junk wedge above the head
+                # survive (27px junk -> 1151px). Removed. The speckle-kill runs
+                # everywhere; floating junk near the head dies again. If real
+                # disconnected wisps ever show, the green-region-gated hair zone
+                # (geography, not blanket exemption) is the correct fix.
                 blended[kill] = 0.0
 
     result[unknown_mask] = blended[unknown_mask]
