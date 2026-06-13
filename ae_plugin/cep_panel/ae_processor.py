@@ -1007,15 +1007,25 @@ def cmd_batch(source_video, output_folder, settings,
                         labels=np.array(_labels, dtype=np.int32),
                         clear_old_points=True,
                     )
+                    # CRISP-SNAP (Berto 2026-06-13 "46px even blur, not motion blur"):
+                    # SAM runs downscaled (1920) then upscales 2x to 4K with INTER_LINEAR,
+                    # smearing every edge into a wide ramp. The TRUE body boundary is the
+                    # 0.5 crossing of the ramp. Snap there + a 0.8px anti-alias so the
+                    # later upscale yields a thin ~2px edge instead of a 46px smear. NOT a
+                    # sharpen filter — geometric reconstruction, adds no noise. SAM is a
+                    # hard silhouette by design; softness only ever existed to dodge jaggies,
+                    # which the tiny anti-alias still covers. (Hair stays CK's job, untouched.)
+                    def _snap_sam_edge(_m):
+                        _b = (_m >= 0.5).astype(np.float32)
+                        return cv2.GaussianBlur(_b, (3, 3), 0.8)
                     # Forward: anchor → last frame. Logits are at padded square
                     # shape — apply ramp, then unpad to source frame shape.
                     for _fi, _obj_ids, _mask_logits in _video_predictor.propagate_in_video(_state):
                         _L = _mask_logits[0].squeeze().cpu().numpy()
                         _m_padded = _ramp(_L)
-                        sam_video_masks[_fi] = (
-                            _unpad_from_square(_m_padded, _pad_box)
-                            if _pad_box is not None else _m_padded
-                        )
+                        _mu = (_unpad_from_square(_m_padded, _pad_box)
+                               if _pad_box is not None else _m_padded)
+                        sam_video_masks[_fi] = _snap_sam_edge(_mu)
                     # Backward: anchor → frame 0. Forward wins on overlap.
                     if sam_anchor_rel > 0:
                         for _fi, _obj_ids, _mask_logits in _video_predictor.propagate_in_video(_state, reverse=True):
@@ -1023,10 +1033,9 @@ def cmd_batch(source_video, output_folder, settings,
                                 continue
                             _L = _mask_logits[0].squeeze().cpu().numpy()
                             _m_padded = _ramp(_L)
-                            sam_video_masks[_fi] = (
-                                _unpad_from_square(_m_padded, _pad_box)
-                                if _pad_box is not None else _m_padded
-                            )
+                            _mu = (_unpad_from_square(_m_padded, _pad_box)
+                                   if _pad_box is not None else _m_padded)
+                            sam_video_masks[_fi] = _snap_sam_edge(_mu)
 
                 # Empty / collapsed-mask post-pass — ported from CorridorKey_Pro.py
                 # (~1806-1847). SAM2 can yield a near-empty mask on some frames:
