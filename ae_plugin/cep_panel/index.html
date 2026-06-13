@@ -566,6 +566,25 @@
   .viewer.ck-quad-view #vwZoom { opacity: 0; pointer-events: none; }
   .viewer.ck-quad-view #zoneOverlay,
   .viewer.ck-quad-view #zoneClearChip { display: none !important; }
+  /* === STAGE ZONE OVERLAY (mirrors viewer zone for the cockpit stage) === */
+  #stageZoneOverlay {
+    position: absolute; display: none;
+    border: 2px dashed var(--cyan);
+    border-radius: 50%;
+    box-shadow: 0 0 8px rgba(40,220,228,0.35);
+    pointer-events: none; z-index: 5;
+  }
+  #stageZoneOverlay.show { display: block; }
+  #stageZoneClearChip {
+    position: absolute; display: none;
+    width: 16px; height: 16px; border-radius: 50%;
+    background: rgba(40,220,228,0.88);
+    color: #06231f; font-size: 10px; font-weight: 800;
+    line-height: 16px; text-align: center;
+    cursor: pointer; pointer-events: auto; z-index: 7;
+    transform: translate(-50%, -50%); user-select: none;
+  }
+  #stageZoneClearChip.show { display: block; }
   .ck-qpane {
     position: relative; overflow: hidden;
     background-size: contain; background-position: center; background-repeat: no-repeat;
@@ -1455,6 +1474,8 @@
         <span class="checker" aria-hidden="true"></span>
         <div class="subject big" aria-hidden="true"></div>
         <span class="glass"></span>
+        <div id="stageZoneOverlay"></div>
+        <div id="stageZoneClearChip" title="Clear zone">&#x00D7;</div>
         <div class="bv-hint" id="stageHint" style="display:none">Click your subject to place SAM points. Tag fine detail like hair and ropes.</div>
         <div class="vw-proc" id="stageProc">
           <span class="scan"></span>
@@ -2100,11 +2121,53 @@
     if (bvHint) bvHint.style.display = 'none';
   });
 
+  // Stage zone drag overlay: parallel gesture to the viewer zone.
+  // Stage uses raw screen coords (no zoom/pan), same contain-letterbox math as placePoint.
+  let _sgZoneDragging = false, _sgZoneDrew = false;
+  let _sgX0 = 0, _sgY0 = 0, _sgX1 = 0, _sgY1 = 0;
+  let _sgDownX = 0, _sgDownY = 0, _sgGestureTracking = false;
+  const stageZoneOverlay = document.getElementById('stageZoneOverlay');
+  const stageZoneClearChip = document.getElementById('stageZoneClearChip');
+  function _stageZoneCoords(e) {
+    const r = stageScreen.getBoundingClientRect();
+    return [e.clientX - r.left, e.clientY - r.top];
+  }
+  function _stageZoneUpdateOverlay(x0, y0, x1, y1) {
+    if (!stageZoneOverlay) return;
+    const left = Math.min(x0, x1), top = Math.min(y0, y1);
+    const w = Math.abs(x1 - x0), h = Math.abs(y1 - y0);
+    stageZoneOverlay.style.left = left + 'px';
+    stageZoneOverlay.style.top = top + 'px';
+    stageZoneOverlay.style.width = w + 'px';
+    stageZoneOverlay.style.height = h + 'px';
+    stageZoneOverlay.classList.add('show');
+    if (stageZoneClearChip) {
+      stageZoneClearChip.style.left = (left + w) + 'px';
+      stageZoneClearChip.style.top = top + 'px';
+    }
+  }
+  function _stageZoneToSource(x0, y0, x1, y1) {
+    const r = stageScreen.getBoundingClientRect();
+    let rw = r.width, rh = r.height, ox = 0, oy = 0;
+    if (CK_SRC_W && CK_SRC_H) {
+      const ar = CK_SRC_W / CK_SRC_H;
+      rw = r.width; rh = r.width / ar;
+      if (rh > r.height) { rh = r.height; rw = r.height * ar; }
+      ox = (r.width - rw) / 2; oy = (r.height - rh) / 2;
+    }
+    const sw = CK_SRC_W || 1, sh = CK_SRC_H || 1;
+    const nx0 = Math.max(0, Math.min(1, (Math.min(x0, x1) - ox) / rw));
+    const ny0 = Math.max(0, Math.min(1, (Math.min(y0, y1) - oy) / rh));
+    const nx1 = Math.max(0, Math.min(1, (Math.max(x0, x1) - ox) / rw));
+    const ny1 = Math.max(0, Math.min(1, (Math.max(y0, y1) - oy) / rh));
+    return { x: Math.round(nx0 * sw), y: Math.round(ny0 * sh), w: Math.round((nx1 - nx0) * sw), h: Math.round((ny1 - ny0) * sh), shape: 'ellipse', feather_px: 8 };
+  }
   // primary: place a point by clicking the big cockpit stage (SAM on only).
   // Gate on the live state, not just the class, so the visible big stage always
   // takes clicks the moment Use SAM is on. Left-click drops the armed polarity;
   // right-click always drops a negative (exclude) point (item 3).
   stageScreen.addEventListener('click', (e) => {
+    if (_sgZoneDrew) { _sgZoneDrew = false; return; }  // absorb click that ended a zone drag
     if (!stageTakesPoints()) return;
     placePoint(stageScreen, e, pointMode === 'neg' ? 0 : 1);
     if (stageHint) stageHint.style.display = 'none';
@@ -2114,6 +2177,55 @@
     e.preventDefault();                  // suppress the browser context menu
     placePoint(stageScreen, e, 0);       // right-click = negative point
     if (stageHint) stageHint.style.display = 'none';
+  });
+  // Stage zone drag gesture: left-button drag >=7px draws zone; quick click places SAM dot.
+  stageScreen.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0) return;
+    _sgDownX = e.clientX; _sgDownY = e.clientY;
+    _sgGestureTracking = true;
+    [_sgX0, _sgY0] = _stageZoneCoords(e);
+    _sgX1 = _sgX0; _sgY1 = _sgY0;
+  });
+  stageScreen.addEventListener('pointermove', (e) => {
+    if (!_sgGestureTracking) return;
+    const dx = e.clientX - _sgDownX, dy = e.clientY - _sgDownY;
+    if (!_sgZoneDragging && Math.sqrt(dx * dx + dy * dy) >= 7) {
+      if (!stageTakesPoints()) { _sgGestureTracking = false; return; }
+      _sgZoneDragging = true;
+      try { stageScreen.setPointerCapture(e.pointerId); } catch (_) {}
+    }
+    if (_sgZoneDragging) {
+      [_sgX1, _sgY1] = _stageZoneCoords(e);
+      _stageZoneUpdateOverlay(_sgX0, _sgY0, _sgX1, _sgY1);
+    }
+  });
+  stageScreen.addEventListener('pointerup', (e) => {
+    _sgGestureTracking = false;
+    if (!_sgZoneDragging) return;
+    _sgZoneDragging = false;
+    [_sgX1, _sgY1] = _stageZoneCoords(e);
+    const w = Math.abs(_sgX1 - _sgX0), h = Math.abs(_sgY1 - _sgY0);
+    if (w < 5 || h < 5) {
+      if (stageZoneOverlay) stageZoneOverlay.classList.remove('show');
+      _sgZoneDrew = true;
+      return;
+    }
+    _stageZoneUpdateOverlay(_sgX0, _sgY0, _sgX1, _sgY1);
+    if (stageZoneClearChip) stageZoneClearChip.classList.add('show');
+    window.CK_ZONE = _stageZoneToSource(_sgX0, _sgY0, _sgX1, _sgY1);
+    try { window.CK_ZONE_ANCHOR_FRAME = (typeof CK_ANCHOR_FRAME !== 'undefined') ? CK_ANCHOR_FRAME : null; } catch (_) {}
+    try {
+      const _src = (typeof CK_LAST_SOURCE !== 'undefined' && CK_LAST_SOURCE) ? CK_LAST_SOURCE : null;
+      if (_src) { localStorage.setItem('ck_zone_' + _src, JSON.stringify({zone: window.CK_ZONE, anchorFrame: window.CK_ZONE_ANCHOR_FRAME})); }
+    } catch (_) {}
+    _sgZoneDrew = true;
+    if (typeof ckUpdateSamDependentFaders === 'function') ckUpdateSamDependentFaders();
+  });
+  if (stageZoneClearChip) stageZoneClearChip.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (typeof zoneClear === 'function') zoneClear();
+    if (stageZoneOverlay) stageZoneOverlay.classList.remove('show');
+    if (stageZoneClearChip) stageZoneClearChip.classList.remove('show');
   });
 
   // Must be declared BEFORE the viewer.addEventListener wiring below — a later
@@ -2322,6 +2434,8 @@
     window.CK_ZONE_ANCHOR_FRAME = null;
     if (zoneOverlay) zoneOverlay.classList.remove('show');
     if (zoneClearChip) zoneClearChip.classList.remove('show');
+    try { const _szo = document.getElementById('stageZoneOverlay'); if (_szo) _szo.classList.remove('show'); } catch (_) {}
+    try { const _szc = document.getElementById('stageZoneClearChip'); if (_szc) _szc.classList.remove('show'); } catch (_) {}
     ckUpdateSamDependentFaders();
   }
   window.ckZoneClear = zoneClear;
@@ -3641,6 +3755,8 @@ function ckEnterWorking() {
 function ckExitWorking() {
     if (typeof ckExitScrubView === 'function') ckExitScrubView();
     try { const u = document.querySelector('.unit'); if (u) u.classList.remove('working'); } catch (_) {}
+    // Clear the approve gate so Done returns to the one-button start state, not the preview-ready console.
+    try { if (typeof backToSource === 'function') backToSource(); } catch (_) {}
     // Done = back to the start screen: snap back down to the small standard size.
     ckResizePanel(CK_STD_W, CK_STD_H);
 }
