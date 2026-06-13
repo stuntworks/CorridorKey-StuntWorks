@@ -350,14 +350,14 @@ function ck_resolveLockedLayer(activeComp, lockHandleJson) {
     return { comp: comp, layer: null, via: "no-match" };
 }
 
-function ae_importSequence(firstFramePath, fps, compStartTime, hideSource, samFirstFramePath, lockHandleJson, ckMatteFirstFramePath, sourceFsName, finalMatteFirstFramePath, ckRgbFirstFramePath, samJunkFirstFramePath) {
+function ae_importSequence(firstFramePath, fps, compStartTime, hideSource, lockHandleJson, ckMatteFirstFramePath, sourceFsName, samJunkFirstFramePath) {
     try {
         // GENERATION TRIPWIRE (2026-06-05): host.jsx loads ONCE per AE session while the
         // panel reloads per open — a stale engine silently drops trailing args (the lock
         // bug). Surface the arg count so version skew shows up as data, never silence.
         var _argc = arguments.length;
-        if (_argc < 11) return JSON.stringify({ ok: false,
-            error: "HOST SCRIPT STALE: ae_importSequence got " + _argc + "/11 args — restart After Effects fully (host.jsx engine is from an older session)." });
+        if (_argc < 8) return JSON.stringify({ ok: false,
+            error: "HOST SCRIPT STALE: ae_importSequence got " + _argc + "/8 args — restart After Effects fully (host.jsx engine is from an older session)." });
         // LAYER LOCK resolution: (a) handle index, (b) handle re-find by source, (c) selection,
         // (d) project-wide scan by source path — the render KNOWS which file it keyed, so even
         // with no lock handle and nothing selected/focused the import still finds its clip
@@ -395,13 +395,6 @@ function ae_importSequence(firstFramePath, fps, compStartTime, hideSource, samFi
         importOptions.sequence = true;
         var importedSeq = app.project.importFile(importOptions);
 
-        var samImported = null;
-        if (samFirstFramePath) {
-            try {
-                var samFirst = new File(String(samFirstFramePath));
-                if (samFirst.exists) { var samOpts = new ImportOptions(samFirst); samOpts.sequence = true; samImported = app.project.importFile(samOpts); }
-            } catch (eSam) {}
-        }
         var ckMatteImported = null;
         if (ckMatteFirstFramePath) {
             try {
@@ -416,24 +409,9 @@ function ae_importSequence(firstFramePath, fps, compStartTime, hideSource, samFi
                 if (sjFirst.exists) { var sjOpts = new ImportOptions(sjFirst); sjOpts.sequence = true; samJunkImported = app.project.importFile(sjOpts); }
             } catch (eSj) {}
         }
-        var fgSeq = null, fmSeq = null, pairImported = null;
-        if (finalMatteFirstFramePath && ckRgbFirstFramePath) {
-            try {
-                var fmFirst = new File(String(finalMatteFirstFramePath));
-                var fgFirst = new File(String(ckRgbFirstFramePath));
-                if (fmFirst.exists && fgFirst.exists) {
-                    var fgOpts = new ImportOptions(fgFirst); fgOpts.sequence = true; fgSeq = app.project.importFile(fgOpts);
-                    var fmOpts = new ImportOptions(fmFirst); fmOpts.sequence = true; fmSeq = app.project.importFile(fmOpts);
-                }
-            } catch (ePair) {}
-        }
-
         // Conform frame rates.
         if (importedSeq) importedSeq.mainSource.conformFrameRate = Number(fps);
-        if (samImported) samImported.mainSource.conformFrameRate = Number(fps);
         if (ckMatteImported) ckMatteImported.mainSource.conformFrameRate = Number(fps);
-        if (fgSeq) fgSeq.mainSource.conformFrameRate = Number(fps);
-        if (fmSeq) fmSeq.mainSource.conformFrameRate = Number(fps);
         if (samJunkImported) samJunkImported.mainSource.conformFrameRate = Number(fps);
 
         // Create a dedicated precomp for all CK layers so the main comp gets ONE
@@ -442,35 +420,14 @@ function ae_importSequence(firstFramePath, fps, compStartTime, hideSource, samFi
         var ckCompDuration = (comp.workAreaDuration > 0) ? comp.workAreaDuration : comp.duration;
         var ckComp = app.project.items.addComp("CK " + srcName, comp.width, comp.height, comp.pixelAspect, ckCompDuration, comp.frameRate);
 
-        // Add layers to precomp in reverse final-stack order — each layers.add() inserts
-        // at position 1 (top), so adding bottom-first produces the right top-to-bottom order.
-        // Final stack top→bottom: SAM | CK MATTE | CK FINAL MATTE (matte) | CK FG | keyed clip.
-        var _warnings = [];  // collect non-fatal layer errors so ok:true still fires on partial success
+        // Add layers in reverse stack order — each layers.add() inserts at pos 1.
+        // Final stack top→bottom: SAM JUNK MASK | CK MATTE | keyed clip.
+        var _warnings = [];
         var ckLayer = null;
         if (importedSeq) {
             ckLayer = ckComp.layers.add(importedSeq);
             ckLayer.name = "CK KEY";
             ckLayer.startTime = 0;
-        }
-        var fgLayer = null, fmLayer = null;
-        if (fgSeq && fmSeq) {
-            try {
-                fgLayer = ckComp.layers.add(fgSeq);
-                fgLayer.name = "CK FG (paint pair)";
-                fgLayer.startTime = 0;
-                fmLayer = ckComp.layers.add(fmSeq);
-                fmLayer.name = "CK FINAL MATTE (paint here)";
-                fmLayer.startTime = 0;
-                // fmLayer is now at pos 1 directly above fgLayer at pos 2 — correct adjacency for track matte.
-                if (typeof fgLayer.setTrackMatte === "function") {
-                    fgLayer.setTrackMatte(fmLayer, TrackMatteType.LUMA);
-                } else {
-                    fgLayer.trackMatteType = TrackMatteType.LUMA;
-                }
-                fmLayer.enabled = false;
-                fgLayer.enabled = false;
-                pairImported = true;
-            } catch (ePair) { _warnings.push("pair layers: " + String(ePair)); }
         }
         if (ckMatteImported) {
             try {
@@ -478,13 +435,6 @@ function ae_importSequence(firstFramePath, fps, compStartTime, hideSource, samFi
                 ckmLayer.name = "CK MATTE";
                 ckmLayer.startTime = 0;
             } catch (eCkm) { _warnings.push("CK matte layer: " + String(eCkm)); }
-        }
-        if (samImported) {
-            try {
-                var samLayer = ckComp.layers.add(samImported);
-                samLayer.name = "CK SAM";
-                samLayer.startTime = 0;
-            } catch (eSam) { _warnings.push("SAM layer: " + String(eSam)); }
         }
         if (samJunkImported) {
             try {
@@ -526,7 +476,7 @@ function ae_importSequence(firstFramePath, fps, compStartTime, hideSource, samFi
         }
         app.endUndoGroup();
         comp.time = comp.time;
-        return JSON.stringify({ ok: true, samImported: !!samImported, ckMatteImported: !!ckMatteImported, pairImported: !!pairImported, samJunkImported: !!samJunkImported, via: via, warnings: _warnings.length ? _warnings : undefined });
+        return JSON.stringify({ ok: true, ckMatteImported: !!ckMatteImported, samJunkImported: !!samJunkImported, via: via, warnings: _warnings.length ? _warnings : undefined });
     } catch (e) { return JSON.stringify({ ok: false, error: String(e) }); }
 }
 

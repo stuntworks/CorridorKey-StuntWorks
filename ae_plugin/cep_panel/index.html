@@ -3451,35 +3451,21 @@ function doCommit() {
                 // No result file at all = Python died before writing the summary — incomplete.
                 return finish('Render produced no completion record — not importing. Re-render.', true);
             }
-            const samFirst = path.join(outDir, 'sam_mattes', 'sam_00000.png');
-            const samSidecar = fs.existsSync(samFirst) ? samFirst : null;
-            // Advanced masks: CK's own raw NN matte (written every render by the engine's
-            // CK_ALPHA sidecar pass) imported as a layer too, so the operator can choose
-            // per shot whether CK's matte or SAM's matte drives the comp (Berto 2026-06-04).
             const ckMatteFirst = path.join(outDir, 'CK_ALPHA', 'CK_ALPHA_00000.png');
             const ckMatteSidecar = fs.existsSync(ckMatteFirst) ? ckMatteFirst : null;
-            // Paintable pair (Berto 2026-06-06): FINAL matte (exact matte the keyed clip
-            // used, mattes/ folder) + straight FG plate (CK_RGB) — imported as a luma
-            // track-matte pair so painting on the matte erases junk live in the comp.
-            const finalMatteFirst = path.join(outDir, 'mattes', 'matte_00000.png');
-            const finalMatteSidecar = fs.existsSync(finalMatteFirst) ? finalMatteFirst : null;
-            const ckRgbFirst = path.join(outDir, 'CK_RGB', 'CK_RGB_00000.png');
-            const ckRgbSidecar = fs.existsSync(ckRgbFirst) ? ckRgbFirst : null;
             // SAM JUNK MASK sidecar — inverted SAM mask written by ae_processor when SAM active.
             const samJunkFirst = path.join(outDir, 'SAM_JUNK', 'SAM_JUNK_00000.png');
             const samJunkSidecar = fs.existsSync(samJunkFirst) ? samJunkFirst : null;
             const importFn = HOST_APP === 'ppro' ? 'ppro_importSequence' : 'ae_importSequence';
             const importArgs = HOST_APP === 'ppro'
-                ? [firstFrame, info.inPointSeconds, info.fps, info.sourceFrameRate || info.fps, samSidecar]
-                : [firstFrame, info.fps, info.compStartTime, true, samSidecar, ckLockJson, ckMatteSidecar, info.sourceFile, finalMatteSidecar, ckRgbSidecar, samJunkSidecar];   // LAYER LOCK + CK matte + source-scan + paintable pair + SAM junk mask
+                ? [firstFrame, info.inPointSeconds, info.fps, info.sourceFrameRate || info.fps, null]
+                : [firstFrame, info.fps, info.compStartTime, true, ckLockJson, ckMatteSidecar, info.sourceFile, samJunkSidecar];   // merged clip + CK matte + SAM junk mask
             ckStatus('Placing on timeline...');
             jsxCall(importFn, importArgs, (imp) => {
                 if (!imp || !imp.ok) return finish('Import failed: ' + (imp && imp.error ? imp.error : 'unknown'), true);
                 if (imp.via) ckLog('commit: import target resolved via ' + imp.via);   // LAYER LOCK diagnostic
                 const extras = [];
-                if (samSidecar) extras.push('SAM matte');
                 if (imp.ckMatteImported) extras.push('CK matte');
-                if (imp.pairImported) extras.push('paint pair');
                 if (imp.samJunkImported) extras.push('SAM junk mask');
                 finish('Done. Keyed clip on your timeline' + (extras.length ? ' (+ ' + extras.join(' + ') + ')' : '') + '.');
             });

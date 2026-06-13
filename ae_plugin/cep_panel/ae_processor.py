@@ -774,76 +774,36 @@ def _atomic_imwrite(path, img, params=None):
 #   (16-bit) plus a per-folder <name>_00000.png dummy on the first written frame.
 # GUARDED: any failure is logged as CK_WARN: and swallowed — a sidecar fault must
 #   never crash the main key (matches the loud-fallback pattern in cmd_batch).
-def _write_fusion_sidecars(fg, ck_alpha, ck_combined, sam_union,
-                           settings, out_dir, seq_num, is_first,
-                           fg_despill_done=False):
-    """Write CK_RGB / CK_COMBINED / CK_ALPHA / SAM_ALPHA sidecars for one frame.
+def _write_fusion_sidecars(ck_alpha, sam_union,
+                           settings, out_dir, seq_num, is_first):
+    """Write CK_ALPHA + SAM_JUNK sidecars for one frame (the two matte deliverables).
 
-    fg              : float32 RGB 0..1 (NN foreground)
-    ck_alpha        : float32 mono 0..1 (RAW CK neural-net alpha)
-    ck_combined     : float32 mono 0..1 (CK x SAM merged matte) or None
-    sam_union       : float32 mono 0..1 (SAM2 soft silhouette) or None
-    fg_despill_done : True when the caller already despilled fg (cmd_batch despills
-                      inline so CK_RGB matches the main export) — skips re-despill.
-    All written as 16-bit PNG. Mattes are written 3-channel (Fusion / numbered-stills
-    importers treat single-channel PNGs as masks with no RGB data).
+    ck_alpha  : float32 mono 0..1 (RAW CK neural-net alpha)
+    sam_union : float32 mono 0..1 (SAM2 soft silhouette) or None
+    CK_ALPHA is written 16-bit 3-channel. SAM_JUNK is uint8 (white=junk, black=body).
     """
     import cv2, numpy as np
 
-    def _to_3ch_16(mono):
-        m16 = (np.clip(mono, 0.0, 1.0) * 65535.0).astype(np.uint16)
-        return cv2.merge([m16, m16, m16])
-
-    def _write(folder_name, file_stem, img16):
+    def _write(folder_name, file_stem, img):
         sub = out_dir / folder_name
         sub.mkdir(parents=True, exist_ok=True)
-        _atomic_imwrite(sub / f"{file_stem}_{seq_num:05d}.png", img16)
-        # Dummy 00000 — host's numbered-stills importer silently drops the first
-        # frame, so seed each folder with a copy on the first written frame.
+        _atomic_imwrite(sub / f"{file_stem}_{seq_num:05d}.png", img)
         if is_first:
-            _atomic_imwrite(sub / f"{file_stem}_00000.png", img16)
+            _atomic_imwrite(sub / f"{file_stem}_00000.png", img)
 
     try:
-        # 1. CK_RGB — NN foreground with despill (same as the main Track-2 export).
-        if fg is not None:
-            fg_clean = np.clip(fg, 0.0, 1.0).copy()
-            _despill_str = float(settings.get("despill", 0.5))
-            if _despill_str > 0 and not fg_despill_done:
-                try:
-                    from CorridorKeyModule.core import color_utils as _cu_sc
-                    fg_clean = _cu_sc.despill_opencv(
-                        fg_clean, green_limit_mode="average", strength=_despill_str)
-                except Exception:
-                    pass
-            # Re-clip AFTER despill: despill adds spill*0.5 back to R/B and can push
-            # a bright spill pixel past 1.0 — the uint16 cast would wrap it into a
-            # bright speck (main export path clips post-despill; this path must too).
-            fg_16 = (np.clip(fg_clean, 0.0, 1.0) * 65535.0).astype(np.uint16)
-            fg_16 = cv2.cvtColor(fg_16, cv2.COLOR_RGB2BGR)
-            _write("CK_RGB", "CK_RGB", fg_16)
-
-        # 2. CK_COMBINED — CK x SAM merged matte (the "clean key" the viewer signed off).
-        if ck_combined is not None:
-            m = ck_combined[:, :, 0] if ck_combined.ndim == 3 else ck_combined
-            _write("CK_COMBINED", "CK_COMBINED", _to_3ch_16(m))
-
-        # 3. CK_ALPHA — RAW CK neural-net alpha (un-merged, un-choked).
+        # 1. CK_ALPHA — RAW CK neural-net alpha (un-merged, un-choked). 16-bit 3-channel.
         if ck_alpha is not None:
             m = ck_alpha[:, :, 0] if ck_alpha.ndim == 3 else ck_alpha
-            _write("CK_ALPHA", "CK_ALPHA", _to_3ch_16(m))
+            m16 = (np.clip(m, 0.0, 1.0) * 65535.0).astype(np.uint16)
+            _write("CK_ALPHA", "CK_ALPHA", cv2.merge([m16, m16, m16]))
 
-        # 4. SAM_ALPHA — SAM2 body silhouette.
-        if sam_union is not None:
-            s = sam_union[:, :, 0] if sam_union.ndim == 3 else sam_union
-            _write("SAM_ALPHA", "SAM_ALPHA", _to_3ch_16(s))
-
-        # 5. SAM_JUNK — inverted SAM mask (uint8 0/255, white=junk to discard, black=body).
+        # 2. SAM_JUNK — inverted SAM mask (uint8 0/255, white=junk to discard, black=body).
         #    AE layer named 'SAM JUNK MASK' with Simple Choker buffer — see host.jsx.
         if sam_union is not None:
             s_2d = sam_union[:, :, 0] if sam_union.ndim == 3 else sam_union
             junk_u8 = ((1.0 - np.clip(s_2d, 0.0, 1.0)) * 255.0).astype(np.uint8)
-            junk_3ch = cv2.merge([junk_u8, junk_u8, junk_u8])
-            _write("SAM_JUNK", "SAM_JUNK", junk_3ch)
+            _write("SAM_JUNK", "SAM_JUNK", cv2.merge([junk_u8, junk_u8, junk_u8]))
     except Exception as _sc_err:
         print(f"CK_WARN: named sidecar pass failed on frame {seq_num} "
               f"(main key unaffected): {_sc_err}", flush=True)
@@ -1183,20 +1143,6 @@ def cmd_batch(source_video, output_folder, settings,
                 settings['zone_anchor_bbox'] = [_zb_x0, _zb_y0, _zb_x1 - _zb_x0 + 1, _zb_y1 - _zb_y0 + 1]
                 log.info(f"zone_anchor_bbox derived from SAM anchor: {settings['zone_anchor_bbox']}")
 
-    # Sidecar dir is created up front so the dummy-first-frame write never
-    # races a missing parent. Empty dir is cheap; gets removed by the caller
-    # if no SAM points were active and no files were ever written.
-    sam_dir = out_dir / "sam_mattes" if sam_active else None
-    if sam_dir is not None:
-        sam_dir.mkdir(parents=True, exist_ok=True)
-        # process_sam_matte lives in the engine root; it is on sys.path already.
-        # Option C — feed soft mask straight in; no binarise step.
-        from corridorkey_sam_merge import process_sam_matte
-
-    garbage_dir = out_dir / "garbage_mattes" if sam_active else None
-    if garbage_dir is not None:
-        garbage_dir.mkdir(parents=True, exist_ok=True)
-
     # CK_COMBINED merge: when a per-frame SAM mask exists, combine the RAW CK alpha
     # with the soft SAM silhouette via the SAME dispatcher DaVinci uses
     # (merge_ck_with_sam_active -> garbage_matte mode). This is what makes the AE key
@@ -1336,49 +1282,15 @@ def cmd_batch(source_video, output_folder, settings,
                             _zone_mask = _zone_cut_from_sam(
                                 (_sz > 0.5).astype(np.uint8), settings, _w_z, _h_z, _w_z / 1920.0)
                             alpha = np.clip(alpha * _zone_mask, 0.0, 1.0)
-                alpha_combined = alpha.copy()
                 alpha = apply_choke(alpha, settings)
                 alpha = apply_despeckle(alpha, settings)
                 fg = apply_despill(fg, settings)
                 fg_uint16 = (np.clip(fg, 0, 1) * 65535).astype(np.uint16)
                 alpha_uint16 = (np.clip(alpha, 0, 1) * 65535).astype(np.uint16)
-                alpha_uint8  = (np.clip(alpha_raw, 0, 1) * 255).astype(np.uint8)
                 fg_bgr = cv2.cvtColor(fg_uint16, cv2.COLOR_RGB2BGR)
                 out_bgra = cv2.merge([fg_bgr[:, :, 0], fg_bgr[:, :, 1], fg_bgr[:, :, 2], alpha_uint16])
                 _atomic_imwrite(out_dir / f"output_{seq_num:05d}.png", out_bgra)
-                # output_tight — despilled RGB + alpha_raw × tightly-feathered binary SAM.
-                # No buffer/escape zone (proximity_px=0 behaviour). Only written when SAM
-                # has a mask for this frame — no SAM means output_ == plain CK already.
-                _sm_tight = sam_video_masks.get(seq_num)
-                if _sm_tight is not None:
-                    try:
-                        _tw = alpha_raw.shape[1]
-                        if _sm_tight.shape[:2] != alpha_raw.shape[:2]:
-                            _sm_tight = cv2.resize(_sm_tight,
-                                                   (_tw, alpha_raw.shape[0]),
-                                                   interpolation=cv2.INTER_LINEAR)
-                        _smb = (_sm_tight > 0.5).astype(np.uint8)
-                        _smb = cv2.dilate(_smb,
-                                          cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
-                        _sigma_t = max(1.0, 1.5 * (_tw / 1920.0))
-                        _smb_f = cv2.GaussianBlur(_smb.astype(np.float32), (0, 0), _sigma_t)
-                        _tight_a16 = (np.clip(alpha_raw * _smb_f, 0, 1) * 65535).astype(np.uint16)
-                        _tight_bgra = cv2.merge([fg_bgr[:, :, 0], fg_bgr[:, :, 1],
-                                                 fg_bgr[:, :, 2], _tight_a16])
-                        _tight_dir = out_dir / "output_tight"
-                        _tight_dir.mkdir(parents=True, exist_ok=True)
-                        _atomic_imwrite(_tight_dir / f"output_tight_{seq_num:05d}.png", _tight_bgra)
-                        if processed == 0:
-                            _atomic_imwrite(_tight_dir / "output_tight_00000.png", _tight_bgra)
-                    except Exception as _te:
-                        log.warning(f"output_tight frame {frame_idx}: write failed: {_te}")
-                # Named sidecar passes (Editable Layers / Fusion-comp parity) — write
-                # CK_RGB/, CK_COMBINED/, CK_ALPHA/, SAM_ALPHA/ as separate 16-bit
-                # numbered-stills sequences. fg is already despilled here so we tell the
-                # writer not to re-despill. SAM silhouette is the per-frame soft mask
-                # (resized to alpha shape) when present. GUARDED inside _write_fusion_
-                # sidecars — a sidecar fault surfaces as CK_WARN: but never crashes the
-                # main key, matching the loud-fallback pattern below.
+                # Sidecar deliverables: CK_ALPHA (raw NN matte) + SAM_JUNK (inverted SAM mask).
                 _sam_for_sidecar = None
                 if seq_num in sam_video_masks:
                     _sam_for_sidecar = sam_video_masks[seq_num]
@@ -1389,84 +1301,9 @@ def cmd_batch(source_video, output_folder, settings,
                             interpolation=cv2.INTER_LINEAR,
                         )
                 _write_fusion_sidecars(
-                    fg, alpha_raw, alpha_combined, _sam_for_sidecar,
+                    alpha_raw, _sam_for_sidecar,
                     settings, out_dir, seq_num, is_first=(processed == 0),
-                    fg_despill_done=True,
                 )
-                # Matte goes into a SUBFOLDER so the main out_dir contains exactly one
-                # PNG pattern. Premiere's importAsNumberedStills auto-detects the range
-                # reliably only when the folder is clean.
-                matte_dir = out_dir / "mattes"
-                matte_dir.mkdir(parents=True, exist_ok=True)
-                _atomic_imwrite(matte_dir / f"matte_{seq_num:05d}.png", alpha_uint8)
-                # v1.0 SAM matte sidecar — one file per frame in sam_mattes/.
-                # uint8 PNG matches the CK matte's format so the host imports
-                # both as identical numbered-stills sequences.
-                if sam_dir is not None and seq_num in sam_video_masks:
-                    try:
-                        _gate_soft = sam_video_masks[seq_num]
-                        if _gate_soft.shape[:2] != alpha.shape[:2]:
-                            _gate_soft = cv2.resize(
-                                _gate_soft,
-                                (alpha.shape[1], alpha.shape[0]),
-                                interpolation=cv2.INTER_LINEAR,
-                            )
-                        # Option C — soft mask flows straight through; no
-                        # binarise step before process_sam_matte.
-                        _sam_processed = process_sam_matte(
-                            _gate_soft,
-                            margin_px=sam_margin,
-                            softness_sigma=sam_soften,
-                            fill_kernel_px=sam_fill,
-                        )
-                        _sam_erode_px = int(settings.get("sam_erode_px", 0))
-                        if _sam_erode_px > 0:
-                            _ek = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_sam_erode_px * 2 + 1, _sam_erode_px * 2 + 1))
-                            _sam_processed = cv2.erode((np.clip(_sam_processed, 0, 1) * 255).astype(np.uint8), _ek, iterations=1).astype(np.float32) / 255.0
-                        _sam_expand_px = int(settings.get("sam_expand_px", 0))
-                        if _sam_expand_px > 0:
-                            _ek2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_sam_expand_px * 2 + 1, _sam_expand_px * 2 + 1))
-                            _sam_processed = cv2.dilate((_sam_processed * 255).astype(np.uint8), _ek2, iterations=1).astype(np.float32) / 255.0
-                        _sam_u8 = (np.clip(_sam_processed, 0, 1) * 255).astype(np.uint8)
-                        _sam_rgba = np.zeros((_sam_u8.shape[0], _sam_u8.shape[1], 4), dtype=np.uint8)
-                        _sam_rgba[:, :, 0] = _sam_u8  # B = mask
-                        _sam_rgba[:, :, 1] = _sam_u8  # G
-                        _sam_rgba[:, :, 2] = _sam_u8  # R
-                        _sam_rgba[:, :, 3] = _sam_u8  # Alpha = mask
-                        _atomic_imwrite(sam_dir / f"sam_{seq_num:05d}.png", _sam_rgba)
-                        if processed == 0:
-                            _atomic_imwrite(sam_dir / "sam_00000.png", _sam_rgba)
-                        # ck_masked sidecar — despilled fg RGBA, alpha = alpha_raw * SAM
-                        try:
-                            ck_masked_dir = out_dir / "ck_masked"
-                            ck_masked_dir.mkdir(parents=True, exist_ok=True)
-                            _masked_alpha = np.clip(alpha_raw * _sam_processed, 0, 1)
-                            _cm_fg16 = (np.clip(fg, 0, 1) * 65535).astype(np.uint16)
-                            _cm_bgr = cv2.cvtColor(_cm_fg16, cv2.COLOR_RGB2BGR)
-                            _cm_a16 = (np.clip(_masked_alpha, 0, 1) * 65535).astype(np.uint16)
-                            _cm_rgba = cv2.merge([_cm_bgr[:, :, 0], _cm_bgr[:, :, 1], _cm_bgr[:, :, 2], _cm_a16])
-                            _atomic_imwrite(ck_masked_dir / f"ck_masked_{seq_num:05d}.png", _cm_rgba)
-                            if processed == 0:
-                                _atomic_imwrite(ck_masked_dir / "ck_masked_00000.png", _cm_rgba)
-                        except Exception as _cm_e:
-                            log.warning(f"ck_masked frame {frame_idx}: write failed: {_cm_e}")
-                    except Exception as _se:
-                        log.warning(f"SAM frame {frame_idx}: sidecar save failed: {_se}")
-                # garbage_matte sidecar — inverted garbage_gate so AE can use it
-                # directly as a junk-kill layer (white = region to discard).
-                if garbage_dir is not None and _garbage_gate is not None:
-                    try:
-                        _junk_u8 = ((1.0 - np.clip(_garbage_gate, 0, 1)) * 255).astype(np.uint8)
-                        _junk_rgba = np.zeros((_junk_u8.shape[0], _junk_u8.shape[1], 4), dtype=np.uint8)
-                        _junk_rgba[:, :, 0] = _junk_u8
-                        _junk_rgba[:, :, 1] = _junk_u8
-                        _junk_rgba[:, :, 2] = _junk_u8
-                        _junk_rgba[:, :, 3] = _junk_u8
-                        _atomic_imwrite(garbage_dir / f"garbage_{seq_num:05d}.png", _junk_rgba)
-                        if processed == 0:
-                            _atomic_imwrite(garbage_dir / "garbage_00000.png", _junk_rgba)
-                    except Exception as _ge:
-                        log.warning(f"garbage_matte frame {frame_idx}: write failed: {_ge}")
                 # Premiere Pro's sequence importer silently drops the first frame. Write
                 # a dummy output_00000.png (and matching matte) so the user's actual
                 # frame range survives the import intact.
@@ -1476,7 +1313,6 @@ def cmd_batch(source_video, output_folder, settings,
                 # FIX C's clean POS_FRAMES decode means frame 0 itself is no longer dirty.
                 if processed == 0:
                     _atomic_imwrite(out_dir / "output_00000.png", out_bgra)
-                    _atomic_imwrite(matte_dir / "matte_00000.png", alpha_uint8)
                 processed += 1
             except Exception as e:
                 failed.append(frame_idx)
