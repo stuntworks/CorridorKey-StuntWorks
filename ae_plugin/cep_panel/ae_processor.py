@@ -1267,6 +1267,11 @@ def cmd_batch(source_video, output_folder, settings,
                 # (later) the CK_ALPHA sidecar both need the un-choked matte.
                 alpha_raw = alpha.copy()
                 _sam_frame = sam_video_masks.get(seq_num)
+                # _garbage_gate is only produced by the experimental_recipe path;
+                # the GARBAGE sidecar write below guards on it. Default None or the
+                # fusion_v2/default paths crash every frame at the sidecar step
+                # (0/27 render bug, 2026-06-12).
+                _garbage_gate = None
                 if settings.get('experimental_recipe'):
                     alpha, _garbage_gate = apply_recipe_composite(
                         alpha_raw, _sam_frame, alpha.shape[1], settings)
