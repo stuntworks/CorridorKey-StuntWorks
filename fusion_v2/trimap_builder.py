@@ -48,15 +48,23 @@ def _get_sam_bbox(sam_bin: np.ndarray):
     sam_bin must be a 2-D uint8 array (0/nonzero).
     Returns OpenCV convention: x = left col, y = top row, w = width, h = height.
     """
-    rows_any = np.any(sam_bin, axis=1)
-    cols_any = np.any(sam_bin, axis=0)
-    if not rows_any.any():
+    if not np.any(sam_bin):
         return None
-    y_min = int(np.argmax(rows_any))
-    y_max = int(len(rows_any) - 1 - np.argmax(rows_any[::-1]))
-    x_min = int(np.argmax(cols_any))
-    x_max = int(len(cols_any) - 1 - np.argmax(cols_any[::-1]))
-    return (x_min, y_min, x_max - x_min + 1, y_max - y_min + 1)
+    # Measure the bbox from the LARGEST blob only (overnight review 2026-06-13).
+    # A single stray SAM pixel (reflection, dust, boom-mic glint) far from the
+    # actor would otherwise inflate the bbox to span the frame, exploding
+    # dilate_radius = dilate_pct * bh and swallowing the whole image — the actor
+    # vanishes. Largest-component bbox = the real body, specks discarded.
+    n_lbl, _lbl, stats, _ = cv2.connectedComponentsWithStats(
+        (sam_bin > 0).astype(np.uint8), connectivity=8)
+    if n_lbl <= 1:
+        return None
+    _main = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    x = int(stats[_main, cv2.CC_STAT_LEFT])
+    y = int(stats[_main, cv2.CC_STAT_TOP])
+    w = int(stats[_main, cv2.CC_STAT_WIDTH])
+    h = int(stats[_main, cv2.CC_STAT_HEIGHT])
+    return (x, y, w, h)
 
 
 # ---------------------------------------------------------------------------
