@@ -591,15 +591,23 @@ def _hybrid_solve(
                                    (W, H), interpolation=cv2.INTER_NEAREST)
             else:
                 _reg  = np.ones((H, W), dtype=np.uint8)  # no green found: keep CK (safe fallback)
-            # Gate: only the narrow above-head zone (y < y_min + margin_r).
-            # This is where the dark junk wedge lives: within the trimap unknown band
-            # (dilated ~6% above y_min) but above where the actor's head begins.
-            # Do NOT extend to the full hair zone -- actor edge pixels at the
-            # shoulder/arm level (outside the 5.5% sam_room but inside the body
-            # zone) must not be killed.
-            _gate_top = min(hair_line, y_min + margin_r + 1)
+            # Gate: the FULL hair zone (top 35% of body bbox), widened from the
+            # old top-5.5% (Berto 2026-06-13, oracle root-cause). The narrow gate
+            # never reached the flying-frame wedge, which sits lower in the hair
+            # zone where the screen ends (studio ceiling / off-green). Widening is
+            # SAFE because the two guards below protect every real actor pixel:
+            #   _reg > 0      -> inside the green-screen region: flying hair kept.
+            #   sam_room > 0  -> inside SAM body + 5.5% margin: head/shoulders/arms
+            #                    kept (the exact shoulder/arm edge the old comment
+            #                    feared losing is inside sam_room, so it survives).
+            # Only pixels that are BOTH off-green AND outside the body margin get
+            # cut -- that is the wedge by definition. Cost: a dark wisp that is
+            # off-green AND detached from the body margin can be cut, but speckle-
+            # kill already drops those, and Berto ranks wedge-kill over theoretical
+            # wisps (see SPECKLE KILL note below).
+            _gate_top = hair_line
             _hgate = unknown_mask.copy()
-            _hgate[_gate_top:, :] = False    # only the above-head zone
+            _hgate[_gate_top:, :] = False    # hair zone only (top 35% of bbox)
             _hgate[_reg > 0]      = False    # in green screen: trust CK (flying hair)
             _hgate[sam_room > 0]  = False    # inside SAM head+margin: trust CK
             blended[_hgate] = (nn_f32 * sam_soft)[_hgate]

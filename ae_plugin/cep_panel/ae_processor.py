@@ -1264,6 +1264,13 @@ def cmd_batch(source_video, output_folder, settings,
                         _expand = int(settings.get("fusion_expand", 6))
                         _trimap_b = _build_trimap(_sam_bin_b, alpha_raw, dilate_pct=_expand / 100.0)
                         alpha = _solve_matte(_frame_u8_b, _trimap_b, alpha_raw, solver='hybrid', sam_binary=_sam_bin_b)
+                        # Shirt/harness rescue (Berto 2026-06-14): the fusion engine never
+                        # ported this step (DRIFT NOTE ~line 1159) — the OLD default path and
+                        # the DaVinci original both run it. Dark webbing/clothing (not green,
+                        # inside SAM body) is under-keyed by CK; this forces alpha=max(alpha,
+                        # SAM) there so the harness strap survives on the frames SAM keeps the
+                        # body. _sf_2d is the soft SAM silhouette already resized to alpha above.
+                        alpha = apply_shirt_rescue(alpha, _sf_2d, img_rgb, settings)
                         if settings.get('zone') and _sam_frame is not None:
                             _h_z, _w_z = alpha.shape[:2]
                             _sz = (_sam_frame if _sam_frame.shape[:2] == (_h_z, _w_z)
@@ -1299,6 +1306,19 @@ def cmd_batch(source_video, output_folder, settings,
                 fg_bgr = cv2.cvtColor(fg_uint16, cv2.COLOR_RGB2BGR)
                 out_bgra = cv2.merge([fg_bgr[:, :, 0], fg_bgr[:, :, 1], fg_bgr[:, :, 2], alpha_uint16])
                 _atomic_imwrite(out_dir / f"output_{seq_num:05d}.png", out_bgra)
+                # CK_ONLY keyed clip (Berto 2026-06-14): the CK key with NO SAM clip —
+                # full hair + all junk. SAM clips hair on the merged result; the user
+                # matte-boxes the head from THIS clip and lays it back over the merged
+                # key to restore the eaten hair. Despilled fg + RAW CK alpha (pre-fusion,
+                # un-choked), so it carries every wisp the merged output loses.
+                _ck_a = alpha_raw[:, :, 0] if alpha_raw.ndim == 3 else alpha_raw
+                _ck_a16 = (np.clip(_ck_a, 0, 1) * 65535).astype(np.uint16)
+                _ck_only_bgra = cv2.merge([fg_bgr[:, :, 0], fg_bgr[:, :, 1], fg_bgr[:, :, 2], _ck_a16])
+                _ck_only_dir = out_dir / "CK_ONLY"
+                _ck_only_dir.mkdir(parents=True, exist_ok=True)
+                _atomic_imwrite(_ck_only_dir / f"CK_ONLY_{seq_num:05d}.png", _ck_only_bgra)
+                if processed == 0:
+                    _atomic_imwrite(_ck_only_dir / "CK_ONLY_00000.png", _ck_only_bgra)
                 # Sidecar deliverables: CK_ALPHA (raw NN matte) + SAM_JUNK (inverted SAM mask).
                 _sam_for_sidecar = None
                 if seq_num in sam_video_masks:
@@ -1911,6 +1931,10 @@ def cmd_postproc(session_dir, output_path, settings, background="checker", v1_pa
             _expand = int(settings.get("fusion_expand", 6))
             _trimap_pp = _build_trimap(_sam_bin_pp, alpha, dilate_pct=_expand / 100.0)
             alpha = _solve_matte(_src_u8_pp, _trimap_pp, alpha, solver='hybrid', sam_binary=_sam_bin_pp)
+            # Shirt/harness rescue (Berto 2026-06-14): preview parity with the batch render
+            # fusion path — fill dark webbing/clothing CK under-keys so the harness strap
+            # shows in PREVIEW too, not just the final render. _sf_pp is the soft SAM resized.
+            alpha = apply_shirt_rescue(alpha, _sf_pp, _source_rgb, settings)
             alpha = apply_choke(alpha, settings)
             alpha = apply_despeckle(alpha, settings)
             fg_rgb = apply_despill(fg_rgb, settings)

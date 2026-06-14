@@ -570,7 +570,7 @@ function ck_addLayerMask(layerName, maskModeStr) {
 //   lockHandleJson        — layer lock handle JSON from ae_lockLayer
 //   advanced              — "true" = show matte layers; "false" = hide them
 function ae_createSAMPrecomp(mergedFirstFramePath, ckMatteFirstFramePath, samMatteFirstFramePath,
-                              fps, compStartTime, sourceFsName, lockHandleJson, advanced) {
+                              fps, compStartTime, sourceFsName, lockHandleJson, advanced, ckOnlyFirstFramePath) {
     try {
         var isAdvanced = (String(advanced) === "true");
         var activeComp = app.project.activeItem;
@@ -631,25 +631,37 @@ function ae_createSAMPrecomp(mergedFirstFramePath, ckMatteFirstFramePath, samMat
             } catch (eSam) {}
         }
 
+        // CK_ONLY (Berto 2026-06-14): the CK key alone (full hair + junk, no SAM clip),
+        // RGBA. For the hair-rescue workflow — matte-box the head, lay over CK MERGED.
+        var ckOnlySeq = null;
+        if (ckOnlyFirstFramePath) {
+            try {
+                var ckoFile = new File(String(ckOnlyFirstFramePath));
+                if (ckoFile.exists) {
+                    var ckoOpts = new ImportOptions(ckoFile); ckoOpts.sequence = true;
+                    ckOnlySeq = app.project.importFile(ckoOpts);
+                    ckOnlySeq.mainSource.conformFrameRate = Number(fps);
+                }
+            } catch (eCko) {}
+        }
+
         // Create precomp
         var srcName = (layer.source && layer.source.name) ? layer.source.name.replace(/\.[^.]+$/, '') : layer.name;
         var ckCompDuration = (comp.workAreaDuration > 0) ? comp.workAreaDuration : comp.duration;
         var ckComp = app.project.items.addComp("CK Comp " + srcName, comp.width, comp.height, comp.pixelAspect, ckCompDuration, comp.frameRate);
 
-        // Add in reverse stack order (each add() inserts at top).
-        // Desired top→bottom: CK MERGED | CK MATTE | SAM MATTE
-        // So add: SAM MATTE first, then CK MATTE, then CK MERGED.
-        if (samMatteSeq) {
-            try {
-                var samLayer = ckComp.layers.add(samMatteSeq);
-                samLayer.name = "SAM MATTE";
-                samLayer.startTime = 0;
-                samLayer.enabled = false;
-            } catch (esl) {}
-        }
+        // Build the exact compositing stack Berto locked (2026-06-14), matching the
+        // DaVinci CorridorKey recipe in AE terms.  Top→bottom:
+        //   CK FULL (hair rescue) | SAM MATTE | CK MERGED | CK MATTE
+        // SAM MATTE drives BOTH CK MERGED and CK FULL as a LUMA-INVERTED track matte
+        // (SAM_JUNK is white=junk, so inverted = keep body / kill junk — same multiply
+        // as DaVinci's ck_alpha * garbage_matte). CK FULL also gets a Simple Choker.
+        // The per-shot tracked Mask Paths (foot/butt-strap/hair saves) stay MANUAL —
+        // they follow each shot's unique motion and cannot be pre-baked (DaVinci can't
+        // either). Add order is reverse: each layers.add() inserts at index 1 (top).
         if (ckMatteSeq) {
             try {
-                var ckmLayer = ckComp.layers.add(ckMatteSeq);
+                var ckmLayer = ckComp.layers.add(ckMatteSeq);   // bottom — parked, optional
                 ckmLayer.name = "CK MATTE";
                 ckmLayer.startTime = 0;
                 ckmLayer.enabled = false;
@@ -658,7 +670,45 @@ function ae_createSAMPrecomp(mergedFirstFramePath, ckMatteFirstFramePath, samMat
         var mergedLayer = ckComp.layers.add(mergedSeq);
         mergedLayer.name = "CK MERGED";
         mergedLayer.startTime = 0;
-        mergedLayer.trackMatteType = TrackMatteType.ALPHA;
+        var samLayer = null;
+        if (samMatteSeq) {
+            try {
+                samLayer = ckComp.layers.add(samMatteSeq);      // directly above CK MERGED
+                samLayer.name = "SAM MATTE";
+                samLayer.startTime = 0;
+            } catch (esl) {}
+        }
+        var ckoLayer = null;
+        if (ckOnlySeq) {
+            try {
+                ckoLayer = ckComp.layers.add(ckOnlySeq);        // top
+                ckoLayer.name = "CK FULL (hair rescue)";
+                ckoLayer.startTime = 0;
+                // Disabled by default: full-frame it would re-clip the hair (SAM matte)
+                // and just shadow CK MERGED. Enable it + draw a head/hair mask per shot.
+                ckoLayer.enabled = false;
+                try {
+                    var ckoChoke = ckoLayer.property("ADBE Effect Parade").addProperty("ADBE Simple Choker");
+                    ckoChoke.property("Choke Matte").setValue(0);   // neutral; tune per shot
+                } catch (eChoke) {}
+            } catch (ecko2) {}
+        }
+
+        // Wire SAM MATTE as a LUMA-INVERTED garbage matte on BOTH CK MERGED and CK FULL.
+        // Prefer the modern setTrackMatte API (AE 2023+) so one SAM layer feeds two
+        // targets without a duplicate. Fall back to the adjacency-based trackMatteType
+        // for CK MERGED (SAM sits directly above it) if setTrackMatte is missing.
+        if (samLayer) {
+            var _lumaInv = TrackMatteType.LUMA_INVERTED;
+            try {
+                if (typeof mergedLayer.setTrackMatte === "function") {
+                    mergedLayer.setTrackMatte(samLayer, _lumaInv);
+                    if (ckoLayer) ckoLayer.setTrackMatte(samLayer, _lumaInv);
+                } else {
+                    mergedLayer.trackMatteType = _lumaInv;   // SAM is directly above CK MERGED
+                }
+            } catch (etm) {}
+        }
 
         // Drop precomp in main comp above source, hide source
         var precompLayer = comp.layers.add(ckComp);

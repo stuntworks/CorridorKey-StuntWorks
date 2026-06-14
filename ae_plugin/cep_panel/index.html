@@ -1900,10 +1900,17 @@
 
   const fusionV2Btn = document.getElementById('fusionV2');
   if (fusionV2Btn) {
-    // Restore persisted state (global, not per-clip -- survives panel reopen)
+    // Restore persisted state (global, not per-clip -- survives panel reopen).
+    // DEFAULT ON (Berto 2026-06-13): Fusion V2 is the engine now. Off-by-default
+    // kept trapping him into rendering the OLD keyer (no gate, no garbage masks)
+    // while believing he tested the new one — same footgun as the invisible-toggle
+    // note below. Only an EXPLICIT saved 'false' keeps it off; unset -> ON + persist.
     var _fv2Saved = localStorage.getItem('ck_global_fusion_v2');
     if (_fv2Saved === 'true' || _fv2Saved === 'false') {
       fusionV2Btn.setAttribute('aria-pressed', _fv2Saved);
+    } else {
+      fusionV2Btn.setAttribute('aria-pressed', 'true');
+      localStorage.setItem('ck_global_fusion_v2', 'true');
     }
     function _ckApplyFusionFaderState() {
       var isOn = fusionV2Btn.getAttribute('aria-pressed') === 'true';
@@ -3703,10 +3710,27 @@ function doSAMCommit(advanced) {
             } catch (_brErr) {
                 return finish('Render produced no completion record — not importing. Re-render.', true);
             }
-            const ckMatteFirst = path.join(outDir, 'mattes', 'matte_00000.png');
-            const ckMattePath = fs.existsSync(ckMatteFirst) ? ckMatteFirst : null;
-            const samMatteFirst = path.join(outDir, 'sam_mattes', 'sam_00000.png');
-            const samMattePath = fs.existsSync(samMatteFirst) ? samMatteFirst : null;
+            // Fusion v2 sidecars (Berto 2026-06-13 fix): the batch render writes
+            // CK_ALPHA/ + SAM_JUNK/ (white=junk garbage matte). The OLD garbage-matte
+            // pipeline wrote mattes/matte_NNNNN.png + sam_mattes/sam_NNNNN.png, which
+            // never exist in a fusion render — so SAM Commit imported the merged clip
+            // only and the precomp came in empty of mattes. Read the fusion folders,
+            // with the same _00000-anchor-then-first-file fallback as doCommit.
+            const _ckAlphaDir = path.join(outDir, 'CK_ALPHA');
+            const _ckAnchor = path.join(_ckAlphaDir, 'CK_ALPHA_00000.png');
+            const ckMattePath = fs.existsSync(_ckAnchor) ? _ckAnchor
+                : (() => { try { const _ff = fs.readdirSync(_ckAlphaDir).filter(n => n.startsWith('CK_ALPHA_') && n.endsWith('.png')).sort(); return _ff.length ? path.join(_ckAlphaDir, _ff[0]) : null; } catch(_) { return null; } })();
+            const _samJunkDir = path.join(outDir, 'SAM_JUNK');
+            const _sjAnchor = path.join(_samJunkDir, 'SAM_JUNK_00000.png');
+            const samMattePath = fs.existsSync(_sjAnchor) ? _sjAnchor
+                : (() => { try { const _ff = fs.readdirSync(_samJunkDir).filter(n => n.startsWith('SAM_JUNK_') && n.endsWith('.png')).sort(); return _ff.length ? path.join(_samJunkDir, _ff[0]) : null; } catch(_) { return null; } })();
+            // CK_ONLY (Berto 2026-06-14): the CK key alone (full hair + junk, no SAM clip),
+            // RGBA. User matte-boxes the head from this and lays it over the merged key to
+            // recover hair SAM ate. Imported as a hidden layer in the precomp.
+            const _ckOnlyDir = path.join(outDir, 'CK_ONLY');
+            const _ckOnlyAnchor = path.join(_ckOnlyDir, 'CK_ONLY_00000.png');
+            const ckOnlyPath = fs.existsSync(_ckOnlyAnchor) ? _ckOnlyAnchor
+                : (() => { try { const _ff = fs.readdirSync(_ckOnlyDir).filter(n => n.startsWith('CK_ONLY_') && n.endsWith('.png')).sort(); return _ff.length ? path.join(_ckOnlyDir, _ff[0]) : null; } catch(_) { return null; } })();
             ckStatus('Building precomp...');
             if (HOST_APP === 'ppro') {
                 jsxCall('ppro_importSequence', [
@@ -3720,7 +3744,7 @@ function doSAMCommit(advanced) {
             jsxCall('ae_createSAMPrecomp', [
                 firstFrame, ckMattePath, samMattePath,
                 info.fps, info.compStartTime,
-                info.sourceFile, ckLockJson, String(isAdvanced)
+                info.sourceFile, ckLockJson, String(isAdvanced), ckOnlyPath
             ], (imp) => {
                 if (!imp || !imp.ok) return finish('Precomp failed: ' + (imp && imp.error ? imp.error : 'unknown'), true);
                 if (imp.via) ckLog('samCommit: layer resolved via ' + imp.via);
