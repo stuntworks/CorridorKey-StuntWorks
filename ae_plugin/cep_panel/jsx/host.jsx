@@ -554,25 +554,33 @@ function ck_addLayerMask(layerName, maskModeStr) {
 // ============================================================
 // SAM PRECOMP — create 3-layer precomp from CK+SAM render
 // ============================================================
-// WHAT IT DOES: Imports the merged CK+SAM result + two B&W matte sequences and
-//   wraps them in a precomp "CK Comp [clip name]" placed above the source layer.
-//   Layer stack top→bottom: CK MERGED | CK MATTE | SAM MATTE.
-//   In basic mode the matte layers are hidden (enabled=false); in advanced they
-//   stay visible so the user can inspect or paint on them.
+// WHAT IT DOES: Imports the merged CK+SAM result + matte sequences + the CK FULL clip
+//   and wraps them in a precomp "CK Comp [clip name]" placed above the source layer.
+//   Layer stack top→bottom: CK FULL (hair rescue) | SAM MATTE | CK MERGED | CK MATTE.
+//   SAM MATTE drives CK FULL and CK MERGED as luma-inverted garbage mattes.
 // WHEN TO CALL: after a SAM batch render finishes (doSAMCommit in index.html).
-// ARGS:
-//   mergedFirstFramePath  — path to output_00001.png (CK+SAM merged BGRA)
-//   ckMatteFirstFramePath — path to mattes/output_matte_00001.png (CK B&W)
-//   samMatteFirstFramePath— path to sam_mattes/output_sam_00001.png (SAM B&W)
+// ARGS (paths corrected 2026-06-14 — old comments said mattes/ + sam_mattes/, wrong):
+//   mergedFirstFramePath  — path to output_00000.png (CK+SAM merged BGRA)
+//   ckMatteFirstFramePath — path to CK_ALPHA/CK_ALPHA_00000.png (raw CK alpha B&W)
+//   samMatteFirstFramePath— path to GARBAGE_MATTE/ (green-aware) or SAM_JUNK/ (fallback), white=junk
 //   fps                   — clip frame rate
 //   compStartTime         — start time in main comp (seconds)
 //   sourceFsName          — source file fsName for layer-lock fallback
 //   lockHandleJson        — layer lock handle JSON from ae_lockLayer
 //   advanced              — "true" = show matte layers; "false" = hide them
+//   ckOnlyFirstFramePath  — path to CK_ONLY/CK_ONLY_00000.png (full-hair CK clip)
 function ae_createSAMPrecomp(mergedFirstFramePath, ckMatteFirstFramePath, samMatteFirstFramePath,
                               fps, compStartTime, sourceFsName, lockHandleJson, advanced, ckOnlyFirstFramePath) {
     try {
         var isAdvanced = (String(advanced) === "true");
+        var _warnings = [];
+        // Version tripwire (audit 2026-06-14): this function gained a 9th arg
+        // (ckOnlyFirstFramePath). If AE is running a STALE host.jsx (panel reloaded
+        // but AE not fully restarted), the 9th arg arrives undefined and CK FULL goes
+        // missing with no error. Surface it so the operator knows to restart AE.
+        if (typeof ckOnlyFirstFramePath === "undefined") {
+            _warnings.push("Stale host.jsx (no CK FULL arg) — fully quit + relaunch AE to load the current import code.");
+        }
         var activeComp = app.project.activeItem;
         var res = ck_resolveLockedLayer((activeComp instanceof CompItem) ? activeComp : null, lockHandleJson);
         var comp = res.comp, layer = res.layer, via = res.via;
@@ -705,9 +713,17 @@ function ae_createSAMPrecomp(mergedFirstFramePath, ckMatteFirstFramePath, samMat
                     mergedLayer.setTrackMatte(samLayer, _lumaInv);
                     if (ckoLayer) ckoLayer.setTrackMatte(samLayer, _lumaInv);
                 } else {
-                    mergedLayer.trackMatteType = _lumaInv;   // SAM is directly above CK MERGED
+                    // Pre-2023 AE: no setTrackMatte. Adjacency only wires CK MERGED
+                    // (SAM sits directly above it); CK FULL can't share one matte here.
+                    mergedLayer.trackMatteType = _lumaInv;
+                    _warnings.push("Old AE: setTrackMatte missing — CK FULL has no garbage matte (wire it by hand).");
                 }
-            } catch (etm) {}
+            } catch (etm) {
+                // Was a silent catch (audit 2026-06-14): a track-matte failure used to
+                // leave the layer unmatted with NO error. Surface it instead.
+                _warnings.push("setTrackMatte failed: " + String(etm));
+                try { $.writeln("CK setTrackMatte error: " + etm); } catch (_w) {}
+            }
         }
 
         // Drop precomp in main comp above source, hide source
@@ -719,7 +735,8 @@ function ae_createSAMPrecomp(mergedFirstFramePath, ckMatteFirstFramePath, samMat
         app.endUndoGroup();
         comp.time = comp.time;
         return JSON.stringify({ ok: true, compName: ckComp.name, advanced: isAdvanced,
-            ckMatte: !!ckMatteSeq, samMatte: !!samMatteSeq, via: via });
+            ckMatte: !!ckMatteSeq, samMatte: !!samMatteSeq, ckFull: !!ckoLayer, via: via,
+            warnings: _warnings.length ? _warnings : undefined });
     } catch (e) { return JSON.stringify({ ok: false, error: String(e) }); }
 }
 

@@ -5,13 +5,13 @@
 #     alpha = W * nn_alpha + (1 - W) * vitmatte_alpha
 #   W is a per-pixel binary map derived from BAND_MODE (see constant below).
 #
-#   BAND_MODE = 'geometric'  (ACTIVE -- Berto verdict 2026-06-12):
-#     W=1 (CK rules)  -- unknown pixel OUTSIDE the SAM binary silhouette.
-#                        Outer edge ring: hair, wisps, fine detail. CK owns it.
-#     W=0 (ViTMatte)  -- unknown pixel INSIDE the SAM binary silhouette.
-#                        Interior holes (eaten-butt class). ViTMatte fills solid.
-#     W=0 (ViTMatte)  -- FEET ZONE (bottom 12% bbox), inner AND outer band.
-#                        Berto: "SAM feet look okay, just combine it with CK."
+#   ACTIVE BAND_MODE = 'ck-only' (set at the BAND_MODE constant below; docstring
+#   corrected 2026-06-14 — it used to say 'geometric', which is parked). 'ck-only':
+#   CK is trusted across the whole band (W=1 everywhere), and a separate zoned SAM
+#   clip below kills junk. NOTE: this whole fusion engine is OPT-IN; the default
+#   product engine is the clean garbage_matte path in corridorkey_sam_merge.py.
+#   The parked modes below ('geometric' etc.) are kept for the gauntlet eval only:
+#     'geometric': W=1 outside SAM (hair), W=0 inside (ViTMatte), feet=ViTMatte.
 #
 #   BAND_MODE = 'green-confidence'  (PARKED -- rejected 2026-06-12):
 #     k-means LAB chroma W map. Rejected: too much CK detail lost. Code kept

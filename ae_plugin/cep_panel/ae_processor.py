@@ -346,17 +346,23 @@ def load_sam2_gate(sam2_mask_path, target_h, target_w):
 #     SAM garbage-matte merge  ->  choke  ->  despeckle  ->  despill
 # despill only touches the foreground, and the SAM merge only reads the source plate
 # (never the despilled fg), so despill being last is order-independent of the matte.
-def sam_garbage_merge(alpha, sam_soft, source_rgb, settings, screen_type="green"):
+def sam_garbage_merge(alpha, sam_soft, source_rgb, settings, screen_type="green",
+                      return_garbage=False):
     """CK x SAM garbage-matte merge via the shared engine (DaVinci-identical).
-    sam_soft: soft 0..1 SAM silhouette, or None. Returns the merged 2D alpha."""
+    sam_soft: soft 0..1 SAM silhouette, or None. Returns the merged 2D alpha.
+    return_garbage (Berto 2026-06-14): when True, returns (alpha, garbage_matte_or_None)
+    so cmd_batch can write the green-aware keep-gate as a stable garbage-matte sidecar.
+    Default False keeps the single-array return — the other caller (cmd_single) is safe."""
     import numpy as np, cv2
+    def _ret(a, g=None):
+        return (a, g) if return_garbage else a
     if sam_soft is None or bool(settings.get("sam2_bypass", False)):
-        return alpha
+        return _ret(alpha)
     try:
         from corridorkey_sam_merge import binarize_sam_silhouette, merge_ck_with_sam_active
     except Exception as e:
         log.warning(f"SAM merge unavailable, using CK alpha: {e}")
-        return alpha
+        return _ret(alpha)
     sg = sam_soft
     if sg.ndim == 3:
         sg = sg[:, :, 0]
@@ -368,13 +374,16 @@ def sam_garbage_merge(alpha, sam_soft, source_rgb, settings, screen_type="green"
         # fader only inflated the exported SAM matte layer — the merge silently ran on
         # edge_guard_px (default 7) and the operator's buffer setting did nothing here.
         _buffer_px = settings.get("sam2_margin", settings.get("edge_guard_px", 0))
+        # merge_ck_with_sam_active returns (alpha, garbage) when return_garbage=True,
+        # else just alpha — so the return is already the right shape for both modes.
         return merge_ck_with_sam_active(
             alpha, binarize_sam_silhouette(sg), source_rgb=source_rgb,
             screen_type=screen_type, proximity_px=int(_buffer_px),
-            carve_points=settings.get("sam_negative") or None)
+            carve_points=settings.get("sam_negative") or None,
+            return_garbage=return_garbage)
     except Exception as e:
         log.warning(f"SAM merge failed, using CK alpha: {e}")
-        return alpha
+        return _ret(alpha)
 
 
 def apply_choke(alpha, settings):
@@ -760,9 +769,12 @@ def _atomic_imwrite(path, img, params=None):
 
 
 # ── Named sidecar passes (Editable Layers / Fusion-comp parity) ───
-# WHAT IT DOES: writes the four named CK sidecar PNGs for one frame, each into its
-#   OWN clean subfolder so the host imports each as an isolated numbered-stills
-#   sequence:  CK_RGB/, CK_COMBINED/, CK_ALPHA/, SAM_ALPHA/.
+# WHAT IT DOES: writes the named CK sidecar PNGs for one frame, each into its OWN
+#   clean subfolder so the host imports each as an isolated numbered-stills sequence.
+#   THIS function writes: CK_ALPHA/ (raw CK alpha) + SAM_JUNK/ (inverted SAM, white=junk).
+#   The cmd_batch loop also writes CK_ONLY/ (full-hair CK clip) and, on the clean
+#   engine, GARBAGE_MATTE/ (green-aware garbage matte). It does NOT write CK_RGB/
+#   CK_COMBINED/SAM_ALPHA (that was the old Resolve naming — corrected 2026-06-14).
 # PORTED FROM: CorridorKey_Pro.py:3156-3231 `_write_fusion_sidecars`. The Resolve
 #   version writes per-clip-named files into ONE dir (Fusion Loader contract). AE's
 #   host (Premiere/AE numbered-stills importer) wants one PNG pattern per folder
@@ -1235,6 +1247,11 @@ def cmd_batch(source_video, output_folder, settings,
                 # fusion_v2/default paths crash every frame at the sidecar step
                 # (0/27 render bug, 2026-06-12).
                 _garbage_gate = None
+                # Green-aware garbage matte (Berto 2026-06-14): the clean engine's
+                # internal keep-gate (white=keep body, black=kill junk), green-screen
+                # informed + stable. Set only by the default branch; stays None on the
+                # fusion path so the sidecar write falls back to inverted-SAM.
+                _green_garbage = None
                 if settings.get('experimental_recipe'):
                     alpha, _garbage_gate = apply_recipe_composite(
                         alpha_raw, _sam_frame, alpha.shape[1], settings)
@@ -1282,9 +1299,9 @@ def cmd_batch(source_video, output_folder, settings,
                         log.info(f'fusion_v2 batch frame {frame_idx}: hybrid solve done')
                     else:
                         # Default: 06-10 proven merge chain
-                        alpha = sam_garbage_merge(
+                        alpha, _green_garbage = sam_garbage_merge(
                             alpha_raw, _sam_frame, img_rgb, settings,
-                            settings["screenType"])
+                            settings["screenType"], return_garbage=True)
                         _sam_for_rescue = _sam_frame
                         if _sam_for_rescue is not None and _sam_for_rescue.shape[:2] != alpha.shape[:2]:
                             _sam_for_rescue = cv2.resize(
@@ -1319,6 +1336,24 @@ def cmd_batch(source_video, output_folder, settings,
                 _atomic_imwrite(_ck_only_dir / f"CK_ONLY_{seq_num:05d}.png", _ck_only_bgra)
                 if processed == 0:
                     _atomic_imwrite(_ck_only_dir / "CK_ONLY_00000.png", _ck_only_bgra)
+                # GARBAGE_MATTE (Berto 2026-06-14): the clean engine's green-aware keep-gate,
+                # surfaced as a STABLE knock-out matte — better than raw inverted-SAM (SAM_JUNK),
+                # which wobbles per-frame. Written SAME polarity as SAM_JUNK (white=junk) so it
+                # is a drop-in luma-inverted matte in the precomp. None on the fusion path, so
+                # the precomp falls back to SAM_JUNK there.
+                if _green_garbage is not None:
+                    _gg = _green_garbage[:, :, 0] if _green_garbage.ndim == 3 else _green_garbage
+                    if _gg.shape[:2] != alpha_raw.shape[:2]:
+                        _gg = cv2.resize(_gg.astype(np.float32),
+                                         (alpha_raw.shape[1], alpha_raw.shape[0]),
+                                         interpolation=cv2.INTER_LINEAR)
+                    _gg_junk = ((1.0 - np.clip(_gg, 0.0, 1.0)) * 255.0).astype(np.uint8)
+                    _gg_dir = out_dir / "GARBAGE_MATTE"
+                    _gg_dir.mkdir(parents=True, exist_ok=True)
+                    _gg_img = cv2.merge([_gg_junk, _gg_junk, _gg_junk])
+                    _atomic_imwrite(_gg_dir / f"GARBAGE_MATTE_{seq_num:05d}.png", _gg_img)
+                    if processed == 0:
+                        _atomic_imwrite(_gg_dir / "GARBAGE_MATTE_00000.png", _gg_img)
                 # Sidecar deliverables: CK_ALPHA (raw NN matte) + SAM_JUNK (inverted SAM mask).
                 _sam_for_sidecar = None
                 if seq_num in sam_video_masks:

@@ -1022,7 +1022,8 @@ def merge_ck_with_garbage_matte(
     screen_type: str = "green",
     proximity_px: Optional[int] = None,
     carve_points=None,
-) -> np.ndarray:
+    return_garbage: bool = False,
+):
     """CK × zoned_dilated_SAM + chroma escape valve for hair.
 
     SAM is used purely as a garbage matte — kill outside, preserve CK inside.
@@ -1030,6 +1031,12 @@ def merge_ck_with_garbage_matte(
     Three zones: generous dilation at head/body (20px, block downward),
     tight lateral-only at feet (2px, no downward). Chroma escape valve
     lets CK hair detail survive beyond the dilation boundary on green pixels.
+
+    return_garbage (Berto 2026-06-14): when True, also returns the green-aware
+    keep-gate `garbage_matte` (white=keep body, black=kill junk) as the 2nd item
+    of a tuple, so callers can surface it as a stable garbage-matte sidecar.
+    Default False keeps the single-array return — every existing caller (the
+    Resolve plugin's 6 call sites included) is untouched.
     """
     import cv2
 
@@ -1040,12 +1047,12 @@ def merge_ck_with_garbage_matte(
     if ck.ndim == 3:
         ck = ck[..., 0]
     if sam_silhouette is None:
-        return ck.copy()
+        return (ck.copy(), None) if return_garbage else ck.copy()
     sam = (np.asarray(sam_silhouette, dtype=np.float32) > 0.5).astype(np.uint8)
     if sam.ndim == 3:
         sam = sam[..., 0]
     if ck.shape != sam.shape:
-        return ck.copy()
+        return (ck.copy(), None) if return_garbage else ck.copy()
     h, w = ck.shape
 
     # FIX A v3 (2026-06-06, review-hardened): cleanup + dot-aware carve re-assert via
@@ -1205,6 +1212,10 @@ def merge_ck_with_garbage_matte(
         except Exception:
             pass
 
+    if return_garbage:
+        # garbage_matte = green-aware keep-gate (white=keep body, black=kill junk),
+        # stable + feathered. Callers invert it to white=junk for an AE luma matte.
+        return final, np.clip(garbage_matte, 0.0, 1.0).astype(np.float32)
     return final
 
 
@@ -1215,13 +1226,20 @@ def merge_ck_with_sam_active(
     screen_type: str = "green",
     proximity_px: Optional[int] = None,
     carve_points=None,
+    return_garbage: bool = False,
 ) -> np.ndarray:
     # WHAT IT DOES: Dispatcher for the active merge mode. Routes based on
     #   MERGE_MODE flag: "garbage_matte" (new), "chroma_gated" (v2.3),
     #   or "path_b" (max-style fallback). Single entry point so call sites
     #   are agnostic to which merge is in effect.
+    # return_garbage (Berto 2026-06-14): opt-in. When True, returns
+    #   (alpha, garbage_matte_or_None). Only the garbage_matte mode produces a
+    #   real gate; every other mode returns None for it. Default False keeps the
+    #   single-array return so all existing callers (Resolve x6, previews) are safe.
+    def _ret(x):
+        return (x, None) if return_garbage else x
     if sam_silhouette is None:
-        return merge_ck_with_sam(ck_alpha, sam_silhouette)
+        return _ret(merge_ck_with_sam(ck_alpha, sam_silhouette))
     if MERGE_MODE == "garbage_matte":
         try:
             return merge_ck_with_garbage_matte(
@@ -1229,6 +1247,7 @@ def merge_ck_with_sam_active(
                 screen_type=screen_type,
                 proximity_px=proximity_px,
                 carve_points=carve_points,
+                return_garbage=return_garbage,
             )
         except Exception:
             try:
@@ -1239,14 +1258,14 @@ def merge_ck_with_sam_active(
                 )
             except Exception:
                 pass
-            return merge_ck_with_sam(ck_alpha, sam_silhouette)
+            return _ret(merge_ck_with_sam(ck_alpha, sam_silhouette))
     if MERGE_MODE == "chroma_gated" and source_rgb is not None:
         try:
-            return merge_ck_with_sam_chroma_gated(
+            return _ret(merge_ck_with_sam_chroma_gated(
                 ck_alpha, sam_silhouette, source_rgb,
                 screen_type=screen_type,
                 proximity_px=proximity_px,
-            )
+            ))
         except Exception:
             try:
                 import traceback as _tb_inner
@@ -1256,8 +1275,8 @@ def merge_ck_with_sam_active(
                 )
             except Exception:
                 pass
-            return merge_ck_with_sam(ck_alpha, sam_silhouette)
-    return merge_ck_with_sam(ck_alpha, sam_silhouette)
+            return _ret(merge_ck_with_sam(ck_alpha, sam_silhouette))
+    return _ret(merge_ck_with_sam(ck_alpha, sam_silhouette))
 
 
 def write_matte_final_dump(alpha_final: np.ndarray, ops_applied) -> None:

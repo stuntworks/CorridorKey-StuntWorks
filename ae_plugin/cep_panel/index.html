@@ -1901,16 +1901,22 @@
   const fusionV2Btn = document.getElementById('fusionV2');
   if (fusionV2Btn) {
     // Restore persisted state (global, not per-clip -- survives panel reopen).
-    // DEFAULT ON (Berto 2026-06-13): Fusion V2 is the engine now. Off-by-default
-    // kept trapping him into rendering the OLD keyer (no gate, no garbage masks)
-    // while believing he tested the new one — same footgun as the invisible-toggle
-    // note below. Only an EXPLICIT saved 'false' keeps it off; unset -> ON + persist.
+    // DEFAULT OFF (Berto 2026-06-14): reverted the 06-13 default-ON. Empirical A/B
+    // proved the OLD engine (clean CK + green-geography garbage) is the product base;
+    // Fusion V2's solver adds speckle + a per-frame-SAM dance. Fusion stays available
+    // as an explicit opt-in, but the clean engine is the default. Force OFF once to
+    // clear the 06-13 auto-ON that was written into localStorage without user intent.
     var _fv2Saved = localStorage.getItem('ck_global_fusion_v2');
-    if (_fv2Saved === 'true' || _fv2Saved === 'false') {
-      fusionV2Btn.setAttribute('aria-pressed', _fv2Saved);
-    } else {
+    if (_fv2Saved === 'false') {
+      fusionV2Btn.setAttribute('aria-pressed', 'false');
+    } else if (_fv2Saved === 'true' && localStorage.getItem('ck_fv2_autoon_cleared') !== '1') {
+      // One-time migration: the 06-13 default-ON auto-wrote 'true'. Clear it so the
+      // panel lands on the clean engine; the user can still re-enable Fusion V2 by hand.
+      fusionV2Btn.setAttribute('aria-pressed', 'false');
+      localStorage.setItem('ck_global_fusion_v2', 'false');
+      localStorage.setItem('ck_fv2_autoon_cleared', '1');
+    } else if (_fv2Saved === 'true') {
       fusionV2Btn.setAttribute('aria-pressed', 'true');
-      localStorage.setItem('ck_global_fusion_v2', 'true');
     }
     function _ckApplyFusionFaderState() {
       var isOn = fusionV2Btn.getAttribute('aria-pressed') === 'true';
@@ -3720,10 +3726,19 @@ function doSAMCommit(advanced) {
             const _ckAnchor = path.join(_ckAlphaDir, 'CK_ALPHA_00000.png');
             const ckMattePath = fs.existsSync(_ckAnchor) ? _ckAnchor
                 : (() => { try { const _ff = fs.readdirSync(_ckAlphaDir).filter(n => n.startsWith('CK_ALPHA_') && n.endsWith('.png')).sort(); return _ff.length ? path.join(_ckAlphaDir, _ff[0]) : null; } catch(_) { return null; } })();
+            // Garbage matte for the precomp's SAM MATTE layer (Berto 2026-06-14):
+            // PREFER the green-aware GARBAGE_MATTE (clean engine, stable, no per-frame
+            // SAM wobble) over the raw inverted-SAM in SAM_JUNK. Both are white=junk so
+            // they wire the SAME luma-inverted track matte. GARBAGE_MATTE only exists on
+            // a clean-engine render; SAM_JUNK is the fallback (fusion render / old output).
+            const _firstPng = (dir, prefix) => { try { const _ff = fs.readdirSync(dir).filter(n => n.startsWith(prefix) && n.endsWith('.png')).sort(); return _ff.length ? path.join(dir, _ff[0]) : null; } catch(_) { return null; } };
+            const _gmDir = path.join(outDir, 'GARBAGE_MATTE');
+            const _gmAnchor = path.join(_gmDir, 'GARBAGE_MATTE_00000.png');
             const _samJunkDir = path.join(outDir, 'SAM_JUNK');
             const _sjAnchor = path.join(_samJunkDir, 'SAM_JUNK_00000.png');
-            const samMattePath = fs.existsSync(_sjAnchor) ? _sjAnchor
-                : (() => { try { const _ff = fs.readdirSync(_samJunkDir).filter(n => n.startsWith('SAM_JUNK_') && n.endsWith('.png')).sort(); return _ff.length ? path.join(_samJunkDir, _ff[0]) : null; } catch(_) { return null; } })();
+            const samMattePath =
+                (fs.existsSync(_gmAnchor) ? _gmAnchor : _firstPng(_gmDir, 'GARBAGE_MATTE_'))
+                || (fs.existsSync(_sjAnchor) ? _sjAnchor : _firstPng(_samJunkDir, 'SAM_JUNK_'));
             // CK_ONLY (Berto 2026-06-14): the CK key alone (full hair + junk, no SAM clip),
             // RGBA. User matte-boxes the head from this and lays it over the merged key to
             // recover hair SAM ate. Imported as a hidden layer in the precomp.
@@ -3748,8 +3763,12 @@ function doSAMCommit(advanced) {
             ], (imp) => {
                 if (!imp || !imp.ok) return finish('Precomp failed: ' + (imp && imp.error ? imp.error : 'unknown'), true);
                 if (imp.via) ckLog('samCommit: layer resolved via ' + imp.via);
+                // Surface host.jsx warnings LOUDLY (audit 2026-06-14): stale-jsx / missing
+                // CK FULL / track-matte failures used to be silent. Now they reach the operator.
+                if (imp.warnings && imp.warnings.length) { imp.warnings.forEach(function (w) { ckLog('samCommit WARNING: ' + w, true); }); }
                 finish('Done. "' + imp.compName + '" on your timeline.' +
-                       (!imp.ckMatte && !imp.samMatte ? ' (mattes not found — CK-only render)' : ''));
+                       (!imp.ckMatte && !imp.samMatte ? ' (mattes not found — CK-only render)' : '') +
+                       (imp.ckFull ? '' : ' (CK FULL missing — restart AE if you expected it)'));
             });
             }
         }, e => finish('Render failed: ' + e.message, true),
