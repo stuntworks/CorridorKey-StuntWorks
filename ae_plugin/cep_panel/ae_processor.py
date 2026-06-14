@@ -1915,6 +1915,25 @@ def cmd_postproc(session_dir, output_path, settings, background="checker", v1_pa
                 view = sam_soft
         else:
             view = np.zeros_like(alpha)
+        # DISPLAY DESPECKLE (Berto 2026-06-14): the raw NN matte carries isolated
+        # sub-threshold noise dots — worst at preview resolution — that make the CK map
+        # look broken to clients even though the matte itself is fine (the full-res
+        # render is clean). Kill only TINY isolated blobs; the actor and anything
+        # substantial (incl. hair, which grows from the body mass) survive. This is the
+        # DISPLAYED inspector matte only — the CK_ALPHA render sidecar stays raw.
+        try:
+            _vb = (np.clip(view, 0, 1) > 0.15).astype(np.uint8)
+            _ncc, _lbl, _stats, _ = cv2.connectedComponentsWithStats(_vb, connectivity=8)
+            # min blob area = ~0.015% of frame (res-independent). 4K -> ~1300px,
+            # so noise dots die, the actor/walls/floor (large) are untouched.
+            _area_min = max(64, int(view.shape[0] * view.shape[1] * 0.00015))
+            _keep = np.zeros(view.shape[:2], dtype=np.float32)
+            for _i in range(1, _ncc):
+                if _stats[_i, cv2.CC_STAT_AREA] >= _area_min:
+                    _keep[_lbl == _i] = 1.0
+            view = view * _keep
+        except Exception as _ds_e:
+            log.warning(f"CK-map display despeckle skipped: {_ds_e}")
         m8 = (np.clip(view, 0, 1) * 255).astype(np.uint8)
         m8 = _maybe_downscale(m8, max_width)
         _mv_out = Path(output_path)
@@ -1989,6 +2008,24 @@ def cmd_postproc(session_dir, output_path, settings, background="checker", v1_pa
             _zone_mask = _zone_cut_from_sam(
                 (_sz > 0.5).astype(np.uint8), settings, _w_z, _h_z, _w_z / 1920.0)
             alpha = np.clip(alpha * _zone_mask, 0.0, 1.0)
+
+    # DISPLAY DESPECKLE (Berto 2026-06-14): PREVIEW-ONLY. cmd_postproc is the preview
+    # path (the delivered render is cmd_batch, untouched). The NN — especially at the
+    # lower scrub/live-preview resolution — scatters tiny isolated noise dots that make
+    # the keyed preview / CK map read as broken to a first-time client. Kill only TINY
+    # isolated blobs; the actor, hair (grows from the body mass), and any substantial
+    # region survive. This never alters a delivered key.
+    try:
+        _ab = (np.clip(alpha, 0, 1) > 0.15).astype(np.uint8)
+        _ncc2, _lbl2, _st2, _ = cv2.connectedComponentsWithStats(_ab, connectivity=8)
+        _amin2 = max(64, int(alpha.shape[0] * alpha.shape[1] * 0.00015))
+        _keep2 = np.zeros(alpha.shape[:2], dtype=np.float32)
+        for _i in range(1, _ncc2):
+            if _st2[_i, cv2.CC_STAT_AREA] >= _amin2:
+                _keep2[_lbl2 == _i] = 1.0
+        alpha = alpha * _keep2
+    except Exception as _dp_e:
+        log.warning(f"Preview display despeckle skipped: {_dp_e}")
 
     # Build background buffer
     h, w = fg_rgb.shape[:2]
