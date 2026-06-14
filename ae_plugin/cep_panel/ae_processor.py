@@ -1915,12 +1915,19 @@ def cmd_postproc(session_dir, output_path, settings, background="checker", v1_pa
                 view = sam_soft
         else:
             view = np.zeros_like(alpha)
-        # DISPLAY DESPECKLE (Berto 2026-06-14): the raw NN matte carries isolated
-        # sub-threshold noise dots — worst at preview resolution — that make the CK map
-        # look broken to clients even though the matte itself is fine (the full-res
-        # render is clean). Kill only TINY isolated blobs; the actor and anything
-        # substantial (incl. hair, which grows from the body mass) survive. This is the
-        # DISPLAYED inspector matte only — the CK_ALPHA render sidecar stays raw.
+        # DISPLAY CLEANUP (Berto 2026-06-14): the CK matte view ('CK' button = matte-ck)
+        # returns HERE, before the composite-path cleanup — so it needs its own grain
+        # kill. The preview NN runs at scrub/live res (1080p-class) vs the full-res 4096
+        # render, leaving (1) mid-alpha GRAIN on edges and (2) tiny isolated noise dots.
+        # median removes the grain; the connected-component pass drops the dots. Actor +
+        # hair (large/connected) survive. DISPLAYED inspector matte only — the CK_ALPHA
+        # render sidecar stays raw, and cmd_batch (the delivered key) is untouched.
+        try:
+            _vmed = (np.clip(view, 0, 1) * 255).astype(np.uint8)
+            _vmed = cv2.medianBlur(_vmed, 5)
+            view = _vmed.astype(np.float32) / 255.0
+        except Exception as _vm_e:
+            log.warning(f"CK-map display median skipped: {_vm_e}")
         try:
             _vb = (np.clip(view, 0, 1) > 0.15).astype(np.uint8)
             _ncc, _lbl, _stats, _ = cv2.connectedComponentsWithStats(_vb, connectivity=8)
