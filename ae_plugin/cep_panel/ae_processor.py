@@ -2009,12 +2009,20 @@ def cmd_postproc(session_dir, output_path, settings, background="checker", v1_pa
                 (_sz > 0.5).astype(np.uint8), settings, _w_z, _h_z, _w_z / 1920.0)
             alpha = np.clip(alpha * _zone_mask, 0.0, 1.0)
 
-    # DISPLAY DESPECKLE (Berto 2026-06-14): PREVIEW-ONLY. cmd_postproc is the preview
-    # path (the delivered render is cmd_batch, untouched). The NN — especially at the
-    # lower scrub/live-preview resolution — scatters tiny isolated noise dots that make
-    # the keyed preview / CK map read as broken to a first-time client. Kill only TINY
-    # isolated blobs; the actor, hair (grows from the body mass), and any substantial
-    # region survive. This never alters a delivered key.
+    # PREVIEW DISPLAY CLEANUP (Berto 2026-06-14): PREVIEW-ONLY. cmd_postproc is the
+    # preview path (the delivered render is cmd_batch, full-res, untouched). The preview
+    # NN runs at the scrub/live resolution (1080p-class) which leaves (a) mid-alpha GRAIN
+    # along set edges and (b) tiny isolated noise dots — both make the CK map read as
+    # broken to a first-time client even though the full-res render is clean.
+    #   1) median kills the edge grain without moving real edges much
+    #   2) connected-component pass drops tiny isolated blobs
+    # The actor, hair (grows from the body mass), and any substantial region survive.
+    try:
+        _am8 = (np.clip(alpha, 0, 1) * 255).astype(np.uint8)
+        _am8 = cv2.medianBlur(_am8, 5)
+        alpha = _am8.astype(np.float32) / 255.0
+    except Exception as _md_e:
+        log.warning(f"Preview median cleanup skipped: {_md_e}")
     try:
         _ab = (np.clip(alpha, 0, 1) > 0.15).astype(np.uint8)
         _ncc2, _lbl2, _st2, _ = cv2.connectedComponentsWithStats(_ab, connectivity=8)
