@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "corridorkey": {
+      "command": "python",
+      "args": ["D:\\New AI Projects\\CorridorKey\\mcp_server\\run_server.py"],
+      "env": {
+        "CORRIDORKEY_ROOT": "D:\\New AI Projects\\CorridorKey"
+      }
+    }
+  }
+}
