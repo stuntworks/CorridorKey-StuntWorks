@@ -78,10 +78,15 @@ CK_SOFT_HI = 0.7
 SOFT_ZONE_SAM_BUFFER_PX = 40
 
 # Saturation ramp endpoints (logit space) — see logits_to_soft_mask below.
-# A 4-logit-wide soft band gives a 2-4 px feather at typical SAM 2 grad
-# magnitudes around the contour. Berto verified on 4K Kitchen Fight.
-SAM_SOFT_LOGIT_LO = -2.0
-SAM_SOFT_LOGIT_HI = 2.0
+# Narrowed from ±2.0 to ±1.0: halves the fade width (~2px at 1920 vs ~4px),
+# so the ramp survives a 2× upscale to 4K as ~4px instead of ~8-16px.
+# The 0.5 crossing stays at logit 0 (true SAM contour) — position unchanged.
+# Tunable: widen toward ±2.0 for softer edge, tighten toward ±0.5 for harder.
+SOFT_RAMP_LO = -1.0
+SOFT_RAMP_HI = 1.0
+# Legacy aliases — keep callers that read these constants by the old name.
+SAM_SOFT_LOGIT_LO = SOFT_RAMP_LO
+SAM_SOFT_LOGIT_HI = SOFT_RAMP_HI
 
 # v1.0 always-on baseline smoothing of the soft SAM matte. Operates on
 # CONTINUOUS values now (the previous MORPH_OPEN k=3 was carving 3 px
@@ -232,15 +237,15 @@ def patch_sam2_loader_for_png() -> None:
 
 def logits_to_soft_mask(
     logits: np.ndarray,
-    lo: float = SAM_SOFT_LOGIT_LO,
-    hi: float = SAM_SOFT_LOGIT_HI,
+    lo: float = SOFT_RAMP_LO,
+    hi: float = SOFT_RAMP_HI,
 ) -> np.ndarray:
     """Convert SAM 2 mask-decoder logits to a soft 0..1 mask via SATURATION RAMP.
 
     Mapping:
         logit >= hi   -> 1.0  (solid interior, kills decoder texture)
         logit <= lo   -> 0.0  (solid background)
-        lo < L < hi   -> linear ramp (soft edge band, ~2-4 px feather)
+        lo < L < hi   -> linear ramp (soft edge band, ~2px at 1920, ~4px at 4K)
 
     Why a ramp instead of sigmoid: SAM 2's mask-decoder logits in confident
     interior pixels sit in the +2..+6 range, not +20..+30. Sigmoid maps that
@@ -256,7 +261,9 @@ def logits_to_soft_mask(
 
     Args:
         logits: float array (any shape) of raw SAM 2 mask-decoder logits.
-        lo, hi: ramp endpoints in logit space (defaults -2..+2).
+        lo, hi: ramp endpoints in logit space (defaults SOFT_RAMP_LO/HI = ±1.0).
+            Widen toward ±2.0 for softer edge; tighten toward ±0.5 for harder.
+            The 0.5 crossing is always at logit 0 — position never moves.
 
     Returns:
         float32 array of same shape, clipped to [0, 1].
@@ -378,6 +385,45 @@ def process_sam_matte(
         out = cv2.GaussianBlur(out, (k, k), sigmaX=sigma, sigmaY=sigma)
 
     return np.clip(out, 0.0, 1.0)
+
+
+def adaptive_green_kill(a_nn, sam_fg, src_rgb):
+    """Per-frame adaptive screen-color green removal. Kills leftover green BACKGROUND
+    (incl. dark/poorly-lit green) while protecting the SAM subject. All thresholds learned
+    per frame (no clip-specific constants). a_nn: float HxW alpha [0,1]; sam_fg: float/bool
+    HxW subject silhouette (solid); src_rgb: HxW3 RGB [0,1] or uint8. Returns cleaned alpha."""
+    import numpy as np, cv2
+    if sam_fg is None or src_rgb is None: return a_nn
+    h, w = a_nn.shape[:2]
+    src = src_rgb.astype(np.float32)
+    if src.max() > 1.5: src = src / 255.0
+    R, G, B = src[:,:,0], src[:,:,1], src[:,:,2]
+    luma = 0.299*R + 0.587*G + 0.114*B
+    noise = float(np.percentile(luma, 1)) + 1e-3
+    eps = max(noise, 1e-3)
+    u = np.log((G+eps)/(R+eps)); v = np.log((G+eps)/(B+eps))
+    F = (np.asarray(sam_fg) > 0.5).astype(np.uint8)
+    if F.shape[:2] != (h, w): F = cv2.resize(F, (w, h), interpolation=cv2.INTER_NEAREST)
+    ew = max(6, int(min(h, w)/120))
+    k = np.ones((ew*2+1, ew*2+1), np.uint8)
+    fg_protect = cv2.erode(F, k); sam_dil = cv2.dilate(F, k)
+    sure_bg = (sam_dil == 0); unknown = (sam_dil > 0) & (fg_protect == 0)
+    bgseed = sure_bg & (src.max(2) < 0.98) & (luma > noise*2)
+    greenside = bgseed & (u > 0) & (v > 0)
+    if greenside.sum() < 200: return a_nn
+    uv = np.stack([u[greenside], v[greenside]], 1)
+    mu = np.median(uv, 0); cov = np.cov(uv.T) + np.eye(2)*1e-3
+    inv = np.linalg.inv(cov)
+    duv = np.stack([u-mu[0], v-mu[1]], -1)
+    d2 = np.einsum('ijc,cd,ijd->ij', duv, inv, duv)
+    P = np.exp(-0.5*d2); P[(u <= 0) | (v <= 0)] = 0.0
+    leak = a_nn[bgseed & (P > 0.5)]
+    T_leak = float(np.percentile(leak, 95)) if leak.size > 50 else 0.5
+    A = a_nn.copy()
+    A[sure_bg] = a_nn[sure_bg] * (1 - P[sure_bg])
+    clean = unknown & (a_nn <= T_leak) & (P > 0.5)
+    A[clean] = a_nn[clean] * (1 - P[clean])
+    return np.clip(A, 0, 1)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1110,7 +1156,11 @@ def merge_ck_with_garbage_matte(
             if screen_type == "blue":
                 _lower, _upper = np.array([100, 50, 50]), np.array([130, 255, 255])
             else:
-                _lower, _upper = np.array([35, 50, 50]), np.array([85, 255, 255])
+                # Value floor 50 -> 20 (Berto 2026-06-22): dark-SHADOWED green behind
+                # black pants/shoes has HSV value <50, so the old floor missed it -> the
+                # gate went tight there -> green-spill edge pixels leaked = the recurring
+                # green fringe. 20 catches shadowed green. THE 3-month root (line never touched before).
+                _lower, _upper = np.array([35, 50, 20]), np.array([85, 255, 255])
             _green_bin = cv2.inRange(hsv_map, _lower, _upper)
             on_green_hsv = _green_bin.astype(np.float32) / 255.0
             _rc = max(3, int(round(9 * _scale)) | 1)
@@ -1158,7 +1208,11 @@ def merge_ck_with_garbage_matte(
 
     # Feather gate edges — converts hard sam_tight wall into gradient so CK
     # soft alpha is never clipped by a binary cliff where green detection missed.
-    _gate_sigma = max(1.0, 2.5 * _scale)
+    # FIXED feather (Berto 2026-06-22): was 2.5*_scale = ~15px at 4K, which bled a
+    # ~10px halo around OFF-GREEN edges where CK has no signal to trim it (the de-noise
+    # exposed this pre-existing feather). Fixed thin sigma matches Resolve's clean edge —
+    # thin at any res, no off-green halo, still avoids a hard cliff that clips hair. Tune 1.5-3.0.
+    _gate_sigma = 2.5
     garbage_matte = cv2.GaussianBlur(garbage_matte, (0, 0), _gate_sigma)
     garbage_matte = np.clip(garbage_matte, 0.0, 1.0)
 
@@ -1251,9 +1305,9 @@ def merge_ck_with_sam_active(
             )
         except Exception:
             try:
-                import traceback as _tb_gm
+                import traceback as _tb_gm, tempfile as _tmp_gm
                 from pathlib import Path as _P_gm
-                _P_gm(r"C:\Users\ragsn\ck_garbage_merge_exception.txt").write_text(
+                _P_gm(_tmp_gm.gettempdir(), "ck_garbage_merge_exception.txt").write_text(
                     _tb_gm.format_exc(), encoding="utf-8"
                 )
             except Exception:
@@ -1268,15 +1322,38 @@ def merge_ck_with_sam_active(
             ))
         except Exception:
             try:
-                import traceback as _tb_inner
+                import traceback as _tb_inner, tempfile as _tmp_inner
                 from pathlib import Path as _P_inner
-                _P_inner(r"C:\Users\ragsn\ck_chroma_merge_exception.txt").write_text(
+                _P_inner(_tmp_inner.gettempdir(), "ck_chroma_merge_exception.txt").write_text(
                     _tb_inner.format_exc(), encoding="utf-8"
                 )
             except Exception:
                 pass
             return _ret(merge_ck_with_sam(ck_alpha, sam_silhouette))
     return _ret(merge_ck_with_sam(ck_alpha, sam_silhouette))
+
+
+def merge_ck_simple(ck_alpha: np.ndarray, sam_silhouette: Optional[np.ndarray]) -> np.ndarray:
+    """Resolve-identical simple combine: binarize SAM at 0.5 → GaussianBlur(11×11, σ=2.5) → ck_alpha × gate → clip 0..1.
+
+    Exact match to resolve_plugin/preview_viewer_v2.py _trimap_fuse + apply_sam2_gate no-halo path
+    (EDGE_FEATHER_KSIZE=11, EDGE_FEATHER_SIGMA=2.5). No hole-punching, no chroma gates,
+    no zone logic, no shirt_rescue. Used as the simple_combine=True A/B path in the AE engine.
+    """
+    import cv2 as _cv2
+    ck = np.asarray(ck_alpha, dtype=np.float32)
+    if ck.ndim == 3:
+        ck = ck[..., 0]
+    if sam_silhouette is None:
+        return ck.copy()
+    sam = np.asarray(sam_silhouette, dtype=np.float32)
+    if sam.ndim == 3:
+        sam = sam[..., 0]
+    if ck.shape != sam.shape:
+        return ck.copy()
+    gate_bin = (sam > 0.5).astype(np.float32)
+    gate_soft = _cv2.GaussianBlur(gate_bin, (11, 11), 2.5)
+    return np.clip(ck * gate_soft, 0.0, 1.0).astype(np.float32)
 
 
 def write_matte_final_dump(alpha_final: np.ndarray, ops_applied) -> None:
