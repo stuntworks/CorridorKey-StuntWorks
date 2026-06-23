@@ -1174,12 +1174,8 @@ def cmd_batch(source_video, output_folder, settings,
             # to a square BEFORE SAM sees them, so the encoder downsample is
             # uniform.
             _count = int(end_frame - start_frame)
-            _actual_preroll = min(1, int(start_frame))  # pre-roll: warm SAM2 with one prior frame; 0 when start_frame==0
-            _total_export = _actual_preroll + _count
-            _sf_export = int(start_frame) - _actual_preroll
-            sam_anchor_rel += _actual_preroll
             sam_tmp_dir = Path(_sam_tmp.mkdtemp(prefix="ck_sam2_batch_"))
-            log.info(f"SAM2 video: exporting {_total_export} frames ({_actual_preroll} pre-roll + {_count} target) to {sam_tmp_dir}")
+            log.info(f"SAM2 video: exporting {_count} frames to {sam_tmp_dir}")
             from corridorkey_sam_merge import (
                 pad_to_square as _pad_to_square,
                 unpad_from_square as _unpad_from_square,
@@ -1192,19 +1188,16 @@ def cmd_batch(source_video, output_folder, settings,
             try:
                 _exp_cap = cv2.VideoCapture(str(source_video), cv2.CAP_FFMPEG)
                 # FIX C: POS_FRAMES + throwaway prime read (MSEC returns a dirty first read on long-GOP).
-                _sf = _sf_export
+                _sf = int(start_frame)
                 if _sf > 0:
                     _exp_cap.set(cv2.CAP_PROP_POS_FRAMES, _sf - 1)
-                    _exp_cap.read()        # throwaway: warms decoder -> next read = _sf_export
-                # _sf_export == 0: never seek — freshly opened cap reads frame 0 cleanly.
-                # When _actual_preroll > 0 and start_frame == 1, _sf_export is 0 and
-                # frame 0 IS the pre-roll — it absorbs the no_mem_embed penalty so
-                # start_frame's mask gets proper temporal context (Berto 2026-06-17).
+                    _exp_cap.read()        # throwaway: warms decoder -> next read = start_frame
+                # _sf == 0: never seek — freshly opened cap reads frame 0 cleanly.
                 _exported = 0
-                for _i in range(_total_export):
+                for _i in range(_count):
                     _ok, _fr = _exp_cap.read()
                     if not _ok or _fr is None:
-                        log.warning(f"SAM2 video: skipped unreadable frame {_sf_export + _i}")
+                        log.warning(f"SAM2 video: skipped unreadable frame {int(start_frame) + _i}")
                         continue
                     _fr_scaled = cv2.resize(_fr, (_sam_w, _sam_h), interpolation=cv2.INTER_AREA) if _sam_scale != 1.0 else _fr
                     if _src_h is None:
@@ -1266,14 +1259,6 @@ def cmd_batch(source_video, output_folder, settings,
                             _mu = np.maximum(_mu, _filled.astype(np.float32))
                             sam_video_masks[_fi] = _mu
 
-                # Pre-roll discard: drop the pre-roll frame(s) and shift indices so
-                # sam_video_masks[0] == actual start_frame (not the pre-roll frame).
-                if _actual_preroll > 0:
-                    sam_video_masks = {
-                        _fi - _actual_preroll: v
-                        for _fi, v in sam_video_masks.items()
-                        if _fi >= _actual_preroll
-                    }
                 # RENDER-PREVIEW PARITY FIX (2026-06-22): process_sam_matte was dilating
                 # the SAM gate by sam_sidecar_margin (default 10px) + baseline Gaussian here,
                 # but cmd_postproc (the PREVIEW the client approved) never calls
@@ -1328,20 +1313,52 @@ def cmd_batch(source_video, output_folder, settings,
                                 _held += 1
                     log.info(f"SAM2 post-pass: {_collapsed} interior empties -> NN fallback, "
                              f"{_held} tail/head empties held to nearest substantial mask.")
-                    # Anchor-frame fix — ported from CorridorKey_Pro.py (~1835-1847).
-                    # Frame 0 uses no_mem_embed (image-SAM mode) producing a weaker
-                    # mask with interior holes. If frame 2 has >10% more coverage than
-                    # frame 0 or 1, copy frame 2 back over the weak anchor frames.
-                    if 2 in sam_video_masks:
-                        _ref_cov = sam_video_masks[2].sum()
-                        if _ref_cov >= _sam_thresh:
-                            _patched = []
-                            for _early in (0, 1):
-                                if _early in sam_video_masks and sam_video_masks[_early].sum() < _ref_cov * 0.9:
-                                    sam_video_masks[_early] = sam_video_masks[2].copy()
-                                    _patched.append(_early)
-                            if _patched:
-                                log.info(f"SAM2 anchor-fix: copied frame 2 -> frames {_patched}")
+                    # Cold-frame hold — anchor-position-independent (2026-06-23).
+                    #
+                    # OLD logic assumed anchor == frame 0, so it hardcoded frame 2 as the
+                    # warm reference and only patched frames 0-1.  When the anchor is
+                    # mid-range (e.g. frame 27 of 60) ALL early frames are backward-
+                    # propagated cold frames — copying frame 2 over frame 0 changes
+                    # nothing useful because frame 2 is equally cold.
+                    #
+                    # NEW logic: use the anchor frame itself as the warm seed, then walk
+                    # outward toward BOTH ends.  Any frame below 85% of anchor coverage
+                    # is held to the nearest already-confirmed warm mask.  This kills the
+                    # lower-leg fringe on early frames regardless of anchor position.
+                    #
+                    # "warm" = coverage >= _cold_warm_thresh (85% of anchor coverage,
+                    # clamped so we never promote a genuinely missing subject frame).
+                    # Conservative: only replaces frames that are truly weak relative to
+                    # the anchor; good backward-propagated frames are left alone.
+                    _anchor_key = sam_anchor_rel  # range-relative anchor (no pre-roll offset)
+                    if _anchor_key in sam_video_masks:
+                        _anchor_cov = sam_video_masks[_anchor_key].sum()
+                        _cold_warm_thresh = max(_sam_thresh, _anchor_cov * 0.85)
+                        _cold_patched = []
+                        # Walk BACKWARD from anchor toward frame 0.
+                        _warm_ref = sam_video_masks[_anchor_key]
+                        for _f in range(_anchor_key - 1, _sorted_keys[0] - 1, -1):
+                            if _f not in sam_video_masks:
+                                continue
+                            if sam_video_masks[_f].sum() >= _cold_warm_thresh:
+                                _warm_ref = sam_video_masks[_f]  # this frame is good — update ref
+                            else:
+                                sam_video_masks[_f] = _warm_ref.copy()
+                                _cold_patched.append(_f)
+                        # Walk FORWARD from anchor toward last frame.
+                        _warm_ref = sam_video_masks[_anchor_key]
+                        for _f in range(_anchor_key + 1, _sorted_keys[-1] + 1):
+                            if _f not in sam_video_masks:
+                                continue
+                            if sam_video_masks[_f].sum() >= _cold_warm_thresh:
+                                _warm_ref = sam_video_masks[_f]
+                            else:
+                                sam_video_masks[_f] = _warm_ref.copy()
+                                _cold_patched.append(_f)
+                        if _cold_patched:
+                            log.info(f"SAM2 cold-hold: anchor=frame {_anchor_key} "
+                                     f"(cov={_anchor_cov:.0f}, thresh={_cold_warm_thresh:.0f}), "
+                                     f"held {len(_cold_patched)} cold frames: {sorted(_cold_patched)}")
 
                 # VRAM teardown — free per-clip state buffers but keep the predictor
                 # warm in _SAM_VIDEO_CACHE. reset_state releases SAM2's internal CUDA
@@ -1769,17 +1786,12 @@ def cmd_batch_scrub(source_video, scrub_folder, settings,
             ckpt = str(CK_ROOT / "sam2_weights" / "sam2.1_hiera_small.pt")
             cfg = "configs/sam2.1/sam2.1_hiera_s.yaml"
             device = "cuda" if sam_torch.cuda.is_available() else "cpu"
-            _actual_preroll = min(1, int(start_frame))  # pre-roll: warm SAM2 with one prior frame; 0 when start_frame==0
-            _total_export = _actual_preroll + int(count)
-            _sf_export = int(start_frame) - _actual_preroll
-            sam_anchor_rel += _actual_preroll
-
             # Export the N scrub frames to a temp dir — SAM2 video predictor
             # reads frames from disk via init_state(video_path=...). Phase 0
             # 2026-05-09: lossless PNG (was JPEG q=95) and letterbox-padded to
             # square BEFORE SAM sees them, so the encoder downsample is uniform.
             sam_tmp_dir = Path(_sam_tmp.mkdtemp(prefix="ck_sam2_scrub_"))
-            log.info(f"SAM2 video: exporting {_total_export} frames ({_actual_preroll} pre-roll + {count} target) to {sam_tmp_dir}")
+            log.info(f"SAM2 video: exporting {count} frames to {sam_tmp_dir}")
             from corridorkey_sam_merge import (
                 pad_to_square as _pad_to_square,
                 unpad_from_square as _unpad_from_square,
@@ -1792,19 +1804,16 @@ def cmd_batch_scrub(source_video, scrub_folder, settings,
             try:
                 _exp_cap = cv2.VideoCapture(str(source_video), cv2.CAP_FFMPEG)
                 # FIX C: POS_FRAMES + throwaway prime read (MSEC dirty first read on long-GOP).
-                _sf = _sf_export
+                _sf = int(start_frame)
                 if _sf > 0:
                     _exp_cap.set(cv2.CAP_PROP_POS_FRAMES, _sf - 1)
-                    _exp_cap.read()        # throwaway warm-up -> next read = _sf_export
-                else:
-                    _exp_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    _exp_cap.read()
-                    _exp_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    _exp_cap.read()        # throwaway warm-up -> next read = start_frame
+                # _sf == 0: never seek — freshly opened cap reads frame 0 cleanly.
                 _exported = 0
-                for _i in range(_total_export):
+                for _i in range(int(count)):
                     _ok, _fr = _exp_cap.read()
                     if not _ok or _fr is None:
-                        log.warning(f"SAM2 video: skipped unreadable frame {_sf_export + _i}")
+                        log.warning(f"SAM2 video: skipped unreadable frame {int(start_frame) + _i}")
                         continue
                     _fr_scaled = cv2.resize(_fr, (_scrub_w, _scrub_h), interpolation=cv2.INTER_AREA) if _scrub_scale != 1.0 else _fr
                     if _src_h is None:
@@ -1872,14 +1881,6 @@ def cmd_batch_scrub(source_video, scrub_folder, settings,
                             _filled = _bfh(_mu >= 0.5)
                             _mu = np.maximum(_mu, _filled.astype(np.float32))
                             sam_video_masks[_fi] = _mu
-                # Pre-roll discard: drop the pre-roll frame(s) and shift indices so
-                # sam_video_masks[0] == actual start_frame (not the pre-roll frame).
-                if _actual_preroll > 0:
-                    sam_video_masks = {
-                        _fi - _actual_preroll: v
-                        for _fi, v in sam_video_masks.items()
-                        if _fi >= _actual_preroll
-                    }
                 from corridorkey_sam_merge import process_sam_matte as _psm
                 for _fi in list(sam_video_masks.keys()):
                     sam_video_masks[_fi] = _psm(
