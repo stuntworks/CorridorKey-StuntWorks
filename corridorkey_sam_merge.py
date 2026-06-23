@@ -78,15 +78,14 @@ CK_SOFT_HI = 0.7
 SOFT_ZONE_SAM_BUFFER_PX = 40
 
 # Saturation ramp endpoints (logit space) — see logits_to_soft_mask below.
-# Narrowed from ±2.0 to ±1.0: halves the fade width (~2px at 1920 vs ~4px),
-# so the ramp survives a 2× upscale to 4K as ~4px instead of ~8-16px.
-# The 0.5 crossing stays at logit 0 (true SAM contour) — position unchanged.
-# Tunable: widen toward ±2.0 for softer edge, tighten toward ±0.5 for harder.
-SOFT_RAMP_LO = -1.0
-SOFT_RAMP_HI = 1.0
-# Legacy aliases — keep callers that read these constants by the old name.
-SAM_SOFT_LOGIT_LO = SOFT_RAMP_LO
-SAM_SOFT_LOGIT_HI = SOFT_RAMP_HI
+# A 4-logit-wide soft band gives a 2-4 px feather at typical SAM 2 grad
+# magnitudes around the contour. Berto verified on 4K Kitchen Fight.
+# RESTORED to 06-12 values (±2.0) — ±1.0 narrowed the feather too aggressively.
+SAM_SOFT_LOGIT_LO = -2.0
+SAM_SOFT_LOGIT_HI = 2.0
+# Forward-compat aliases used by newer call sites.
+SOFT_RAMP_LO = SAM_SOFT_LOGIT_LO
+SOFT_RAMP_HI = SAM_SOFT_LOGIT_HI
 
 # v1.0 always-on baseline smoothing of the soft SAM matte. Operates on
 # CONTINUOUS values now (the previous MORPH_OPEN k=3 was carving 3 px
@@ -1156,11 +1155,9 @@ def merge_ck_with_garbage_matte(
             if screen_type == "blue":
                 _lower, _upper = np.array([100, 50, 50]), np.array([130, 255, 255])
             else:
-                # Value floor 50 -> 20 (Berto 2026-06-22): dark-SHADOWED green behind
-                # black pants/shoes has HSV value <50, so the old floor missed it -> the
-                # gate went tight there -> green-spill edge pixels leaked = the recurring
-                # green fringe. 20 catches shadowed green. THE 3-month root (line never touched before).
-                _lower, _upper = np.array([35, 50, 20]), np.array([85, 255, 255])
+                # RESTORED to 06-12 value floor=50. Value floor 20 added post-06-12
+                # to catch shadowed green — reverted for 06-12 parity test.
+                _lower, _upper = np.array([35, 50, 50]), np.array([85, 255, 255])
             _green_bin = cv2.inRange(hsv_map, _lower, _upper)
             on_green_hsv = _green_bin.astype(np.float32) / 255.0
             _rc = max(3, int(round(9 * _scale)) | 1)
@@ -1208,11 +1205,8 @@ def merge_ck_with_garbage_matte(
 
     # Feather gate edges — converts hard sam_tight wall into gradient so CK
     # soft alpha is never clipped by a binary cliff where green detection missed.
-    # FIXED feather (Berto 2026-06-22): was 2.5*_scale = ~15px at 4K, which bled a
-    # ~10px halo around OFF-GREEN edges where CK has no signal to trim it (the de-noise
-    # exposed this pre-existing feather). Fixed thin sigma matches Resolve's clean edge —
-    # thin at any res, no off-green halo, still avoids a hard cliff that clips hair. Tune 1.5-3.0.
-    _gate_sigma = 2.5
+    # RESTORED to 06-12: scale-dependent sigma (2.5*_scale). Fixed 2.5 was post-06-12.
+    _gate_sigma = max(1.0, 2.5 * _scale)
     garbage_matte = cv2.GaussianBlur(garbage_matte, (0, 0), _gate_sigma)
     garbage_matte = np.clip(garbage_matte, 0.0, 1.0)
 

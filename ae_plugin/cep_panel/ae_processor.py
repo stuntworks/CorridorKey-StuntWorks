@@ -655,9 +655,11 @@ def apply_matte_postproc(fg_rgb, alpha_raw, settings, sam_soft=None, source_rgb=
             alpha = _np_r.clip(alpha * _zone_mask, 0.0, 1.0)
         if settings.get('fill_body_holes', True) and _sam_r is not None:
             alpha = _fill_body_holes(alpha, _sam_r)
-        if settings.get('green_kill', False):
-            from corridorkey_sam_merge import adaptive_green_kill
-            alpha = adaptive_green_kill(alpha, _sam_r, src)
+        # adaptive_green_kill CALL DISABLED (06-12 restore): function remains defined
+        # in corridorkey_sam_merge; call disabled per 06-12 parity (did not exist then).
+        # if settings.get('green_kill', False):
+        #     from corridorkey_sam_merge import adaptive_green_kill
+        #     alpha = adaptive_green_kill(alpha, _sam_r, src)
 
     alpha = apply_choke(alpha, settings)
     alpha = apply_despeckle(alpha, settings)
@@ -1272,14 +1274,21 @@ def cmd_batch(source_video, output_folder, settings,
                         for _fi, v in sam_video_masks.items()
                         if _fi >= _actual_preroll
                     }
-                from corridorkey_sam_merge import process_sam_matte as _psm
-                for _fi in list(sam_video_masks.keys()):
-                    sam_video_masks[_fi] = _psm(
-                        sam_video_masks[_fi],
-                        margin_px=float(sam_margin),
-                        softness_sigma=float(sam_soften),
-                        fill_kernel_px=int(sam_fill),
-                    )
+                # RENDER-PREVIEW PARITY FIX (2026-06-22): process_sam_matte was dilating
+                # the SAM gate by sam_sidecar_margin (default 10px) + baseline Gaussian here,
+                # but cmd_postproc (the PREVIEW the client approved) never calls
+                # process_sam_matte — it uses only the raw gate + sam_erode_px/sam_expand_px
+                # sliders (both 0 by default). That produced a ~10px border on render that
+                # was absent from preview. Removed to make render gate-prep identical to
+                # preview gate-prep. To re-enable, uncomment the block below.
+                #   from corridorkey_sam_merge import process_sam_matte as _psm
+                #   for _fi in list(sam_video_masks.keys()):
+                #       sam_video_masks[_fi] = _psm(
+                #           sam_video_masks[_fi],
+                #           margin_px=float(sam_margin),
+                #           softness_sigma=float(sam_soften),
+                #           fill_kernel_px=int(sam_fill),
+                #       )
                 # Empty / collapsed-mask post-pass — ported from CorridorKey_Pro.py
                 # (~1806-1847). SAM2 can yield a near-empty mask on some frames:
                 #   - INTERIOR collapse (mid-range tracking glitch): a frame between
@@ -1492,9 +1501,10 @@ def cmd_batch(source_video, output_folder, settings,
                     # sequence here to stay byte-identical to the pre-unification render.
                     if settings.get('fill_body_holes', True) and _sam_frame is not None:
                         alpha = _fill_body_holes(alpha, _sam_frame)
-                    if settings.get('green_kill', False):
-                        from corridorkey_sam_merge import adaptive_green_kill
-                        alpha = adaptive_green_kill(alpha, _sam_frame, img_rgb)
+                    # adaptive_green_kill CALL DISABLED (06-12 restore)
+                    # if settings.get('green_kill', False):
+                    #     from corridorkey_sam_merge import adaptive_green_kill
+                    #     alpha = adaptive_green_kill(alpha, _sam_frame, img_rgb)
                     alpha = apply_choke(alpha, settings)
                     alpha = apply_despeckle(alpha, settings)
                     fg = apply_despill(fg, settings)
@@ -1544,9 +1554,10 @@ def cmd_batch(source_video, output_folder, settings,
                         log.info(f'fusion_v2 batch frame {frame_idx}: hybrid solve done')
                         if settings.get('fill_body_holes', True) and _sam_frame is not None:
                             alpha = _fill_body_holes(alpha, _sam_frame)
-                        if settings.get('green_kill', False):
-                            from corridorkey_sam_merge import adaptive_green_kill
-                            alpha = adaptive_green_kill(alpha, _sam_frame, img_rgb)
+                        # adaptive_green_kill CALL DISABLED (06-12 restore)
+                        # if settings.get('green_kill', False):
+                        #     from corridorkey_sam_merge import adaptive_green_kill
+                        #     alpha = adaptive_green_kill(alpha, _sam_frame, img_rgb)
                         alpha = apply_choke(alpha, settings)
                         alpha = apply_despeckle(alpha, settings)
                         fg = apply_despill(fg, settings)
@@ -1566,9 +1577,10 @@ def cmd_batch(source_video, output_folder, settings,
                 # key to restore the eaten hair. Despilled fg + RAW CK alpha (pre-fusion,
                 # un-choked), so it carries every wisp the merged output loses.
                 _ck_a = alpha_raw[:, :, 0] if alpha_raw.ndim == 3 else alpha_raw
-                if settings.get('green_kill', False):
-                    from corridorkey_sam_merge import adaptive_green_kill
-                    _ck_a = adaptive_green_kill(_ck_a, _sam_frame, img_rgb)
+                # adaptive_green_kill CALL DISABLED (06-12 restore)
+                # if settings.get('green_kill', False):
+                #     from corridorkey_sam_merge import adaptive_green_kill
+                #     _ck_a = adaptive_green_kill(_ck_a, _sam_frame, img_rgb)
                 _ck_a16 = (np.clip(_ck_a, 0, 1) * 65535).astype(np.uint16)
                 _ck_only_bgra = cv2.merge([fg_bgr[:, :, 0], fg_bgr[:, :, 1], fg_bgr[:, :, 2], _ck_a16])
                 _ck_only_dir = out_dir / "CK_ONLY"
@@ -2236,9 +2248,10 @@ def cmd_postproc(session_dir, output_path, settings, background="checker", v1_pa
             # fusion path — fill dark webbing/clothing CK under-keys so the harness strap
             # shows in PREVIEW too, not just the final render. _sf_pp is the soft SAM resized.
             alpha = apply_shirt_rescue(alpha, _sf_pp, _source_rgb, settings)
-            if settings.get('green_kill', False):
-                from corridorkey_sam_merge import adaptive_green_kill
-                alpha = adaptive_green_kill(alpha, _sf_pp, _source_rgb)
+            # adaptive_green_kill CALL DISABLED (06-12 restore)
+            # if settings.get('green_kill', False):
+            #     from corridorkey_sam_merge import adaptive_green_kill
+            #     alpha = adaptive_green_kill(alpha, _sf_pp, _source_rgb)
             alpha = apply_choke(alpha, settings)
             alpha = apply_despeckle(alpha, settings)
             fg_rgb = apply_despill(fg_rgb, settings)
