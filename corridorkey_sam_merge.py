@@ -1115,6 +1115,13 @@ def merge_ck_with_garbage_matte(
     feet_start = bbox_y0 + int(bbox_h * 0.70)
     transition_px = 30
 
+    # Framing guard: if the body runs off the BOTTOM of the frame (waist/hip crop,
+    # no feet/floor visible), the feet-zone hug + the 92% "shadow below feet" cut
+    # below are WRONG — they were designed for full-body shots with feet on the
+    # floor. On a waist crop they land on the lower torso and mangle the bottom
+    # edge (ragged/broken bottom in BOTH viewer and render). Detect and skip them.
+    _body_exits_bottom = bbox_y1 >= int(h * 0.97)
+
     # Resolution-aware kernel scaling — constants calibrated at 1920px wide.
     _scale = float(w) / 1920.0
     _pg = max(1, int(round(20.0 * _scale)))  # sam_wide radius: green-zone CK protection
@@ -1199,9 +1206,12 @@ def merge_ck_with_garbage_matte(
     # the garbage matte hugs RAW SAM: no lateral dilation, no wide protection.
     # The 5px@1920 lateral dilation scales to ~11px at 4K — that was the ring.
     _feet_zone = np.zeros((h, w), dtype=np.float32)
-    _feet_zone[feet_start:, :] = 1.0
-    garbage_matte = (garbage_matte * (1.0 - _feet_zone)
-                     + np.minimum(garbage_matte, sam.astype(np.float32)) * _feet_zone)
+    if not _body_exits_bottom:
+        # Only hug raw SAM at the feet when feet are actually in frame. On a waist
+        # crop this zone lands on the lower torso and squares off the bottom edge.
+        _feet_zone[feet_start:, :] = 1.0
+        garbage_matte = (garbage_matte * (1.0 - _feet_zone)
+                         + np.minimum(garbage_matte, sam.astype(np.float32)) * _feet_zone)
 
     # Feather gate edges — converts hard sam_tight wall into gradient so CK
     # soft alpha is never clipped by a binary cliff where green detection missed.
@@ -1232,10 +1242,17 @@ def merge_ck_with_garbage_matte(
     # where the green screen ends; SAM fills the body beyond that boundary.
     if on_green_hsv is not None:
         try:
-            _y_cut = int(ys.min()) + int((ys.max() - ys.min()) * 0.92)
             _no_shadow = np.ones((h, w), dtype=np.float32)
-            _no_shadow[_y_cut:, :] = 0.0
+            if not _body_exits_bottom:
+                # Cut "shadow below feet" only when feet are in frame. On a waist
+                # crop there is no floor/shadow — cutting at 92% just chops the
+                # lower body into a hard horizontal line. Keep full height instead.
+                _y_cut = int(ys.min()) + int((ys.max() - ys.min()) * 0.92)
+                _no_shadow[_y_cut:, :] = 0.0
             off_green_body = sam.astype(np.float32) * (1.0 - on_green_hsv) * _no_shadow
+            # Feather the off-green fill: raw SAM is binary/jagged and was added
+            # AFTER the gate feather, so its edges printed ragged. Soften to match.
+            off_green_body = cv2.GaussianBlur(off_green_body, (0, 0), _gate_sigma)
             final = np.clip(final + off_green_body * (1.0 - final), 0.0, 1.0).astype(np.float32)
         except Exception:
             pass

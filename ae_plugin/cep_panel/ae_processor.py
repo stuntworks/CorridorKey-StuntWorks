@@ -203,6 +203,21 @@ _SAM_WARM_DISABLE = False  # RE-ENABLED 2026-06-22: warm cache was wrongly suspe
                            # is innocent — keep it ON for speed (cold reload was the slow preview/render).
                            # True = build fresh each render (pre-warm-SAM behavior). Flip to False to re-enable cache.
 
+# ── Off-green edge choke (AE path only) ──────────────────────
+# Erodes the final alpha ONLY along off-green edges (where the subject stands in
+# front of the dark studio background). On-green edges (hair, green-side detail)
+# are untouched. Both the render (cmd_batch) and the preview (cmd_postproc) run
+# apply_matte_postproc at the session frame resolution, so a single set of
+# constants here keeps preview == render by construction.
+#
+# Values are in REFERENCE pixels at 1920-wide source. apply_matte_postproc
+# scales them to the actual matte width before use, so the visual result is the
+# same regardless of source resolution (4K, 1080p, scrub-res).
+#
+# Tune one unit at a time by eye. Set to 0 to disable the entire block.
+OFF_GREEN_CHOKE_PX  = 0.0   # DISABLED: blanket off-green erode ate dark subject edges (pants hem broke up). Needs a smarter rim-only fix.
+OFF_GREEN_FEATHER_PX = 1.0  # gaussian feather applied to the choked region
+
 
 def _get_video_predictor(cfg: str, ckpt: str, device: str):
     _ensure_determinism()
@@ -664,6 +679,63 @@ def apply_matte_postproc(fg_rgb, alpha_raw, settings, sam_soft=None, source_rgb=
     alpha = apply_choke(alpha, settings)
     alpha = apply_despeckle(alpha, settings)
     fg_rgb = apply_despill(fg_rgb, settings)
+
+    # ── Off-green edge choke ──────────────────────────────────
+    # Erodes the alpha ~1px only along edges that lie over dark/non-green background,
+    # leaving on-green edges (hair, detail) untouched. Tunable via OFF_GREEN_CHOKE_PX
+    # and OFF_GREEN_FEATHER_PX at module top. No-op when OFF_GREEN_CHOKE_PX <= 0 or
+    # source_rgb is absent / shape-mismatched.
+    if OFF_GREEN_CHOKE_PX > 0:
+        _src_og = source_rgb if source_rgb is not None else None
+        if _src_og is not None:
+            try:
+                _h_og, _w_og = alpha.shape[:2]
+                _src_arr = _np_r.asarray(_src_og)
+                # Shape guard: skip if source doesn't match matte
+                if _src_arr.shape[:2] == (_h_og, _w_og):
+                    # Resolution-relative scale: reference is 1920px wide
+                    _og_scale = max(_w_og, 1) / 1920.0
+                    _choke_scaled = max(1, int(round(OFF_GREEN_CHOKE_PX * _og_scale)))
+                    _feat_scaled  = max(1.0, OFF_GREEN_FEATHER_PX * _og_scale)
+
+                    # Build on-green mask using same HSV bounds as corridorkey_sam_merge:
+                    #   hue [35..85], sat [50..255], val [50..255] (06-12 parity values)
+                    if _src_arr.dtype in (_np_r.float32, _np_r.float64):
+                        _u8_og = (_np_r.clip(_src_arr, 0.0, 1.0) * 255).astype(_np_r.uint8)
+                    else:
+                        _u8_og = _np_r.clip(_src_arr, 0, 255).astype(_np_r.uint8)
+                    if _u8_og.ndim == 2:
+                        _u8_og = _np_r.stack([_u8_og, _u8_og, _u8_og], axis=-1)
+                    # source_rgb is RGB; cv2.COLOR_RGB2BGR then COLOR_BGR2HSV
+                    _bgr_og  = _cv2_r.cvtColor(_u8_og, _cv2_r.COLOR_RGB2BGR)
+                    _hsv_og  = _cv2_r.cvtColor(_bgr_og, _cv2_r.COLOR_BGR2HSV)
+                    _lo_og   = _np_r.array([35,  50,  50], dtype=_np_r.uint8)
+                    _hi_og   = _np_r.array([85, 255, 255], dtype=_np_r.uint8)
+                    _green_bin = _cv2_r.inRange(_hsv_og, _lo_og, _hi_og)
+                    # on_green: float32 0..1  (1 = green-screen pixel)
+                    on_green  = _green_bin.astype(_np_r.float32) / 255.0
+                    off_green = 1.0 - on_green
+
+                    # Erode the full alpha, then blend: off-green gets eroded, on-green keeps original
+                    _k_og = _cv2_r.getStructuringElement(
+                        _cv2_r.MORPH_ELLIPSE,
+                        (_choke_scaled * 2 + 1, _choke_scaled * 2 + 1))
+                    _a8_og = (_np_r.clip(alpha, 0.0, 1.0) * 255).astype(_np_r.uint8)
+                    _eroded = _cv2_r.erode(_a8_og, _k_og).astype(_np_r.float32) / 255.0
+                    alpha = alpha * on_green + _eroded * off_green
+
+                    # Feather the off-green region only: blur the full alpha, blend back into off-green
+                    _bk_og = max(3, int(round(_feat_scaled * 4)) | 1)  # odd kernel, >= 3
+                    _alpha_blur = _cv2_r.GaussianBlur(
+                        _np_r.clip(alpha, 0.0, 1.0).astype(_np_r.float32),
+                        (_bk_og, _bk_og), _feat_scaled)
+                    alpha = alpha * on_green + _alpha_blur * off_green
+
+                    alpha = _np_r.clip(alpha, 0.0, 1.0)
+            except Exception as _e_og:
+                log.warning(f"off_green_choke skipped: {_e_og}")
+    # ── end off-green edge choke ──────────────────────────────
+
     if return_garbage:
         return fg_rgb, alpha, _green_garbage
     return fg_rgb, alpha
@@ -1312,20 +1384,20 @@ def cmd_batch(source_video, output_folder, settings,
                                 _held += 1
                     log.info(f"SAM2 post-pass: {_collapsed} interior empties -> NN fallback, "
                              f"{_held} tail/head empties held to nearest substantial mask.")
-                    # Anchor-frame fix — matches DaVinci CorridorKey_Pro.py ~1835-1847.
-                    # Frame 0 uses no_mem_embed (image-SAM mode) producing a weaker
-                    # mask with interior holes. If frame 2 has >10% more binarized
-                    # coverage than frame 0 or 1, copy frame 2 back over those frames.
-                    if 2 in sam_video_masks:
-                        _ref_cov = (sam_video_masks[2] > 0.5).sum()
-                        if _ref_cov >= 100:
-                            _patched = []
-                            for _early in (0, 1):
-                                if _early in sam_video_masks and (sam_video_masks[_early] > 0.5).sum() < _ref_cov * 0.9:
-                                    sam_video_masks[_early] = sam_video_masks[2].copy()
-                                    _patched.append(_early)
-                            if _patched:
-                                log.info(f"SAM2 anchor-fix: copied frame 2 -> frames {_patched}")
+                    # First-frame cold-start fix. The SAM2 VIDEO predictor's FIRST
+                    # frame (frame 0) runs with no temporal memory (no_mem_embed) and
+                    # comes out weak — small interior holes / notches at the bottom
+                    # that frames 1+ never have. The defect barely changes total
+                    # coverage, so the old >10% coverage test never fired and frame 0
+                    # stayed broken (the user's "it's just the first frame" bug).
+                    # Frame 0 is ALWAYS the cold-start; frame 1 is one frame away (same
+                    # pose, one step of tracker memory), so copy frame 1's warm mask
+                    # onto frame 0 unconditionally. Universal across clips, pose-safe
+                    # (adjacent frame); .copy() so no aliasing.
+                    if 0 in sam_video_masks and 1 in sam_video_masks \
+                            and (sam_video_masks[1] > 0.5).sum() >= 100:
+                        sam_video_masks[0] = sam_video_masks[1].copy()
+                        log.info("SAM2 first-frame fix: copied frame 1 -> frame 0 (video cold-start)")
 
                 # VRAM teardown — free per-clip state buffers but keep the predictor
                 # warm in _SAM_VIDEO_CACHE. reset_state releases SAM2's internal CUDA
