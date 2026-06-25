@@ -1684,6 +1684,8 @@
                     <span>Expand</span>
                   </button>
                   <button class="clear-btn" id="clearSam" type="button">Clear</button>
+                  <button class="clear-btn" id="addFrameBtn" type="button" title="Stamp the current dots onto this frame index, then clear so you can dot the next frame. Use when subject moves a lot between frames.">ADD FRAME</button>
+                  <button class="clear-btn" id="loadFrameBtn" type="button" title="Pull the current AE timeline frame into the viewer so you can dot it. Clears working dots only — stamped frames are kept.">LOAD FRAME</button>
                   <button class="clear-btn" id="zoneModeBtn" type="button" aria-pressed="false" title="ZONE: click to ARM, then drag an ellipse on the picture around a body part that leaves the green (feet, hands). SAM cuts tight only inside it. (Restored 2026-06-16.)">Zone</button>
                   <button class="clear-btn" id="fusionV2Main" type="button" aria-pressed="false" title="FUSION V2: new keying engine — CK untouched on green, SAM kills junk, zoned hair/feet room. Click to switch engines.">Fusion V2</button>
                 </div>
@@ -2061,6 +2063,34 @@
   // screen size. STUB: this array is what the real backend wiring sends to
   // SAM2 (point_coords + point_labels). Nothing reads it yet.
   const samPoints = [];
+  // Multi-frame SAM: maps absolute frame index → {positive:[[x,y],...], negative:[[x,y],...]}
+  // populated by stampDotsToFrame(). Empty = single-frame legacy path (no regression).
+  const samFrames = {};
+  let samFrameCount = 0;  // display counter (Object.keys length after each stamp)
+
+  // Stamp the current working samPoints onto frameIdx in samFrames.
+  // Converts normalized coords → full-res px (same math as ckSamPayload).
+  // Clears working samPoints + DOM dots after stamping so the next frame starts fresh.
+  function stampDotsToFrame(frameIdx) {
+    if (!samPoints.length) { ckStatus('No dots to stamp — place dots on the subject first'); return; }
+    if (!CK_SRC_W || !CK_SRC_H) { ckStatus('Stamp failed: source dims unknown — KEY a frame first'); return; }
+    const pos = [], neg = [];
+    samPoints.forEach(p => {
+      const px = [Math.round(p.x * CK_SRC_W), Math.round(p.y * CK_SRC_H)];
+      if (p.label === 1) pos.push(px); else neg.push(px);
+    });
+    samFrames[frameIdx] = { positive: pos, negative: neg };
+    samFrameCount = Object.keys(samFrames).length;
+    clearPoints();  // wipes DOM dots + samPoints + resets mode
+    ckStatus('Frame ' + frameIdx + ' stamped (' + samFrameCount + ' frame' + (samFrameCount === 1 ? '' : 's') + ' total). Dot the next frame, then ADD FRAME again.');
+    _updateAddFrameBtn();
+  }
+
+  function _updateAddFrameBtn() {
+    const btn = document.getElementById('addFrameBtn');
+    if (!btn) return;
+    btn.textContent = samFrameCount > 0 ? 'ADD FRAME (' + samFrameCount + ')' : 'ADD FRAME';
+  }
 
   // ---- point MODE: which polarity a left-click drops (item 1) ----
   // 'pos' = include/positive (default), 'neg' = exclude/negative.
@@ -2623,6 +2653,10 @@
     vwZoom.querySelectorAll('.sampt').forEach(n => n.remove());   // dots now live in #vwZoom
     points = 0;
     samPoints.length = 0;          // zero the data model too
+    // Also wipe multi-frame stamps so CLEAR is a true full reset.
+    Object.keys(samFrames).forEach(k => delete samFrames[k]);
+    samFrameCount = 0;
+    _updateAddFrameBtn();
     setPointMode('pos');           // back to the default include mode
     refreshCounts();
     if (bvHint) bvHint.style.display = '';
@@ -2648,6 +2682,40 @@
   function clearAll() { clearPoints(); if (typeof zoneClear === 'function') zoneClear(); }
   bvClear.addEventListener('click', clearAll);
   clearSam.addEventListener('click', clearAll);
+
+  const addFrameBtn = document.getElementById('addFrameBtn');
+  if (addFrameBtn) {
+    addFrameBtn.addEventListener('click', () => {
+      const infoFn = HOST_APP === 'ppro' ? 'ppro_getFrameInfo' : 'ae_getFrameInfo';
+      jsxCall(infoFn, [], (info) => {
+        if (!info || typeof info.sourceFrame !== 'number') {
+          ckStatus('ADD FRAME: could not read AE frame — try KEYing a frame first');
+          return;
+        }
+        stampDotsToFrame(info.sourceFrame);
+      });
+    });
+  }
+
+  const loadFrameBtn = document.getElementById('loadFrameBtn');
+  if (loadFrameBtn) {
+    loadFrameBtn.addEventListener('click', () => {
+      // Clear working dots only — do NOT touch samFrames (stamped frames must survive)
+      // and do NOT call clearPoints() which wipes samFrames and may re-trigger doKey.
+      [bvScreen, stageScreen, vwZoom].forEach(function(surf) {
+        if (surf) surf.querySelectorAll('.sampt').forEach(function(n) { n.remove(); });
+      });
+      samPoints.length = 0;
+      // Strip the .keyed class so the raw source plate is visible (mirrors the
+      // early-source display path at ~line 3366).
+      var _vwr = document.getElementById('viewer');
+      if (_vwr) _vwr.classList.remove('keyed');
+      // Pull the current AE/PPro timeline frame and show it in the dot-placement viewer.
+      if (typeof ckLoadSourceFrame === 'function') {
+        ckLoadSourceFrame(['vwZoom', 'stageScreen'], 'Frame loaded — click your dots, then ADD FRAME');
+      }
+    });
+  }
 
   // Ctrl+Z removes the last placed SAM dot (panel undo — AE undo can't touch panel state)
   function undoLastDot() {
@@ -3005,14 +3073,55 @@ function ckGetSettings() {
 function ckSamPayload(anchorFrame) {
     const pts = (typeof samPoints !== 'undefined') ? samPoints : [];
     const samOn = (typeof samIsOn === 'function') ? samIsOn() : false;
-    if (!samOn || !pts.length || !CK_SRC_W || !CK_SRC_H) return null;
+    // Multi-frame path: stamped frames exist — working dots may be empty or partial.
+    const hasStamped = (typeof samFrames !== 'undefined') && Object.keys(samFrames).length > 0;
+    if (!samOn || (!pts.length && !hasStamped) || !CK_SRC_W || !CK_SRC_H) return null;
     const scale = p => [Math.round(p.x * CK_SRC_W), Math.round(p.y * CK_SRC_H)];
     const anchor = (typeof anchorFrame === 'number') ? anchorFrame : CK_ANCHOR_FRAME;
-    return {
-        sam_positive: pts.filter(p => p.label === 1).map(scale),
-        sam_negative: pts.filter(p => p.label === 0).map(scale),
-        sam_anchor_frame: anchor,
+    // Build the legacy single-frame fields from the working dots (or first stamped frame
+    // if working is empty) so the Python anchor path always has data.
+    let anchorPos = pts.filter(p => p.label === 1).map(scale);
+    let anchorNeg = pts.filter(p => p.label === 0).map(scale);
+    let resolvedAnchor = anchor;
+    if (!anchorPos.length && !anchorNeg.length && hasStamped) {
+        // No unstamped working dots — seed the legacy fields from the earliest stamped frame.
+        const keys = Object.keys(samFrames).map(Number).sort((a, b) => a - b);
+        const firstKey = keys[0];
+        anchorPos = (samFrames[firstKey].positive || []);
+        anchorNeg = (samFrames[firstKey].negative || []);
+        resolvedAnchor = firstKey;
+    }
+    const payload = {
+        sam_positive: anchorPos,
+        sam_negative: anchorNeg,
+        sam_anchor_frame: resolvedAnchor,
     };
+    if (!hasStamped) {
+        // No stamped frames — exact legacy payload, no sam_frames key added.
+        return payload;
+    }
+    // Build sam_frames list: stamped frames + working dots as one more entry (if any).
+    const framesList = [];
+    Object.keys(samFrames).forEach(k => {
+        const fi = parseInt(k, 10);
+        const sf = samFrames[fi];
+        if ((sf.positive && sf.positive.length) || (sf.negative && sf.negative.length)) {
+            framesList.push({ frame: fi, positive: sf.positive || [], negative: sf.negative || [] });
+        }
+    });
+    // Add the current unstamped working dots as one more entry for the live anchor frame
+    // so dots placed but not yet stamped are NOT lost.
+    if (pts.length > 0) {
+        const livePos = pts.filter(p => p.label === 1).map(scale);
+        const liveNeg = pts.filter(p => p.label === 0).map(scale);
+        if (livePos.length || liveNeg.length) {
+            framesList.push({ frame: anchor, positive: livePos, negative: liveNeg });
+        }
+    }
+    if (framesList.length > 0) {
+        payload.sam_frames = framesList;
+    }
+    return payload;
 }
 
 // ===== SAM live overlay (cyan silhouette + magenta buffer edge) =====

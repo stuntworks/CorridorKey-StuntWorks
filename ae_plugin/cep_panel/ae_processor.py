@@ -1197,6 +1197,7 @@ def cmd_batch(source_video, output_folder, settings,
     sam_pos = settings.get("sam_positive", []) or []
     sam_neg = settings.get("sam_negative", []) or []
     sam_anchor_abs = settings.get("sam_anchor_frame")
+    sam_frames_raw = settings.get("sam_frames", None)  # list of {frame, positive, negative} for multi-frame prompting
     # Match DaVinci exactly: margin from sam2_margin (default 0 = no dilation).
     # NOT sam_sidecar_margin (=10) — that 10px dilation grabs dark background
     # off-green and prints a ~10px border around the subject. DaVinci uses 0.
@@ -1304,11 +1305,19 @@ def cmd_batch(source_video, output_folder, settings,
                 log.info(f"SAM2 video: {_exported} frames exported")
 
                 _video_predictor = _get_video_predictor(cfg, ckpt, device)
-                _all_pts = list(sam_pos) + list(sam_neg)
-                _labels  = [1] * len(sam_pos) + [0] * len(sam_neg)
-                if _sam_scale != 1.0:
-                    _all_pts = [[p[0] * _sam_scale, p[1] * _sam_scale] for p in _all_pts]
-                _all_pts_padded = _shift_pts(_all_pts, _pad_box) if _pad_box is not None else _all_pts
+                def _build_sam_pts_labels(pos_list, neg_list):
+                    """Scale + pad a pos/neg point list to SAM's padded-square space.
+                    Returns (points_np float32, labels_np int32) or (None, None) if empty."""
+                    pts = list(pos_list) + list(neg_list)
+                    lbls = [1] * len(pos_list) + [0] * len(neg_list)
+                    if not pts:
+                        return None, None
+                    if _sam_scale != 1.0:
+                        pts = [[p[0] * _sam_scale, p[1] * _sam_scale] for p in pts]
+                    pts_padded = _shift_pts(pts, _pad_box) if _pad_box is not None else pts
+                    return np.array(pts_padded, dtype=np.float32), np.array(lbls, dtype=np.int32)
+
+                _pts_np, _lbl_np = _build_sam_pts_labels(sam_pos, sam_neg)
                 log.info(f"SAM2 video: anchor at range frame {sam_anchor_rel} (absolute {sam_anchor_abs})")
                 with sam_torch.inference_mode():
                     _state = _video_predictor.init_state(
@@ -1320,10 +1329,40 @@ def cmd_batch(source_video, output_folder, settings,
                         inference_state=_state,
                         frame_idx=sam_anchor_rel,
                         obj_id=1,
-                        points=np.array(_all_pts_padded, dtype=np.float32),
-                        labels=np.array(_labels, dtype=np.int32),
+                        points=_pts_np,
+                        labels=_lbl_np,
                         clear_old_points=True,
                     )
+                    # Multi-frame SAM prompting: register additional anchor frames.
+                    # clear_old_points=False is critical — True would wipe prior frames' prompts.
+                    if sam_frames_raw:
+                        _extra_registered = 0
+                        for _sf_entry in sam_frames_raw:
+                            try:
+                                _sf_abs = int(_sf_entry["frame"])
+                                if not (start_frame <= _sf_abs < end_frame):
+                                    continue  # outside this render range
+                                _sf_rel = _sf_abs - int(start_frame)
+                                if _sf_rel == sam_anchor_rel:
+                                    continue  # already registered as anchor
+                                _sf_pos = _sf_entry.get("positive", [])
+                                _sf_neg = _sf_entry.get("negative", [])
+                                _sf_pts_np, _sf_lbl_np = _build_sam_pts_labels(_sf_pos, _sf_neg)
+                                if _sf_pts_np is None:
+                                    continue  # no points for this frame
+                                _video_predictor.add_new_points_or_box(
+                                    inference_state=_state,
+                                    frame_idx=_sf_rel,
+                                    obj_id=1,
+                                    points=_sf_pts_np,
+                                    labels=_sf_lbl_np,
+                                    clear_old_points=False,
+                                )
+                                _extra_registered += 1
+                            except Exception as _sfex:
+                                log.warning(f"SAM2 multi-frame: skipping entry {_sf_entry}: {_sfex}")
+                        if _extra_registered:
+                            log.info(f"SAM2 multi-frame: {_extra_registered} extra frame(s) registered")
                     from scipy.ndimage import binary_fill_holes as _bfh
                     # Forward: anchor → last frame. Logits are at padded square
                     # shape — apply ramp, then unpad to source frame shape.
