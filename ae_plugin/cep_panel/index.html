@@ -2978,7 +2978,7 @@ function ckGetSettings() {
         refiner: 1.0,
         despeckle: false,
         despeckleSize: 400,
-        choke: 0,
+        choke: 1,   // 1px edge shrink — removes the thin pale rim on hands/edges. Same value to preview + render (parity). Bump to 2 if rim persists.
         sam2_margin: 0, sam_sidecar_margin: 10, sam2_soften: 0, fill_holes: 0,
         sam_erode_px: 0,
         sam_expand_px: 0,

@@ -552,15 +552,28 @@ def sam_garbage_merge(alpha, sam_soft, source_rgb, settings, screen_type="green"
 
 
 def apply_choke(alpha, settings):
-    """Shrink the matte edge inward by N px (cv2.erode, ellipse kernel). 0 = off."""
+    """Shrink the matte edge inward by N px (cv2.erode, ellipse kernel). 0 = off.
+    Never chokes against a FRAME edge: where the subject runs off the edge of the
+    frame (e.g. body off the bottom on a waist crop) that contact is not a real
+    subject boundary, so eroding it just opens a gap along the frame. BORDER_REPLICATE
+    + an explicit border-band restore keep the matte flush to the frame; only true
+    interior edges (hands, shoulders) shrink."""
     import numpy as np, cv2
     choke_px = int(settings.get("choke", 0))
     if choke_px <= 0:
         return alpha
-    k = choke_px * 2 + 1
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    # HORIZONTAL-ONLY erosion (1-row kernel): shrinks near-vertical edges (hand
+    # and body SIDES, where the pale rim sits) but never top/bottom edges — so the
+    # shirt/pants bottom hem and the body-runs-off-frame-bottom contact are never
+    # eaten. A full ellipse choke ate the bottom of the frame.
+    kernel = np.ones((1, choke_px * 2 + 1), np.uint8)
     a8 = (np.clip(alpha, 0, 1) * 255).astype(np.uint8)
-    return cv2.erode(a8, kernel).astype(np.float32) / 255.0
+    eroded = cv2.erode(a8, kernel, borderType=cv2.BORDER_REPLICATE).astype(np.float32) / 255.0
+    # Keep flush at the left/right frame edges too (subject running off a side).
+    b = max(1, choke_px)
+    eroded[:, :b] = alpha[:, :b]
+    eroded[:, -b:] = alpha[:, -b:]
+    return eroded
 
 
 def apply_despeckle(alpha, settings):
