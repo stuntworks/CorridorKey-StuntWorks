@@ -402,11 +402,13 @@
      z-index 9000 keeps it above all panel chrome. display:none when idle. */
   #ck-busy-strip {
     display: none;
-    position: fixed; left: 0; right: 0; top: 0; z-index: 9000;
-    align-items: center; justify-content: center; gap: 16px;
-    padding: 16px 24px;
+    /* Centered vertically (Berto 2026-06-17: "I can't see the text when it renders,
+       put it in the center the whole time it renders"). */
+    position: fixed; left: 0; right: 0; top: 50%; transform: translateY(-50%); z-index: 9000;
+    flex-direction: column; align-items: center; justify-content: center; gap: 10px;
+    padding: 22px 24px;
     background: rgba(6, 8, 10, 0.96);
-    border-bottom: 3px solid var(--cyan);
+    border-top: 3px solid var(--cyan); border-bottom: 3px solid var(--cyan);
     box-shadow: 0 0 40px rgba(40,220,228,0.4), 0 4px 24px rgba(0,0,0,0.8);
   }
   #ck-busy-strip.show { display: flex; }
@@ -556,6 +558,12 @@
   .viewer:not(.ck-view-sam) canvas.sam-overlay { display: none !important; }
   .viewer:not(.ck-view-sam) #zoneOverlay.show { display: none !important; }
   .viewer:not(.ck-view-sam) #zoneClearChip.show { display: none !important; }
+  /* While ZONE is armed, force the ellipse overlay + clear chip visible over ANY
+     view, so the user draws over the FOOTAGE they can SEE (Berto 2026-06-16:
+     "I can't draw a zone on a white map with no edges"). Placed after the hide
+     rules so it wins at equal specificity. */
+  .viewer.zone-arming #zoneOverlay.show { display: block !important; }
+  .viewer.zone-arming #zoneClearChip.show { display: block !important; }
   /* Feature B: QUAD 2x2 view grid */
   #ckQuadGrid {
     display: none; position: absolute; inset: 0;
@@ -1378,8 +1386,8 @@
             </svg>
           </div>
           <div>
-            <a class="brand-name" href="https://corridordigital.com" target="_blank" title="Neural engine by Niko Pueringer / Corridor Digital" style="display:block;text-decoration:none">Corridor<b>Key</b></a>
-            <a class="brand-sub" href="https://youtube.com/@StuntWorksCinema" target="_blank" title="StuntWorks Cinema on YouTube" style="display:block;text-decoration:none">StuntWorks</a>
+            <a class="brand-name" href="#" title="Neural engine by Niko Pueringer / Corridor Digital — corridordigital.com" style="display:block;text-decoration:none;cursor:pointer;font-size:15px;font-weight:800;color:#3ee84e" onclick="ckOpenURL('https://corridordigital.com');return false;">Corridor<b>Key</b></a>
+            <a class="brand-sub" href="#" title="StuntWorks Cinema on YouTube" style="display:block;text-decoration:none;cursor:pointer;font-size:15px;font-weight:800;color:#e23cf0" onclick="ckOpenURL('https://www.youtube.com/@StuntWorksCinema');return false;">StuntWorks Cinema ↗</a>
           </div>
         </div>
       </div>
@@ -1436,6 +1444,11 @@
           <div class="vw-proc" id="vwProc">
             <span class="scan"></span>
             <span class="pl" id="procLabel">Keying frame</span>
+            <!-- Credits shown while it renders (Berto 2026-06-17: captive audience during the wait). -->
+            <div id="vwProcCredit" style="margin-top:12px;text-align:center;line-height:1.55;pointer-events:auto;">
+              <a href="#" title="StuntWorks Cinema on YouTube" onclick="ckOpenURL('https://www.youtube.com/@StuntWorksCinema');return false;" style="display:block;font:800 15px system-ui;color:#e23cf0;text-decoration:none;cursor:pointer;">StuntWorks Cinema&nbsp;&nbsp;↗</a>
+              <a href="#" title="CorridorKey engine by Niko Pueringer / Corridor Digital" onclick="ckOpenURL('https://corridordigital.com');return false;" style="display:block;font:800 15px system-ui;color:#3ee84e;text-decoration:none;cursor:pointer;margin-top:4px;">CorridorKey&nbsp;·&nbsp;by Niko Pueringer&nbsp;&nbsp;↗</a>
+            </div>
           </div>
           <span id="vwZoomBadge">1.0x</span>
           <span id="vwRenderBadge">Rendering</span>
@@ -1550,45 +1563,46 @@
           </div>
         </div>
 
-        <!-- Strap Bridge: connectivity bridge radius, 4–40 px. Raise if a dangling strap or prop gets cut. -->
-        <div class="matte-fader" id="faderJunkMat" style="margin-top:12px">
-          <div class="fader-head">
-            <span class="cell-title">Strap Bridge</span>
-            <span class="fader-value" id="junkMatVal">8</span>
-          </div>
-          <div class="fader-row">
-            <div class="fader-track">
-              <div class="fader-slot"></div>
-              <div class="fader-fill" id="junkMatFill" style="width:11%"></div>
-              <div class="fader-ticks" id="junkMatTicks"></div>
-              <input type="range" class="fader" id="junkMat" min="4" max="40" value="8"
-                     aria-label="Strap bridge, 4 to 40 px. Raise if a dangling strap or prop gets cut." />
-              <div class="fader-cap-lines" id="junkMatCap" style="left:11%"></div>
-            </div>
-            <div class="fader-scale"><span>4</span><span>8</span><span>16</span><span>28</span><span>40</span></div>
-          </div>
-        </div>
+        <!-- Junk Kill slider REMOVED 2026-06-16: proven dead — strap_bridge_px only runs in
+             the engine's experimental_recipe branch, which the panel never sends, so 4 vs 40
+             gave byte-identical output. Active junk control is the Fusion-V2 path. -->
 
         <!-- Zone Edge: SAM erosion radius inside zone, 0–15 px. -->
         <div class="matte-fader" id="faderZoneEdge" style="margin-top:12px">
           <div class="fader-head">
             <span class="cell-title">Zone Edge</span>
-            <span class="fader-value" id="zoneEdgeVal">4</span>
+            <span class="fader-value" id="zoneEdgeVal">1</span>
           </div>
           <div class="fader-row">
             <div class="fader-track">
               <div class="fader-slot"></div>
-              <div class="fader-fill" id="zoneEdgeFill" style="width:27%"></div>
+              <div class="fader-fill" id="zoneEdgeFill" style="width:7%"></div>
               <div class="fader-ticks" id="zoneEdgeTicks"></div>
-              <input type="range" class="fader" id="zoneEdge" min="0" max="15" value="4"
+              <input type="range" class="fader" id="zoneEdge" min="0" max="15" value="1"
                      aria-label="Zone edge erosion, 0 to 15 px" />
-              <div class="fader-cap-lines" id="zoneEdgeCap" style="left:27%"></div>
+              <div class="fader-cap-lines" id="zoneEdgeCap" style="left:7%"></div>
             </div>
             <div class="fader-scale"><span>0</span><span>4</span><span>8</span><span>12</span><span>15</span></div>
           </div>
         </div>
 
-        <!-- Expand: band-room knob for Fusion V2 (shown when fusion toggle ON, Strap Bridge hidden) -->
+        <!-- Green Clean: adaptive per-frame green-screen removal. Default OFF. -->
+        <div class="cell" id="cellGreenKill" style="margin-top:12px">
+          <div class="cell-top">
+            <span class="cell-title">Green Clean</span>
+            <div class="cell-control">
+              <button class="pswitch" id="greenKill" type="button" aria-pressed="false" aria-label="Green Clean — adaptive green-screen removal">
+                <span class="knob"></span>
+              </button>
+            </div>
+          </div>
+          <div class="ww">
+            <span class="w-row"><b>What.</b> Per-frame adaptive green removal — kills leftover green background including dark or unlit patches.</span>
+            <span class="w-row"><b>Why.</b> Leave OFF by default. Turn ON when the standard key leaves green fringe the normal pipeline misses.</span>
+          </div>
+        </div>
+
+        <!-- Expand: band-room knob for Fusion V2 (shown when fusion toggle ON, Junk Kill hidden) -->
         <div class="matte-fader" id="faderFusionExpand" style="margin-top:12px;display:none">
           <div class="fader-head">
             <span class="cell-title">Expand</span>
@@ -1670,6 +1684,7 @@
                     <span>Expand</span>
                   </button>
                   <button class="clear-btn" id="clearSam" type="button">Clear</button>
+                  <button class="clear-btn" id="zoneModeBtn" type="button" aria-pressed="false" title="ZONE: click to ARM, then drag an ellipse on the picture around a body part that leaves the green (feet, hands). SAM cuts tight only inside it. (Restored 2026-06-16.)">Zone</button>
                   <button class="clear-btn" id="fusionV2Main" type="button" aria-pressed="false" title="FUSION V2: new keying engine — CK untouched on green, SAM kills junk, zoned hair/feet room. Click to switch engines.">Fusion V2</button>
                 </div>
               </div>
@@ -1898,6 +1913,13 @@
     syncStageSamMode();
   });
 
+  const greenKillBtn = document.getElementById('greenKill');
+  if (greenKillBtn) greenKillBtn.addEventListener('click', () => {
+    const on = greenKillBtn.getAttribute('aria-pressed') === 'true';
+    greenKillBtn.setAttribute('aria-pressed', on ? 'false' : 'true');
+    if (typeof ckScheduleRepreview === 'function') ckScheduleRepreview();
+  });
+
   const fusionV2Btn = document.getElementById('fusionV2');
   if (fusionV2Btn) {
     // Restore persisted state (global, not per-clip -- survives panel reopen).
@@ -1997,11 +2019,10 @@
     }
   }
   wireFader('despill');
-  wireFader('junkMat');
   wireFader('zoneEdge');
   wireFader('fusionExpand');
   (function () {
-    ['despill', 'junkMat', 'zoneEdge', 'fusionExpand'].forEach(function (id) {
+    ['despill', 'zoneEdge', 'fusionExpand'].forEach(function (id) {
       const el = document.getElementById(id);
       if (el) el.addEventListener('change', function () { if (typeof ckScheduleRepreview === 'function') ckScheduleRepreview(); });
     });
@@ -2529,7 +2550,10 @@
     if (!_gestureTracking || vwPanning) return;
     const dx = e.clientX - _gDownX, dy = e.clientY - _gDownY;
     if (!_zoneDragging && Math.sqrt(dx * dx + dy * dy) >= 7) {
-      if (!viewerTakesPoints()) { _gestureTracking = false; return; }
+      // Zone draw is allowed when the viewer takes points OR when ZONE is armed
+      // (the armed button works in ANY view — restored 2026-06-16 after the
+      // arm-less gesture left zone unreachable from RESULT/PREVIEW).
+      if (!viewerTakesPoints() && !window.CK_ZONE_ARMED) { _gestureTracking = false; return; }
       _zoneDragging = true;
       try { viewer.setPointerCapture(e.pointerId); } catch (_) {}
     }
@@ -2559,12 +2583,36 @@
       if (_src) { localStorage.setItem('ck_zone_' + _src, JSON.stringify({zone: window.CK_ZONE, anchorFrame: window.CK_ZONE_ANCHOR_FRAME})); ckLog('zone saved ' + _src); }
     } catch (_) {}
     _zoneDrew = true;
+    // Disarm ZONE after a zone is drawn (one-shot, like the old zoneModeBtn).
+    if (window.CK_ZONE_ARMED) {
+      window.CK_ZONE_ARMED = false;
+      var _zb = document.getElementById('zoneModeBtn');
+      if (_zb) { _zb.setAttribute('aria-pressed', 'false'); _zb.style.color = ''; _zb.style.borderColor = ''; }
+      var _vz = document.getElementById('viewer');
+      if (_vz) _vz.classList.remove('zone-arming');
+    }
     ckUpdateSamDependentFaders();
   });
 
   if (zoneClearChip) zoneClearChip.addEventListener('click', (e) => {
     e.stopPropagation();
     zoneClear();
+  });
+
+  // ZONE arm button (restored 2026-06-16): click to arm, then drag an ellipse on
+  // the picture to draw the zone. Works in any view, unlike the bare gesture.
+  var zoneModeBtn = document.getElementById('zoneModeBtn');
+  if (zoneModeBtn) zoneModeBtn.addEventListener('click', function () {
+    window.CK_ZONE_ARMED = !window.CK_ZONE_ARMED;
+    zoneModeBtn.setAttribute('aria-pressed', window.CK_ZONE_ARMED ? 'true' : 'false');
+    zoneModeBtn.style.color = window.CK_ZONE_ARMED ? '#7de8ec' : '';
+    zoneModeBtn.style.borderColor = window.CK_ZONE_ARMED ? '#4dd8e6' : '';
+    // Force the zone overlay visible over the footage you can see while armed.
+    var _vEl = document.getElementById('viewer');
+    if (_vEl) _vEl.classList.toggle('zone-arming', window.CK_ZONE_ARMED);
+    ckStatus(window.CK_ZONE_ARMED
+      ? 'Zone armed — drag an ellipse on the picture around the junk'
+      : 'Zone off');
   });
 
   function clearPoints() {
@@ -2861,11 +2909,12 @@ function runPython(args) {
     const ckRoot = findCorridorkeyRoot();
     const python = findPythonExe(ckRoot);
     const processor = path.join(PANEL_DIR, 'ae_processor.py');
+    const ckLaunch = path.join(PANEL_DIR, 'ck_send.py');  // thin socket client -> ck_broker.py (runs CUDA engine OUTSIDE AE's CEF sandbox). ck_send falls back to direct if broker down. ck_launch.py kept but dead.
     if (!fs.existsSync(python)) throw new Error('Python not found: ' + python);
     if (!fs.existsSync(processor)) throw new Error('Processor not found: ' + processor);
     ckLog('exec: ' + python + ' ' + args.join(' '));
-    const res = childProcess.spawnSync(python, [processor].concat(args), {
-        encoding: 'utf8', windowsHide: true, maxBuffer: 64 * 1024 * 1024,
+    const res = childProcess.spawnSync(python, [ckLaunch].concat(args), {
+        encoding: 'utf8', windowsHide: true, maxBuffer: 64 * 1024 * 1024, cwd: PANEL_DIR,
         env: Object.assign({}, process.env, { CORRIDORKEY_ROOT: ckRoot })
     });
     if (res.stdout) for (const line of res.stdout.split(/\r?\n/)) { if (line) ckLog('py: ' + line); }
@@ -2882,11 +2931,12 @@ function runPythonAsync(args, onDone, onErr, onLine) {
         const ckRoot = findCorridorkeyRoot();
         const python = findPythonExe(ckRoot);
         const processor = path.join(PANEL_DIR, 'ae_processor.py');
+        const ckLaunch = path.join(PANEL_DIR, 'ck_send.py');  // thin socket client -> ck_broker.py (runs CUDA engine OUTSIDE AE's CEF sandbox). ck_send falls back to direct if broker down. ck_launch.py kept but dead.
         if (!fs.existsSync(python)) throw new Error('Python not found: ' + python);
         if (!fs.existsSync(processor)) throw new Error('Processor not found: ' + processor);
         ckLog('exec(async): ' + python + ' ' + args.join(' '));
-        const child = childProcess.spawn(python, [processor].concat(args), {
-            windowsHide: true,
+        const child = childProcess.spawn(python, [ckLaunch].concat(args), {
+            windowsHide: true, cwd: PANEL_DIR,
             env: Object.assign({}, process.env, { CORRIDORKEY_ROOT: ckRoot })
         });
         let errTail = '';
@@ -2917,9 +2967,11 @@ function ckGetSettings() {
     const strap_bridge_px = junkMatEl ? (parseInt(junkMatEl.value, 10) || 8) : 8;
     const zoneEdgeEl = document.getElementById('zoneEdge');
     const _zeParsed = zoneEdgeEl ? parseInt(zoneEdgeEl.value, 10) : NaN;
-    const zone_erode_px = isNaN(_zeParsed) ? 4 : _zeParsed;
+    const zone_erode_px = isNaN(_zeParsed) ? 1 : _zeParsed;
     const fusionV2El = document.getElementById('fusionV2');
     const fusion_v2 = fusionV2El ? (fusionV2El.getAttribute('aria-pressed') === 'true') : false;
+    const greenKillEl = document.getElementById('greenKill');
+    const green_kill = greenKillEl ? (greenKillEl.getAttribute('aria-pressed') === 'true') : false;
     const settings = {
         screenType: screenType,
         despill: despill,
@@ -2933,7 +2985,8 @@ function ckGetSettings() {
         strap_bridge_px: strap_bridge_px,
         zone_erode_px: zone_erode_px,
         fusion_v2: fusion_v2,
-        fusion_expand: (function(){ var e=document.getElementById('fusionExpand'); return e ? (parseInt(e.value,10)||6) : 6; })()
+        fusion_expand: (function(){ var e=document.getElementById('fusionExpand'); return e ? (parseInt(e.value,10)||6) : 6; })(),
+        green_kill: green_kill
     };
     ckLog('fusion_v2: ' + (fusion_v2 ? 'on' : 'off') + ' at settings build');
     if (window.CK_ZONE) {
@@ -3013,8 +3066,15 @@ function ckDrawOverlayImage(screenEl, img) {
     for (let i = 0, p = 0; i < bin.length; i++, p += 4) bin[i] = data[p] > 128 ? 1 : 0;
     const bufDisp = Math.max(1, Math.round(SAM_OVERLAY_BUFFER_PX * (rw / img.naturalWidth)));
     const dil = ckDilate(bin, sw, sh, bufDisp);
-    const edge = (m, idx, x, y) => m[idx] && (x === 0 || y === 0 || x === sw - 1 || y === sh - 1 ||
-        !m[idx - 1] || !m[idx + 1] || !m[idx - sw] || !m[idx + sw]);
+    // Edge = a SET pixel with an EMPTY IN-BOUNDS neighbor. Do NOT treat frame
+    // borders as edges (the old `x===0||y===0||x===sw-1||y===sh-1` + unguarded
+    // out-of-bounds neighbor checks forced the whole bottom/side row to paint a
+    // magenta/cyan fringe whenever the subject touched the frame edge). Frame-edge
+    // contact is not a real silhouette boundary, so out-of-bounds neighbors count
+    // as "filled", not empty.
+    const edge = (m, idx, x, y) => !!m[idx] && (
+        (x > 0 && !m[idx - 1]) || (x < sw - 1 && !m[idx + 1]) ||
+        (y > 0 && !m[idx - sw]) || (y < sh - 1 && !m[idx + sw]));
     const out = octx.createImageData(sw, sh); const od = out.data;
     for (let y = 0, i = 0; y < sh; y++) for (let x = 0; x < sw; x++, i++) {
         const p = i * 4;
@@ -3092,14 +3152,28 @@ function ckRepreview() {
 function ckScheduleRepreview() { if (window.CK_SCRUB_VIEW) window.CK_SCRUB_GEN = (window.CK_SCRUB_GEN || 0) + 1; if (_repreviewT) clearTimeout(_repreviewT); _repreviewT = setTimeout(window.CK_SCRUB_VIEW ? function(){ ckScrubShowFrame((window.CK_SCRUB && window.CK_SCRUB.cur) || 0); } : ckRepreview, 200); }
 
 // Drop the real keyed PNG into the console's viewer + cockpit stage.
+// SIMPLIFIED 2026-06-16: validates file size + catches image-load failures
+// so a blank viewer always surfaces WHY (corrupt PNG, CEF issue, missing file).
 function ckShowKeyed(png) {
     try {
+        // Guard: file must exist and have real image bytes.
+        if (!fs.existsSync(png)) {
+            ckStatus('Preview image missing — key may have failed');
+            ckLog('show preview: file not found: ' + png, true);
+            return;
+        }
+        const st = fs.statSync(png);
+        if (st.size < 100) {
+            ckStatus('Preview image is empty — engine produced blank output');
+            ckLog('show preview: file too small (' + st.size + ' bytes): ' + png, true);
+            return;
+        }
         const dest = path.join(PANEL_DIR, '_ck_preview.png');
         fs.copyFileSync(png, dest);
-        try { if (window.CK_SESSION_DIR) {
-            var _qa = path.join(window.CK_SESSION_DIR, 'alpha.png');
+        try { if (CK_SESSION_DIR) {
+            var _qa = path.join(CK_SESSION_DIR, 'alpha.png');
             if (fs.existsSync(_qa)) fs.copyFileSync(_qa, path.join(PANEL_DIR, '_ck_alpha.png'));
-            var _qg = path.join(window.CK_SESSION_DIR, 'sam2_gate_raw.png');
+            var _qg = path.join(CK_SESSION_DIR, 'sam2_gate_raw.png');
             if (fs.existsSync(_qg)) fs.copyFileSync(_qg, path.join(PANEL_DIR, '_ck_gate.png'));
         } } catch (_) {}
         const url = '_ck_preview.png?t=' + Date.now();
@@ -3118,11 +3192,15 @@ function ckShowKeyed(png) {
             });
             if (typeof ckRefreshQuad === 'function') ckRefreshQuad();
         };
+        pre.onerror = () => {
+            ckStatus('Preview image failed to load — try restarting AE');
+            ckLog('show preview: image load failed for ' + url + ' (CEF/NVIDIA cache issue?)', true);
+        };
         pre.src = url;
         // hide the mock silhouette/checker so the real composite shows through
         document.querySelectorAll('.subject, .checker').forEach(el => { el.style.display = 'none'; });
-        ckLog('preview shown');
-    } catch (e) { ckLog('show preview failed: ' + e.message, true); }
+        ckLog('preview shown (' + st.size + ' bytes)');
+    } catch (e) { ckLog('show preview failed: ' + e.message, true); ckStatus('Preview error: ' + e.message); }
 }
 
 // THE one action. extract -> cache(NN) -> [sam-apply if SAM points] -> postproc -> show.
@@ -3147,41 +3225,80 @@ function doKey(auto) {
 
     const infoFn = HOST_APP === 'ppro' ? 'ppro_getFrameInfo' : 'ae_getFrameInfo';
     jsxCall(infoFn, [], (info) => {
-        setTimeout(() => {     // let the busy state paint before spawnSync blocks
-            try {
-                if (!info.ok) throw new Error(info.error || 'Select a clip first');
-                if (info.sourceFile && info.sourceFile !== CK_LAST_SOURCE) {
-                    CK_LAST_SOURCE = info.sourceFile;
-                    try {
-                        const _saved = localStorage.getItem('ck_zone_' + info.sourceFile);
-                        if (_saved) {
-                            const _d = JSON.parse(_saved);
-                            window.CK_ZONE = _d.zone || null;
-                            window.CK_ZONE_ANCHOR_FRAME = (_d.anchorFrame !== undefined) ? _d.anchorFrame : null;
-                            ckLog('zone restored ' + info.sourceFile);
-                        } else {
-                            if (typeof window.ckZoneClear === 'function') window.ckZoneClear();
-                        }
-                    } catch (_) {
-                        if (typeof window.ckZoneClear === 'function') window.ckZoneClear();
-                    }
-                }
-                const framePng = randomTempPath('extract', '.png');
-                const ea = (typeof info.sourceTimeSeconds === 'number')
-                    ? ['extract', info.sourceFile, framePng, '--time', String(info.sourceTimeSeconds)]
-                    : ['extract', info.sourceFile, framePng, '--frame', String(info.sourceFrame)];
-                runPython(ea);
-                if (!fs.existsSync(framePng)) throw new Error('Extract produced no output');
+        // doKey is now fully async (runPythonAsync) so the UI thread stays free
+        // and the #ck-busy-strip scanner actually animates the whole time it runs.
+        function keyDone(msg, isErr) {
+            if (vwProc) vwProc.classList.remove('show');
+            if (stageProc) stageProc.classList.remove('show');
+            try { setBusy(false); } catch (_) {}
+            delete keyBtn.dataset.busy;
+            ckStatus(msg);
+            if (isErr) {
+                ckLog('KEY failed: ' + msg, true);
+                if (ringLabel) ringLabel.textContent = 'Ready';
+                if (kbSub) kbSub.textContent = 'Preview';
+            }
+        }
 
-                const sess = randomTempPath('session', '');
-                fs.mkdirSync(sess, { recursive: true });
-                const src = path.join(sess, 'source.png');
-                fs.copyFileSync(framePng, src);
+        if (!info.ok) { keyDone(info.error || 'Select a clip first', true); return; }
+        if (info.sourceFile && info.sourceFile !== CK_LAST_SOURCE) {
+            CK_LAST_SOURCE = info.sourceFile;
+            try {
+                const _saved = localStorage.getItem('ck_zone_' + info.sourceFile);
+                if (_saved) {
+                    const _d = JSON.parse(_saved);
+                    window.CK_ZONE = _d.zone || null;
+                    window.CK_ZONE_ANCHOR_FRAME = (_d.anchorFrame !== undefined) ? _d.anchorFrame : null;
+                    ckLog('zone restored ' + info.sourceFile);
+                } else {
+                    if (typeof window.ckZoneClear === 'function') window.ckZoneClear();
+                }
+            } catch (_) {
+                if (typeof window.ckZoneClear === 'function') window.ckZoneClear();
+            }
+        }
+
+        let framePng;
+        try { framePng = randomTempPath('extract', '.png'); }
+        catch (e) { keyDone('Error: ' + e.message, true); return; }
+        const ea = (typeof info.sourceTimeSeconds === 'number')
+            ? ['extract', info.sourceFile, framePng, '--time', String(info.sourceTimeSeconds)]
+            : ['extract', info.sourceFile, framePng, '--frame', String(info.sourceFrame)];
+
+        // STEP 1: extract
+        runPythonAsync(ea, () => {
+            if (!fs.existsSync(framePng)) { keyDone('Extract produced no output', true); return; }
+            // SOURCE PLATE EARLY: show the extracted frame immediately so the viewer
+            // is never blank while the NN/postproc runs (can take 10-30s).
+            // The matte swap in ckShowKeyed() will overwrite this when postproc finishes.
+            try {
+                const _srcDest = path.join(PANEL_DIR, '_ck_source.png');
+                fs.copyFileSync(framePng, _srcDest);
+                if (typeof ckShowSourceImage === 'function') {
+                    // Strip the .keyed class from #viewer NOW so the raw plate is
+                    // visible immediately (not buried under the .viewer.keyed dark bg).
+                    const _vwr = document.getElementById('viewer');
+                    if (_vwr) { _vwr.classList.remove('keyed'); _vwr.querySelectorAll('.subject,.checker').forEach(function(c){ c.style.display='none'; }); }
+                    ckShowSourceImage('_ck_source.png?t=' + Date.now(), ['vwZoom', 'stageScreen']);
+                    ckStatus('Source loaded — keying...');
+                } else {
+                    ckLog('early source: ckShowSourceImage not defined yet', true);
+                }
+            } catch (_srcErr) {
+                ckLog('early source display failed: ' + (_srcErr && _srcErr.message), true);
+            }
+            let sess, src, settings;
+            try {
+                sess = randomTempPath('session', ''); fs.mkdirSync(sess, { recursive: true });
+                src = path.join(sess, 'source.png'); fs.copyFileSync(framePng, src);
                 CK_SESSION_DIR = sess;
-                const settings = ckGetSettings();
-                const cacheParams = writeParamsFile(Object.assign({}, settings, { sourceFrame: info.sourceFrame }));
-                ckStatus('CorridorKey...');
-                runPython(['cache', src, sess, '--params', cacheParams]);
+                settings = ckGetSettings();
+            } catch (e) { keyDone('Error: ' + e.message, true); return; }
+            const cacheParams = writeParamsFile(Object.assign({}, settings, { sourceFrame: info.sourceFrame }));
+            ckStatus('CorridorKey...');
+
+            // STEP 2: cache (NN key)
+            runPythonAsync(['cache', src, sess, '--params', cacheParams], () => {
                 try { fs.unlinkSync(cacheParams); } catch (_) {}
                 try { const meta = JSON.parse(fs.readFileSync(path.join(sess, 'meta.json'), 'utf8')); CK_SRC_W = meta.width; CK_SRC_H = meta.height; } catch (_) {}
                 if (window.CK_ZONE && typeof window.ckZoneRenderOverlay === 'function') window.ckZoneRenderOverlay();
@@ -3191,67 +3308,98 @@ function doKey(auto) {
                 const samPayload = (typeof ckSamPayload === 'function') ? ckSamPayload(info.sourceFrame) : null;
                 if (!samPayload && (typeof samPoints !== 'undefined') && samPoints.length)
                     ckLog('KEY: ' + samPoints.length + ' dots but SAM skipped (samOn=' + (samIsOn && samIsOn()) + ' dims=' + CK_SRC_W + 'x' + CK_SRC_H + ')', true);
+
+                function runPostproc(spPayload) {
+                    const prev = path.join(sess, 'preview.png');
+                    const ppParams = writeParamsFile(Object.assign({}, settings, spPayload || {}));
+                    ckStatus('Compositing...');
+
+                    // STEP 4 (or 3 if no SAM): postproc
+                    runPythonAsync(['postproc', sess, prev, '--params', ppParams, '--background', CK_PREVIEW_BG, '--max-width', '1280'], () => {
+                        try { fs.unlinkSync(ppParams); } catch (_) {}
+                        if (!fs.existsSync(prev)) { keyDone('Postproc produced no preview', true); return; }
+                        ckShowKeyed(prev);
+                        // SAM feedback: cyan silhouette + magenta buffer edge over the preview.
+                        if (typeof ckRefreshSamOverlays === 'function') ckRefreshSamOverlays(!!spPayload);
+
+                        // Paint the keyed preview. In auto mode (pre-key on open) we show
+                        // the clean sample but DO NOT lock the flow: no approve gate, no
+                        // 'keyed' lock, so KEY stays pressable to commit the whole clip and
+                        // Advanced stays reachable.
+                        const viewer = document.getElementById('viewer');
+                        const vwTag = document.getElementById('vwTag'); if (vwTag) vwTag.textContent = 'Preview';
+                        const monLabel = document.getElementById('monLabel'); if (monLabel) monLabel.textContent = auto ? 'Keyed Sample' : 'Keyed Preview';
+                        if (!auto) {
+                            if (viewer) viewer.classList.add('keyed');
+                            if (ringLabel) ringLabel.textContent = 'Preview';
+                            if (kbSub) kbSub.textContent = 'Preview';
+                            const approveGate = document.getElementById('approveGate'); if (approveGate) approveGate.classList.add('show');
+                            if (typeof syncStageFromViewer === 'function') syncStageFromViewer();
+                            if (typeof syncStageSamMode === 'function') syncStageSamMode();
+                        }
+                        keyDone((auto ? 'Auto-key ready' : 'Preview ready') + (spPayload ? ' (SAM applied)' : ''));
+                    }, e => keyDone('Composite failed: ' + e.message, true));
+                }
+
                 if (samPayload) {
+                    // STEP 3: sam-apply (only when SAM points exist)
                     ckLog('KEY: running SAM (' + samPayload.sam_positive.length + ' incl / ' + samPayload.sam_negative.length + ' excl)');
                     try { fs.writeFileSync(path.join(sess, 'live_params.json'), JSON.stringify(samPayload)); } catch (_) {}
                     const samParams = writeParamsFile(samPayload);
                     ckStatus('Running SAM...');
-                    runPython(['sam-apply', sess, '--params', samParams]);
-                    try { fs.unlinkSync(samParams); } catch (_) {}
+                    runPythonAsync(['sam-apply', sess, '--params', samParams], () => {
+                        try { fs.unlinkSync(samParams); } catch (_) {}
+                        runPostproc(samPayload);
+                    }, e => { try { fs.unlinkSync(samParams); } catch (_) {} keyDone('SAM failed: ' + e.message, true); });
+                } else {
+                    runPostproc(null);
                 }
-
-                const prev = path.join(sess, 'preview.png');
-                const ppParams = writeParamsFile(Object.assign({}, settings, samPayload || {}));
-                ckStatus('Compositing...');
-                runPython(['postproc', sess, prev, '--params', ppParams, '--background', CK_PREVIEW_BG, '--max-width', '1280']);
-                try { fs.unlinkSync(ppParams); } catch (_) {}
-                if (!fs.existsSync(prev)) throw new Error('Postproc produced no preview');
-                ckShowKeyed(prev);
-                // SAM feedback: cyan silhouette + magenta buffer edge over the preview.
-                if (typeof ckRefreshSamOverlays === 'function') ckRefreshSamOverlays(!!samPayload);
-
-                // Paint the keyed preview. In auto mode (pre-key on open) we show
-                // the clean sample but DO NOT lock the flow: no approve gate, no
-                // 'keyed' lock, so KEY stays pressable to commit the whole clip and
-                // Advanced stays reachable.
-                const viewer = document.getElementById('viewer');
-                const vwTag = document.getElementById('vwTag'); if (vwTag) vwTag.textContent = 'Preview';
-                const monLabel = document.getElementById('monLabel'); if (monLabel) monLabel.textContent = auto ? 'Keyed Sample' : 'Keyed Preview';
-                if (!auto) {
-                    if (viewer) viewer.classList.add('keyed');
-                    if (ringLabel) ringLabel.textContent = 'Preview';
-                    if (kbSub) kbSub.textContent = 'Preview';
-                    const approveGate = document.getElementById('approveGate'); if (approveGate) approveGate.classList.add('show');
-                    if (typeof syncStageFromViewer === 'function') syncStageFromViewer();
-                    if (typeof syncStageSamMode === 'function') syncStageSamMode();
-                }
-                ckStatus((auto ? 'Auto-key ready' : 'Preview ready') + (samPayload ? ' (SAM applied)' : ''));
-            } catch (e) {
-                ckLog('KEY failed: ' + e.message, true);
-                ckStatus('Error: ' + e.message);
-                if (ringLabel) ringLabel.textContent = 'Ready';
-                if (kbSub) kbSub.textContent = 'Preview';
-            } finally {
-                if (vwProc) vwProc.classList.remove('show');
-                if (stageProc) stageProc.classList.remove('show');
-                try { setBusy(false); } catch (_) {}
-                delete keyBtn.dataset.busy;
-            }
-        }, 60);
+            }, e => { try { fs.unlinkSync(cacheParams); } catch (_) {} keyDone('Key failed: ' + e.message, true); });
+        }, e => keyDone('Extract failed: ' + e.message, true));
     });
 }
 
 // Paint a real image (file URL) into one or more screen elements + hide the mock
 // silhouette/checker inside them so the user sees actual footage, not the prototype art.
+// SIMPLIFIED 2026-06-16: file-size guard + onerror so blank source frames are caught.
 function ckShowSourceImage(url, targetIds) {
+    try {
+        // If url is a relative path, resolve it against PANEL_DIR for validation.
+        var _chk = url;
+        if (!_chk.startsWith('file:') && !_chk.startsWith('data:') && !_chk.startsWith('http')) {
+            _chk = path.join(PANEL_DIR, _chk.split('?')[0]);
+        }
+        if (!fs.existsSync(_chk)) {
+            ckLog('show source: file not found: ' + _chk, true);
+            return;
+        }
+        var _st = fs.statSync(_chk);
+        if (_st.size < 100) {
+            ckLog('show source: file too small (' + _st.size + ' bytes): ' + _chk, true);
+            return;
+        }
+    } catch (_) {}
     targetIds.forEach(id => {
         const el = document.getElementById(id);
         if (!el) return;
         el.classList.remove('keyed');
-        el.style.backgroundImage = 'url("' + url + '")';
-        el.style.backgroundSize = 'contain';
-        el.style.backgroundPosition = 'center';
-        el.style.backgroundRepeat = 'no-repeat';
+        // When painting into #vwZoom, .keyed lives on its parent #viewer — clear it there too
+        // so the dark .viewer.keyed background does not hide the raw plate.
+        if (id === 'vwZoom') {
+            const _par = document.getElementById('viewer');
+            if (_par) { _par.classList.remove('keyed'); _par.querySelectorAll('.subject,.checker').forEach(function(c){ c.style.display='none'; }); }
+        }
+        const pre = new Image();
+        pre.onload = () => {
+            el.style.backgroundImage = 'url("' + url + '")';
+            el.style.backgroundSize = 'contain';
+            el.style.backgroundPosition = 'center';
+            el.style.backgroundRepeat = 'no-repeat';
+        };
+        pre.onerror = () => {
+            ckLog('show source: image load failed for ' + url, true);
+        };
+        pre.src = url;
         el.querySelectorAll('.subject, .checker').forEach(c => { c.style.display = 'none'; });
     });
     // FIX COORD: populate CK_SRC_W/H the moment a source frame loads, so dots placed
@@ -3383,6 +3531,25 @@ function autoKeyAsync() {
             : ['extract', info.sourceFile, framePng, '--frame', String(info.sourceFrame)];
         runPythonAsync(ea, () => {
             if (!fs.existsSync(framePng)) return done('Extract produced no output', true);
+            // SOURCE PLATE EARLY: show the extracted frame immediately so the viewer
+            // is never blank while the NN/postproc runs (can take 10-30s on startup).
+            // The matte swap in ckShowKeyed() will overwrite this when postproc finishes.
+            try {
+                const _srcDest = path.join(PANEL_DIR, '_ck_source.png');
+                fs.copyFileSync(framePng, _srcDest);
+                if (typeof ckShowSourceImage === 'function') {
+                    // Strip the .keyed class from #viewer NOW so the raw plate is
+                    // visible immediately (not buried under the .viewer.keyed dark bg).
+                    const _vwr = document.getElementById('viewer');
+                    if (_vwr) { _vwr.classList.remove('keyed'); _vwr.querySelectorAll('.subject,.checker').forEach(function(c){ c.style.display='none'; }); }
+                    ckShowSourceImage('_ck_source.png?t=' + Date.now(), ['vwZoom', 'stageScreen']);
+                    ckStatus('Source loaded — keying...');
+                } else {
+                    ckLog('auto-key early source: ckShowSourceImage not defined yet', true);
+                }
+            } catch (_srcErr) {
+                ckLog('auto-key early source display failed: ' + (_srcErr && _srcErr.message), true);
+            }
             let sess, src;
             try {
                 sess = randomTempPath('session', ''); fs.mkdirSync(sess, { recursive: true });
@@ -3410,12 +3577,16 @@ function autoKeyAsync() {
                     const vwTag = document.getElementById('vwTag'); if (vwTag) vwTag.textContent = 'Preview';
                     if (monLabel) monLabel.textContent = 'Keyed Sample';
                     done('Auto-key ready');
-                    try { autoPreCache(info); } catch (_) {}
+                    if (CK_AUTO_PRECACHE) { try { autoPreCache(info); } catch (_) {} }
                 }, e => done('Composite failed: ' + e.message, true));
             }, e => done('Key failed: ' + e.message, true));
         }, e => done('Extract failed: ' + e.message, true));
     });
 }
+// OFF by default: GPU hog after every key; suspected cause of 600s worker wedge.
+// Manual path (KEY SCRUB button -> ae_getWorkAreaInfo -> batch-scrub) is untouched.
+// Flip to true to re-enable background pre-warm after each auto-key.
+const CK_AUTO_PRECACHE = false;
 // Auto pre-cache: after autoKeyAsync succeeds, kick off batch-scrub for 10 frames
 // in the background so the SCRUB slider is pre-warmed. Fires only once per clip load
 // (guard: skip if CK_SCRUB already busy or already has a dir).
@@ -3444,7 +3615,7 @@ function autoPreCache(info) {
     tag.style.display = 'block';
     try { if (typeof window._ckBigShow === 'function') window._ckBigShow('PRE-CACHING…'); } catch (_) {}
     if (window.CK_SCRUB) window.CK_SCRUB.busy = true;
-    var scrubDir = randomTempPath('scrub');
+    var scrubDir = path.join(CK_SESSION_DIR, 'scrub');
     var pp = writeParamsFile(settings);
     runPythonAsync(
         ['batch-scrub', info.sourceFile, scrubDir, '--params', pp,
@@ -3739,6 +3910,9 @@ function doSAMCommit(advanced) {
             const samMattePath =
                 (fs.existsSync(_gmAnchor) ? _gmAnchor : _firstPng(_gmDir, 'GARBAGE_MATTE_'))
                 || (fs.existsSync(_sjAnchor) ? _sjAnchor : _firstPng(_samJunkDir, 'SAM_JUNK_'));
+            // Tight SAM matte: raw inverted-SAM from SAM_JUNK/ only — no green-aware fallback.
+            // Secondary holdout layer for off-green shots. host.jsx skips it if identical to wide.
+            const tightSamPath = (fs.existsSync(_sjAnchor) ? _sjAnchor : _firstPng(_samJunkDir, 'SAM_JUNK_')) || null;
             // CK_ONLY (Berto 2026-06-14): the CK key alone (full hair + junk, no SAM clip),
             // RGBA. User matte-boxes the head from this and lays it over the merged key to
             // recover hair SAM ate. Imported as a hidden layer in the precomp.
@@ -3759,7 +3933,7 @@ function doSAMCommit(advanced) {
             jsxCall('ae_createSAMPrecomp', [
                 firstFrame, ckMattePath, samMattePath,
                 info.fps, info.compStartTime,
-                info.sourceFile, ckLockJson, String(isAdvanced), ckOnlyPath
+                info.sourceFile, ckLockJson, String(isAdvanced), ckOnlyPath, tightSamPath
             ], (imp) => {
                 if (!imp || !imp.ok) return finish('Precomp failed: ' + (imp && imp.error ? imp.error : 'unknown'), true);
                 if (imp.via) ckLog('samCommit: layer resolved via ' + imp.via);
@@ -3803,6 +3977,15 @@ function ckExitWorking() {
     // Done = back to the start screen: snap back down to the small standard size.
     ckResizePanel(CK_STD_W, CK_STD_H);
 }
+// Open an external URL from the CEP panel. target="_blank" does NOT work inside
+// CEP — must go through the CEP util. Try every known route, then window.open.
+function ckOpenURL(url) {
+    try { if (window.cep && window.cep.util && window.cep.util.openURLInDefaultBrowser) { window.cep.util.openURLInDefaultBrowser(url); return; } } catch (_) {}
+    try { var _c = (typeof require === 'function') ? require('cep') : null; if (_c && _c.util && _c.util.openURLInDefaultBrowser) { _c.util.openURLInDefaultBrowser(url); return; } } catch (_) {}
+    try { if (window.__adobe_cep__ && window.__adobe_cep__.openURLInDefaultBrowser) { window.__adobe_cep__.openURLInDefaultBrowser(url); return; } } catch (_) {}
+    try { var cp = require('child_process'); cp.exec('cmd /c start "" "' + url + '"'); return; } catch (_) {}
+    try { window.open(url, '_blank'); } catch (_) {}
+}
 (function () {
     // 1) Build top bar: LEFT (SCREEN + SUBJECT POINTS) | spacer | RIGHT (FRAMES + VIEWS)
     var topbar = document.getElementById('workTopBar');
@@ -3817,6 +4000,29 @@ function ckExitWorking() {
         var _tbSpacer = document.createElement('div');
         _tbSpacer.style.cssText = 'flex:1;';
         topbar.appendChild(_tbSpacer);
+
+        // Brand/credit advert (Berto 2026-06-16) — pinned to the TOP edge of the 58px
+        // bar, FULL WIDTH + centered (absolute, so the wide left/right clusters can't
+        // squeeze/clip it; clusters sit at the bottom via align-items:flex-end).
+        var _brandBar = document.createElement('div');
+        _brandBar.style.cssText = 'position:absolute;top:3px;left:0;right:0;display:flex;justify-content:center;gap:18px;pointer-events:none;z-index:1;';
+        var _brandCK = document.createElement('span');
+        _brandCK.innerHTML = 'CorridorKey <span style="opacity:.8">by Niko Pueringer ↗</span>';
+        _brandCK.title = 'CorridorKey AI engine by Niko Pueringer / Corridor Digital — visit corridordigital.com';
+        _brandCK.style.cssText = 'font:800 13px system-ui;color:#3ee84e;cursor:pointer;white-space:nowrap;pointer-events:auto;';
+        _brandCK.addEventListener('mouseenter', function () { _brandCK.style.color = '#86ff92'; });
+        _brandCK.addEventListener('mouseleave', function () { _brandCK.style.color = '#3ee84e'; });
+        _brandCK.addEventListener('click', function () { ckOpenURL('https://corridordigital.com'); });
+        var _brandSW = document.createElement('span');
+        _brandSW.innerHTML = 'StuntWorks Cinema ↗';
+        _brandSW.title = 'Visit StuntWorks Cinema on YouTube';
+        _brandSW.style.cssText = 'font:800 13px system-ui;color:#e23cf0;cursor:pointer;white-space:nowrap;pointer-events:auto;';
+        _brandSW.addEventListener('mouseenter', function () { _brandSW.style.color = '#f59aff'; _brandSW.style.textDecoration = 'underline'; });
+        _brandSW.addEventListener('mouseleave', function () { _brandSW.style.color = '#e23cf0'; _brandSW.style.textDecoration = 'none'; });
+        _brandSW.addEventListener('click', function () { ckOpenURL('https://www.youtube.com/@StuntWorksCinema'); });
+        _brandBar.appendChild(_brandCK);
+        _brandBar.appendChild(_brandSW);
+        topbar.appendChild(_brandBar);
 
         // Right cluster — FRAMES group + VIEWS group
         var ckBarRight = document.createElement('div');
@@ -3858,7 +4064,7 @@ function ckExitWorking() {
     // Move faders to pod body as full-style slider row (ABOVE the button row)
     var podBody = document.getElementById('workPodBody');
     if (podBody) {
-        ['faderDespill', 'faderJunkMat', 'faderZoneEdge', 'faderFusionExpand'].forEach(function (id) {
+        ['faderDespill', 'faderZoneEdge', 'faderFusionExpand'].forEach(function (id) {
             var f = document.getElementById(id);
             if (!f) return;
             var _savedDisplay = f.style.display;  // preserve fusion hide state across cssText wipe
@@ -3880,6 +4086,8 @@ function ckExitWorking() {
     // 2) pod KEY = PREVIEW this frame (+ SAM mask); COMMIT = render whole clip; Done = exit
     const podKey = document.getElementById('podKey');
     if (podKey) podKey.addEventListener('click', function () {
+        const _kb = document.getElementById('keyBtn');
+        if (_kb && _kb.dataset.busy) return;
         if (typeof doKey === 'function') doKey();
     });
     const podCommit = document.getElementById('podCommit');
@@ -3941,6 +4149,53 @@ function ckExitWorking() {
         });
         grip.addEventListener('pointerup', function () { dragging = false; });
     }
+})();
+
+// WARM-ON-OPEN: signal the broker to start loading the CUDA engine immediately
+// so the cold-load (model + torch.compile + SAM) overlaps with the operator
+// reading the panel and placing dots, not with the first KEY press.
+// SAFETY: calls schtasks only — never spawns the engine directly from CEP
+// (direct CUDA spawn inside CEF sandbox → 0xC0000005 crash).
+// If the task is absent, schtasks exits non-zero and we silently ignore it.
+(function ckWarmBroker() {
+    try {
+        childProcess.spawn(
+            'schtasks',
+            ['/run', '/tn', 'CorridorKey\\CUDABroker'],
+            { windowsHide: true, detached: true, stdio: 'ignore' }
+        ).unref();
+    } catch (_) { /* task absent or schtasks missing — no-op */ }
+})();
+
+// Show the pulsing strip immediately so the panel NEVER looks frozen on open.
+// The strip hides naturally when autoKeyAsync calls setBusy(false) on finish,
+// or after the 45s safety timeout if no clip is selected (early-return path).
+(function () {
+    try {
+        if (typeof window._ckBigShow === 'function') {
+            window._ckBigShow('Warming up…');
+        }
+        // Safety auto-hide: if autoKeyAsync never ran a key (no clip selected),
+        // clear the indicator after 45s so it doesn't sit stuck.
+        var _warmTimer = setTimeout(function () {
+            try {
+                var _msg = document.getElementById('ck-busy-msg');
+                if (_msg && _msg.textContent.toLowerCase().indexOf('warming') !== -1) {
+                    if (typeof window._ckBigHide === 'function') window._ckBigHide();
+                }
+            } catch (_) {}
+        }, 45000);
+        // If autoKeyAsync kicks off, it will call setBusy(true) immediately —
+        // that replaces "Warming up" with "Keying frame" and owns hide on finish.
+        // Cancel the safety timer the moment any real setBusy(true) fires.
+        var _origSB = (typeof setBusy === 'function') ? setBusy : null;
+        if (_origSB) {
+            setBusy = function (on) {
+                if (on && _warmTimer) { clearTimeout(_warmTimer); _warmTimer = null; }
+                _origSB(on);
+            };
+        }
+    } catch (_) {}
 })();
 
 setTimeout(() => { try { autoKeyAsync(); } catch (_) {} }, 700);
@@ -4300,7 +4555,7 @@ function ckResizePanel(w, h) {
                     st.count = count;
                     // Clean up previous scrub dir (each SCRUB creates a new temp dir; old ones accumulate otherwise).
                     if (CK_SCRUB.dir) { try { fs.rmSync(CK_SCRUB.dir, { recursive: true, force: true }); } catch (_) {} CK_SCRUB.dir = null; }
-                    var scrubDir = randomTempPath('scrub');
+                    var scrubDir = path.join(CK_SESSION_DIR, 'scrub');
                     var pp = writeParamsFile(st);
                     var _bigTrackLabel = document.getElementById('ckScrubBigLabel');
                     if (!_bigTrackLabel) {

@@ -1112,7 +1112,10 @@ def cmd_batch(source_video, output_folder, settings,
     sam_pos = settings.get("sam_positive", []) or []
     sam_neg = settings.get("sam_negative", []) or []
     sam_anchor_abs = settings.get("sam_anchor_frame")
-    sam_margin   = float(settings.get("sam_sidecar_margin", settings.get("sam2_margin", 0)))
+    # Match DaVinci exactly: margin from sam2_margin (default 0 = no dilation).
+    # NOT sam_sidecar_margin (=10) — that 10px dilation grabs dark background
+    # off-green and prints a ~10px border around the subject. DaVinci uses 0.
+    sam_margin   = float(settings.get("sam2_margin", 0))
     sam_soften   = float(settings.get("sam2_soften", 0))
     sam_fill     = int(settings.get("fill_holes", 0))
 
@@ -1174,12 +1177,9 @@ def cmd_batch(source_video, output_folder, settings,
             # to a square BEFORE SAM sees them, so the encoder downsample is
             # uniform.
             _count = int(end_frame - start_frame)
-            _actual_preroll = min(1, int(start_frame))  # pre-roll: warm SAM2 with one prior frame; 0 when start_frame==0
-            _total_export = _actual_preroll + _count
-            _sf_export = int(start_frame) - _actual_preroll
-            sam_anchor_rel += _actual_preroll
+            _sf_export = int(start_frame)
             sam_tmp_dir = Path(_sam_tmp.mkdtemp(prefix="ck_sam2_batch_"))
-            log.info(f"SAM2 video: exporting {_total_export} frames ({_actual_preroll} pre-roll + {_count} target) to {sam_tmp_dir}")
+            log.info(f"SAM2 video: exporting {_count} frames to {sam_tmp_dir}")
             from corridorkey_sam_merge import (
                 pad_to_square as _pad_to_square,
                 unpad_from_square as _unpad_from_square,
@@ -1197,11 +1197,8 @@ def cmd_batch(source_video, output_folder, settings,
                     _exp_cap.set(cv2.CAP_PROP_POS_FRAMES, _sf - 1)
                     _exp_cap.read()        # throwaway: warms decoder -> next read = _sf_export
                 # _sf_export == 0: never seek — freshly opened cap reads frame 0 cleanly.
-                # When _actual_preroll > 0 and start_frame == 1, _sf_export is 0 and
-                # frame 0 IS the pre-roll — it absorbs the no_mem_embed penalty so
-                # start_frame's mask gets proper temporal context (Berto 2026-06-17).
                 _exported = 0
-                for _i in range(_total_export):
+                for _i in range(_count):
                     _ok, _fr = _exp_cap.read()
                     if not _ok or _fr is None:
                         log.warning(f"SAM2 video: skipped unreadable frame {_sf_export + _i}")
@@ -1266,29 +1263,16 @@ def cmd_batch(source_video, output_folder, settings,
                             _mu = np.maximum(_mu, _filled.astype(np.float32))
                             sam_video_masks[_fi] = _mu
 
-                # Pre-roll discard: drop the pre-roll frame(s) and shift indices so
-                # sam_video_masks[0] == actual start_frame (not the pre-roll frame).
-                if _actual_preroll > 0:
-                    sam_video_masks = {
-                        _fi - _actual_preroll: v
-                        for _fi, v in sam_video_masks.items()
-                        if _fi >= _actual_preroll
-                    }
-                # RENDER-PREVIEW PARITY FIX (2026-06-22): process_sam_matte was dilating
-                # the SAM gate by sam_sidecar_margin (default 10px) + baseline Gaussian here,
-                # but cmd_postproc (the PREVIEW the client approved) never calls
-                # process_sam_matte — it uses only the raw gate + sam_erode_px/sam_expand_px
-                # sliders (both 0 by default). That produced a ~10px border on render that
-                # was absent from preview. Removed to make render gate-prep identical to
-                # preview gate-prep. To re-enable, uncomment the block below.
-                #   from corridorkey_sam_merge import process_sam_matte as _psm
-                #   for _fi in list(sam_video_masks.keys()):
-                #       sam_video_masks[_fi] = _psm(
-                #           sam_video_masks[_fi],
-                #           margin_px=float(sam_margin),
-                #           softness_sigma=float(sam_soften),
-                #           fill_kernel_px=int(sam_fill),
-                #       )
+                # Match DaVinci: apply process_sam_matte per-frame (margin/soften/fill
+                # from settings, same params DaVinci uses in its per-frame render loop).
+                from corridorkey_sam_merge import process_sam_matte as _psm
+                for _fi in list(sam_video_masks.keys()):
+                    sam_video_masks[_fi] = _psm(
+                        sam_video_masks[_fi],
+                        margin_px=float(sam_margin),
+                        softness_sigma=float(sam_soften),
+                        fill_kernel_px=int(sam_fill),
+                    )
                 # Empty / collapsed-mask post-pass — ported from CorridorKey_Pro.py
                 # (~1806-1847). SAM2 can yield a near-empty mask on some frames:
                 #   - INTERIOR collapse (mid-range tracking glitch): a frame between
@@ -1302,19 +1286,19 @@ def cmd_batch(source_video, output_folder, settings,
                 # range-relative frame index; DaVinci keys per obj_id).
                 _sorted_keys = sorted(sam_video_masks.keys())
                 if _sorted_keys:
-                    # Soft-coverage sum (logits_to_soft_mask yields float [0..1], so
-                    # sum() = fractional pixel area), scaled by _sam_scale^2 so
-                    # hold/collapse behaviour is identical at full-res and 1080p-cap.
-                    _sam_thresh = max(1, int(round(100 * _sam_scale * _sam_scale)))
+                    # Flat 100-px threshold on BINARIZED counts — matches DaVinci exactly.
+                    # Using (m > 0.5).sum() instead of soft m.sum() so a subject turning
+                    # sideways (legitimately smaller mask) is never incorrectly treated as
+                    # empty and overwritten with a held neighbor frame.
                     _first_sub = next(
-                        (f for f in _sorted_keys if sam_video_masks[f].sum() >= _sam_thresh), None)
+                        (f for f in _sorted_keys if (sam_video_masks[f] > 0.5).sum() >= 100), None)
                     _last_sub = next(
-                        (f for f in reversed(_sorted_keys) if sam_video_masks[f].sum() >= _sam_thresh), None)
+                        (f for f in reversed(_sorted_keys) if (sam_video_masks[f] > 0.5).sum() >= 100), None)
                     _collapsed = 0
                     _held = 0
                     if _first_sub is not None and _last_sub is not None:
                         for _f in _sorted_keys:
-                            if sam_video_masks[_f].sum() >= _sam_thresh:
+                            if (sam_video_masks[_f] > 0.5).sum() >= 100:
                                 continue
                             if _first_sub <= _f <= _last_sub:
                                 # interior collapse -> ones-mask -> CK-only fallback
@@ -1328,16 +1312,16 @@ def cmd_batch(source_video, output_folder, settings,
                                 _held += 1
                     log.info(f"SAM2 post-pass: {_collapsed} interior empties -> NN fallback, "
                              f"{_held} tail/head empties held to nearest substantial mask.")
-                    # Anchor-frame fix — ported from CorridorKey_Pro.py (~1835-1847).
+                    # Anchor-frame fix — matches DaVinci CorridorKey_Pro.py ~1835-1847.
                     # Frame 0 uses no_mem_embed (image-SAM mode) producing a weaker
-                    # mask with interior holes. If frame 2 has >10% more coverage than
-                    # frame 0 or 1, copy frame 2 back over the weak anchor frames.
+                    # mask with interior holes. If frame 2 has >10% more binarized
+                    # coverage than frame 0 or 1, copy frame 2 back over those frames.
                     if 2 in sam_video_masks:
-                        _ref_cov = sam_video_masks[2].sum()
-                        if _ref_cov >= _sam_thresh:
+                        _ref_cov = (sam_video_masks[2] > 0.5).sum()
+                        if _ref_cov >= 100:
                             _patched = []
                             for _early in (0, 1):
-                                if _early in sam_video_masks and sam_video_masks[_early].sum() < _ref_cov * 0.9:
+                                if _early in sam_video_masks and (sam_video_masks[_early] > 0.5).sum() < _ref_cov * 0.9:
                                     sam_video_masks[_early] = sam_video_masks[2].copy()
                                     _patched.append(_early)
                             if _patched:
@@ -1751,7 +1735,8 @@ def cmd_batch_scrub(source_video, scrub_folder, settings,
         sam_anchor_rel = 0
 
     sam_active = (len(sam_pos) + len(sam_neg)) > 0
-    sam_margin = float(settings.get("sam_sidecar_margin", settings.get("sam2_margin", 0)))
+    # Match DaVinci: margin from sam2_margin (0 = no dilation); see cmd_batch note.
+    sam_margin = float(settings.get("sam2_margin", 0))
     sam_soften = float(settings.get("sam2_soften", 0))
     sam_fill   = int(settings.get("fill_holes", 0))
     sam_video_masks = {}  # {frame_offset: float32 soft mask 0..1}
