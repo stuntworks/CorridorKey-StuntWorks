@@ -3291,6 +3291,7 @@ function ckShowKeyed(png) {
                 el.style.backgroundRepeat = 'no-repeat';
             });
             if (typeof ckRefreshQuad === 'function') ckRefreshQuad();
+            try { if (window.ckFitViewerModule) window.ckFitViewerModule(); } catch (_e) {}
         };
         pre.onerror = () => {
             ckStatus('Preview image failed to load — try restarting AE');
@@ -4064,6 +4065,7 @@ function ckEnterWorking() {
     try {
         const u = document.querySelector('.unit');
         if (u) { u.classList.remove('cockpit'); u.classList.add('working'); }
+        try { requestAnimationFrame(function(){ if (window.ckFitViewerModule) window.ckFitViewerModule(); }); } catch (_) {}
     } catch (_) {}
     // Advance = dot work: grow the floating panel to the working size (operator can
     // still drag-resize or hit FIT). Open stays small; only working mode is big.
@@ -4319,8 +4321,28 @@ try { ckUpdateSamDependentFaders(); } catch (_) {}
         void u.offsetWidth;          // ...read forces a synchronous layout...
         u.style.width = '';          // ...then back to the CSS 100%
     }
+    function ckFitViewerModule() {
+        try {
+            var u = document.querySelector('.unit');
+            var md = document.querySelector('.viewer-module');
+            if (!md) return;
+            if (!u || !u.classList.contains('working')) {
+                // not in working mode: drop any inline insets so CSS defaults apply
+                md.style.top = ''; md.style.bottom = '';
+                return;
+            }
+            var tb = document.querySelector('.work-topbar');
+            var wp = document.querySelector('.work-pod');
+            var topH = tb ? tb.getBoundingClientRect().height : 75;
+            var botH = wp ? wp.getBoundingClientRect().height : 150;
+            md.style.top = (Math.ceil(topH) + 4) + 'px';
+            md.style.bottom = (Math.ceil(botH) + 6) + 'px';
+        } catch (_) {}
+    }
+    window.ckFitViewerModule = ckFitViewerModule;
     try {
         window.addEventListener('resize', ckReflow);
+        window.addEventListener('resize', ckFitViewerModule);
         // Redraw the SAM outline on resize — otherwise the canvas stretches its old
         // bitmap and the outline squishes (Berto's resize bug). Debounced; redraws from cache.
         var _samRT = null;
@@ -4334,6 +4356,7 @@ try { ckUpdateSamDependentFaders(); } catch (_) {}
             }, 160);
         });
         [80, 300, 800, 1600, 3000].forEach(function (t) { setTimeout(ckReflow, t); });
+        [80, 300, 800, 1600, 3000].forEach(function (t) { setTimeout(ckFitViewerModule, t); });
     } catch (_) {}
 })();
 
