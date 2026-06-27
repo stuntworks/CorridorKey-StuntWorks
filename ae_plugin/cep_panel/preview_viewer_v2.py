@@ -44,7 +44,7 @@ from PySide6 import QtWidgets, QtGui, QtCore
 # that doesn't have torch in its env. CK_ROOT is three levels up:
 # ae_plugin/cep_panel/preview_viewer_v2.py -> ae_plugin/cep_panel -> ae_plugin -> repo root.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-from sam2_combine import apply_sam2_gate, apply_sam2_gate_additive, apply_sam2_gate_weighted, trim_gate_by_chroma, fill_holes_color_aware
+from sam2_combine import apply_sam2_gate, apply_sam2_gate_additive, apply_sam2_gate_weighted, apply_sam2_gate_subtract, trim_gate_by_chroma, fill_holes_color_aware
 
 # WHAT IT DOES: Installs diagnostic crash / exception loggers as early as possible.
 #   faulthandler dumps Python tracebacks on native signals (SIGSEGV, stack overflow,
@@ -93,12 +93,7 @@ class _ViewerColorUtils:
 
     @staticmethod
     def despill_opencv(image, green_limit_mode="average", strength=1.0):
-        """Removes green spill from an RGB float (0-1) image. Subtractive only
-        (no R/B boost) + warm-wardrobe guard (R >= G skipped). Mirrors the
-        engine's color_utils.despill_opencv. Both fixes are required to keep
-        yellow/orange/tan wardrobe from shifting pink. DANGER ZONE FRAGILE —
-        if the viewer ever shows yellow shirts as pink again, FIRST check
-        whether someone reverted these two changes."""
+        """Removes green spill from an RGB float (0-1) image."""
         if strength <= 0.0:
             return image
         r = image[..., 0]
@@ -109,12 +104,9 @@ class _ViewerColorUtils:
         else:
             limit = (r + b) / 2.0
         spill_amount = np.maximum(g - limit, 0.0)
-        # Warm-wardrobe guard — zero spill on R >= G pixels.
-        spill_amount = np.where(r >= g, 0.0, spill_amount)
-        # SUBTRACTIVE despill — do NOT reintroduce R/B boost.
         g_new = g - spill_amount
-        r_new = r
-        b_new = b
+        r_new = r + (spill_amount * 0.5)
+        b_new = b + (spill_amount * 0.5)
         despilled = np.stack([r_new, g_new, b_new], axis=-1)
         if strength < 1.0:
             return image * (1.0 - strength) + despilled * strength
@@ -337,7 +329,7 @@ class Session:
 # DEPENDS-ON: engine's color_utils (despill_opencv, clean_matte_opencv, create_checkerboard,
 #   composite_straight), a loaded Session.
 # AFFECTS: returns a fresh uint8 RGB image for display. Session state unchanged.
-def render_composite(cu, session: Session, params: dict):
+def render_composite(cu, session: Session, params: dict, override_alpha=None):
     despill_strength = float(params.get("despill", 1.0))
     despeckle_on = bool(params.get("despeckle", True))
     despeckle_size = int(params.get("despeckleSize", 400))
@@ -349,60 +341,54 @@ def render_composite(cu, session: Session, params: dict):
     sam2_margin = int(params.get("sam2_margin", 0))
     sam2_soften = int(params.get("sam2_soften", 0))
     halo_px = int(params.get("halo_px", 0))
+    halo_body_px = int(params.get("halo_body_px", 0))
     trim_chroma = int(params.get("trim_chroma", 0))
     fill_holes = int(params.get("fill_holes", 0))
     sam2_additive = bool(params.get("sam2_additive", False))
     sam2_weighted = bool(params.get("sam2_weighted", False))
-    # DaVinci formula exactly: multiply NN × gate first, then dilate+soften the result.
-    # Dilating the product spreads existing NN alpha values outward so MARGIN visibly
-    # grows the body. Gate cuts background bleed. SOFTEN feathers the expanded edge.
-    # halo_px>0 dilates the gate inside apply_sam2_gate so a band of NN values around
-    # the SAM2 silhouette survives — recovers hair / motion-blur detail at the edge.
-    # trim_chroma>0 removes screen-colored pixels from the gate before combine.
-    # fill_holes>0 fills alpha=0 holes inside the gate at non-screen-color pixels —
-    # rescues NN dropouts on yellow/skin/red. Applied AFTER the combine using the
-    # SAME (post-trim) gate so fill respects whatever TRIM SAM2 did.
-    if session.alpha_nn is not None and session.sam2_gate_raw is not None:
+    sam2_subtract = bool(params.get("sam2_subtract", False))
+    sam2_bypass = bool(params.get("sam2_bypass", False))
+    edge_guard_px = int(params.get("edge_guard_px", 20))
+    # v1.0 TWO-MASK MODE — CK is the displayed master, SAM is processed
+    # separately for export (Phase B) and side-by-side preview (Phase C).
+    # No merge happens here. SAM gate is run through the simple v1.0
+    # MARGIN / SOFTEN / FILL HOLES chain and stored on session for the
+    # renderer to write as a sidecar alpha PNG.
+    # Mode flags (sam2_subtract / _weighted / _additive) and HALO / EDGE
+    # GUARD / TRIM SAM2 are NO-OPS in v1.0. v2.2 chain lives in git tag
+    # v2.2-experimental-2026-05-08 for hot-revert.
+    session.sam_matte_v1 = None
+    if session.alpha_nn is not None and session.sam2_gate_raw is not None and not sam2_bypass:
+        # Option C — soft gate flows straight through. The binarise step that
+        # used to live here was the source of the bumpy contour from
+        # 2026-05-09 — it collapsed the 2-4 px feather the saturation ramp
+        # produced.
+        from corridorkey_sam_merge import process_sam_matte
         _gate = session.sam2_gate_raw.copy()
         if _gate.shape != session.alpha_nn.shape:
             _gate = cv2.resize(_gate, (session.alpha_nn.shape[1], session.alpha_nn.shape[0]),
                                interpolation=cv2.INTER_LINEAR)
-        _src_rgb = session.original_rgb if session.original_rgb is not None else session.fg_rgb
-        if sam2_weighted:
-            # SMART BLEND: per-pixel weighted combine — NN trusted in green
-            # regions, SAM2 trusted off-green. Skips trim/fill/halo (the
-            # chroma-derived weight handles boundary blending).
-            alpha = np.clip(apply_sam2_gate_weighted(session.alpha_nn, _gate,
-                                                     _src_rgb, screen_type="green"),
-                            0.0, 1.0)
-        elif sam2_additive:
-            # ADDITIVE mode: alpha = max(NN, gate * non_screen). SAM2 can ADD
-            # confidence where NN missed but never SUBTRACT NN's correct alpha.
-            # trim_chroma / fill_holes don't apply here (additive math has no
-            # multiplicative combine to gate). HALO still functional but its
-            # semantics shift — it dilates the SAM2 gate so the additive
-            # contribution extends outward, rather than preserving NN's edge band.
-            _gate_for_add = _gate
-            if halo_px and halo_px > 0:
-                _bin = (_gate_for_add > 0.5).astype(np.uint8)
-                _k = int(halo_px) * 2 + 1
-                _kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_k, _k))
-                _gate_for_add = cv2.dilate(_bin, _kernel).astype(np.float32)
-            alpha = np.clip(apply_sam2_gate_additive(session.alpha_nn, _gate_for_add,
-                                                     _src_rgb, screen_type="green"),
-                            0.0, 1.0)
-        else:
-            if trim_chroma > 0:
-                _gate = trim_gate_by_chroma(_gate, _src_rgb, "green", trim_chroma)
-            alpha = np.clip(apply_sam2_gate(session.alpha_nn, _gate, invert=False, halo_px=halo_px), 0.0, 1.0)
-            if fill_holes > 0:
-                alpha = fill_holes_color_aware(alpha, _gate, _src_rgb, "green", fill_holes)
+        session.sam_matte_v1 = process_sam_matte(
+            _gate,
+            margin_px=float(sam2_margin),
+            softness_sigma=float(sam2_soften),
+            fill_kernel_px=int(fill_holes),
+        )
+    # Live preview shows the picture WITH SAM applied (CK x SAM) — restored to the
+    # pre-3ebc4ee9 behavior, exactly as git did it: synchronously, inline. (An
+    # off-thread version crashed the viewer, so we keep the proven inline merge.)
+    if session.alpha_nn is not None and session.sam2_gate_raw is not None and not sam2_bypass:
+        from corridorkey_sam_merge import binarize_sam_silhouette, merge_ck_with_sam_active
+        _src_rgb = session.original_rgb if getattr(session, "original_rgb", None) is not None else session.fg_rgb
+        _gate_c = session.sam2_gate_raw.copy()
+        if _gate_c.shape != session.alpha_nn.shape:
+            _gate_c = cv2.resize(_gate_c, (session.alpha_nn.shape[1], session.alpha_nn.shape[0]),
+                                 interpolation=cv2.INTER_LINEAR)
+        alpha = merge_ck_with_sam_active(session.alpha_nn, binarize_sam_silhouette(_gate_c),
+                                         source_rgb=_src_rgb, proximity_px=edge_guard_px,
+                                         carve_points=params.get("sam_negative") or None)  # FIX: preview/render parity
     else:
         alpha = session.alpha.copy()
-    if sam2_margin > 0:
-        alpha = _dilate_mask(alpha, sam2_margin)
-    if sam2_soften > 0:
-        alpha = _soften_mask(alpha, sam2_soften)
     if choke_px > 0:
         int_choke = int(choke_px)
         frac = choke_px - int_choke
@@ -511,15 +497,21 @@ class PersistentWindow(QtWidgets.QWidget):
             # NN values around the silhouette survives — recovers hair /
             # motion-blur detail at the SAM2 edge. SAM2-only control.
             "halo_px": 0,
+            # HALO BODY: SAM2 gate dilation in GREEN-BORDERED zones (body
+            # silhouette where it meets the green screen). Pairs with halo_px
+            # (= HALO FEET) for the May 1 TWO HALO design — independent control
+            # so a 30+ px buffer can recover hair / butt-across-strap detail
+            # without bloating feet into the floor. 0 = off (bit-identical).
+            "halo_body_px": 0,
             # TRIM SAM2: chroma-aware mask refinement. 0 = off (bit-identical).
             # >0 removes screen-colored pixels from the SAM2 gate before
             # combine — kills "holes" at silhouette edges where SAM2 claims
             # green but NN keyed transparent. SAM2-only control.
             "trim_chroma": 0,
-            # FILL HOLES: color-aware interior alpha-zero fill. 0 = off
-            # (bit-identical). >0 fills alpha=0 holes inside the SAM2 gate at
-            # non-screen-color pixels — rescues NN dropouts on yellow shirts,
-            # skin, red. SAM2-only control.
+            # FILL HOLES: morphological close kernel size (px). v1.0 spec.
+            # 0 = no-op (default). User opts in only when a shot has actual
+            # interior holes; running close on every frame baked polygonal
+            # facets into the contour. SAM2-only control.
             "fill_holes": 0,
             "choke": 0,
             # FG SOURCE: "nn" = model FG (default, original behavior)
@@ -535,13 +527,23 @@ class PersistentWindow(QtWidgets.QWidget):
             # green-presence (chroma-derived weight). Wins over sam2_additive
             # when both are checked. Off = bit-identical.
             "sam2_weighted": False,
+            # SAM2 SUBTRACT: NN matte preserved in green zones; SAM2 only kills
+            # in non-green regions past the EDGE GUARD buffer. Wins over
+            # sam2_weighted/sam2_additive when toggled. Off = bit-identical.
+            "sam2_subtract": False,
+            # EDGE GUARD: distance (px) past green edge before SAM2 may kill.
+            # Feather auto-set to half this value. Default 8.
+            "edge_guard_px": 20,
+            # SAM2 BYPASS: master switch — when True, skip ALL SAM2 paths.
+            "sam2_bypass": False,
+            # SHOW SAM2: viewer-only cyan outline overlay.
+            "show_sam2": False,
         }
         # Drop-stale: if a new update comes in while we're painting, we only keep
         # the latest one. _pending is None when idle, or a dict when a render is
         # queued. _painting is True between compute and paint.
         self._pending = None
         self._painting = False
-
         # Live-params persistence: when the user drags a slider IN THE VIEWER, we
         # update self._params immediately (local render), then debounce a write of
         # live_params.json so the panel sees the value for batch processing. The
@@ -678,11 +680,17 @@ class PersistentWindow(QtWidgets.QWidget):
         mode_row.addStretch(1)
         # Each mode gets its own color — muted so it doesn't
         # compete with the footage, bright enough to read.
+        # v1.0 dual-mask: replaced single "Matte" pill with four discrete
+        # views (CK Matte / SAM Matte / Combined / Split). Mirrors the
+        # Resolve viewer so AE users get the same UX.
         self._mode_colors = {
-            "Original": ("#3a5a6a", "#7ab"),    # slate blue (neutral/source)
-            "Composite": ("#1a4a2a", "#5b5"),    # muted green (result)
-            "Foreground": ("#1a3a5a", "#5af"),   # steel blue (extracted)
-            "Matte": ("#4a3a1a", "#da5"),         # amber (technical)
+            "Original":   ("#3a5a6a", "#7ab"),  # slate blue (neutral/source)
+            "Composite":  ("#1a4a2a", "#5b5"),  # muted green (result)
+            "Foreground": ("#1a3a5a", "#5af"),  # steel blue (extracted)
+            "CK Matte":   ("#4a3a1a", "#da5"),  # amber (CK matte alone)
+            "SAM Matte":  ("#1a3a4a", "#0cd"),  # cyan (SAM matte alone)
+            "Combined":   ("#3a1a4a", "#c5f"),  # purple (CK x SAM preview)
+            "Split":      ("#3a2a1a", "#a85"),  # bronze (CK | SAM side-by-side)
         }
         self.mode_buttons = {}
         for mode, (bg, fg) in self._mode_colors.items():
@@ -694,12 +702,17 @@ class PersistentWindow(QtWidgets.QWidget):
             btn.clicked.connect(lambda _=False, m=mode: self._set_view_mode(m))
             mode_row.addWidget(btn)
             self.mode_buttons[mode] = btn
-        # Split toggle
-        self._split_btn = QtWidgets.QPushButton("Split")
+        # Source toggle (legacy two-pane mode) — renamed from "Split" so it
+        # doesn't collide with the new SPLIT view mode above.
+        self._split_btn = QtWidgets.QPushButton("Source")
         self._split_btn.setCheckable(True)
         self._split_btn.setStyleSheet(
             "background-color: #111; color: #667; padding: 6px 12px; "
             "border: 1px solid #2a2a2a; border-radius: 12px; font-size: 12px;"
+        )
+        self._split_btn.setToolTip(
+            "Show the input frame in a second pane next to the current view. "
+            "Useful for A/B comparison."
         )
         self._split_btn.clicked.connect(self._toggle_split)
         mode_row.addWidget(self._split_btn)
@@ -978,10 +991,10 @@ class PersistentWindow(QtWidgets.QWidget):
         self.choke_value_label.setMinimumWidth(42)
         grid.addWidget(self.choke_value_label, 2, 2)
 
-        # --- SAM2 margin: expand mask boundary outward (px) ---
+        # --- SAM2 MARGIN: bidirectional shrink/grow (-50..+50 px). v1.0 spec. ---
         grid.addWidget(_label("MARGIN"), 3, 0)
         self.sam2_margin_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.sam2_margin_slider.setRange(0, 80)
+        self.sam2_margin_slider.setRange(-50, 50)
         self.sam2_margin_slider.setValue(int(self._params["sam2_margin"]))
         self.sam2_margin_slider.valueChanged.connect(self._on_sam2_margin_changed)
         grid.addWidget(self.sam2_margin_slider, 3, 1)
@@ -989,10 +1002,10 @@ class PersistentWindow(QtWidgets.QWidget):
         self.sam2_margin_value_label.setMinimumWidth(42)
         grid.addWidget(self.sam2_margin_value_label, 3, 2)
 
-        # --- SAM2 soften: feather mask edges with Gaussian blur (px) ---
+        # --- SAM2 SOFTEN: Gaussian sigma 0..30 px. v1.0 spec. ---
         grid.addWidget(_label("SOFTEN"), 4, 0)
         self.sam2_soften_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.sam2_soften_slider.setRange(0, 80)
+        self.sam2_soften_slider.setRange(0, 30)
         self.sam2_soften_slider.setValue(int(self._params["sam2_soften"]))
         self.sam2_soften_slider.valueChanged.connect(self._on_sam2_soften_changed)
         grid.addWidget(self.sam2_soften_slider, 4, 1)
@@ -1000,58 +1013,55 @@ class PersistentWindow(QtWidgets.QWidget):
         self.sam2_soften_value_label.setMinimumWidth(42)
         grid.addWidget(self.sam2_soften_value_label, 4, 2)
 
-        # --- HALO: trimap-guided halo band width in px (slider 0-150, integer). ---
-        # SAM2-only. Dilates the SAM2 gate so a band of NN-driven alpha values
-        # around the silhouette survives the gate multiply — recovers hair and
-        # motion-blur detail at the SAM2 edge. 0 = current behavior.
-        self.halo_label_widget = _label("HALO")
-        grid.addWidget(self.halo_label_widget, 5, 0)
+        # --- HALO BODY: dilate SAM2 silhouette INTO green pixels only (slider 0-300). ---
+        # Option 5 design (2026-05-02): the dilated SAM2 silhouette is
+        # intersected with NN's green mask so the expansion can ONLY land on
+        # pixels NN keyed as background. Recovers hair / butt-across-strap /
+        # fingertip detail. By construction cannot bleed into floor or other
+        # non-green regions. Self-clamping at green edges. 0 = off.
+        self.halo_body_label_widget = _label("HALO BODY")
+        grid.addWidget(self.halo_body_label_widget, 5, 0)
+        self.halo_body_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.halo_body_slider.setRange(0, 300)
+        self.halo_body_slider.setValue(int(self._params["halo_body_px"]))
+        self.halo_body_slider.valueChanged.connect(self._on_halo_body_changed)
+        grid.addWidget(self.halo_body_slider, 5, 1)
+        self.halo_body_value_label = _label(f"{int(self._params['halo_body_px'])}", "#0ff")
+        self.halo_body_value_label.setMinimumWidth(42)
+        grid.addWidget(self.halo_body_value_label, 5, 2)
+
+        # --- HALO FEET: bidirectional silhouette adjustment at feet (-100 to +150). ---
+        # Negative values SHRINK the silhouette upward from the bottom edge —
+        # useful for removing connected floor patches. Positive values extend
+        # the silhouette down (foot shadow / contact recovery). Zero = no change.
+        self.halo_label_widget = _label("HALO FEET")
+        grid.addWidget(self.halo_label_widget, 6, 0)
         self.halo_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.halo_slider.setRange(0, 150)
+        self.halo_slider.setRange(-100, 150)
         self.halo_slider.setValue(int(self._params["halo_px"]))
         self.halo_slider.valueChanged.connect(self._on_halo_changed)
-        grid.addWidget(self.halo_slider, 5, 1)
+        grid.addWidget(self.halo_slider, 6, 1)
         self.halo_value_label = _label(f"{int(self._params['halo_px'])}", "#0ff")
         self.halo_value_label.setMinimumWidth(42)
-        grid.addWidget(self.halo_value_label, 5, 2)
+        grid.addWidget(self.halo_value_label, 6, 2)
 
-        # --- TRIM SAM2: chroma-aware mask refinement (slider 0-100 integer). ---
-        # SAM2-only. Removes screen-colored pixels from the SAM2 gate before
-        # combine — kills "holes" at silhouette edges where SAM2 claims green
-        # but NN keyed transparent. NN edge detail preserved. 0 = bit-identical.
-        _TRIM_TOOLTIP = ("TRIM SAM2 — removes screen-colored pixels from SAM2 mask edges.\n"
-                         "0 = off (bit-identical). 30-60 typical. Higher = more aggressive trim.")
-        self.trim_chroma_label_widget = _label("TRIM SAM2")
-        self.trim_chroma_label_widget.setToolTip(_TRIM_TOOLTIP)
-        grid.addWidget(self.trim_chroma_label_widget, 6, 0)
-        self.trim_chroma_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.trim_chroma_slider.setRange(0, 100)
-        self.trim_chroma_slider.setValue(int(self._params["trim_chroma"]))
-        self.trim_chroma_slider.valueChanged.connect(self._on_trim_chroma_changed)
-        self.trim_chroma_slider.setToolTip(_TRIM_TOOLTIP)
-        grid.addWidget(self.trim_chroma_slider, 6, 1)
-        self.trim_chroma_value_label = _label(f"{int(self._params['trim_chroma'])}", "#0ff")
-        self.trim_chroma_value_label.setMinimumWidth(42)
-        self.trim_chroma_value_label.setToolTip(_TRIM_TOOLTIP)
-        grid.addWidget(self.trim_chroma_value_label, 6, 2)
+        # TRIM SAM2 widget removed from UI 2026-05-01 (Berto declared useless).
+        # Underlying flow + helper kept; param defaults to 0.
 
-        # --- FILL HOLES: color-aware interior alpha-zero fill (slider 0-100 integer). ---
-        # SAM2-only. Fills alpha=0 holes INSIDE the SAM2 gate at pixels whose
-        # source RGB is NOT screen-colored — rescues NN dropouts on yellow
-        # shirts / skin / red while leaving correctly-killed green pixels alone.
-        # 0 = bit-identical. Higher = more lenient (more pixels qualify as
-        # "non-screen"). Mirrors Resolve viewer's FILL HOLES slider.
-        _FILL_TOOLTIP = ("FILL HOLES — fills NN alpha=0 dropouts inside SAM2 mask, but only for non-screen-color pixels.\n"
-                         "0 = off (bit-identical). 30-60 typical. Higher = more aggressive.")
+        # --- FILL HOLES: morphological close kernel (slider 0..50). v1.0 spec. ---
+        # SAM2-only. Fills small interior holes inside the SAM2 mask via
+        # cv2.MORPH_CLOSE. 0 = no-op. Mirrors Resolve viewer.
+        _FILL_TOOLTIP = ("FILL HOLES — close kernel size in pixels.\n"
+                         "Fills small interior holes inside the SAM2 mask.\n"
+                         "0 = off. 5 default. 20-50 for larger gaps.")
         self.fill_holes_label_widget = _label("FILL HOLES")
         self.fill_holes_label_widget.setToolTip(_FILL_TOOLTIP)
         grid.addWidget(self.fill_holes_label_widget, 7, 0)
         self.fill_holes_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.fill_holes_slider.setRange(0, 100)
+        self.fill_holes_slider.setRange(0, 50)
         self.fill_holes_slider.setValue(int(self._params["fill_holes"]))
         self.fill_holes_slider.valueChanged.connect(self._on_fill_holes_changed)
         self.fill_holes_slider.setToolTip(_FILL_TOOLTIP)
-        grid.addWidget(self.fill_holes_slider, 7, 1)
         self.fill_holes_value_label = _label(f"{int(self._params['fill_holes'])}", "#0ff")
         self.fill_holes_value_label.setMinimumWidth(42)
         self.fill_holes_value_label.setToolTip(_FILL_TOOLTIP)
@@ -1113,7 +1123,7 @@ class PersistentWindow(QtWidgets.QWidget):
             "SAM2 misses across visual boundaries (straps, props). Off = "
             "bit-identical to before."
         )
-        self.sam2_additive_label_widget = _label("SAM2 ON/OFF")
+        self.sam2_additive_label_widget = _label("SAM2 ADDITIVE")
         self.sam2_additive_label_widget.setToolTip(_SAM2_ADDITIVE_TOOLTIP)
         grid.addWidget(self.sam2_additive_label_widget, 9, 0)
         self.sam2_additive_checkbox = QtWidgets.QCheckBox("")
@@ -1129,34 +1139,97 @@ class PersistentWindow(QtWidgets.QWidget):
         self.sam2_additive_checkbox.toggled.connect(self._on_sam2_additive_changed)
         grid.addWidget(self.sam2_additive_checkbox, 9, 1, 1, 2)
 
-        # --- SAM2 SMART BLEND: weighted combine toggle (checkbox) ---
-        # Per-pixel blends NN alpha and SAM2 gate by chroma-derived weight:
-        # NN trusted in green regions (preserves hair / butt-across-strap),
-        # SAM2 trusted off-green (kills floor / props NN can't see). OFF =
-        # bit-identical. Wins over SAM2 ADDITIVE when both are checked.
-        # SAM2-only — has no visible effect when SAM2 is inactive.
-        _SAM2_WEIGHTED_TOOLTIP = (
-            "SMART BLEND — auto-blend NN and SAM2 per pixel. NN owns "
-            "green-screen regions (preserves fine detail like hair and "
-            "butt-across-strap). SAM2 owns non-green regions (kills "
-            "off-screen floor and props NN can't see). Off = bit-identical "
-            "to before."
+        # SMART BLEND widget removed from UI 2026-05-01 (50/50 ghost confirmed
+        # broken). Underlying flow + helper kept; param defaults to False.
+
+        # --- SAM2 SUBTRACT: subtract-only combine toggle (checkbox) ---
+        # alpha * dilated_SAM2_silhouette. Industry-standard garbage matte combine.
+        _SAM2_SUBTRACT_TOOLTIP = (
+            "SAM2 SUBTRACT — multiplies NN's matte by a dilated SAM2 "
+            "silhouette. Anything OUTSIDE the silhouette + EDGE GUARD pixels "
+            "gets killed (walls, props, crew, furniture). Anything INSIDE "
+            "passes through with NN's full alpha (hair, motion blur, "
+            "translucency). Use EDGE GUARD slider to tune margin per shot."
         )
-        self.sam2_weighted_label_widget = _label("SMART BLEND")
-        self.sam2_weighted_label_widget.setToolTip(_SAM2_WEIGHTED_TOOLTIP)
-        grid.addWidget(self.sam2_weighted_label_widget, 10, 0)
-        self.sam2_weighted_checkbox = QtWidgets.QCheckBox("")
-        self.sam2_weighted_checkbox.setStyleSheet(
+        self.sam2_subtract_label_widget = _label("SUBTRACT")
+        self.sam2_subtract_label_widget.setToolTip(_SAM2_SUBTRACT_TOOLTIP)
+        grid.addWidget(self.sam2_subtract_label_widget, 11, 0)
+        self.sam2_subtract_checkbox = QtWidgets.QCheckBox("")
+        self.sam2_subtract_checkbox.setStyleSheet(
             "QCheckBox { color: #8ab; border: none; background: transparent; "
             "font-size: 12px; font-weight: 600; letter-spacing: 0.5px; } "
             "QCheckBox::indicator { width: 12px; height: 12px; border: 1px solid "
             "#2a6a7a; border-radius: 2px; background: #001a28; } "
             "QCheckBox::indicator:checked { background: #0ff; border-color: #0ff; }"
         )
-        self.sam2_weighted_checkbox.setChecked(bool(self._params.get("sam2_weighted", False)))
-        self.sam2_weighted_checkbox.setToolTip(_SAM2_WEIGHTED_TOOLTIP)
-        self.sam2_weighted_checkbox.toggled.connect(self._on_sam2_weighted_changed)
-        grid.addWidget(self.sam2_weighted_checkbox, 10, 1, 1, 2)
+        self.sam2_subtract_checkbox.setChecked(bool(self._params.get("sam2_subtract", False)))
+        self.sam2_subtract_checkbox.setToolTip(_SAM2_SUBTRACT_TOOLTIP)
+        self.sam2_subtract_checkbox.toggled.connect(self._on_sam2_subtract_changed)
+        grid.addWidget(self.sam2_subtract_checkbox, 11, 1, 1, 2)
+
+        # --- EDGE GUARD: isotropic dilation pixels around SAM2 silhouette ---
+        _EDGE_GUARD_TOOLTIP = (
+            "EDGE GUARD — pixels the keep-zone extends past the SAM2 "
+            "silhouette. Higher = recovers hair / butt curve / fingertips "
+            "SAM2 cut tight; lower = tighter cut, less junk near subject. "
+            "Default 20. Action shots with motion blur: crank up. Tight "
+            "shots: drop down. Only used when SUBTRACT mode is on."
+        )
+        self.edge_guard_label_widget = _label("EDGE GUARD")
+        self.edge_guard_label_widget.setToolTip(_EDGE_GUARD_TOOLTIP)
+        grid.addWidget(self.edge_guard_label_widget, 12, 0)
+        self.edge_guard_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.edge_guard_slider.setRange(0, 60)
+        self.edge_guard_slider.setValue(int(self._params.get("edge_guard_px", 20)))
+        self.edge_guard_slider.valueChanged.connect(self._on_edge_guard_changed)
+        self.edge_guard_slider.setToolTip(_EDGE_GUARD_TOOLTIP)
+        grid.addWidget(self.edge_guard_slider, 12, 1)
+        self.edge_guard_value_label = _label(f"{int(self._params.get('edge_guard_px', 20))}", "#0ff")
+        self.edge_guard_value_label.setMinimumWidth(42)
+        self.edge_guard_value_label.setToolTip(_EDGE_GUARD_TOOLTIP)
+        grid.addWidget(self.edge_guard_value_label, 12, 2)
+
+        # --- BYPASS SAM2 master toggle ---
+        _SAM2_BYPASS_TOOLTIP = (
+            "BYPASS SAM2 — master switch. When ON, ignore SAM2 entirely. "
+            "Lets you A/B compare NN vs NN+SAM2 without clearing dots."
+        )
+        self.sam2_bypass_label_widget = _label("BYPASS SAM2")
+        self.sam2_bypass_label_widget.setToolTip(_SAM2_BYPASS_TOOLTIP)
+        grid.addWidget(self.sam2_bypass_label_widget, 13, 0)
+        self.sam2_bypass_checkbox = QtWidgets.QCheckBox("")
+        self.sam2_bypass_checkbox.setStyleSheet(
+            "QCheckBox { color: #8ab; border: none; background: transparent; "
+            "font-size: 12px; font-weight: 600; letter-spacing: 0.5px; } "
+            "QCheckBox::indicator { width: 12px; height: 12px; border: 1px solid "
+            "#2a6a7a; border-radius: 2px; background: #001a28; } "
+            "QCheckBox::indicator:checked { background: #0ff; border-color: #0ff; }"
+        )
+        self.sam2_bypass_checkbox.setChecked(bool(self._params.get("sam2_bypass", False)))
+        self.sam2_bypass_checkbox.setToolTip(_SAM2_BYPASS_TOOLTIP)
+        self.sam2_bypass_checkbox.toggled.connect(self._on_sam2_bypass_changed)
+        grid.addWidget(self.sam2_bypass_checkbox, 13, 1, 1, 2)
+
+        # --- SHOW SAM2 overlay ---
+        _SHOW_SAM2_TOOLTIP = (
+            "SHOW SAM2 — overlays a cyan outline of SAM2's silhouette on "
+            "the view. Display only; does not change render output."
+        )
+        self.show_sam2_label_widget = _label("SHOW SAM2")
+        self.show_sam2_label_widget.setToolTip(_SHOW_SAM2_TOOLTIP)
+        grid.addWidget(self.show_sam2_label_widget, 14, 0)
+        self.show_sam2_checkbox = QtWidgets.QCheckBox("")
+        self.show_sam2_checkbox.setStyleSheet(
+            "QCheckBox { color: #8ab; border: none; background: transparent; "
+            "font-size: 12px; font-weight: 600; letter-spacing: 0.5px; } "
+            "QCheckBox::indicator { width: 12px; height: 12px; border: 1px solid "
+            "#2a6a7a; border-radius: 2px; background: #001a28; } "
+            "QCheckBox::indicator:checked { background: #0ff; border-color: #0ff; }"
+        )
+        self.show_sam2_checkbox.setChecked(bool(self._params.get("show_sam2", False)))
+        self.show_sam2_checkbox.setToolTip(_SHOW_SAM2_TOOLTIP)
+        self.show_sam2_checkbox.toggled.connect(self._on_show_sam2_changed)
+        grid.addWidget(self.show_sam2_checkbox, 14, 1, 1, 2)
 
         grid.setColumnStretch(1, 1)
         parent_layout.addWidget(panel)
@@ -1212,10 +1285,19 @@ class PersistentWindow(QtWidgets.QWidget):
         self._schedule_save()
 
     def _on_halo_changed(self, value: int):
+        # HALO FEET — SAM2 gate dilation in non-green zones (feet, floor).
         # Slider 0-150 px integer. SAM2-only — visible effect requires an
         # active SAM2 mask. Mirrors Resolve viewer's _on_halo_changed.
         self._params["halo_px"] = int(value)
         self.halo_value_label.setText(str(int(value)))
+        self._render_now()
+        self._schedule_save()
+
+    def _on_halo_body_changed(self, value: int):
+        # HALO BODY — SAM2 gate dilation in green-bordered zones (body
+        # silhouette). Slider 0-150 px integer. SAM2-only.
+        self._params["halo_body_px"] = int(value)
+        self.halo_body_value_label.setText(str(int(value)))
         self._render_now()
         self._schedule_save()
 
@@ -1272,6 +1354,35 @@ class PersistentWindow(QtWidgets.QWidget):
     # AFFECTS: self._params["sam2_weighted"], repaint, persists to disk.
     def _on_sam2_weighted_changed(self, checked: bool):
         self._params["sam2_weighted"] = bool(checked)
+        self._local_change_time = time.perf_counter()
+        self._render_now()
+        self._save_live_params_now()
+
+    # WHAT IT DOES: SAM2 SUBTRACT checkbox handler. Toggles subtract-only
+    #   combine. Wins over sam2_weighted + sam2_additive when checked.
+    def _on_sam2_subtract_changed(self, checked: bool):
+        self._params["sam2_subtract"] = bool(checked)
+        self._local_change_time = time.perf_counter()
+        self._render_now()
+        self._save_live_params_now()
+
+    # WHAT IT DOES: EDGE GUARD slider handler. 0-50 px integer.
+    def _on_edge_guard_changed(self, value: int):
+        self._params["edge_guard_px"] = int(value)
+        self.edge_guard_value_label.setText(f"{int(value)}")
+        self._schedule_render()
+        self._schedule_save()
+
+    # WHAT IT DOES: BYPASS SAM2 master toggle.
+    def _on_sam2_bypass_changed(self, checked: bool):
+        self._params["sam2_bypass"] = bool(checked)
+        self._local_change_time = time.perf_counter()
+        self._render_now()
+        self._save_live_params_now()
+
+    # WHAT IT DOES: SHOW SAM2 overlay toggle.
+    def _on_show_sam2_changed(self, checked: bool):
+        self._params["show_sam2"] = bool(checked)
         self._local_change_time = time.perf_counter()
         self._render_now()
         self._save_live_params_now()
@@ -1356,7 +1467,7 @@ class PersistentWindow(QtWidgets.QWidget):
                     pass  # PNGs unreadable — stale view is better than a crash
         merged = dict(self._params)
         for k, v in params.items():
-            if k in ("despill", "despeckle", "despeckleSize", "background", "sam2_margin", "sam2_soften", "halo_px", "trim_chroma", "fill_holes", "fg_source", "sam2_additive", "sam2_weighted"):
+            if k in ("despill", "despeckle", "despeckleSize", "background", "sam2_margin", "sam2_soften", "halo_px", "halo_body_px", "trim_chroma", "fill_holes", "fg_source", "sam2_additive", "sam2_weighted", "sam2_subtract", "edge_guard_px", "sam2_bypass", "show_sam2"):
                 merged[k] = v
         if self._painting:
             self._pending = merged
@@ -1522,6 +1633,7 @@ class PersistentWindow(QtWidgets.QWidget):
             if self._view_mode == "Original":
                 img = self.original_u8.copy()
             elif self._view_mode == "Composite":
+                # render_composite applies SAM inline (CK x SAM) — see its body.
                 img = render_composite(self.cu, self.session, self._params)
             elif self._view_mode == "Foreground":
                 # Pure despilled RGB with NO alpha blend — shows what the colour
@@ -1535,25 +1647,34 @@ class PersistentWindow(QtWidgets.QWidget):
                         fg_rgb, green_limit_mode="average", strength=despill_strength
                     )
                 img = np.clip(fg_rgb * 255.0, 0, 255).astype(np.uint8)
-            else:  # Matte
-                # Apply despeckle (matte is what it edits) and show as grayscale RGB
+            elif self._view_mode in ("CK Matte", "SAM Matte", "Combined", "Split"):
+                # v1.0 dual-mask matte branch. Compute the post-processed CK
+                # alpha once, then dispatch to whichever of the four matte
+                # views is selected.
                 params_for_matte = dict(self._params)
                 _m = int(params_for_matte.get("sam2_margin", 0))
                 _s = int(params_for_matte.get("sam2_soften", 0))
                 _halo = int(params_for_matte.get("halo_px", 0))
+                _halo_body = int(params_for_matte.get("halo_body_px", 0))
                 _trim = int(params_for_matte.get("trim_chroma", 0))
                 _fill = int(params_for_matte.get("fill_holes", 0))
                 _additive = bool(params_for_matte.get("sam2_additive", False))
                 _weighted = bool(params_for_matte.get("sam2_weighted", False))
-                if self.session.alpha_nn is not None and self.session.sam2_gate_raw is not None:
+                _subtract = bool(params_for_matte.get("sam2_subtract", False))
+                _bypass = bool(params_for_matte.get("sam2_bypass", False))
+                _edge_guard = int(params_for_matte.get("edge_guard_px", 20))
+                # PATH B (per Berto 2026-05-05) — Matte view mirror of the
+                # Composite branch above. SAM gate binarised at 0.5 and
+                # OR-blended into CK alpha. Mode flags and HALO / EDGE GUARD /
+                # TRIM SAM2 / FILL HOLES are NO-OPS — sliders remain wired
+                # but feed nothing.
+                if self.session.alpha_nn is not None and self.session.sam2_gate_raw is not None and not _bypass:
+                    from corridorkey_sam_merge import binarize_sam_silhouette, merge_ck_with_sam_active
+                    # source_rgb for the active dispatcher (chroma-gated merge).
+                    _src_rgb_m = (self.session.original_rgb
+                                  if self.session.original_rgb is not None
+                                  else self.session.fg_rgb)
                     _gate = self.session.sam2_gate_raw.copy()
-                    # SAM2 returns the gate at 256x256 — must resize to alpha
-                    # shape or the multiply throws "operands could not be
-                    # broadcast together" and the Matte view goes blank /
-                    # the Split view shows a render error. The Composite
-                    # branch (render_composite) has this resize already; the
-                    # Matte branch was missing it. Fix re-applied 2026-04-28
-                    # after a cleanup revert that wiped it.
                     if _gate.shape != self.session.alpha_nn.shape:
                         _gate = cv2.resize(
                             _gate,
@@ -1561,37 +1682,10 @@ class PersistentWindow(QtWidgets.QWidget):
                              self.session.alpha_nn.shape[0]),
                             interpolation=cv2.INTER_LINEAR,
                         )
-                    _src_rgb_m = (self.session.original_rgb
-                                  if self.session.original_rgb is not None
-                                  else self.session.fg_rgb)
-                    if _weighted:
-                        # SMART BLEND mirror of Composite branch — per-pixel
-                        # weighted NN/SAM2 by chroma. trim/fill_holes/halo
-                        # intentionally not applied here either.
-                        alpha = np.clip(apply_sam2_gate_weighted(self.session.alpha_nn,
-                                                                 _gate, _src_rgb_m,
-                                                                 screen_type="green"),
-                                        0.0, 1.0)
-                    elif _additive:
-                        # ADDITIVE mode mirrors the Composite branch. HALO still
-                        # functional but its semantics shift (extends additive
-                        # contribution outward rather than preserving NN edge band).
-                        _gate_for_add = _gate
-                        if _halo and _halo > 0:
-                            _bin = (_gate_for_add > 0.5).astype(np.uint8)
-                            _k = int(_halo) * 2 + 1
-                            _kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_k, _k))
-                            _gate_for_add = cv2.dilate(_bin, _kernel).astype(np.float32)
-                        alpha = np.clip(apply_sam2_gate_additive(self.session.alpha_nn,
-                                                                 _gate_for_add, _src_rgb_m,
-                                                                 screen_type="green"),
-                                        0.0, 1.0)
-                    else:
-                        if _trim > 0:
-                            _gate = trim_gate_by_chroma(_gate, _src_rgb_m, "green", _trim)
-                        alpha = np.clip(apply_sam2_gate(self.session.alpha_nn, _gate, invert=False, halo_px=_halo), 0.0, 1.0)
-                        if _fill > 0:
-                            alpha = fill_holes_color_aware(alpha, _gate, _src_rgb_m, "green", _fill)
+                    alpha = merge_ck_with_sam_active(self.session.alpha_nn,
+                                                     binarize_sam_silhouette(_gate),
+                                                     source_rgb=_src_rgb_m, proximity_px=_edge_guard,
+                                                     carve_points=self._params.get("sam_negative") or None)  # FIX: preview/render parity
                 else:
                     alpha = self.session.alpha.copy()
                 if _m > 0:
@@ -1602,7 +1696,68 @@ class PersistentWindow(QtWidgets.QWidget):
                     alpha = self.cu.clean_matte_opencv(
                         alpha, area_threshold=int(params_for_matte.get("despeckleSize", 400))
                     )
-                img = alpha_to_rgb_u8(alpha)
+                # v1.0 dual-mask dispatch. session.sam_matte_v1 is the SAM
+                # matte AFTER process_sam_matte (always-on baseline cleanup +
+                # user FILL HOLES / MARGIN / SOFTEN). When SAM is bypassed or
+                # absent, SAM-dependent views fall back to CK so the pane is
+                # never blank.
+                _sam_v1 = getattr(self.session, "sam_matte_v1", None)
+                _sam_active = _sam_v1 is not None and not _bypass
+                _sam_arr = np.asarray(_sam_v1, dtype=np.float32) if _sam_active else None
+                if _sam_active and _sam_arr.shape != alpha.shape:
+                    _sam_arr = cv2.resize(
+                        _sam_arr, (alpha.shape[1], alpha.shape[0]),
+                        interpolation=cv2.INTER_LINEAR,
+                    )
+
+                if self._view_mode == "CK Matte":
+                    img = alpha_to_rgb_u8(alpha)
+                elif self._view_mode == "SAM Matte":
+                    img = alpha_to_rgb_u8(_sam_arr if _sam_active else alpha)
+                elif self._view_mode == "Combined":
+                    # `alpha` is ALREADY CK x SAM (computed by the garbage-matte
+                    # merge above, line ~1673). Multiplying it by sam_matte_v1
+                    # again double-applied SAM — squared the soft edge (dark halo)
+                    # and punched holes wherever the soft matte dipped below the
+                    # already-gated CK alpha. Show the single, correct result.
+                    img = alpha_to_rgb_u8(alpha)
+                else:  # Split
+                    if _sam_active:
+                        _ck_rgb = alpha_to_rgb_u8(alpha)
+                        _sam_rgb = alpha_to_rgb_u8(_sam_arr)
+                        _sep = np.full((_ck_rgb.shape[0], 4, 3), 60, dtype=np.uint8)
+                        _sep[:, :] = (60, 90, 100)
+                        img = np.concatenate([_ck_rgb, _sep, _sam_rgb], axis=1)
+                    else:
+                        img = alpha_to_rgb_u8(alpha)
+            else:
+                # Unknown mode — fall back to Composite so the viewer never
+                # paints a blank pane.
+                img = render_composite(self.cu, self.session, self._params)
+
+            # SHOW SAM2 viewer-only overlay (cyan outline of SAM2 silhouette).
+            # Suppressed in any matte view — drawing the outline on a multi-
+            # panel matte image stretches the gate horizontally and lands the
+            # outline in the gutter (the "weird outline" Berto called out
+            # 2026-05-09). The Combined / Split views already display SAM
+            # data, so the overlay would be redundant on top of those too.
+            _is_matte_view = self._view_mode in (
+                "CK Matte", "SAM Matte", "Combined", "Split"
+            )
+            if (not _is_matte_view) and bool(self._params.get("show_sam2", False)) \
+                    and self.session is not None \
+                    and self.session.sam2_gate_raw is not None and img is not None:
+                try:
+                    _g = self.session.sam2_gate_raw
+                    if img.ndim == 3 and (_g.shape[0] != img.shape[0] or _g.shape[1] != img.shape[1]):
+                        _g = cv2.resize(_g, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_LINEAR)
+                    _gb = (_g > 0.5).astype(np.uint8) * 255
+                    _edges = cv2.Canny(_gb, 50, 150)
+                    _edges = cv2.dilate(_edges, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
+                    img = img.copy()
+                    img[_edges > 0] = [0, 255, 255]  # cyan (RGB)
+                except Exception:
+                    pass
 
             # Cache the full-res result so window resizes can rescale without
             # re-running stage-2. Then paint it at the current label size.
@@ -1616,13 +1771,34 @@ class PersistentWindow(QtWidgets.QWidget):
             # same, the display layer is broken. This is the first data point any
             # debugger reaches for when "nothing seems to be happening."
             mean_r, mean_g, mean_b = img.reshape(-1, 3).mean(axis=0)
-            self.status.setText(
-                f"Mode: {self._view_mode}  |  despill={self._params['despill']:.2f}  "
-                f"despeckle={'on' if self._params['despeckle'] else 'off'}"
-                f"@{self._params['despeckleSize']}  bg={self._params['background']}  "
-                f"|  meanRGB=({mean_r:.1f},{mean_g:.1f},{mean_b:.1f})  "
-                f"|  render {dt_ms:.0f} ms"
-            )
+            # Per-mode status text. Matte views get a short user-facing hint
+            # rather than the diagnostic readout.
+            _sam_present = getattr(self.session, "sam_matte_v1", None) is not None
+            if self._view_mode == "CK Matte":
+                self.status.setText("  CK matte (full size)  |  Output: this matte goes to your CK keyed clip.")
+            elif self._view_mode == "SAM Matte":
+                if _sam_present:
+                    self.status.setText("  SAM matte (full size)  |  Output: ships as a sidecar layer in your comp / sequence.")
+                else:
+                    self.status.setText("  SAM matte (full size)  |  No SAM points active — showing CK matte as fallback.")
+            elif self._view_mode == "Combined":
+                if _sam_present:
+                    self.status.setText("  Combined preview (CK x SAM)  |  Reference look only — output is still two separate mattes.")
+                else:
+                    self.status.setText("  Combined preview  |  No SAM points active — showing CK matte as fallback.")
+            elif self._view_mode == "Split":
+                if _sam_present:
+                    self.status.setText("  CK MATTE (left)  /  SAM MATTE (right)  |  Combine in AE: track matte or Roto+ blend.")
+                else:
+                    self.status.setText("  CK matte  |  No SAM points active — Split view collapses to CK matte alone.")
+            else:
+                self.status.setText(
+                    f"Mode: {self._view_mode}  |  despill={self._params['despill']:.2f}  "
+                    f"despeckle={'on' if self._params['despeckle'] else 'off'}"
+                    f"@{self._params['despeckleSize']}  bg={self._params['background']}  "
+                    f"|  meanRGB=({mean_r:.1f},{mean_g:.1f},{mean_b:.1f})  "
+                    f"|  render {dt_ms:.0f} ms"
+                )
         except Exception as e:
             self.status.setText(f"Render error: {e}")
         finally:
@@ -1633,6 +1809,10 @@ class PersistentWindow(QtWidgets.QWidget):
                 self._params = next_params
                 # Defer through the event loop so UI stays responsive during drag.
                 QtCore.QTimer.singleShot(0, self._render_now)
+
+    # _on_merge_done / _on_merge_fail / _ensure_merged_alpha / _merge_worker fields
+    # were the off-thread _MatteMergeWorker approach — REMOVED (crashed the viewer;
+    # see comment at line ~379). The proven inline merge in _render_now is the live path.
 
     # WHAT IT DOES: Scales a full-res uint8 RGB array to the current size of the
     #   given label (respecting aspect ratio via a letterbox bounding box) and
@@ -1799,6 +1979,15 @@ class PersistentWindow(QtWidgets.QWidget):
                 return
             # Source image for SAM2: uint8 RGB (session stores float32 RGB 0..1)
             frame_rgb = np.clip(self.session.fg_rgb * 255.0, 0, 255).astype(np.uint8)
+            # Phase 0a — letterbox-pad to square BEFORE SAM (mirrors Resolve
+            # viewer). Removes the anisotropic 16:9-to-1024² squash that was
+            # warping the silhouette. Output mask is cropped back to source.
+            from corridorkey_sam_merge import (
+                pad_to_square, unpad_from_square,
+                shift_points_for_padding, logits_to_soft_mask,
+            )
+            padded_frame, _pad_box = pad_to_square(frame_rgb)
+            adjusted_pts = shift_points_for_padding(all_pts, _pad_box)
             # CORRIDORKEY_ROOT is injected by the CEP panel's spawnViewer() env block.
             # Fall back to parent.parent for the Resolve plugin where __file__ is
             # inside resolve_plugin/core/ so parent.parent IS the engine root.
@@ -1810,13 +1999,17 @@ class PersistentWindow(QtWidgets.QWidget):
             from sam2.sam2_image_predictor import SAM2ImagePredictor
             model = build_sam2(cfg, ckpt, device=device)
             pred  = SAM2ImagePredictor(model)
-            pred.set_image(frame_rgb)
-            # return_logits=True returns the raw probability map (pre-threshold).
-            # SAM2 internally produces smooth logits (-32..+32); the default API
-            # binarizes them at 0 and we lose the soft transition at the edges.
-            # Multiplying NN by a hard 0/1 gate is what creates the jagged matte.
-            masks, scores, logits = pred.predict(
-                point_coords=np.array(all_pts),
+            pred.set_image(padded_frame)
+            # Option C — return_logits=True so we can run our own saturation
+            # ramp. Default predict() binarises masks at logit 0 and we lose
+            # the 2-4 px soft edge band that makes the matte composit-able.
+            # SAM 2 returns (masks_np, iou_predictions_np, low_res_masks_np).
+            # With return_logits=True, masks_np is the HIGH-RES float logits at
+            # orig_hw (padded square shape here). The third return is fixed
+            # 256x256 low-res — using it was the actual source of the wave
+            # Berto saw (it was bilinearly upsampled on display).
+            masks_hi, scores, _low_res = pred.predict(
+                point_coords=np.array(adjusted_pts),
                 point_labels=np.array(labels),
                 multimask_output=True,
                 return_logits=True,
@@ -1824,28 +2017,11 @@ class PersistentWindow(QtWidgets.QWidget):
             del pred, model
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            # Pick the highest-IoU candidate, then convert logits to a soft 0..1
-            # gate using a SATURATION RAMP (not sigmoid).
-            #
-            # WHY NOT SIGMOID: SAM2 mask-decoder logits in confident interior
-            # pixels often sit in the +2..+6 range (not +20..+30). Sigmoid maps
-            # that to 0.88..0.998 — with subtle per-pixel variation that tracks
-            # image texture. Multiplied by the solid-white NN alpha, that
-            # variation prints as horizontal banding + checker artifacts inside
-            # the body silhouette. The artifact is invisible at 1080p but very
-            # visible at 4K and above (the gate's 256x256 native res, when
-            # upsampled, makes the variation block-sized).
-            #
-            # WHAT THE RAMP DOES: linear ramp on raw logits.
-            #   logit >= +2  -> 1.0  (solid interior, kills decoder texture)
-            #   logit <= -2  -> 0.0  (solid background)
-            #   -2 < L < +2  -> linear ramp (soft edge band, ~2-4 px feather)
-            #
-            # Same fix Resolve plugin shipped earlier — porting to AE now.
-            # Berto verified the checker artifact on 4K footage 2026-04-28.
             best_idx = int(np.argmax(scores))
-            logits_best = logits[best_idx].astype(np.float32)
-            best = np.clip(0.5 + logits_best * 0.25, 0.0, 1.0)
+            # masks_hi[best_idx] is at padded square shape — apply the soft-
+            # mask ramp first, then crop the square back to source frame shape.
+            _soft_padded = logits_to_soft_mask(masks_hi[best_idx])
+            best = unpad_from_square(_soft_padded, _pad_box)
             # Save soft gate as uint16 PNG so the 0..1 precision survives the
             # save/load roundtrip (uint8 would quantize to 256 levels and undo
             # the soft-edge benefit). _to_float01 handles uint16 on read.
