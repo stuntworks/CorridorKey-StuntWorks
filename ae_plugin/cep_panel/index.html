@@ -2006,9 +2006,11 @@
     const ticksEl = document.getElementById(id + 'Ticks');
     function sync() {
       const v = +slider.value;
+      const mn = +slider.min || 0;
+      const mx = (slider.max !== '' && slider.max != null) ? +slider.max : 100;
+      const pct = (mx > mn) ? (v - mn) / (mx - mn) : 0;   // normalize to 0..1 for any slider range
       val.textContent = v;
-      fill.style.width = v + '%';
-      const pct = v / 100;
+      fill.style.width = (pct * 100) + '%';
       cap.style.left = 'calc(' + (pct * 100) + '% + ' + ((0.5 - pct) * 22) + 'px)';
     }
     slider.addEventListener('input', sync);
@@ -2271,8 +2273,9 @@
     [_sgX1, _sgY1] = _stageZoneCoords(e);
     const w = Math.abs(_sgX1 - _sgX0), h = Math.abs(_sgY1 - _sgY0);
     if (w < 5 || h < 5) {
+      // aborted tiny drag drew no zone — do NOT set _sgZoneDrew, or the click
+      // absorber would swallow the user's next click.
       if (stageZoneOverlay) stageZoneOverlay.classList.remove('show');
-      _sgZoneDrew = true;
       return;
     }
     _stageZoneUpdateOverlay(_sgX0, _sgY0, _sgX1, _sgY1);
@@ -2285,6 +2288,12 @@
     } catch (_) {}
     _sgZoneDrew = true;
     if (typeof ckUpdateSamDependentFaders === 'function') ckUpdateSamDependentFaders();
+  });
+  stageScreen.addEventListener('pointercancel', () => {
+    // pointer cancelled mid-gesture (OS gesture, pen lift) — reset drag state so
+    // the stage doesn't stay stuck thinking a drag is in progress.
+    _sgGestureTracking = false;
+    _sgZoneDragging = false;
   });
   if (stageZoneClearChip) stageZoneClearChip.addEventListener('click', (e) => {
     e.stopPropagation();
@@ -3524,21 +3533,23 @@ function ckShowSourceImage(url, targetIds) {
 function ckLoadSourceFrame(targetIds, okMsg) {
     const infoFn = HOST_APP === 'ppro' ? 'ppro_getFrameInfo' : 'ae_getFrameInfo';
     jsxCall(infoFn, [], (info) => {
-        setTimeout(() => {
-            try {
-                if (!info.ok) { ckStatus(info.error || 'Select a clip on the timeline to see it here'); return; }
-                const framePng = randomTempPath('extract', '.png');
-                const ea = (typeof info.sourceTimeSeconds === 'number')
-                    ? ['extract', info.sourceFile, framePng, '--time', String(info.sourceTimeSeconds)]
-                    : ['extract', info.sourceFile, framePng, '--frame', String(info.sourceFrame)];
-                runPython(ea);
-                if (!fs.existsSync(framePng)) { ckStatus('Could not load frame'); return; }
-                fs.copyFileSync(framePng, path.join(PANEL_DIR, '_ck_source.png'));
-                ckShowSourceImage('_ck_source.png?t=' + Date.now(), targetIds);
-                try { fs.unlinkSync(framePng); } catch (_) {}
-                if (okMsg) ckStatus(okMsg);
-            } catch (e) { ckStatus('Load failed: ' + e.message); ckLog('load source failed: ' + e.message, true); }
-        }, 30);
+        try {
+            if (!info.ok) { ckStatus(info.error || 'Select a clip on the timeline to see it here'); return; }
+            const framePng = randomTempPath('extract', '.png');
+            const ea = (typeof info.sourceTimeSeconds === 'number')
+                ? ['extract', info.sourceFile, framePng, '--time', String(info.sourceTimeSeconds)]
+                : ['extract', info.sourceFile, framePng, '--frame', String(info.sourceFrame)];
+            ckStatus('Loading frame…');
+            runPythonAsync(ea, () => {
+                try {
+                    if (!fs.existsSync(framePng)) { ckStatus('Could not load frame'); return; }
+                    fs.copyFileSync(framePng, path.join(PANEL_DIR, '_ck_source.png'));
+                    ckShowSourceImage('_ck_source.png?t=' + Date.now(), targetIds);
+                    try { fs.unlinkSync(framePng); } catch (_) {}
+                    if (okMsg) ckStatus(okMsg);
+                } catch (e) { ckStatus('Load failed: ' + e.message); ckLog('load source failed: ' + e.message, true); }
+            }, (err) => { ckStatus('Load failed: ' + (err && err.message ? err.message : err)); ckLog('load source async failed: ' + err, true); });
+        } catch (e) { ckStatus('Load failed: ' + e.message); ckLog('load source failed: ' + e.message, true); }
     });
 }
 function ckLoadSourceToStage() { ckLoadSourceFrame(['stageScreen'], 'Frame loaded — click your subject, then press KEY'); }
