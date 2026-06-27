@@ -2343,6 +2343,9 @@
 
   // wheel: zoom 1..8, ~1.15/notch, ANCHORED at the cursor (point under cursor stays put)
   viewer.addEventListener('wheel', (e) => {
+    // Plain wheel must NOT zoom — a stray scroll was accidentally zooming the viewer to
+    // ~1.3x and cropping the clip ("sometimes good, sometimes not"). Require Ctrl to zoom.
+    if (!e.ctrlKey) return;
     e.preventDefault();                                      // {passive:false} below
     const rect = viewer.getBoundingClientRect();             // #viewer itself is NOT transformed
     const mx = e.clientX - rect.left, my = e.clientY - rect.top;
@@ -3193,7 +3196,7 @@ function ckExitScrubView() {
     // Bump gen so any in-flight pre-decode loop aborts its recursion.
     if (window.CK_SCRUB) { window.CK_SCRUB.gen = (window.CK_SCRUB.gen || 0) + 1; window.CK_SCRUB.busy = false; }
     try { var _sv = document.getElementById('viewer'); if (_sv) _sv.classList.remove('scrub'); } catch (_) {}
-    try { var _sb = document.getElementById('ckScrubBar'); if (_sb) _sb.style.display = 'none'; } catch (_) {}
+    try { var _ctrls=document.getElementById('ckScrubCtrls'); if(_ctrls) _ctrls.style.display='none'; } catch (_) {}
     // Hide canvas and clear bitmap cache.
     try { var _sc = document.getElementById('ckScrubCanvas'); if (_sc) _sc.style.display = 'none'; } catch (_) {}
     try { if (typeof _scrubBmps !== 'undefined') { _scrubBmps.forEach(function (e) { try { if (e.fg.close) e.fg.close(); } catch (_) {} try { if (e.alpha.close) e.alpha.close(); } catch (_) {} }); _scrubBmps.clear(); } } catch (_) {}
@@ -3249,6 +3252,9 @@ function ckScheduleRepreview() { if (window.CK_SCRUB_VIEW) window.CK_SCRUB_GEN =
 // SIMPLIFIED 2026-06-16: validates file size + catches image-load failures
 // so a blank viewer always surfaces WHY (corrupt PNG, CEF issue, missing file).
 function ckShowKeyed(png) {
+    // Always present the keyed frame fit-to-viewer — reset any stray zoom so a previous
+    // accidental zoom can't leave the next preview cropped.
+    try { if (window.ckVwReset) window.ckVwReset(); } catch (_) {}
     try {
         // Guard: file must exist and have real image bytes.
         if (!fs.existsSync(png)) {
@@ -4429,6 +4435,14 @@ function ckResizePanel(w, h) {
             'border:1px solid #3a3e44;border-radius:6px;padding:6px 9px;box-shadow:0 3px 10px rgba(0,0,0,.6);' +
             'pointer-events:none;letter-spacing:.02em;';
         document.body.appendChild(tip);
+        // Faders aren't chrome buttons, so they missed the hover explainer the buttons get.
+        // Wire the same #ckBtnTip popup onto the DESPILL + ZONE EDGE faders (Berto 2026-06-26).
+        [['faderDespill', 'DESPILL: pulls green/blue screen color spill (the color cast) off the subject — edges, hair, semi-transparent areas. Higher = more spill removed.'],
+         ['faderZoneEdge', 'ZONE EDGE: feather or tighten the matte edge inside the ZONE region you drew.']].forEach(function (_fp) {
+            var _fe = document.getElementById(_fp[0]); if (!_fe) return;
+            _fe.addEventListener('mouseenter', function () { tip.textContent = _fp[1]; tip.style.display = 'block'; });
+            _fe.addEventListener('mouseleave', function () { tip.style.display = 'none'; });
+        });
         function ckChromeBtn(id, rightPx, svg, label, tipText, onClick) {
             var b = document.createElement('button');
             b.id = id; b.type = 'button';
@@ -4745,15 +4759,15 @@ function ckResizePanel(w, h) {
         var scrubBar = (function () {
             var bar = document.createElement('div');
             bar.id = 'ckScrubBar';
-            bar.style.cssText = 'display:none;align-items:center;gap:8px;width:100%;box-sizing:border-box;' +
+            bar.style.cssText = 'display:flex;align-items:center;gap:8px;width:100%;box-sizing:border-box;' +
                 'background:linear-gradient(180deg,#26292d,#191b1e);border:1px solid #3a3e44;border-radius:6px;' +
                 'padding:5px 10px;margin-top:4px;box-shadow:0 3px 10px rgba(0,0,0,.6);';
             bar.innerHTML =
+                '<span id="ckScrubCtrls" style="display:none;flex:1;min-width:0;align-items:center;gap:8px;">' +
                 '<input type="range" id="ckScrubSlider" min="0" max="0" value="0" step="1" ' +
                 'style="flex:1;min-width:0;accent-color:#a5f;vertical-align:middle;cursor:pointer;">' +
                 '<span id="ckScrubLabel" style="font:700 10px system-ui;color:#c9a5ff;white-space:nowrap;min-width:44px;text-align:right;">--</span>' +
-                '<button type="button" id="ckScrubExit" style="flex-shrink:0;padding:2px 8px;border:1px solid #5c3a7a;border-radius:4px;' +
-                'background:linear-gradient(180deg,#3a2057,#28143e);color:#c9a5ff;font:700 9px system-ui;cursor:pointer;letter-spacing:.04em;">EXIT SCRUB</button>';
+                '</span>';   // EXIT button removed — ▶Preview toggles in/out
             // Place in the WORK POD (visible in working mode — where the user scrubs), just
             // above PREVIEW/RENDER. The viewer-module spot got pushed off-screen because
             // .viewer-wrap is height:100% in working mode. Fallback: after viewer-wrap.
@@ -4767,18 +4781,15 @@ function ckResizePanel(w, h) {
             // Wire slider.
             var sl = bar.querySelector('#ckScrubSlider');
             if (sl) sl.addEventListener('input', function () { ckScrubShowFrame(parseInt(this.value, 10) || 0); });
-            // Wire EXIT button.
-            var ex = bar.querySelector('#ckScrubExit');
-            if (ex) ex.addEventListener('click', function () { ckExitScrubView(); });
             return bar;
         })();
 
         // ── SCRUB BUTTON + FRAMES input (VIEWS cluster, beside QUAD/RESULT/SAM/CK) ──
-        var scrubSvg = '<svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="#a5f" stroke-width="1.6">' +
-            '<path d="M1 6 H11 M3 3 V9 M6 2 V10 M9 3 V9"/></svg>';
-        ckChromeBtn('ckScrubBtn', 206, scrubSvg, 'SCRUB',
-            'SCRUB: keys every frame in the work area at preview quality. Drag the purple slider to step through pre-keyed frames instantly.',
-            function () { window.ckRunScrub(); });
+        var scrubSvg = '<svg width="11" height="11" viewBox="0 0 12 12" fill="#a5f">' +
+            '<polygon points="2,1.5 10.5,6 2,10.5"/></svg>';   // play triangle ▶
+        ckChromeBtn('ckScrubBtn', 206, scrubSvg, 'Preview',
+            'Preview: play the clip at proxy quality to review the key. Click ▶Preview again to exit. Drag the slider; click a frame to add a dot.',
+            function () { if (window.CK_SCRUB_VIEW) { ckExitScrubView(); } else { window.ckRunScrub(); } });
         // FRAMES count input — injected right after the SCRUB button.
         (function () {
             try {
@@ -4794,6 +4805,17 @@ function ckResizePanel(w, h) {
                     _fInput.style.cssText = 'width:38px;height:30px;margin-left:3px;background:#1a1a2e;color:#c9a5ff;border:1px solid #c9a5ff44;border-radius:4px;text-align:center;font-size:12px;font-family:monospace;vertical-align:middle;';
                     _scrubBtn.parentNode.insertBefore(_fInput, _scrubBtn.nextSibling);
                 }
+            } catch (_) {}
+        })();
+
+        // ── Move SCRUB button + frames input into #ckScrubBar ──
+        (function () {
+            try {
+                var _bar = document.getElementById('ckScrubBar');
+                var _btn = document.getElementById('ckScrubBtn');
+                var _frm = document.getElementById('ckScrubMaxInput');
+                if (_bar && _btn) _bar.insertBefore(_btn, _bar.firstChild);
+                if (_bar && _frm) _bar.insertBefore(_frm, _btn.nextSibling);
             } catch (_) {}
         })();
 
@@ -4855,7 +4877,7 @@ function ckResizePanel(w, h) {
                         } catch (_idxErr) { CK_SCRUB.frames = null; }
                         var sl2 = document.getElementById('ckScrubSlider');
                         if (sl2) { sl2.max = String(CK_SCRUB.count - 1); sl2.value = '0'; }
-                        scrubBar.style.display = 'flex';
+                        var _ctrls=document.getElementById('ckScrubCtrls'); if(_ctrls) _ctrls.style.display='flex';
                         window.CK_SCRUB_VIEW = true;
                         // Show PROXY badge.
                         try { var _pb = document.getElementById('ckProxyBadge'); if (_pb) _pb.style.display = 'block'; } catch (_) {}
