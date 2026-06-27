@@ -570,7 +570,8 @@ function ck_addLayerMask(layerName, maskModeStr) {
 //   advanced              — "true" = show matte layers; "false" = hide them
 //   ckOnlyFirstFramePath  — path to CK_ONLY/CK_ONLY_00000.png (full-hair CK clip)
 function ae_createSAMPrecomp(mergedFirstFramePath, ckMatteFirstFramePath, samMatteFirstFramePath,
-                              fps, compStartTime, sourceFsName, lockHandleJson, advanced, ckOnlyFirstFramePath) {
+                              fps, compStartTime, sourceFsName, lockHandleJson, advanced, ckOnlyFirstFramePath,
+                              tightSamFirstFramePath) {
     try {
         var isAdvanced = (String(advanced) === "true");
         var _warnings = [];
@@ -580,6 +581,9 @@ function ae_createSAMPrecomp(mergedFirstFramePath, ckMatteFirstFramePath, samMat
         // missing with no error. Surface it so the operator knows to restart AE.
         if (typeof ckOnlyFirstFramePath === "undefined") {
             _warnings.push("Stale host.jsx (no CK FULL arg) — fully quit + relaunch AE to load the current import code.");
+        }
+        if (typeof tightSamFirstFramePath === "undefined") {
+            _warnings.push("Stale host.jsx (no TIGHT SAM arg) — fully quit + relaunch AE to load the current import code.");
         }
         var activeComp = app.project.activeItem;
         var res = ck_resolveLockedLayer((activeComp instanceof CompItem) ? activeComp : null, lockHandleJson);
@@ -639,6 +643,23 @@ function ae_createSAMPrecomp(mergedFirstFramePath, ckMatteFirstFramePath, samMat
             } catch (eSam) {}
         }
 
+        // Tight SAM matte (SAM_JUNK): raw inverted-SAM, no green-aware dilation.
+        // Secondary garbage matte for off-green shots. Null if same as wide (fusion render
+        // where GARBAGE_MATTE was absent and wide already fell back to SAM_JUNK).
+        var tightSamSeq = null;
+        var _effectiveTightPath = (tightSamFirstFramePath && tightSamFirstFramePath !== samMatteFirstFramePath)
+            ? tightSamFirstFramePath : null;
+        if (_effectiveTightPath) {
+            try {
+                var tsmFile = new File(String(_effectiveTightPath));
+                if (tsmFile.exists) {
+                    var tsmOpts = new ImportOptions(tsmFile); tsmOpts.sequence = true;
+                    tightSamSeq = app.project.importFile(tsmOpts);
+                    tightSamSeq.mainSource.conformFrameRate = Number(fps);
+                }
+            } catch (eTsm) {}
+        }
+
         // CK_ONLY (Berto 2026-06-14): the CK key alone (full hair + junk, no SAM clip),
         // RGBA. For the hair-rescue workflow — matte-box the head, lay over CK MERGED.
         var ckOnlySeq = null;
@@ -658,69 +679,98 @@ function ae_createSAMPrecomp(mergedFirstFramePath, ckMatteFirstFramePath, samMat
         var ckCompDuration = (comp.workAreaDuration > 0) ? comp.workAreaDuration : comp.duration;
         var ckComp = app.project.items.addComp("CK Comp " + srcName, comp.width, comp.height, comp.pixelAspect, ckCompDuration, comp.frameRate);
 
-        // Build the exact compositing stack Berto locked (2026-06-14), matching the
-        // DaVinci CorridorKey recipe in AE terms.  Top→bottom:
-        //   CK FULL (hair rescue) | SAM MATTE | CK MERGED | CK MATTE
-        // SAM MATTE drives BOTH CK MERGED and CK FULL as a LUMA-INVERTED track matte
-        // (SAM_JUNK is white=junk, so inverted = keep body / kill junk — same multiply
-        // as DaVinci's ck_alpha * garbage_matte). CK FULL also gets a Simple Choker.
-        // The per-shot tracked Mask Paths (foot/butt-strap/hair saves) stay MANUAL —
-        // they follow each shot's unique motion and cannot be pre-baked (DaVinci can't
-        // either). Add order is reverse: each layers.add() inserts at index 1 (top).
-        if (ckMatteSeq) {
-            try {
-                var ckmLayer = ckComp.layers.add(ckMatteSeq);   // bottom — parked, optional
-                ckmLayer.name = "CK MATTE";
-                ckmLayer.startTime = 0;
-                ckmLayer.enabled = false;
-            } catch (eckm) {}
-        }
-        var mergedLayer = ckComp.layers.add(mergedSeq);
-        mergedLayer.name = "CK MERGED";
-        mergedLayer.startTime = 0;
-        var samLayer = null;
-        if (samMatteSeq) {
-            try {
-                samLayer = ckComp.layers.add(samMatteSeq);      // directly above CK MERGED
-                samLayer.name = "SAM MATTE";
-                samLayer.startTime = 0;
-            } catch (esl) {}
-        }
+        // Build the compositing stack.
+        // DEFAULT (Berto 2026-06-27): CK MASTER (raw CK, clean edges) is the PICTURE,
+        // GARBAGE_MATTE (green-aware junk gate) is a LUMA-INVERTED track matte over it
+        // to cut the wall/background junk. CK + SAM merge is demoted to an OFF alternate.
+        // Falls back to the old CK+SAM-ON layout when GARBAGE_MATTE (samMatteSeq) is absent.
+        // Final top→bottom: GARBAGE MASK (off) | CK + SAM AI OUTPUT (off) | GARBAGE MATTE | CK MASTER (on).
+        // Add in reverse: each layers.add() inserts at index 1 (top), so first-added ends at bottom.
+        var _useMasterDefault = !!(ckOnlySeq && samMatteSeq);
+
+        // CK MASTER — raw CK clip; the active PICTURE when GARBAGE_MATTE exists.
         var ckoLayer = null;
         if (ckOnlySeq) {
             try {
-                ckoLayer = ckComp.layers.add(ckOnlySeq);        // top
-                ckoLayer.name = "CK FULL (hair rescue)";
+                ckoLayer = ckComp.layers.add(ckOnlySeq);        // added 1st → bottom
+                ckoLayer.name = "CK MASTER (edit me)";
+                ckoLayer.comment = _useMasterDefault
+                    ? "AUTO output: raw CK key, GARBAGE MATTE cuts the junk. Raise Simple Choker to trim edge."
+                    : "Raw CK key. No SAM. All hair + junk kept. Mask junk by hand.";
                 ckoLayer.startTime = 0;
-                // Disabled by default: full-frame it would re-clip the hair (SAM matte)
-                // and just shadow CK MERGED. Enable it + draw a head/hair mask per shot.
-                ckoLayer.enabled = false;
+                ckoLayer.enabled = _useMasterDefault;            // ON when it is the default picture
                 try {
                     var ckoChoke = ckoLayer.property("ADBE Effect Parade").addProperty("ADBE Simple Choker");
-                    ckoChoke.property("Choke Matte").setValue(0);   // neutral; tune per shot
+                    ckoChoke.property("Choke Matte").setValue(0);
                 } catch (eChoke) {}
             } catch (ecko2) {}
         }
 
-        // Wire SAM MATTE as a LUMA-INVERTED garbage matte on BOTH CK MERGED and CK FULL.
-        // Prefer the modern setTrackMatte API (AE 2023+) so one SAM layer feeds two
-        // targets without a duplicate. Fall back to the adjacency-based trackMatteType
-        // for CK MERGED (SAM sits directly above it) if setTrackMatte is missing.
-        if (samLayer) {
-            var _lumaInv = TrackMatteType.LUMA_INVERTED;
+        // GARBAGE MATTE — green-aware junk gate; LUMA-INVERTED track matte for CK MASTER.
+        // Placed directly above CK MASTER so legacy-AE adjacency also works.
+        var garbageMatteLayer = null;
+        if (_useMasterDefault) {
+            try {
+                garbageMatteLayer = ckComp.layers.add(samMatteSeq);  // added 2nd → directly above CK MASTER
+                garbageMatteLayer.name = "GARBAGE MATTE";
+                garbageMatteLayer.comment = "Green-aware junk matte (luma-inverted track matte for CK MASTER). White=junk -> cut.";
+                garbageMatteLayer.startTime = 0;
+                garbageMatteLayer.enabled = false;
+            } catch (eGm) {}
+        }
+
+        // CK + SAM AI OUTPUT — merged CK+SAM. The default picture ONLY when GARBAGE_MATTE is absent.
+        var mergedLayer = ckComp.layers.add(mergedSeq);        // added 3rd
+        mergedLayer.name = "CK + SAM AI OUTPUT";
+        mergedLayer.comment = _useMasterDefault
+            ? "Alternate: CK + SAM merge. Off by default — enable to compare against CK MASTER."
+            : "Auto result: CK key + SAM garbage cut. Add/raise Simple Choker to adjust edge.";
+        mergedLayer.startTime = 0;
+        mergedLayer.enabled = !_useMasterDefault;              // OFF when CK MASTER is the default
+        try {
+            var mergedChoke = mergedLayer.property("ADBE Effect Parade").addProperty("ADBE Simple Choker");
+            mergedChoke.property("Choke Matte").setValue(0);   // neutral; tune per shot
+        } catch (eMergedChoke) {}
+
+        // GARBAGE MASK — SAM_JUNK matte source; LUMA-INVERTED track matte for the CK+SAM alternate.
+        var tightSamLayer = null;
+        if (tightSamSeq) {
+            try {
+                tightSamLayer = ckComp.layers.add(tightSamSeq); // added 4th → top
+                tightSamLayer.name = "GARBAGE MASK";
+                tightSamLayer.comment = "SAM junk mask (track matte for the CK+SAM alternate). Enable + trim to cut off-green junk.";
+                tightSamLayer.startTime = 0;
+                tightSamLayer.enabled = false;
+            } catch (eTsl) {}
+        }
+        // Per-layer instructions live in each layer's .comment (Comment column), set above.
+
+        // Wire track mattes (LUMA-INVERTED: white = cut).
+        var _lumaInv = TrackMatteType.LUMA_INVERTED;
+        // CK MASTER <- GARBAGE MATTE (the new default holdout). GARBAGE MATTE sits directly above CK MASTER.
+        if (ckoLayer && garbageMatteLayer) {
+            try {
+                if (typeof ckoLayer.setTrackMatte === "function") {
+                    ckoLayer.setTrackMatte(garbageMatteLayer, _lumaInv);
+                } else {
+                    ckoLayer.trackMatteType = _lumaInv;
+                    _warnings.push("Old AE: setTrackMatte missing — GARBAGE MATTE wired by adjacency.");
+                }
+            } catch (etmM) {
+                _warnings.push("CK MASTER setTrackMatte failed: " + String(etmM));
+                try { $.writeln("CK MASTER setTrackMatte error: " + etmM); } catch (_wM) {}
+            }
+        }
+        // CK + SAM AI OUTPUT <- GARBAGE MASK (legacy alternate holdout). GARBAGE MASK sits directly above CK+SAM.
+        if (tightSamLayer) {
             try {
                 if (typeof mergedLayer.setTrackMatte === "function") {
-                    mergedLayer.setTrackMatte(samLayer, _lumaInv);
-                    if (ckoLayer) ckoLayer.setTrackMatte(samLayer, _lumaInv);
+                    mergedLayer.setTrackMatte(tightSamLayer, _lumaInv);
                 } else {
-                    // Pre-2023 AE: no setTrackMatte. Adjacency only wires CK MERGED
-                    // (SAM sits directly above it); CK FULL can't share one matte here.
                     mergedLayer.trackMatteType = _lumaInv;
-                    _warnings.push("Old AE: setTrackMatte missing — CK FULL has no garbage matte (wire it by hand).");
+                    _warnings.push("Old AE: setTrackMatte missing — GARBAGE MASK wired by adjacency.");
                 }
             } catch (etm) {
-                // Was a silent catch (audit 2026-06-14): a track-matte failure used to
-                // leave the layer unmatted with NO error. Surface it instead.
                 _warnings.push("setTrackMatte failed: " + String(etm));
                 try { $.writeln("CK setTrackMatte error: " + etm); } catch (_w) {}
             }
@@ -735,7 +785,7 @@ function ae_createSAMPrecomp(mergedFirstFramePath, ckMatteFirstFramePath, samMat
         app.endUndoGroup();
         comp.time = comp.time;
         return JSON.stringify({ ok: true, compName: ckComp.name, advanced: isAdvanced,
-            ckMatte: !!ckMatteSeq, samMatte: !!samMatteSeq, ckFull: !!ckoLayer, via: via,
+            ckMatte: !!ckMatteSeq, samMatte: !!samMatteSeq, tightSamMatte: !!tightSamSeq, ckFull: !!ckoLayer, via: via,
             warnings: _warnings.length ? _warnings : undefined });
     } catch (e) { return JSON.stringify({ ok: false, error: String(e) }); }
 }

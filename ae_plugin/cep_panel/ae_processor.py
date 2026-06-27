@@ -1255,6 +1255,8 @@ def cmd_batch(source_video, output_folder, settings,
                 sam_anchor_rel = int(sam_anchor_abs) - int(start_frame)
             else:
                 sam_anchor_rel = 0
+            _actual_preroll = min(1, int(start_frame))  # warm SAM2 with one prior frame; 0 when start_frame==0
+            sam_anchor_rel += _actual_preroll
 
             # Export the N range frames to a temp dir — SAM2 video predictor
             # reads frames from disk via init_state(video_path=...). Phase 0
@@ -1262,9 +1264,10 @@ def cmd_batch(source_video, output_folder, settings,
             # to a square BEFORE SAM sees them, so the encoder downsample is
             # uniform.
             _count = int(end_frame - start_frame)
-            _sf_export = int(start_frame)
+            _total_export = _actual_preroll + _count
+            _sf_export = int(start_frame) - _actual_preroll
             sam_tmp_dir = Path(_sam_tmp.mkdtemp(prefix="ck_sam2_batch_"))
-            log.info(f"SAM2 video: exporting {_count} frames to {sam_tmp_dir}")
+            log.info(f"SAM2 video: exporting {_total_export} frames ({_actual_preroll} pre-roll + {_count} target) to {sam_tmp_dir}")
             from corridorkey_sam_merge import (
                 pad_to_square as _pad_to_square,
                 unpad_from_square as _unpad_from_square,
@@ -1283,8 +1286,10 @@ def cmd_batch(source_video, output_folder, settings,
                     _exp_cap.read()        # throwaway: warms decoder -> next read = _sf_export
                 # _sf_export == 0: never seek — freshly opened cap reads frame 0 cleanly.
                 _exported = 0
-                for _i in range(_count):
+                for _i in range(_total_export):
+                    _dbg_pos = _exp_cap.get(cv2.CAP_PROP_POS_FRAMES); _dbg_ms = _exp_cap.get(cv2.CAP_PROP_POS_MSEC)
                     _ok, _fr = _exp_cap.read()
+                    log.info(f"DBG-SAMEXPORT slot={_i} want={_sf_export + _i} cvpos={_dbg_pos:.1f} msec={_dbg_ms:.1f} ok={_ok}")
                     if not _ok or _fr is None:
                         log.warning(f"SAM2 video: unreadable frame {_sf_export + _i} - writing black placeholder to keep numbering")
                         _sq = max(int(_sam_h), int(_sam_w))
@@ -1391,6 +1396,15 @@ def cmd_batch(source_video, output_folder, settings,
                             _mu = np.maximum(_mu, _filled.astype(np.float32))
                             sam_video_masks[_fi] = _mu
 
+                # Pre-roll discard: drop the warm-up frame and shift indices so
+                # sam_video_masks[0] == the real start_frame (not the pre-roll frame).
+                if _actual_preroll > 0:
+                    sam_video_masks = {
+                        _fi - _actual_preroll: v
+                        for _fi, v in sam_video_masks.items()
+                        if _fi >= _actual_preroll
+                    }
+
                 # Match DaVinci: apply process_sam_matte per-frame (margin/soften/fill
                 # from settings, same params DaVinci uses in its per-frame render loop).
                 from corridorkey_sam_merge import process_sam_matte as _psm
@@ -1450,10 +1464,14 @@ def cmd_batch(source_video, output_folder, settings,
                     # pose, one step of tracker memory), so copy frame 1's warm mask
                     # onto frame 0 unconditionally. Universal across clips, pose-safe
                     # (adjacent frame); .copy() so no aliasing.
-                    if 0 in sam_video_masks and 1 in sam_video_masks \
+                    # Cold-start fallback ONLY when no pre-roll was available (start_frame==0).
+                    # When start_frame>0 the pre-roll warm-up already gives frame 0 its own
+                    # correct mask, so copying frame 1 (which shifts the matte on moving
+                    # subjects) must NOT run.
+                    if _actual_preroll == 0 and 0 in sam_video_masks and 1 in sam_video_masks \
                             and (sam_video_masks[1] > 0.5).sum() >= 100:
                         sam_video_masks[0] = sam_video_masks[1].copy()
-                        log.info("SAM2 first-frame fix: copied frame 1 -> frame 0 (video cold-start)")
+                        log.info("SAM2 first-frame fix: copied frame 1 -> frame 0 (video cold-start, no pre-roll)")
 
                 # VRAM teardown — free per-clip state buffers but keep the predictor
                 # warm in _SAM_VIDEO_CACHE. reset_state releases SAM2's internal CUDA
@@ -1571,7 +1589,9 @@ def cmd_batch(source_video, output_folder, settings,
             cap = cv2.VideoCapture(str(source_video), cv2.CAP_FFMPEG)
         for frame_idx in range(int(start_frame), int(end_frame)):
             seq_num = frame_idx - int(start_frame)
+            _dbg_pos = cap.get(cv2.CAP_PROP_POS_FRAMES); _dbg_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
             ok, frame = cap.read()
+            log.info(f"DBG-KEYREAD seq={seq_num} want={frame_idx} cvpos={_dbg_pos:.1f} msec={_dbg_ms:.1f} ok={ok}")
             if not ok or frame is None:
                 failed.append(frame_idx)
                 # stdout line parsed by the panel
