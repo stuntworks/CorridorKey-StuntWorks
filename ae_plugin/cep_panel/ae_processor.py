@@ -1780,17 +1780,36 @@ def cmd_batch(source_video, output_folder, settings,
 # NOTE: Like cmd_cache, post-proc is DISABLED — the viewer applies despill/
 #   choke/despeckle live from sliders. uint16 PNG matches cache precision.
 def cmd_batch_scrub(source_video, scrub_folder, settings,
-                    start_frame=None, count=None):
+                    start_frame=None, count=None, end_frame=None):
     import numpy as np
     import cv2
     if count is None:
         count = int(settings.get("count", 10))
     if start_frame is None:
         start_frame = int(settings.get("startFrame", 0))
+    if end_frame is None:
+        end_frame = int(settings.get("endFrame", start_frame + count))
+    start_frame = int(start_frame)
+    count = int(count)
+    end_frame = int(end_frame)
+    # Build evenly-sampled frame list across [start_frame, end_frame).
+    _range = end_frame - start_frame
+    if _range <= count:
+        # Fewer source frames than slots — use all consecutive.
+        _scrub_frames = list(range(start_frame, min(end_frame, start_frame + count)))
+    else:
+        _scrub_frames = [start_frame + round(i * (_range - 1) / max(1, count - 1)) for i in range(count)]
+        # Deduplicate while preserving order.
+        _seen = set(); _deduped = []
+        for _f in _scrub_frames:
+            if _f not in _seen: _seen.add(_f); _deduped.append(_f)
+        _scrub_frames = _deduped
+    count = len(_scrub_frames)  # actual count after dedup
 
     scrub_dir = Path(scrub_folder)
     scrub_dir.mkdir(parents=True, exist_ok=True)
-    log.info(f"Batch-scrub: {source_video} frames {start_frame}..{start_frame+count}")
+    _eff_end = end_frame if end_frame is not None else (start_frame + count)
+    log.info(f"Batch-scrub: {source_video} sample {count} frames across [{start_frame}..{_eff_end})")
 
     cap = cv2.VideoCapture(str(source_video), cv2.CAP_FFMPEG)   # FIX C: FFMPEG backend
     if not cap.isOpened():
@@ -1801,12 +1820,15 @@ def cmd_batch_scrub(source_video, scrub_folder, settings,
         log.warning("Source fps unknown, defaulting to 24")
         source_fps = 24.0
 
-    # Scrub resolution cap: clamp to 1080p-class to save VRAM and speed up scrub.
-    # RENDER (cmd_batch) runs full-res — only scrub is capped here.
+    # Scrub resolution cap: clamp to 720p-class (1280 long edge) to match the DaVinci
+    # scrubber, which keys the preview at 720p (CorridorKey_Pro.py:3875). Scrub is a
+    # throwaway preview — keying at near-4K wasted ~2x the time for no visible benefit.
+    # RENDER (cmd_batch) still runs FULL-res — only the scrub preview is capped here.
+    _SCRUB_CAP = 1280
     _src_w_probe = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1920
     _src_h_probe = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1080
-    if max(_src_w_probe, _src_h_probe) > 1920:
-        _scrub_scale = 1920.0 / max(_src_w_probe, _src_h_probe)
+    if max(_src_w_probe, _src_h_probe) > _SCRUB_CAP:
+        _scrub_scale = float(_SCRUB_CAP) / max(_src_w_probe, _src_h_probe)
         _scrub_w = int(round(_src_w_probe * _scrub_scale))
         _scrub_h = int(round(_src_h_probe * _scrub_scale))
         log.info(f"Scrub downscale: {_src_w_probe}x{_src_h_probe} -> {_scrub_w}x{_scrub_h} (scale={_scrub_scale:.4f})")
@@ -1853,8 +1875,12 @@ def cmd_batch_scrub(source_video, scrub_folder, settings,
     # Map absolute click frame → range-relative index. If the click was
     # outside the scrub range (or never recorded), anchor at frame 0 and
     # forward-propagate only — same fallback DaVinci uses.
-    if sam_anchor_abs is not None and start_frame <= int(sam_anchor_abs) < (start_frame + int(count)):
-        sam_anchor_rel = int(sam_anchor_abs) - int(start_frame)
+    if sam_anchor_abs is not None and int(sam_anchor_abs) in _scrub_frames:
+        sam_anchor_rel = _scrub_frames.index(int(sam_anchor_abs))
+    elif sam_anchor_abs is not None and start_frame <= int(sam_anchor_abs) < end_frame:
+        # Anchor not in sampled list — pick nearest sampled frame.
+        _nearest = min(range(len(_scrub_frames)), key=lambda _i: abs(_scrub_frames[_i] - int(sam_anchor_abs)))
+        sam_anchor_rel = _nearest
     else:
         sam_anchor_rel = 0
 
@@ -1900,20 +1926,19 @@ def cmd_batch_scrub(source_video, scrub_folder, settings,
             _src_h = _src_w = _pad_box = None
             try:
                 _exp_cap = cv2.VideoCapture(str(source_video), cv2.CAP_FFMPEG)
-                # FIX C: POS_FRAMES + throwaway prime read (MSEC dirty first read on long-GOP).
-                _sf = _sf_export
-                if _sf > 0:
-                    _exp_cap.set(cv2.CAP_PROP_POS_FRAMES, _sf - 1)
-                    _exp_cap.read()        # throwaway warm-up -> next read = _sf_export
-                else:
-                    _exp_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    _exp_cap.read()
-                    _exp_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                # Export the SAMPLED scrub frames (+ optional 1-frame pre-roll before the
+                # first) so SAM2's per-frame masks align 1:1 with the sampled keyed frames.
+                # Consecutive export here would mis-map masks onto the wrong sampled frames
+                # (slot i must be _scrub_frames[i] in BOTH the keying and SAM passes).
+                _sam_export_frames = list(_scrub_frames)
+                if _actual_preroll > 0:
+                    _sam_export_frames = [max(0, int(_scrub_frames[0]) - 1)] + _sam_export_frames
                 _exported = 0
-                for _i in range(_total_export):
+                for _i, _abs in enumerate(_sam_export_frames):
+                    _exp_cap.set(cv2.CAP_PROP_POS_FRAMES, int(_abs))
                     _ok, _fr = _exp_cap.read()
                     if not _ok or _fr is None:
-                        log.warning(f"SAM2 video: skipped unreadable frame {_sf_export + _i}")
+                        log.warning(f"SAM2 video: skipped unreadable frame {_abs}")
                         continue
                     _fr_scaled = cv2.resize(_fr, (_scrub_w, _scrub_h), interpolation=cv2.INTER_AREA) if _scrub_scale != 1.0 else _fr
                     if _src_h is None:
@@ -1928,7 +1953,7 @@ def cmd_batch_scrub(source_video, scrub_folder, settings,
                                 [cv2.IMWRITE_PNG_COMPRESSION, 1])
                     _exported += 1
                 _exp_cap.release()
-                log.info(f"SAM2 video: {_exported} frames exported")
+                log.info(f"SAM2 video: {_exported} sampled frames exported")
 
                 # Load video predictor and propagate from the actual click anchor.
                 # DaVinci's two-pass approach: forward from anchor → end, then
@@ -2025,18 +2050,17 @@ def cmd_batch_scrub(source_video, scrub_folder, settings,
     keyed = 0
     failed = []
     try:
-        # FIX C: POS_FRAMES seek + throwaway prime read (same as cmd_batch) — MSEC returns a
-        # dirty first read on long-GOP. Warm the decoder so the first real read is clean.
-        _sf = int(start_frame)
-        if _sf > 0:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, _sf - 1)
-            cap.read()                 # throwaway warm-up -> next read = start_frame
-        else:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            cap.read()
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        for frame_offset in range(int(count)):
-            frame_idx = start_frame + frame_offset
+        for frame_offset, frame_idx in enumerate(_scrub_frames):
+            # Seek to each target frame individually (non-consecutive after sampling).
+            # FIX C: POS_FRAMES seek + throwaway prime read — MSEC dirty on long-GOP.
+            _sf = int(frame_idx)
+            if _sf > 0:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, _sf - 1)
+                cap.read()  # throwaway warm-up -> next read = frame_idx
+            else:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                cap.read()
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             ok, frame = cap.read()
             if not ok or frame is None:
                 failed.append(frame_idx)
@@ -2064,14 +2088,18 @@ def cmd_batch_scrub(source_video, scrub_folder, settings,
                 alpha_u16 = (np.clip(alpha, 0, 1) * 65535.0).astype(np.uint16)
                 fg_bgr_u16 = cv2.cvtColor(fg_u16, cv2.COLOR_RGB2BGR)
                 cv2.imwrite(str(out_dir / "fg.png"), fg_bgr_u16)
-                cv2.imwrite(str(out_dir / "alpha.png"), alpha_u16)
                 # Raw plate — source_rgb for garbage_matte body fill / chroma escape.
                 plate_u8 = (np.clip(img_rgb, 0, 1) * 255).astype(np.uint8)
                 cv2.imwrite(str(out_dir / "plate.png"), cv2.cvtColor(plate_u8, cv2.COLOR_RGB2BGR))
                 # Pull the pre-propagated video-predictor mask for this frame.
-                # Saving alpha_nn.png + sam2_gate_raw.png makes the viewer's
-                # render do alpha_nn × gate composite (with live margin/soften
-                # sliders) instead of falling back to plain alpha.png.
+                # When a SAM mask exists: finalize alpha through the same
+                # apply_matte_postproc path cmd_batch uses (sam_garbage_merge +
+                # shirt_rescue + zone + fill_body_holes + choke + despeckle).
+                # alpha.png is written AFTER finalization so the scrub preview
+                # matches the render matte exactly. alpha_nn.png = raw CK alpha
+                # (kept for debugging); sam2_gate_raw.png = cleaned SAM mask
+                # (kept for the live cyan overlay). The JS gate multiply in
+                # ckScrubComposite has been removed — alpha.png is already final.
                 if frame_offset in sam_video_masks:
                     try:
                         _gate_soft = sam_video_masks[frame_offset]
@@ -2085,9 +2113,21 @@ def cmd_batch_scrub(source_video, scrub_folder, settings,
                             )
                         _gate_u16 = (np.clip(_gate_soft, 0, 1) * 65535.0).astype(np.uint16)
                         cv2.imwrite(str(out_dir / "sam2_gate_raw.png"), _gate_u16)
+                        # Preserve raw NN alpha for debugging.
                         cv2.imwrite(str(out_dir / "alpha_nn.png"), alpha_u16)
+                        # Finalize: mirror cmd_batch's canonical merge chain.
+                        _fg_final, _alpha_final, _ = apply_matte_postproc(
+                            fg, alpha, settings,
+                            sam_soft=_gate_soft,
+                            source_rgb=img_rgb,
+                            screen_type=settings.get("screenType", "green"),
+                            return_garbage=True,
+                        )
+                        alpha_u16 = (np.clip(_alpha_final, 0, 1) * 65535.0).astype(np.uint16)
                     except Exception as _se:
-                        log.warning(f"SAM2 frame {frame_idx}: gate save failed: {_se}")
+                        log.warning(f"SAM2 frame {frame_idx}: finalize failed: {_se}")
+                # Write finalized (or raw-fallback) alpha.
+                cv2.imwrite(str(out_dir / "alpha.png"), alpha_u16)
                 keyed += 1
             except Exception as e:
                 failed.append(frame_idx)
@@ -2110,7 +2150,8 @@ def cmd_batch_scrub(source_video, scrub_folder, settings,
     index_path = scrub_dir.parent / "scrub_index.json"
     try:
         with open(str(index_path), "w") as f:
-            json.dump({"count": keyed, "base_dir": scrub_dir.name}, f)
+            json.dump({"count": keyed, "base_dir": scrub_dir.name,
+                       "frames": [_scrub_frames[_i] for _i in range(keyed)]}, f)
         log.info(f"Wrote {index_path}: count={keyed}")
     except Exception as e:
         log.error(f"Failed to write scrub_index.json: {e}")
@@ -2727,6 +2768,7 @@ def build_parser():
     bs.add_argument("--params", help="JSON file with settings + count + startFrame")
     bs.add_argument("--start-frame", dest="start_frame", type=int)
     bs.add_argument("--count", type=int, help="Number of frames to key (default 10)")
+    bs.add_argument("--end-frame", dest="end_frame", type=int, help="End frame (exclusive); samples count frames across [start,end)")
     bs.add_argument("--screen", choices=["green", "blue"])
     bs.add_argument("--despill", type=float)
     bs.add_argument("--despeckle", type=int)
@@ -2800,11 +2842,12 @@ def main():
             settings = load_settings(args.params, args)
             start_frame = args.start_frame if args.start_frame is not None else settings.get("startFrame")
             count = args.count if args.count is not None else settings.get("count", 10)
+            end_frame = args.end_frame if args.end_frame is not None else settings.get("endFrame")
             if start_frame is None:
                 log.error("batch-scrub requires --start-frame N (or startFrame in --params JSON)")
                 sys.exit(2)
             n = cmd_batch_scrub(args.source, args.scrub_folder, settings,
-                                start_frame=start_frame, count=count)
+                                start_frame=start_frame, count=count, end_frame=end_frame)
             sys.exit(0 if n > 0 else 1)
 
         if args.mode == "cache":

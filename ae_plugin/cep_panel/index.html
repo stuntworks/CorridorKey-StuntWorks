@@ -1429,6 +1429,9 @@
           <!-- zoom/pan wrapper: footage bg + SAM dots + SAM overlay canvas live
                here so they scale/translate together. Chrome below stays at
                #viewer level and never zooms. -->
+          <!-- ckScrubCanvas: in-panel compositor (v1). Shown only during SCRUB. -->
+          <span id="ckProxyBadge" style="display:none;position:absolute;top:8px;left:8px;z-index:30;padding:3px 9px;border-radius:12px;background:rgba(0,0,0,0.62);color:#c9a5ff;font:700 10px system-ui;letter-spacing:.05em;pointer-events:none;">PROXY &middot; low-res preview</span>
+          <canvas id="ckScrubCanvas" style="display:none;position:absolute;inset:0;width:100%;height:100%;z-index:15;pointer-events:none;object-fit:contain;"></canvas>
           <div id="vwZoom">
             <div id="zoneOverlay"></div>
             <div id="zoneClearChip" title="Clear zone">&#x00D7;</div>
@@ -1684,8 +1687,6 @@
                     <span>Expand</span>
                   </button>
                   <button class="clear-btn" id="clearSam" type="button">Clear</button>
-                  <button class="clear-btn" id="addFrameBtn" type="button" title="Stamp the current dots onto this frame index, then clear so you can dot the next frame. Use when subject moves a lot between frames.">ADD FRAME</button>
-                  <button class="clear-btn" id="loadFrameBtn" type="button" title="Pull the current AE timeline frame into the viewer so you can dot it. Clears working dots only — stamped frames are kept.">LOAD FRAME</button>
                   <button class="clear-btn" id="zoneModeBtn" type="button" aria-pressed="false" title="ZONE: click to ARM, then drag an ellipse on the picture around a body part that leaves the green (feet, hands). SAM cuts tight only inside it. (Restored 2026-06-16.)">Zone</button>
                   <button class="clear-btn" id="fusionV2Main" type="button" aria-pressed="false" title="FUSION V2: new keying engine — CK untouched on green, SAM kills junk, zoned hair/feet room. Click to switch engines.">Fusion V2</button>
                 </div>
@@ -2683,40 +2684,6 @@
   bvClear.addEventListener('click', clearAll);
   clearSam.addEventListener('click', clearAll);
 
-  const addFrameBtn = document.getElementById('addFrameBtn');
-  if (addFrameBtn) {
-    addFrameBtn.addEventListener('click', () => {
-      const infoFn = HOST_APP === 'ppro' ? 'ppro_getFrameInfo' : 'ae_getFrameInfo';
-      jsxCall(infoFn, [], (info) => {
-        if (!info || typeof info.sourceFrame !== 'number') {
-          ckStatus('ADD FRAME: could not read AE frame — try KEYing a frame first');
-          return;
-        }
-        stampDotsToFrame(info.sourceFrame);
-      });
-    });
-  }
-
-  const loadFrameBtn = document.getElementById('loadFrameBtn');
-  if (loadFrameBtn) {
-    loadFrameBtn.addEventListener('click', () => {
-      // Clear working dots only — do NOT touch samFrames (stamped frames must survive)
-      // and do NOT call clearPoints() which wipes samFrames and may re-trigger doKey.
-      [bvScreen, stageScreen, vwZoom].forEach(function(surf) {
-        if (surf) surf.querySelectorAll('.sampt').forEach(function(n) { n.remove(); });
-      });
-      samPoints.length = 0;
-      // Strip the .keyed class so the raw source plate is visible (mirrors the
-      // early-source display path at ~line 3366).
-      var _vwr = document.getElementById('viewer');
-      if (_vwr) _vwr.classList.remove('keyed');
-      // Pull the current AE/PPro timeline frame and show it in the dot-placement viewer.
-      if (typeof ckLoadSourceFrame === 'function') {
-        ckLoadSourceFrame(['vwZoom', 'stageScreen'], 'Frame loaded — click your dots, then ADD FRAME');
-      }
-    });
-  }
-
   // Ctrl+Z removes the last placed SAM dot (panel undo — AE undo can't touch panel state)
   function undoLastDot() {
     if (!samPoints.length) return;
@@ -2883,6 +2850,16 @@ function ckLog(msg, isErr) {
     try { fs.appendFileSync(LOG_PATH, '[' + new Date().toISOString() + '] ' + msg + '\n'); } catch (_) {}
     if (isErr) { try { console.error(msg); } catch (_) {} }
 }
+// Capture uncaught errors + promise rejections to the log so silent failures (e.g. the
+// scrub compositor) are diagnosable from corridorkey.log without dev tools.
+try {
+    window.addEventListener('error', function (e) {
+        try { ckLog('JS ERROR: ' + (e.message || (e.error && e.error.message) || e.error) + ' @ ' + (e.filename || '') + ':' + (e.lineno || ''), true); } catch (_) {}
+    });
+    window.addEventListener('unhandledrejection', function (e) {
+        try { var r = e.reason; ckLog('PROMISE REJECT: ' + ((r && (r.stack || r.message)) || r), true); } catch (_) {}
+    });
+} catch (_) {}
 function ckStatus(msg) { try { const g = document.getElementById('gateStatus'); if (g) g.textContent = msg; const p = document.getElementById('podStatus'); if (p) p.textContent = msg; } catch (_) {} }
 
 // ============ BIG BUSY STRIP — mirrors all busy state to a panel-wide bar ============
@@ -3213,8 +3190,16 @@ function ckRefreshSamOverlays(show) {
 window.CK_SCRUB_VIEW = false;
 function ckExitScrubView() {
     window.CK_SCRUB_VIEW = false;
+    // Bump gen so any in-flight pre-decode loop aborts its recursion.
+    if (window.CK_SCRUB) { window.CK_SCRUB.gen = (window.CK_SCRUB.gen || 0) + 1; window.CK_SCRUB.busy = false; }
     try { var _sv = document.getElementById('viewer'); if (_sv) _sv.classList.remove('scrub'); } catch (_) {}
     try { var _sb = document.getElementById('ckScrubBar'); if (_sb) _sb.style.display = 'none'; } catch (_) {}
+    // Hide canvas and clear bitmap cache.
+    try { var _sc = document.getElementById('ckScrubCanvas'); if (_sc) _sc.style.display = 'none'; } catch (_) {}
+    try { if (typeof _scrubBmps !== 'undefined') { _scrubBmps.forEach(function (e) { try { if (e.fg.close) e.fg.close(); } catch (_) {} try { if (e.alpha.close) e.alpha.close(); } catch (_) {} }); _scrubBmps.clear(); } } catch (_) {}
+    try { _scrubCheckerPat = null; } catch (_) {}
+    try { var _sc2 = document.getElementById('ckScrubCanvas'); if (_sc2) _sc2.style.pointerEvents = 'none'; } catch (_) {}
+    try { var _pb = document.getElementById('ckProxyBadge'); if (_pb) _pb.style.display = 'none'; } catch (_) {}
 }
 
 // Live slider feedback: re-run ONLY the fast post-step (despill/choke/SAM merge) on the
@@ -4138,34 +4123,17 @@ function ckOpenURL(url) {
         ckBarRight.style.cssText = 'display:flex;align-items:flex-end;gap:16px;flex:0 0 auto;';
         topbar.appendChild(ckBarRight);
 
-        // FRAMES group
-        var framesGrp = document.createElement('div');
-        framesGrp.className = 'ck-grp';
-        var framesLbl = document.createElement('span');
-        framesLbl.className = 'cell-title';
-        framesLbl.textContent = 'FRAMES';
-        var framesInp = document.createElement('input');
-        framesInp.id = 'ckScrubMaxInput';
-        framesInp.type = 'number'; framesInp.min = '1'; framesInp.max = '24'; framesInp.value = '24';
-        framesInp.style.cssText = 'width:44px;background:#1a1c1f;border:1px solid #393e44;border-radius:3px;' +
-            'color:#c9a5ff;font:700 12px system-ui;text-align:center;padding:2px;outline:none;height:30px;';
-        framesGrp.appendChild(framesLbl);
-        framesGrp.appendChild(framesInp);
-        ckBarRight.appendChild(framesGrp);
-
-        // VIEWS group — chrome buttons (SCRUB/RESULT/CK/SAM/RESET) appended here by startup IIFE
+        // VIEWS group — chrome buttons (SCRUB/RESULT/CK/SAM/RESET) appended here by startup IIFE.
+        // NO "VIEWS" text label: it sits at the same height as the centered credit band and
+        // crossed "StuntWorks Cinema" on narrow panels. Buttons are self-evident.
         var viewsGrp = document.createElement('div');
         viewsGrp.className = 'ck-grp';
-        var viewsLbl = document.createElement('span');
-        viewsLbl.className = 'cell-title';
-        viewsLbl.textContent = 'VIEWS';
         var viewsCtrl = document.createElement('div');
         viewsCtrl.id = 'ckViewsCtrl';
         viewsCtrl.style.cssText = 'display:flex;align-items:center;gap:3px;padding:6px 8px;border-radius:7px;' +
             'background:linear-gradient(180deg,#2b2f34 0%,#212528 100%);' +
             'box-shadow:0 1px 0 rgba(255,255,255,0.07) inset,0 -2px 4px rgba(0,0,0,0.45) inset,' +
             '0 1px 2px rgba(0,0,0,0.5),0 0 0 1px rgba(0,0,0,0.5);';
-        viewsGrp.appendChild(viewsLbl);
         viewsGrp.appendChild(viewsCtrl);
         ckBarRight.appendChild(viewsGrp);
     }
@@ -4590,141 +4558,344 @@ function ckResizePanel(w, h) {
         // Flow: SCRUB -> ae_getWorkAreaInfo -> batch-scrub renders up to MAXF frames
         // (stage-1 only) -> slider appears -> dragging runs the fast postproc on that
         // frame's mini-session, honoring the active mask view (COMB/CK/SAM buttons).
-        var CK_SCRUB = window.CK_SCRUB = { dir: null, count: 0, cur: 0, busy: false };
-        var scrubSvg = '<svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="#a5f" stroke-width="1.6">' +
-            '<path d="M1 6 H11 M3 3 V9 M6 2 V10 M9 3 V9"/></svg>';
-        var scrubBar = document.createElement('div');
-        scrubBar.id = 'ckScrubBar';
-        scrubBar.style.cssText = 'display:none;align-items:center;width:100%;box-sizing:border-box;' +
-            'background:linear-gradient(180deg,#26292d,#191b1e);border:1px solid #3a3e44;border-radius:6px;' +
-            'padding:5px 12px;margin-top:4px;box-shadow:0 3px 10px rgba(0,0,0,.6);';
-        scrubBar.innerHTML = '<input type="range" id="ckScrubSlider" min="0" max="0" value="0" step="1" ' +
-            'style="flex:1;min-width:0;accent-color:#a5f;vertical-align:middle;">' +
-            '<span id="ckScrubLabel" style="font:700 10px system-ui;color:#c9a5ff;margin-left:8px;min-width:52px;display:inline-block;">--</span>';
-        // Insert directly below viewer-wrap so it reads as a timeline scrubber under the monitor
-        (function () { var vw = document.querySelector('.viewer-wrap'); if (vw && vw.parentNode) { vw.parentNode.insertBefore(scrubBar, vw.nextSibling); } else { document.body.appendChild(scrubBar); } })();
-        // ckScrubMaxInput is created inside the VIEWS group in the top-bar IIFE above.
-        var _scrubT = null;
-        function ckScrubShowFrame(idx) {
-            if (!CK_SCRUB.dir) return;
-            CK_SCRUB.cur = idx;
+        var CK_SCRUB = window.CK_SCRUB = { dir: null, count: 0, cur: 0, busy: false, gen: 0, startFrame: 0, frames: null };
+
+        // Returns the absolute source frame number for scrub slot idx.
+        // Uses CK_SCRUB.frames mapping if available (evenly-sampled), else falls back to startFrame+idx.
+        function _scrubAbsFrame(idx) {
+            return (CK_SCRUB.frames && CK_SCRUB.frames[idx] != null) ? CK_SCRUB.frames[idx] : ((CK_SCRUB.startFrame || 0) + idx);
+        }
+
+        // ── Canvas compositor (v1): subject over transparency checker, zero Python per frame ──
+        // Seam: despill live slider, matte/plate background modes, WebGL shader → hook here (v2+).
+
+        // LRU bitmap cache: frame idx → {fg: ImageBitmap, alpha: ImageBitmap}
+        var _scrubBmps = new Map();
+        var _SCRUB_CACHE_CAP = 60;
+
+        // Checker pattern canvas, built once.
+        var _scrubCheckerPat = null;
+        function _scrubGetChecker(ctx) {
+            if (_scrubCheckerPat) return _scrubCheckerPat;
+            var sz = 24;
+            var oc = document.createElement('canvas');
+            oc.width = sz * 2; oc.height = sz * 2;
+            var octx = oc.getContext('2d');
+            octx.fillStyle = '#4a4a4a'; octx.fillRect(0, 0, sz * 2, sz * 2);
+            octx.fillStyle = '#2e2e2e';
+            octx.fillRect(0, 0, sz, sz);
+            octx.fillRect(sz, sz, sz, sz);
+            _scrubCheckerPat = ctx.createPattern(oc, 'repeat');
+            return _scrubCheckerPat;
+        }
+
+        // Load fg+alpha bitmaps for a frame (+ optional SAM gate). Returns Promise<{fg,alpha,gate}> or rejects if not ready.
+        function _scrubLoadFrame(idx) {
+            if (_scrubBmps.has(idx)) { return Promise.resolve(_scrubBmps.get(idx)); }
+            var frameDir = path.join(CK_SCRUB.dir, String(idx).padStart(3, '0'));
+            var fgPath    = path.join(frameDir, 'fg.png');
+            var alphaPath = path.join(frameDir, 'alpha.png');
+            if (!fs.existsSync(fgPath) || !fs.existsSync(alphaPath)) {
+                return Promise.reject(new Error('frame not ready'));
+            }
+            var fgBuf    = fs.readFileSync(fgPath);
+            var alphaBuf = fs.readFileSync(alphaPath);
+            var fgBlob    = new Blob([fgBuf],    { type: 'image/png' });
+            var alphaBlob = new Blob([alphaBuf], { type: 'image/png' });
+            // alpha.png is already finalized by ae_processor (SAM combine + cleanup
+            // applied in Python). No gate load needed — the gate multiply was removed.
+            return Promise.all([
+                createImageBitmap(fgBlob),
+                createImageBitmap(alphaBlob)
+            ]).then(function (bitmaps) {
+                var entry = { fg: bitmaps[0], alpha: bitmaps[1] };
+                // Evict oldest if over cap.
+                if (_scrubBmps.size >= _SCRUB_CACHE_CAP) {
+                    var firstKey = _scrubBmps.keys().next().value;
+                    var evicted  = _scrubBmps.get(firstKey);
+                    try { if (evicted.fg.close)    evicted.fg.close();    } catch (_) {}
+                    try { if (evicted.alpha.close) evicted.alpha.close(); } catch (_) {}
+                    _scrubBmps.delete(firstKey);
+                }
+                _scrubBmps.set(idx, entry);
+                return entry;
+            });
+        }
+
+        // Core compositor: draws checker + fg×alpha onto #ckScrubCanvas.
+        function ckScrubComposite(idx) {
+            try { if (window.ckVwReset) window.ckVwReset(); } catch (_) {}
             var lab = document.getElementById('ckScrubLabel');
             if (lab) lab.textContent = (idx + 1) + '/' + CK_SCRUB.count;
-            if (_scrubT) clearTimeout(_scrubT);
-            _scrubT = setTimeout(function () {
-                try {
-                    var frameDir = path.join(CK_SCRUB.dir, String(idx).padStart(3, '0'));
-                    if (!fs.existsSync(path.join(frameDir, 'alpha.png'))) return;
-                    var st = ckGetSettings();
-                    try { if (typeof ckSamPayload === 'function') Object.assign(st, ckSamPayload() || {}); } catch (_) {}
-                    var _sMode = (CK_PREVIEW_BG || 'checker').replace(/[^a-z0-9-]/g, '');
-                    var prev = path.join(frameDir, 'preview_' + _sMode + '_g' + (window.CK_SCRUB_GEN || 0) + '.png');
-                    if (fs.existsSync(prev)) { ckShowKeyed(prev); if (typeof ckRefreshSamOverlays === 'function') ckRefreshSamOverlays(false); ckStatus('Scrub ' + (idx + 1) + '/' + CK_SCRUB.count); return; }
-                    var pp = writeParamsFile(st);
-                    // Keep last clean frame visible — use lightweight corner tag, not the full overlay
-                    var _wTag = document.getElementById('vwPreCacheTag');
-                    if (!_wTag) { _wTag = document.createElement('div'); _wTag.id = 'vwPreCacheTag'; _wTag.className = 'vw-tag'; _wTag.style.cssText = 'left:auto;right:10px;top:auto;bottom:10px;'; var _vwEl = document.getElementById('viewer'); if (_vwEl) _vwEl.appendChild(_wTag); }
-                    if (_wTag) { _wTag.textContent = 'Working…'; _wTag.style.display = 'block'; }
-                    runPythonAsync(['postproc', frameDir, prev, '--params', pp, '--background', CK_PREVIEW_BG, '--max-width', '1100'], function () {
-                        if (idx !== CK_SCRUB.cur) { if (_wTag) _wTag.style.display = 'none'; return; }
-                        if (_wTag) _wTag.style.display = 'none';
-                        try { fs.unlinkSync(pp); } catch (_) {}
-                        if (fs.existsSync(prev)) { ckShowKeyed(prev); if (typeof ckRefreshSamOverlays === 'function') ckRefreshSamOverlays(false); }
-                        ckStatus('Scrub ' + (idx + 1) + '/' + CK_SCRUB.count);
-                    }, function () {
-                        if (_wTag) _wTag.style.display = 'none';
-                        ckStatus('Scrub frame failed');
-                    });
-                } catch (_) {}
-            }, 160);
+            CK_SCRUB.cur = idx;
+            if (!CK_SCRUB.dir) return;
+            var frameDir  = path.join(CK_SCRUB.dir, String(idx).padStart(3, '0'));
+            var alphaPath = path.join(frameDir, 'alpha.png');
+            if (!fs.existsSync(alphaPath)) { ckStatus('Frame ' + (idx + 1) + ' still keying…'); return; }
+            _scrubLoadFrame(idx).then(function (bitmaps) {
+                // Stale guard: user moved the slider while we were loading.
+                if (idx !== CK_SCRUB.cur) return;
+                var canvas = document.getElementById('ckScrubCanvas');
+                if (!canvas) return;
+                var fg    = bitmaps.fg;
+                var alpha = bitmaps.alpha;
+                // Show first so the element has layout dims, then size the backing store to
+                // the VIEWER box (not the source) and draw the frame CONTAIN-fit into it —
+                // explicit fit so nothing crops, independent of aspect/zoom.
+                canvas.style.display = 'block';
+                var _vEl = document.getElementById('viewer');
+                var _vr = _vEl ? _vEl.getBoundingClientRect() : { width: fg.width, height: fg.height };
+                var _cw = Math.max(2, Math.round(_vr.width)), _ch = Math.max(2, Math.round(_vr.height));
+                canvas.width  = _cw;
+                canvas.height = _ch;
+                var ctx = canvas.getContext('2d');
+
+                // Step 1: composite fg×alpha onto an offscreen canvas to apply the matte.
+                var oc = document.createElement('canvas');
+                oc.width  = fg.width;
+                oc.height = fg.height;
+                var octx = oc.getContext('2d');
+                octx.drawImage(fg, 0, 0);
+                var ocData = octx.getImageData(0, 0, oc.width, oc.height);
+
+                var oa = document.createElement('canvas');
+                oa.width  = alpha.width  || fg.width;
+                oa.height = alpha.height || fg.height;
+                var oactx = oa.getContext('2d');
+                oactx.drawImage(alpha, 0, 0, oa.width, oa.height);
+                var oaData = oactx.getImageData(0, 0, oa.width, oa.height);
+
+                // Copy alpha luminance (R channel of grayscale alpha map) into fg alpha.
+                var len = ocData.data.length / 4;
+                for (var i = 0; i < len; i++) {
+                    ocData.data[i * 4 + 3] = oaData.data[i * 4];
+                }
+                octx.putImageData(ocData, 0, 0);
+                // Gate multiply removed: alpha.png is now finalized in Python
+                // (apply_matte_postproc: SAM combine + cleanup already baked in).
+                // Drawing alpha luminance directly above is sufficient.
+
+                // Step 2: checker over the WHOLE canvas (opaque → fully covers the zoomed
+                // preview + SAM dots underneath), then the masked fg CONTAIN-fit centered.
+                var checker = _scrubGetChecker(ctx);
+                ctx.fillStyle = checker || '#3a3a3a';
+                ctx.fillRect(0, 0, _cw, _ch);
+                var _scale = Math.min(_cw / fg.width, _ch / fg.height);
+                var _dw = Math.round(fg.width * _scale), _dh = Math.round(fg.height * _scale);
+                var _dx = Math.round((_cw - _dw) / 2), _dy = Math.round((_ch - _dh) / 2);
+                ctx.imageSmoothingEnabled = true;
+                ctx.drawImage(oc, 0, 0, fg.width, fg.height, _dx, _dy, _dw, _dh);
+                // Store contain rect for the canvas click handler (dot placement).
+                CK_SCRUB.fit = { dx: _dx, dy: _dy, dw: _dw, dh: _dh, fgw: fg.width, fgh: fg.height };
+                // Enable click interaction while scrub is active.
+                canvas.style.pointerEvents = 'auto';
+                var _absF = _scrubAbsFrame(idx);
+                ckStatus('Scrub ' + (idx + 1) + '/' + CK_SCRUB.count + '  (frame ' + _absF + ')');
+            }).catch(function (err) {
+                ckLog('scrub composite frame ' + (idx + 1) + ' failed: ' + (err && err.message ? err.message : err), true);
+                ckStatus('Frame ' + (idx + 1) + ' not ready');
+            });
         }
-        try {
-            var sl = scrubBar.querySelector('#ckScrubSlider');
-            sl.addEventListener('input', function () { ckScrubShowFrame(parseInt(sl.value, 10) || 0); });
-        } catch (_) {}
+
+        // ckScrubShowFrame: kept as the public name (slider, external callers). Now calls compositor.
+        function ckScrubShowFrame(idx) {
+            ckScrubComposite(idx);
+        }
+
+        // ── Canvas click → drop SAM dot on the scrubbed frame ──
+        // Added once; pointer-events:none when not in scrub (set by ckExitScrubView).
+        (function () {
+            var _canvas = document.getElementById('ckScrubCanvas');
+            if (!_canvas || _canvas._ckDotBound) return;
+            _canvas._ckDotBound = true;
+
+            function _placeDot(e, neg) {
+                if (!window.CK_SCRUB_VIEW) return;
+                var fit = CK_SCRUB.fit;
+                if (!fit) return;
+                var r  = _canvas.getBoundingClientRect();
+                var cx = (e.clientX - r.left)  * (_canvas.width  / r.width);
+                var cy = (e.clientY - r.top)   * (_canvas.height / r.height);
+                // Reject clicks outside the contain rect (letterbox area).
+                if (cx < fit.dx || cx > fit.dx + fit.dw || cy < fit.dy || cy > fit.dy + fit.dh) return;
+                var fx = (cx - fit.dx) / fit.dw;
+                var fy = (cy - fit.dy) / fit.dh;
+                var sx = Math.round(fx * (typeof CK_SRC_W !== 'undefined' && CK_SRC_W ? CK_SRC_W : fit.fgw));
+                var sy = Math.round(fy * (typeof CK_SRC_H !== 'undefined' && CK_SRC_H ? CK_SRC_H : fit.fgh));
+                var f  = _scrubAbsFrame(CK_SCRUB.cur);
+                // Store into samFrames (first-script variable, already exists).
+                var e0 = (typeof samFrames !== 'undefined' && samFrames[f]) ? samFrames[f] : { positive: [], negative: [] };
+                (neg ? e0.negative : e0.positive).push([sx, sy]);
+                if (typeof samFrames !== 'undefined') samFrames[f] = e0;
+                if (typeof samFrameCount !== 'undefined') samFrameCount = Object.keys(samFrames).length;
+                // Visual feedback: draw dot on canvas.
+                var ctx2 = _canvas.getContext('2d');
+                ctx2.beginPath();
+                ctx2.arc(cx, cy, 5, 0, Math.PI * 2);
+                ctx2.fillStyle = neg ? 'rgba(255,60,60,0.9)' : 'rgba(0,230,255,0.9)';
+                ctx2.fill();
+                ckStatus('Dot added on frame ' + f + ' — RENDER to apply (propagates both ways)');
+            }
+
+            _canvas.addEventListener('click', function (e) { _placeDot(e, false); });
+            _canvas.addEventListener('contextmenu', function (e) { e.preventDefault(); _placeDot(e, true); });
+        })();
+
+        // ── SCRUB BAR (slider + label + exit button, shown below the viewer) ──
+        var scrubBar = (function () {
+            var bar = document.createElement('div');
+            bar.id = 'ckScrubBar';
+            bar.style.cssText = 'display:none;align-items:center;gap:8px;width:100%;box-sizing:border-box;' +
+                'background:linear-gradient(180deg,#26292d,#191b1e);border:1px solid #3a3e44;border-radius:6px;' +
+                'padding:5px 10px;margin-top:4px;box-shadow:0 3px 10px rgba(0,0,0,.6);';
+            bar.innerHTML =
+                '<input type="range" id="ckScrubSlider" min="0" max="0" value="0" step="1" ' +
+                'style="flex:1;min-width:0;accent-color:#a5f;vertical-align:middle;cursor:pointer;">' +
+                '<span id="ckScrubLabel" style="font:700 10px system-ui;color:#c9a5ff;white-space:nowrap;min-width:44px;text-align:right;">--</span>' +
+                '<button type="button" id="ckScrubExit" style="flex-shrink:0;padding:2px 8px;border:1px solid #5c3a7a;border-radius:4px;' +
+                'background:linear-gradient(180deg,#3a2057,#28143e);color:#c9a5ff;font:700 9px system-ui;cursor:pointer;letter-spacing:.04em;">EXIT SCRUB</button>';
+            // Place in the WORK POD (visible in working mode — where the user scrubs), just
+            // above PREVIEW/RENDER. The viewer-module spot got pushed off-screen because
+            // .viewer-wrap is height:100% in working mode. Fallback: after viewer-wrap.
+            (function () {
+                var foot = document.querySelector('#workPod .work-pod-foot');
+                if (foot && foot.parentNode) { foot.parentNode.insertBefore(bar, foot); return; }
+                var vw = document.querySelector('.viewer-wrap');
+                if (vw && vw.parentNode) { vw.parentNode.insertBefore(bar, vw.nextSibling); return; }
+                document.body.appendChild(bar);
+            })();
+            // Wire slider.
+            var sl = bar.querySelector('#ckScrubSlider');
+            if (sl) sl.addEventListener('input', function () { ckScrubShowFrame(parseInt(this.value, 10) || 0); });
+            // Wire EXIT button.
+            var ex = bar.querySelector('#ckScrubExit');
+            if (ex) ex.addEventListener('click', function () { ckExitScrubView(); });
+            return bar;
+        })();
+
+        // ── SCRUB BUTTON + FRAMES input (VIEWS cluster, beside QUAD/RESULT/SAM/CK) ──
+        var scrubSvg = '<svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="#a5f" stroke-width="1.6">' +
+            '<path d="M1 6 H11 M3 3 V9 M6 2 V10 M9 3 V9"/></svg>';
+        ckChromeBtn('ckScrubBtn', 206, scrubSvg, 'SCRUB',
+            'SCRUB: keys every frame in the work area at preview quality. Drag the purple slider to step through pre-keyed frames instantly.',
+            function () { window.ckRunScrub(); });
+        // FRAMES count input — injected right after the SCRUB button.
+        (function () {
+            try {
+                var _scrubBtn = document.getElementById('ckScrubBtn');
+                if (_scrubBtn && _scrubBtn.parentNode) {
+                    // Compact: no "FRAMES" word (it widened the VIEWS cluster and pushed the
+                    // VIEWS label into the centered credit). Just the box + a tooltip.
+                    var _fInput = document.createElement('input');
+                    _fInput.type = 'number';
+                    _fInput.id = 'ckScrubMaxInput';
+                    _fInput.min = '1'; _fInput.max = '120'; _fInput.value = '10';
+                    _fInput.title = 'Scrub: number of frames to sample across the clip (1-120)';
+                    _fInput.style.cssText = 'width:38px;height:30px;margin-left:3px;background:#1a1a2e;color:#c9a5ff;border:1px solid #c9a5ff44;border-radius:4px;text-align:center;font-size:12px;font-family:monospace;vertical-align:middle;';
+                    _scrubBtn.parentNode.insertBefore(_fInput, _scrubBtn.nextSibling);
+                }
+            } catch (_) {}
+        })();
+
+        // ── window.ckRunScrub: kicks off batch-scrub then shows the slider ──
         window.ckRunScrub = function () {
-                if (CK_SCRUB.busy) { ckStatus('Scrub already running'); return; }
-                jsxCall(HOST_APP === 'ppro' ? 'ppro_getInOutInfo' : 'ae_getWorkAreaInfo', [], function (info) {
-                    if (!info || !info.ok) { ckStatus('SCRUB: ' + (info && info.error ? info.error : 'Select a clip and set the work area (yellow handles on the timeline), then try SCRUB')); return; }
-                    if (HOST_APP === 'ppro' && typeof info.startSeconds === 'number') {
-                        var _srcFps = info.sourceFrameRate || info.fps;
-                        info.startFrame = Math.round(info.startSeconds * _srcFps);
-                        info.endFrame   = Math.round(info.endSeconds   * _srcFps);
-                    }
-                    var _smEl = document.getElementById('ckScrubMaxInput');
-                    var MAXF = Math.min(24, Math.max(1, parseInt((_smEl && _smEl.value) || '24', 10) || 24));
-                    var total = Math.max(1, (info.endFrame - info.startFrame) | 0);
-                    var count = Math.min(MAXF, total);
-                    var st = ckGetSettings();
-                    // Anchor = the frame the dots were CLICKED on (CK_ANCHOR_FRAME) — dot
-                    // coords only make sense on that image. (info.sourceFrame doesn't exist
-                    // on ae_getWorkAreaInfo; review 2026-06-06 caught the undefined.)
-                    try { if (typeof ckSamPayload === 'function') Object.assign(st, ckSamPayload() || {}); } catch (_) {}
-                    st.startFrame = info.startFrame;
-                    st.count = count;
-                    // Clean up previous scrub dir (each SCRUB creates a new temp dir; old ones accumulate otherwise).
-                    if (CK_SCRUB.dir) { try { fs.rmSync(CK_SCRUB.dir, { recursive: true, force: true }); } catch (_) {} CK_SCRUB.dir = null; }
-                    var scrubDir = path.join(CK_SESSION_DIR, 'scrub');
-                    var pp = writeParamsFile(st);
-                    var _bigTrackLabel = document.getElementById('ckScrubBigLabel');
-                    if (!_bigTrackLabel) {
-                        _bigTrackLabel = document.createElement('div');
-                        _bigTrackLabel.id = 'ckScrubBigLabel';
-                        _bigTrackLabel.style.cssText = 'position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-size:20px;font-weight:bold;color:cyan;pointer-events:none;z-index:50;display:none;text-align:center;white-space:nowrap;';
-                        var _vEl = document.getElementById('viewer');
-                        if (_vEl) { if (!_vEl.style.position) _vEl.style.position = 'relative'; _vEl.appendChild(_bigTrackLabel); }
-                    }
-                    _bigTrackLabel.textContent = 'TRACKING ' + count + ' FRAMES…';
-                    _bigTrackLabel.style.display = 'block';
-                    CK_SCRUB.busy = true;
-                    ckStatus('Scrubbing ' + count + ' frames...');
-                    try { if (typeof procLabel !== 'undefined' && procLabel) procLabel.textContent = 'Scrubbing...'; if (typeof vwProc !== 'undefined' && vwProc) vwProc.classList.add('show'); if (typeof stageProc !== 'undefined' && stageProc) stageProc.classList.add('show'); if (typeof setBusy === 'function') setBusy(true); } catch (_) {}
-                    try { var _sv = document.getElementById('viewer'); if (_sv) _sv.classList.add('scrub'); } catch (_) {}
-                    runPythonAsync(['batch-scrub', info.sourceFile, scrubDir, '--params', pp,
-                                    '--start-frame', String(info.startFrame), '--count', String(count)], function () {
-                        try { if (typeof vwProc !== 'undefined' && vwProc) vwProc.classList.remove('show'); if (typeof stageProc !== 'undefined' && stageProc) stageProc.classList.remove('show'); } catch (_) {}
-                        try { if (typeof setBusy === 'function') setBusy(false); } catch (_) {}
-                        try { var _sv2 = document.getElementById('viewer'); if (_sv2) _sv2.classList.remove('scrub'); } catch (_) {}
+            if (CK_BATCH_IN_PROGRESS) { ckStatus('Finish the current render first, then SCRUB.'); return; }
+            if (CK_SCRUB.busy) { ckStatus('Scrub already running — wait for it to finish.'); return; }
+            jsxCall(HOST_APP === 'ppro' ? 'ppro_getInOutInfo' : 'ae_getWorkAreaInfo', [], function (info) {
+                if (!info || !info.ok) {
+                    ckStatus('SCRUB: ' + (info && info.error ? info.error : 'Set a clip + work area, then SCRUB'));
+                    return;
+                }
+                var _mfEl = document.getElementById('ckScrubMaxInput'); var MAXF = Math.min(120, Math.max(1, parseInt((_mfEl && _mfEl.value) || '10', 10) || 10));
+                var total = Math.max(1, (info.endFrame - info.startFrame) | 0);
+                var count = Math.min(MAXF, total);
+                var st = ckGetSettings();
+                try { if (typeof ckSamPayload === 'function') Object.assign(st, ckSamPayload() || {}); } catch (_) {}
+                st.startFrame = info.startFrame;
+                st.count = count;
+                // Clean up previous scrub dir.
+                if (CK_SCRUB.dir) {
+                    try { fs.rmSync(CK_SCRUB.dir, { recursive: true, force: true }); } catch (_) {}
+                    CK_SCRUB.dir = null;
+                }
+                var scrubDir = path.join(CK_SESSION_DIR, 'scrub');
+                var pp = writeParamsFile(st);
+                // Bump gen so any prior prerender loop aborts.
+                CK_SCRUB.gen = (CK_SCRUB.gen || 0) + 1;
+                var myGen = CK_SCRUB.gen;
+                CK_SCRUB.busy = true;
+                ckStatus('Scrubbing ' + count + ' frames…');
+                try { if (typeof vwProc !== 'undefined' && vwProc) vwProc.classList.add('show'); } catch (_) {}
+                try { if (typeof stageProc !== 'undefined' && stageProc) stageProc.classList.add('show'); } catch (_) {}
+                try { if (typeof setBusy === 'function') setBusy(true); } catch (_) {}
+                runPythonAsync(
+                    ['batch-scrub', info.sourceFile, scrubDir,
+                     '--params', pp,
+                     '--start-frame', String(info.startFrame),
+                     '--end-frame', String(info.endFrame),
+                     '--count', String(count)],
+                    // onOk
+                    function () {
                         try { fs.unlinkSync(pp); } catch (_) {}
+                        try { if (typeof vwProc !== 'undefined' && vwProc) vwProc.classList.remove('show'); } catch (_) {}
+                        try { if (typeof stageProc !== 'undefined' && stageProc) stageProc.classList.remove('show'); } catch (_) {}
+                        try { if (typeof setBusy === 'function') setBusy(false); } catch (_) {}
                         CK_SCRUB.busy = false;
-                        try { if (_bigTrackLabel) _bigTrackLabel.style.display = 'none'; } catch (_) {}
-                        CK_SCRUB.dir = scrubDir; CK_SCRUB.count = count;
+                        CK_SCRUB.dir = scrubDir;
+                        CK_SCRUB.count = count;
+                        CK_SCRUB.startFrame = info.startFrame;
+                        // Read frames mapping from scrub_index.json written by Python.
+                        try {
+                            var _idxPath = path.join(scrubDir, '..', 'scrub_index.json');
+                            if (fs.existsSync(_idxPath)) {
+                                var _idxData = JSON.parse(fs.readFileSync(_idxPath, 'utf8'));
+                                CK_SCRUB.frames = (_idxData.frames && _idxData.frames.length) ? _idxData.frames : null;
+                                if (_idxData.count) CK_SCRUB.count = _idxData.count;
+                            }
+                        } catch (_idxErr) { CK_SCRUB.frames = null; }
                         var sl2 = document.getElementById('ckScrubSlider');
-                        if (sl2) { sl2.max = String(count - 1); sl2.value = '0'; }
+                        if (sl2) { sl2.max = String(CK_SCRUB.count - 1); sl2.value = '0'; }
                         scrubBar.style.display = 'flex';
-                        try { var _sv4 = document.getElementById('viewer'); if (_sv4) _sv4.classList.add('scrub'); } catch (_) {}
                         window.CK_SCRUB_VIEW = true;
+                        // Show PROXY badge.
+                        try { var _pb = document.getElementById('ckProxyBadge'); if (_pb) _pb.style.display = 'block'; } catch (_) {}
                         ckStatus('Scrub ready — drag the purple slider');
-                        if (CK_PREVIEW_BG === 'matte-ck' || CK_PREVIEW_BG === 'matte-sam') { ckSetMatteView('matte'); }
                         ckScrubShowFrame(0);
-                        (function prerender(i, gen) {
+                        // Background pre-decode: warm the bitmap cache for frames 1..N-1.
+                        // Pure JS (fs→Blob→createImageBitmap), no Python, no IPC.
+                        // Aborts if gen changes (exit or new scrub).
+                        (function preDecode(i) {
+                            if (myGen !== CK_SCRUB.gen) return;   // aborted
                             if (i >= CK_SCRUB.count) return;
-                            var fDir = path.join(CK_SCRUB.dir, String(i).padStart(3, '0'));
-                            if (!fs.existsSync(path.join(fDir, 'alpha.png'))) { prerender(i + 1, gen); return; }
-                            var _fMode = (CK_PREVIEW_BG || 'checker').replace(/[^a-z0-9-]/g, '');
-                            var fprev = path.join(fDir, 'preview_' + _fMode + '_g' + gen + '.png');
-                            if (fs.existsSync(fprev)) { prerender(i + 1, gen); return; }
-                            var fst = ckGetSettings();
-                            try { if (typeof ckSamPayload === 'function') Object.assign(fst, ckSamPayload() || {}); } catch (_) {}
-                            var fpp = writeParamsFile(fst);
-                            runPythonAsync(['postproc', fDir, fprev, '--params', fpp, '--background', CK_PREVIEW_BG, '--max-width', '1100'],
-                                function () { try { fs.unlinkSync(fpp); } catch (_) {} prerender(i + 1, gen); },
-                                function () { prerender(i + 1, gen); });
-                        })(1, window.CK_SCRUB_GEN || 0);
-                    }, function (e) {
-                        try { if (typeof vwProc !== 'undefined' && vwProc) vwProc.classList.remove('show'); if (typeof stageProc !== 'undefined' && stageProc) stageProc.classList.remove('show'); if (typeof setBusy === 'function') setBusy(false); } catch (_) {}
-                        try { var _sv3 = document.getElementById('viewer'); if (_sv3) _sv3.classList.remove('scrub'); } catch (_) {}
-                        CK_SCRUB.busy = false; try { if (_bigTrackLabel) _bigTrackLabel.style.display = 'none'; } catch (_) {} ckStatus('Scrub failed: ' + e.message);
+                            _scrubLoadFrame(i).then(function () {
+                                if (myGen !== CK_SCRUB.gen) return;
+                                setTimeout(function () { preDecode(i + 1); }, 40);
+                            }).catch(function () {
+                                // Frame not ready yet — skip, move on.
+                                setTimeout(function () { preDecode(i + 1); }, 40);
+                            });
+                        })(1);
                     },
+                    // onErr
+                    function (e) {
+                        try { if (typeof vwProc !== 'undefined' && vwProc) vwProc.classList.remove('show'); } catch (_) {}
+                        try { if (typeof stageProc !== 'undefined' && stageProc) stageProc.classList.remove('show'); } catch (_) {}
+                        try { if (typeof setBusy === 'function') setBusy(false); } catch (_) {}
+                        CK_SCRUB.busy = false;
+                        ckStatus('Scrub failed: ' + (e && e.message ? e.message : String(e)));
+                    },
+                    // onLine
                     function (line) {
                         var m = line.match(/PROGRESS\s+(\d+)\/(\d+)/);
-                        if (m) { ckStatus('Scrubbing frame ' + m[1] + ' of ' + m[2] + '...'); try { if (typeof procLabel !== 'undefined' && procLabel) procLabel.textContent = 'Frame ' + m[1] + ' / ' + m[2]; } catch (_) {} try { if (_bigTrackLabel) _bigTrackLabel.textContent = 'TRACKING ' + m[1] + ' / ' + m[2]; } catch (_) {} }
-                    });
-                });
+                        if (m) {
+                            ckStatus('Keying ' + m[1] + '/' + m[2] + '…');
+                            try { if (typeof procLabel !== 'undefined' && procLabel) procLabel.textContent = 'Frame ' + m[1] + ' / ' + m[2]; } catch (_) {}
+                        }
+                    }
+                );
+            });
         };
-        ckChromeBtn('ckScrubBtn', 206, scrubSvg, 'SCRUB',
-            'SCRUB: keys the number of frames you set (Frames input, max 24) from the work area at preview quality. Drag the purple slider to step through; CK / RESULT buttons work on every frame.',
-            function () { window.ckRunScrub(); });
+
     } catch (_) {}
 })();
 </script>
