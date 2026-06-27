@@ -118,7 +118,6 @@ def find_corridorkey_root():
             except Exception:
                 pass
     candidates.append(script_dir.parent.parent / "CorridorKey")
-    candidates.append(Path(r"D:\New AI Projects\CorridorKey"))
     candidates.append(Path.home() / "CorridorKey")
     for path in candidates:
         if path and path.exists():
@@ -1287,7 +1286,12 @@ def cmd_batch(source_video, output_folder, settings,
                 for _i in range(_count):
                     _ok, _fr = _exp_cap.read()
                     if not _ok or _fr is None:
-                        log.warning(f"SAM2 video: skipped unreadable frame {_sf_export + _i}")
+                        log.warning(f"SAM2 video: unreadable frame {_sf_export + _i} - writing black placeholder to keep numbering")
+                        _sq = max(int(_sam_h), int(_sam_w))
+                        cv2.imwrite(str(sam_tmp_dir / f"{_i:06d}.png"),
+                                    np.zeros((_sq, _sq, 3), np.uint8),
+                                    [cv2.IMWRITE_PNG_COMPRESSION, 1])
+                        _exported += 1
                         continue
                     _fr_scaled = cv2.resize(_fr, (_sam_w, _sam_h), interpolation=cv2.INTER_AREA) if _sam_scale != 1.0 else _fr
                     if _src_h is None:
@@ -1938,7 +1942,12 @@ def cmd_batch_scrub(source_video, scrub_folder, settings,
                     _exp_cap.set(cv2.CAP_PROP_POS_FRAMES, int(_abs))
                     _ok, _fr = _exp_cap.read()
                     if not _ok or _fr is None:
-                        log.warning(f"SAM2 video: skipped unreadable frame {_abs}")
+                        log.warning(f"SAM2 video: unreadable frame {_abs} - writing black placeholder to keep numbering")
+                        _sq = max(int(_scrub_h), int(_scrub_w))
+                        cv2.imwrite(str(sam_tmp_dir / f"{_i:06d}.png"),
+                                    np.zeros((_sq, _sq, 3), np.uint8),
+                                    [cv2.IMWRITE_PNG_COMPRESSION, 1])
+                        _exported += 1
                         continue
                     _fr_scaled = cv2.resize(_fr, (_scrub_w, _scrub_h), interpolation=cv2.INTER_AREA) if _scrub_scale != 1.0 else _fr
                     if _src_h is None:
@@ -1961,7 +1970,7 @@ def cmd_batch_scrub(source_video, scrub_folder, settings,
                 # Reusing the SAME state across both passes is critical — the
                 # tracker memory built during the forward pass carries over and
                 # makes backward results coherent. Reinitialising would lose it.
-                _video_predictor = build_sam2_video_predictor(cfg, ckpt, device=device)
+                _video_predictor = _get_video_predictor(cfg, ckpt, device)
                 _all_pts = list(sam_pos) + list(sam_neg)
                 _labels  = [1] * len(sam_pos) + [0] * len(sam_neg)
                 if _scrub_scale != 1.0:
@@ -2049,6 +2058,7 @@ def cmd_batch_scrub(source_video, scrub_folder, settings,
 
     keyed = 0
     failed = []
+    _kept_abs = []   # absolute frame for each WRITTEN slot, in slot order
     try:
         for frame_offset, frame_idx in enumerate(_scrub_frames):
             # Seek to each target frame individually (non-consecutive after sampling).
@@ -2058,9 +2068,11 @@ def cmd_batch_scrub(source_video, scrub_folder, settings,
                 cap.set(cv2.CAP_PROP_POS_FRAMES, _sf - 1)
                 cap.read()  # throwaway warm-up -> next read = frame_idx
             else:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                cap.read()
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                # frame 0: reopen instead of seeking. A POS_FRAMES seek (even to 0)
+                # flushes the long-GOP decoder and the first read after is dirty.
+                # A freshly opened demuxer decodes frame 0 clean. (mirror cmd_batch)
+                cap.release()
+                cap = cv2.VideoCapture(str(source_video), cv2.CAP_FFMPEG)
             ok, frame = cap.read()
             if not ok or frame is None:
                 failed.append(frame_idx)
@@ -2081,7 +2093,7 @@ def cmd_batch_scrub(source_video, scrub_folder, settings,
                 if len(alpha.shape) == 3:
                     alpha = alpha[:, :, 0]
 
-                out_dir = scrub_dir / f"{frame_offset:03d}"
+                out_dir = scrub_dir / f"{keyed:03d}"   # contiguous slot index (no gaps on failure)
                 out_dir.mkdir(parents=True, exist_ok=True)
                 # uint16 — match cmd_cache for precision under live sliders.
                 fg_u16 = (np.clip(fg, 0, 1) * 65535.0).astype(np.uint16)
@@ -2128,6 +2140,7 @@ def cmd_batch_scrub(source_video, scrub_folder, settings,
                         log.warning(f"SAM2 frame {frame_idx}: finalize failed: {_se}")
                 # Write finalized (or raw-fallback) alpha.
                 cv2.imwrite(str(out_dir / "alpha.png"), alpha_u16)
+                _kept_abs.append(int(frame_idx))
                 keyed += 1
             except Exception as e:
                 failed.append(frame_idx)
@@ -2151,7 +2164,7 @@ def cmd_batch_scrub(source_video, scrub_folder, settings,
     try:
         with open(str(index_path), "w") as f:
             json.dump({"count": keyed, "base_dir": scrub_dir.name,
-                       "frames": [_scrub_frames[_i] for _i in range(keyed)]}, f)
+                       "frames": _kept_abs}, f)
         log.info(f"Wrote {index_path}: count={keyed}")
     except Exception as e:
         log.error(f"Failed to write scrub_index.json: {e}")

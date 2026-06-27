@@ -2836,7 +2836,6 @@ function findCorridorkeyRoot() {
         try { if (fs.existsSync(cp)) candidates.push(fs.readFileSync(cp, 'utf8').trim()); } catch (_) {}
     }
     candidates.push(path.resolve(PANEL_DIR, '..', '..', 'CorridorKey'));
-    candidates.push('D:\\New AI Projects\\CorridorKey');
     candidates.push(path.join(os.homedir(), 'CorridorKey'));
     for (const p of candidates) {
         if (!p) continue;
@@ -4810,8 +4809,8 @@ function ckResizePanel(w, h) {
         // ── SCRUB BUTTON + FRAMES input (VIEWS cluster, beside QUAD/RESULT/SAM/CK) ──
         var scrubSvg = '<svg width="11" height="11" viewBox="0 0 12 12" fill="#a5f">' +
             '<polygon points="2,1.5 10.5,6 2,10.5"/></svg>';   // play triangle ▶
-        ckChromeBtn('ckScrubBtn', 206, scrubSvg, 'Preview',
-            'Preview: play the clip at proxy quality to review the key. Click ▶Preview again to exit. Drag the slider; click a frame to add a dot.',
+        ckChromeBtn('ckScrubBtn', 206, scrubSvg, 'Review',
+            'Review: play the clip at proxy quality to review the key across the whole clip. Click ▶Review again to exit. Drag the slider; click a frame to add a dot.',
             function () { if (window.CK_SCRUB_VIEW) { ckExitScrubView(); } else { window.ckRunScrub(); } });
         // FRAMES count input — injected right after the SCRUB button.
         (function () {

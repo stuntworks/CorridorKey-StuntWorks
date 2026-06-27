@@ -67,7 +67,6 @@ def find_corridorkey_root():
             except Exception:
                 pass
     candidates.append(script_dir.parent.parent / "CorridorKey")
-    candidates.append(Path(r"D:\New AI Projects\CorridorKey"))
     candidates.append(Path.home() / "CorridorKey")
     for path in candidates:
         if path and path.exists():
