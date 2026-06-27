@@ -1713,6 +1713,26 @@ def cmd_batch(source_video, output_folder, settings,
                 # if settings.get('green_kill', False):
                 #     from corridorkey_sam_merge import adaptive_green_kill
                 #     _ck_a = adaptive_green_kill(_ck_a, _sam_frame, img_rgb)
+                # Feet-clean for CK MASTER (2026-06-27): keep raw CK alpha for hair/body
+                # (hair-rescue), but in the FEET ZONE (bottom 30% of the matte) min() with the
+                # merged alpha, which already killed the floor/fringe via SAM feet-ring + shadow-
+                # kill. Driven off the merged `alpha` (full-res, same shape as _ck_a) so it can NOT
+                # shape-mismatch _sam_frame (which is at SAM res and silently hit except: pass).
+                # Hair (top) untouched. Skipped on waist crops (body exits bottom of frame).
+                try:
+                    _am = alpha[:, :, 0] if (hasattr(alpha, "ndim") and alpha.ndim == 3) else alpha
+                    if _am is not None and _am.shape == _ck_a.shape:
+                        _amb = _am > 0.5
+                        _rows = np.where(_amb.any(axis=1))[0]
+                        if _rows.size:
+                            _y0, _y1 = int(_rows.min()), int(_rows.max())
+                            _exits_bottom = bool(_amb[-1, :].any())
+                            if (not _exits_bottom) and _y1 > _y0:
+                                _fs = int(_y1 - 0.30 * (_y1 - _y0))
+                                _ck_a = _ck_a.copy()
+                                _ck_a[_fs:, :] = np.minimum(_ck_a[_fs:, :], _am[_fs:, :])
+                except Exception:
+                    pass
                 _ck_a16 = (np.clip(_ck_a, 0, 1) * 65535).astype(np.uint16)
                 _ck_only_bgra = cv2.merge([fg_bgr[:, :, 0], fg_bgr[:, :, 1], fg_bgr[:, :, 2], _ck_a16])
                 _ck_only_dir = out_dir / "CK_ONLY"
