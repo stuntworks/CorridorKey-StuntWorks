@@ -686,7 +686,7 @@ function ae_createSAMPrecomp(mergedFirstFramePath, ckMatteFirstFramePath, samMat
         // Falls back to the old CK+SAM-ON layout when GARBAGE_MATTE (samMatteSeq) is absent.
         // Final top→bottom: GARBAGE MASK (off) | CK + SAM AI OUTPUT (off) | GARBAGE MATTE | CK MASTER (on).
         // Add in reverse: each layers.add() inserts at index 1 (top), so first-added ends at bottom.
-        var _useMasterDefault = !!(ckOnlySeq && samMatteSeq);
+        var _useMasterDefault = !!(ckOnlySeq && (tightSamSeq || samMatteSeq));
 
         // CK MASTER — raw CK clip; the active PICTURE when GARBAGE_MATTE exists.
         var ckoLayer = null;
@@ -695,7 +695,7 @@ function ae_createSAMPrecomp(mergedFirstFramePath, ckMatteFirstFramePath, samMat
                 ckoLayer = ckComp.layers.add(ckOnlySeq);        // added 1st → bottom
                 ckoLayer.name = "CK MASTER (edit me)";
                 ckoLayer.comment = _useMasterDefault
-                    ? "AUTO output: raw CK key, GARBAGE MATTE cuts the junk. Raise Simple Choker to trim edge."
+                    ? "AUTO output: raw CK key. GARBAGE MASK (SAM) cuts the junk by default (best off the green screen). Switch the Track Matte to GARBAGE MATTE for on-green-heavy shots. Raise Simple Choker to trim edge."
                     : "Raw CK key. No SAM. All hair + junk kept. Mask junk by hand.";
                 ckoLayer.startTime = 0;
                 ckoLayer.enabled = _useMasterDefault;            // ON when it is the default picture
@@ -709,11 +709,11 @@ function ae_createSAMPrecomp(mergedFirstFramePath, ckMatteFirstFramePath, samMat
         // GARBAGE MATTE — green-aware junk gate; LUMA-INVERTED track matte for CK MASTER.
         // Placed directly above CK MASTER so legacy-AE adjacency also works.
         var garbageMatteLayer = null;
-        if (_useMasterDefault) {
+        if (samMatteSeq) {
             try {
-                garbageMatteLayer = ckComp.layers.add(samMatteSeq);  // added 2nd → directly above CK MASTER
+                garbageMatteLayer = ckComp.layers.add(samMatteSeq);  // alternate matte (green-aware)
                 garbageMatteLayer.name = "GARBAGE MATTE";
-                garbageMatteLayer.comment = "Green-aware junk matte (luma-inverted track matte for CK MASTER). White=junk -> cut.";
+                garbageMatteLayer.comment = "ALTERNATE matte (green-aware). Switch CK MASTER's Track Matte to this for on-green-heavy shots. White=junk -> cut.";
                 garbageMatteLayer.startTime = 0;
                 garbageMatteLayer.enabled = false;
             } catch (eGm) {}
@@ -747,34 +747,25 @@ function ae_createSAMPrecomp(mergedFirstFramePath, ckMatteFirstFramePath, samMat
 
         // Wire track mattes (LUMA-INVERTED: white = cut).
         var _lumaInv = TrackMatteType.LUMA_INVERTED;
-        // CK MASTER <- GARBAGE MATTE (the new default holdout). GARBAGE MATTE sits directly above CK MASTER.
-        if (ckoLayer && garbageMatteLayer) {
+        // CK MASTER <- GARBAGE MASK (SAM) by DEFAULT — it cuts the off-green wall/junk the
+        // green-aware GARBAGE MATTE leaves around shoulder/hair. Falls back to GARBAGE MATTE
+        // when SAM_JUNK is absent (fusion path). User can switch to GARBAGE MATTE per shot.
+        var _ckMatteLayer = tightSamLayer ? tightSamLayer : garbageMatteLayer;
+        if (ckoLayer && _ckMatteLayer) {
             try {
                 if (typeof ckoLayer.setTrackMatte === "function") {
-                    ckoLayer.setTrackMatte(garbageMatteLayer, _lumaInv);
+                    ckoLayer.setTrackMatte(_ckMatteLayer, _lumaInv);
                 } else {
                     ckoLayer.trackMatteType = _lumaInv;
-                    _warnings.push("Old AE: setTrackMatte missing — GARBAGE MATTE wired by adjacency.");
+                    _warnings.push("Old AE: setTrackMatte missing — CK MASTER matte wired by adjacency (may pick the adjacent layer, not GARBAGE MASK).");
                 }
             } catch (etmM) {
                 _warnings.push("CK MASTER setTrackMatte failed: " + String(etmM));
                 try { $.writeln("CK MASTER setTrackMatte error: " + etmM); } catch (_wM) {}
             }
         }
-        // CK + SAM AI OUTPUT <- GARBAGE MASK (legacy alternate holdout). GARBAGE MASK sits directly above CK+SAM.
-        if (tightSamLayer) {
-            try {
-                if (typeof mergedLayer.setTrackMatte === "function") {
-                    mergedLayer.setTrackMatte(tightSamLayer, _lumaInv);
-                } else {
-                    mergedLayer.trackMatteType = _lumaInv;
-                    _warnings.push("Old AE: setTrackMatte missing — GARBAGE MASK wired by adjacency.");
-                }
-            } catch (etm) {
-                _warnings.push("setTrackMatte failed: " + String(etm));
-                try { $.writeln("CK setTrackMatte error: " + etm); } catch (_w) {}
-            }
-        }
+        // CK + SAM AI OUTPUT stays an OFF alternate with no track matte (GARBAGE MASK is now
+        // CK MASTER's default matte; a layer can only be one layer's track matte).
 
         // Drop precomp in main comp above source, hide source
         var precompLayer = comp.layers.add(ckComp);
