@@ -1190,7 +1190,12 @@ def merge_ck_with_garbage_matte(
     # sam_gate: full wide protection where green is behind, tight hug elsewhere.
     # Falls back to Y-position blend when source_rgb absent (original behavior).
     if G_soft is not None:
-        garbage_matte = sam_tight * (1.0 - G_soft) + sam_wide * G_soft
+        # Off-green (G_soft -> 0) hug the RAW tight SAM, not the 5px-dilated sam_tight:
+        # the dilation left "too much space" on off-green frames (Berto 2026-06-27) — the
+        # green-aware GARBAGE MATTE looked loose off green vs the raw-SAM GARBAGE MASK.
+        # On-green (G_soft -> 1) keeps sam_wide for green-aware hair protection. Per-pixel,
+        # so ONE matte is right on AND off green every shot — no per-shot matte swapping.
+        garbage_matte = sam.astype(np.float32) * (1.0 - G_soft) + sam_wide * G_soft
     else:
         blend = np.ones((h, w), dtype=np.float32)
         ramp_end = min(feet_start + transition_px, h)
