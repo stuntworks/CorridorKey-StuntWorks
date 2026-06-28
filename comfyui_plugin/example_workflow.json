@@ -1,0 +1,117 @@
+{
+  "last_node_id": 6,
+  "last_link_id": 5,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "LoadImage",
+      "pos": [80, 200],
+      "size": [320, 320],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {"name": "IMAGE", "type": "IMAGE", "links": [1, 4], "slot_index": 0},
+        {"name": "MASK", "type": "MASK", "links": null, "slot_index": 1}
+      ],
+      "properties": {"Node name for S&R": "LoadImage"},
+      "widgets_values": ["example.png", "image"]
+    },
+    {
+      "id": 2,
+      "type": "CorridorKeySWLoader",
+      "pos": [80, 560],
+      "size": [340, 130],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {"name": "ck_model", "type": "CK_MODEL", "links": [2], "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "CorridorKeySWLoader"},
+      "widgets_values": ["CorridorKey.pth", "cuda", 2048, true]
+    },
+    {
+      "id": 3,
+      "type": "CorridorKeySWKeyer",
+      "pos": [460, 200],
+      "size": [320, 220],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {"name": "ck_model", "type": "CK_MODEL", "link": 2},
+        {"name": "image", "type": "IMAGE", "link": 1},
+        {"name": "alpha_hint", "type": "MASK", "link": null}
+      ],
+      "outputs": [
+        {"name": "fg", "type": "IMAGE", "links": [3], "slot_index": 0},
+        {"name": "ck_alpha", "type": "MASK", "links": [5], "slot_index": 1}
+      ],
+      "properties": {"Node name for S&R": "CorridorKeySWKeyer"},
+      "widgets_values": ["green", 1.0, 1.0, true, 400]
+    },
+    {
+      "id": 5,
+      "type": "PreviewImage",
+      "pos": [840, 200],
+      "size": [320, 320],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {"name": "images", "type": "IMAGE", "link": 3}
+      ],
+      "outputs": [],
+      "properties": {"Node name for S&R": "PreviewImage"}
+    },
+    {
+      "id": 4,
+      "type": "CorridorKeySWGarbageMerge",
+      "pos": [460, 560],
+      "size": [340, 150],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {"name": "image", "type": "IMAGE", "link": 4},
+        {"name": "ck_alpha", "type": "MASK", "link": 5},
+        {"name": "sam_mask", "type": "MASK", "link": null}
+      ],
+      "outputs": [
+        {"name": "clean_alpha", "type": "MASK", "links": null, "slot_index": 0},
+        {"name": "garbage_matte", "type": "MASK", "links": null, "slot_index": 1}
+      ],
+      "properties": {"Node name for S&R": "CorridorKeySWGarbageMerge"},
+      "widgets_values": ["green"]
+    },
+    {
+      "id": 6,
+      "type": "Note",
+      "pos": [840, 560],
+      "size": [340, 220],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {"text": ""},
+      "widgets_values": [
+        "CorridorKey StuntWorks example.\n\n1) Keyer-only path runs as-is: Load Image -> Keyer -> Preview (fg).\n\n2) For the green-aware GARBAGE MERGE: connect a SAM2 subject mask (from any ComfyUI segmentation node) into the Garbage Merge 'sam_mask' input. Outputs clean_alpha + garbage_matte (white=junk).\n\n3) To view a MASK, add a 'Convert Mask to Image' node then a Preview.\n\nModel: put CorridorKey.pth/safetensors in ComfyUI/models/corridorkey/.\nEngine: set CORRIDORKEY_ROOT or corridorkey_path.txt.\n\nTutorials: youtube.com/@StuntWorksCinema"
+      ]
+    }
+  ],
+  "links": [
+    [1, 1, 0, 3, 1, "IMAGE"],
+    [2, 2, 0, 3, 0, "CK_MODEL"],
+    [3, 3, 0, 5, 0, "IMAGE"],
+    [4, 1, 0, 4, 0, "IMAGE"],
+    [5, 3, 1, 4, 1, "MASK"]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {},
+  "version": 0.4
+}

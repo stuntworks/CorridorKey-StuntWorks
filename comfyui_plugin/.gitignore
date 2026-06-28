@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+# machine-specific engine path (each user sets their own / uses CORRIDORKEY_ROOT)
+corridorkey_path.txt

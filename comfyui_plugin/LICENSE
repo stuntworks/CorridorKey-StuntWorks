@@ -1,0 +1,32 @@
+CorridorKey — StuntWorks Cinema build (ComfyUI plugin)
+
+The CorridorKey neural keying engine was created by Niko Pueringer / Corridor
+Digital and is licensed under the Creative Commons Attribution-NonCommercial-
+ShareAlike 4.0 International License (CC BY-NC-SA 4.0).
+
+This ComfyUI plugin (by Roberto & Elvis Lopez / StuntWorks Cinema) is a
+derivative work and is distributed under the SAME license: CC BY-NC-SA 4.0.
+
+You are free to:
+  - Share — copy and redistribute the material in any medium or format
+  - Adapt — remix, transform, and build upon the material
+
+Under the following terms:
+  - Attribution — You must give appropriate credit to Niko Pueringer / Corridor
+    Digital (the engine) and StuntWorks Cinema (this plugin), provide a link to
+    the license, and indicate if changes were made.
+  - NonCommercial — You may NOT use the material for commercial purposes.
+    This plugin and the engine are free and may not be sold.
+  - ShareAlike — If you remix or build upon the material, you must distribute
+    your contributions under the same license as the original.
+
+Full license text: https://creativecommons.org/licenses/by-nc-sa/4.0/legalcode
+Human-readable summary: https://creativecommons.org/licenses/by-nc-sa/4.0/
+
+Third-party components:
+  - SAM2 (Segment Anything Model 2) (c) Meta AI — Apache License 2.0.
+    Not bundled with this plugin; supplied by the user's own ComfyUI nodes.
+
+Engine:  https://github.com/nikopueringer/CorridorKey
+Plugin:  https://github.com/stuntworks/CorridorKey-Plugin
+YouTube: https://www.youtube.com/@StuntWorksCinema

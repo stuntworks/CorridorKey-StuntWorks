@@ -1,0 +1,26 @@
+[project]
+name = "comfyui-corridorkey-stuntworks"
+description = "AI green screen keyer for ComfyUI — CorridorKey neural key + green-aware garbage matte (clean key + clean junk). StuntWorks Cinema build."
+version = "0.1.0"
+license = { text = "CC BY-NC-SA 4.0" }
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "opencv-python",
+    "torch",
+    "scipy",
+]
+
+[project.urls]
+Repository = "https://github.com/stuntworks/CorridorKey-Plugin"
+YouTube = "https://www.youtube.com/@StuntWorksCinema"
+"CorridorKey Engine" = "https://github.com/nikopueringer/CorridorKey"
+"Corridor Digital" = "https://corridordigital.com"
+Funding = "https://ko-fi.com/stuntworks"
+
+# ComfyUI Registry metadata (https://docs.comfy.org/registry/)
+[tool.comfy]
+PublisherId = "stuntworks"
+DisplayName = "CorridorKey (StuntWorks)"
+Icon = ""

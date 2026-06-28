@@ -1,0 +1,13 @@
+# CorridorKey StuntWorks ComfyUI plugin — engine dependencies.
+# These must be importable in ComfyUI's OWN python env (the plugin uses
+# ComfyUI's interpreter, not the CorridorKey repo .venv).
+# torch / torchvision normally already present in ComfyUI — listed for completeness.
+numpy
+opencv-python
+scipy
+timm
+safetensors
+torch
+torchvision
+# SAM2 is NOT required here — bring your subject mask from any ComfyUI
+# segmentation node. (sam2 only needed if you generate masks in ComfyUI.)
