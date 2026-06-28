@@ -1,0 +1,37 @@
+{
+  "_comment": "CorridorKey model manifest. Each entry describes one weight file stored in Cloudflare R2. The downloader fetches presigned URLs from the license server at runtime — weights are never bundled. sha256 and size_bytes are TODO placeholders; fill in once final weights are locked.",
+  "schema_version": "1",
+  "models": [
+    {
+      "name": "CorridorKey Engine",
+      "description": "Primary CorridorKey matting model (Niko's trained weights). Required by all host adapters.",
+      "filename": "CorridorKey.pth",
+      "sha256": "TODO_SHA256_CORRIDORKEY_PTH",
+      "r2_key": "models/v0.9/CorridorKey.pth",
+      "size_bytes": 0,
+      "required": true
+    },
+    {
+      "name": "SAM 2.1 Hiera Base Plus",
+      "description": "Segment Anything Model 2.1 — base-plus variant. Higher accuracy, larger memory footprint. Preferred on machines with >= 8 GB VRAM.",
+      "filename": "sam2.1_hiera_base_plus.pt",
+      "sha256": "TODO_SHA256_SAM21_BASE_PLUS_PT",
+      "r2_key": "models/v0.9/sam2.1_hiera_base_plus.pt",
+      "size_bytes": 0,
+      "required": false,
+      "variant_group": "sam2.1",
+      "variant_note": "Choose one SAM 2.1 variant. base_plus = higher quality, more VRAM."
+    },
+    {
+      "name": "SAM 2.1 Hiera Small",
+      "description": "Segment Anything Model 2.1 — small variant. Lower VRAM requirement (~4 GB). Suitable for machines without a high-end GPU.",
+      "filename": "sam2.1_hiera_small.pt",
+      "sha256": "TODO_SHA256_SAM21_SMALL_PT",
+      "r2_key": "models/v0.9/sam2.1_hiera_small.pt",
+      "size_bytes": 0,
+      "required": false,
+      "variant_group": "sam2.1",
+      "variant_note": "Choose one SAM 2.1 variant. small = lower VRAM, slightly lower quality."
+    }
+  ]
+}

@@ -1,0 +1,94 @@
+# =============================================================================
+# ci.yml — CorridorKey continuous integration
+#
+# Triggered by: pull_request (any branch → any branch)
+#
+# Jobs:
+#   test-engine   — runs the Python engine test suite
+#   lint-manifest — validates JSON files (manifest.json, etc.)
+#
+# TODO before tests are meaningful:
+#   - Add engine/ directory with pyproject.toml once the folder cutover happens.
+#   - Add real pytest tests under engine/tests/.
+#   - Add type-checking (mypy) and linting (ruff) steps.
+#   - Add a CEP panel build smoke-test (bolt-cep build, no sign).
+# =============================================================================
+
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - "**"
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # Job: test-engine
+  # Runs the shared AI engine test suite.
+  # Currently a placeholder echo because engine/ does not yet exist.
+  # Once the folder cutover is done, replace the echo with:
+  #   cd engine && pip install -e ".[dev]" && pytest tests/ -v
+  # ---------------------------------------------------------------------------
+  test-engine:
+    name: "Engine tests (pytest)"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # TODO: once engine/ exists:
+          # pip install -e "engine/[dev]"
+          echo "TODO: install engine test dependencies from engine/pyproject.toml"
+
+      - name: Run engine tests
+        run: |
+          # TODO: replace with real pytest invocation once engine/ exists:
+          #   cd engine && pytest tests/ -v --tb=short
+          echo "TODO: pytest — engine/ not yet created (pending folder cutover)"
+          echo "Placeholder CI step passed."
+
+      # TODO: add CorridorKeyModule tests (current name before cutover)
+      # - name: Run CorridorKeyModule tests (pre-cutover)
+      #   run: |
+      #     pip install -r requirements.txt
+      #     pytest CorridorKeyModule/tests/ -v --tb=short
+
+  # ---------------------------------------------------------------------------
+  # Job: lint-manifest
+  # Validates that model-downloader/manifest.json is well-formed JSON.
+  # Cheap and fast — catches typos before a release.
+  # ---------------------------------------------------------------------------
+  lint-manifest:
+    name: "Lint manifest.json"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate manifest.json
+        run: |
+          python -c "
+          import json, sys, pathlib
+          path = pathlib.Path('model-downloader/manifest.json')
+          try:
+              data = json.loads(path.read_text())
+              models = data.get('models', [])
+              print(f'manifest.json OK — {len(models)} model entries')
+          except json.JSONDecodeError as e:
+              print(f'INVALID JSON: {e}', file=sys.stderr)
+              sys.exit(1)
+          "
+
+      - name: Validate downloader.py syntax
+        run: python -m py_compile model-downloader/downloader.py && echo "downloader.py syntax OK"

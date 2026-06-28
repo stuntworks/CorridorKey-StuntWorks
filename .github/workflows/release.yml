@@ -1,0 +1,270 @@
+# =============================================================================
+# release.yml — CorridorKey release pipeline
+#
+# Triggered by: git tag v* (e.g. v0.9.0)
+#
+# Jobs (parallel fan-out):
+#   build-adobe-cep    → CorridorKey-v<tag>-Adobe.zxp       (ubuntu runner)
+#   build-resolve-win  → CorridorKey-v<tag>-Resolve-Win.exe (windows runner)
+#   build-resolve-mac  → CorridorKey-v<tag>-Resolve-Mac.pkg (macos runner)
+#   build-comfyui      → CorridorKey-v<tag>-ComfyUI.zip     (ubuntu runner)
+#   draft-release      → GitHub Release draft with all artifacts attached
+#
+# TODO before first real release:
+#   - Populate signing secrets in GitHub repository Settings > Secrets:
+#       ADOBE_CERT_P12       (base64-encoded .p12 file)
+#       ADOBE_CERT_PASS      (passphrase for the .p12)
+#   - Install prerequisites into each runner (see per-job TODO comments).
+#   - Replace placeholder echo steps with real build script calls.
+#   - Decide whether to push the ComfyUI zip to the ComfyUI Registry here
+#     or keep that as a manual step.
+# =============================================================================
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Shared env available to all jobs
+env:
+  DIST_DIR: dist
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # Job: build-adobe-cep
+  # Builds the ZXP extension for After Effects + Premiere Pro.
+  # Runs on ubuntu because ZXPSignCmd is available for Linux and the CEP panel
+  # is a web-tech (HTML/JS/CSS) bundle that does not need Windows.
+  # ---------------------------------------------------------------------------
+  build-adobe-cep:
+    name: "Build Adobe CEP (.zxp)"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Read version from VERSION file
+        id: version
+        run: echo "VERSION=$(cat VERSION | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
+
+      # TODO: Install Node.js and bolt-cep
+      # - name: Set up Node.js
+      #   uses: actions/setup-node@v4
+      #   with:
+      #     node-version: "20"
+      # - name: Install bolt-cep
+      #   run: npm install -g bolt-cep
+
+      # TODO: Download ZXPSignCmd and add to PATH
+      # - name: Install ZXPSignCmd
+      #   run: |
+      #     # Download from Adobe Exchange (URL requires acceptance of license)
+      #     # Place binary at /usr/local/bin/ZXPSignCmd and chmod +x
+      #     echo "TODO: install ZXPSignCmd"
+
+      # TODO: Decode the signing certificate from GitHub Secrets
+      # - name: Decode signing certificate
+      #   env:
+      #     CERT_P12_B64: ${{ secrets.ADOBE_CERT_P12 }}
+      #     CERT_PASS: ${{ secrets.ADOBE_CERT_PASS }}
+      #   run: |
+      #     echo "$CERT_P12_B64" | base64 -d > /tmp/corridorkey.p12
+      #     echo "CERT_P12=/tmp/corridorkey.p12" >> "$GITHUB_ENV"
+      #     echo "CERT_PASS=$CERT_PASS"          >> "$GITHUB_ENV"
+
+      - name: Build Adobe CEP package
+        run: |
+          # TODO: replace with the real build script once prerequisites are set up:
+          # bash packaging/build-adobe-cep.sh
+          mkdir -p dist
+          echo "PLACEHOLDER - not a real ZXP" > "dist/CorridorKey-v${{ steps.version.outputs.VERSION }}-Adobe.zxp"
+          echo "TODO: run packaging/build-adobe-cep.sh"
+
+      - name: Upload ZXP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: adobe-cep-zxp
+          path: "dist/CorridorKey-v${{ steps.version.outputs.VERSION }}-Adobe.zxp"
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Job: build-resolve-win
+  # Builds the Windows OFX installer (.exe) on a Windows runner.
+  # Requires cmake, the OFX SDK, and NSIS.
+  # ---------------------------------------------------------------------------
+  build-resolve-win:
+    name: "Build Resolve OFX — Windows (.exe)"
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Read version from VERSION file
+        id: version
+        shell: bash
+        run: echo "VERSION=$(cat VERSION | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
+
+      # TODO: Install cmake
+      # - name: Install cmake
+      #   uses: lukka/get-cmake@latest
+
+      # TODO: Install NSIS
+      # - name: Install NSIS
+      #   run: choco install nsis -y
+
+      # TODO: Download or cache the DaVinci Resolve OFX SDK
+      # - name: Cache OFX SDK
+      #   uses: actions/cache@v4
+      #   with:
+      #     path: C:\ofx-sdk
+      #     key: ofx-sdk-v1
+
+      - name: Build Resolve OFX Windows installer
+        shell: bash
+        run: |
+          # TODO: replace with the real build script:
+          # bash packaging/build-resolve-ofx.sh
+          mkdir -p dist
+          echo "PLACEHOLDER - not a real installer" > "dist/CorridorKey-v${{ steps.version.outputs.VERSION }}-Resolve-Win.exe"
+          echo "TODO: run packaging/build-resolve-ofx.sh"
+
+      - name: Upload Windows installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: resolve-win-exe
+          path: "dist/CorridorKey-v${{ steps.version.outputs.VERSION }}-Resolve-Win.exe"
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Job: build-resolve-mac
+  # Builds the macOS OFX installer (.pkg) on a macOS runner.
+  # Requires cmake, the OFX SDK, and Xcode Command Line Tools.
+  # ---------------------------------------------------------------------------
+  build-resolve-mac:
+    name: "Build Resolve OFX — macOS (.pkg)"
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Read version from VERSION file
+        id: version
+        run: echo "VERSION=$(cat VERSION | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
+
+      # TODO: Install cmake
+      # - name: Install cmake
+      #   run: brew install cmake ninja
+
+      # TODO: Download or cache the DaVinci Resolve OFX SDK (macOS build)
+      # - name: Cache OFX SDK (mac)
+      #   uses: actions/cache@v4
+      #   with:
+      #     path: /opt/ofx-sdk
+      #     key: ofx-sdk-mac-v1
+
+      - name: Build Resolve OFX macOS installer
+        run: |
+          # TODO: replace with the real build script:
+          # bash packaging/build-resolve-ofx.sh
+          mkdir -p dist
+          echo "PLACEHOLDER - not a real pkg" > "dist/CorridorKey-v${{ steps.version.outputs.VERSION }}-Resolve-Mac.pkg"
+          echo "TODO: run packaging/build-resolve-ofx.sh"
+
+      - name: Upload macOS installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: resolve-mac-pkg
+          path: "dist/CorridorKey-v${{ steps.version.outputs.VERSION }}-Resolve-Mac.pkg"
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Job: build-comfyui
+  # Zips the ComfyUI custom nodes. Pure Python — no compilation needed.
+  # ---------------------------------------------------------------------------
+  build-comfyui:
+    name: "Build ComfyUI nodes (.zip)"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Read version from VERSION file
+        id: version
+        run: echo "VERSION=$(cat VERSION | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Build ComfyUI zip
+        run: bash packaging/build-comfyui.sh
+
+      - name: Upload ComfyUI zip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: comfyui-zip
+          path: "dist/CorridorKey-v${{ steps.version.outputs.VERSION }}-ComfyUI.zip"
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Job: draft-release
+  # Waits for all build jobs, then creates a GitHub Release draft and attaches
+  # all four artifacts.
+  # ---------------------------------------------------------------------------
+  draft-release:
+    name: "Draft GitHub Release"
+    runs-on: ubuntu-latest
+    needs:
+      - build-adobe-cep
+      - build-resolve-win
+      - build-resolve-mac
+      - build-comfyui
+
+    permissions:
+      contents: write  # required to create releases and upload assets
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Read version from VERSION file
+        id: version
+        run: echo "VERSION=$(cat VERSION | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+
+      - name: List downloaded artifacts
+        run: ls -lh dist/
+
+      # TODO: Extract the [Unreleased] section from CHANGELOG.md and pass it
+      # as the release body. Example with awk:
+      #   body=$(awk '/^## \[Unreleased\]/{flag=1;next} /^## \[/{flag=0} flag' CHANGELOG.md)
+
+      - name: Create GitHub Release draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ github.ref_name }}"
+          VERSION="${{ steps.version.outputs.VERSION }}"
+
+          # TODO: replace --notes with real CHANGELOG extraction
+          gh release create "$TAG" \
+            --title "CorridorKey v${VERSION}" \
+            --notes "TODO: extract from CHANGELOG.md [Unreleased] section" \
+            --draft \
+            dist/CorridorKey-v${VERSION}-Adobe.zxp \
+            dist/CorridorKey-v${VERSION}-Resolve-Win.exe \
+            dist/CorridorKey-v${VERSION}-Resolve-Mac.pkg \
+            dist/CorridorKey-v${VERSION}-ComfyUI.zip
