@@ -679,93 +679,69 @@ function ae_createSAMPrecomp(mergedFirstFramePath, ckMatteFirstFramePath, samMat
         var ckCompDuration = (comp.workAreaDuration > 0) ? comp.workAreaDuration : comp.duration;
         var ckComp = app.project.items.addComp("CK Comp " + srcName, comp.width, comp.height, comp.pixelAspect, ckCompDuration, comp.frameRate);
 
-        // Build the compositing stack.
-        // DEFAULT (Berto 2026-06-27): CK MASTER (raw CK, clean edges) is the PICTURE,
-        // GARBAGE_MATTE (green-aware junk gate) is a LUMA-INVERTED track matte over it
-        // to cut the wall/background junk. CK + SAM merge is demoted to an OFF alternate.
-        // Falls back to the old CK+SAM-ON layout when GARBAGE_MATTE (samMatteSeq) is absent.
-        // Final top→bottom: GARBAGE MASK (off) | CK + SAM AI OUTPUT (off) | GARBAGE MATTE | CK MASTER (on).
+        // Build the compositing stack. Final top→bottom:
+        //   guide text (no render) | GARBAGE MASK (OFF) | CK + SAM AI OUTPUT (ON) | CK MASTER (edit me) (OFF)
         // Add in reverse: each layers.add() inserts at index 1 (top), so first-added ends at bottom.
-        var _useMasterDefault = !!(ckOnlySeq && (tightSamSeq || samMatteSeq));
-
-        // CK MASTER — raw CK clip; the active PICTURE when GARBAGE_MATTE exists.
+        // ROLLED BACK 2026-06-27 (Berto): the CK-MASTER-as-default auto-stack broke preview=render
+        // (preview shows the MERGED output; CK MASTER is raw CK) and lost hair. Restored to the
+        // known-good = CK + SAM AI OUTPUT (merged) as the visible default, which the preview
+        // matches and which keeps on-green hair. CK MASTER stays an OFF alternate (hair-rescue).
+        // CK MASTER — raw CK clip, no SAM matte, user draws masks here
         var ckoLayer = null;
         if (ckOnlySeq) {
             try {
                 ckoLayer = ckComp.layers.add(ckOnlySeq);        // added 1st → bottom
                 ckoLayer.name = "CK MASTER (edit me)";
-                ckoLayer.comment = _useMasterDefault
-                    ? "AUTO output: raw CK key. GARBAGE MASK (SAM) cuts the junk by default (best off the green screen). Switch the Track Matte to GARBAGE MATTE for on-green-heavy shots. Raise Simple Choker to trim edge."
-                    : "Raw CK key. No SAM. All hair + junk kept. Mask junk by hand.";
+                ckoLayer.comment = "Raw CK key. No SAM. All hair + junk kept. Mask junk by hand.";
                 ckoLayer.startTime = 0;
-                ckoLayer.enabled = _useMasterDefault;            // ON when it is the default picture
+                ckoLayer.enabled = false;
                 try {
                     var ckoChoke = ckoLayer.property("ADBE Effect Parade").addProperty("ADBE Simple Choker");
                     ckoChoke.property("Choke Matte").setValue(0);
                 } catch (eChoke) {}
             } catch (ecko2) {}
         }
-
-        // GARBAGE MATTE — green-aware junk gate; LUMA-INVERTED track matte for CK MASTER.
-        // Placed directly above CK MASTER so legacy-AE adjacency also works.
-        var garbageMatteLayer = null;
-        if (samMatteSeq) {
-            try {
-                garbageMatteLayer = ckComp.layers.add(samMatteSeq);  // alternate matte (green-aware)
-                garbageMatteLayer.name = "GARBAGE MATTE";
-                garbageMatteLayer.comment = "ALTERNATE matte (green-aware). Switch CK MASTER's Track Matte to this for on-green-heavy shots. White=junk -> cut.";
-                garbageMatteLayer.startTime = 0;
-                garbageMatteLayer.enabled = false;
-            } catch (eGm) {}
-        }
-
-        // CK + SAM AI OUTPUT — merged CK+SAM. The default picture ONLY when GARBAGE_MATTE is absent.
-        var mergedLayer = ckComp.layers.add(mergedSeq);        // added 3rd
+        // CK + SAM AI OUTPUT — merged CK with SAM garbage matte; the active auto output
+        var mergedLayer = ckComp.layers.add(mergedSeq);        // added 2nd → above CK MASTER
         mergedLayer.name = "CK + SAM AI OUTPUT";
-        mergedLayer.comment = _useMasterDefault
-            ? "Alternate: CK + SAM merge. Off by default — enable to compare against CK MASTER."
-            : "Auto result: CK key + SAM garbage cut. Add/raise Simple Choker to adjust edge.";
+        mergedLayer.comment = "Auto result: CK key + SAM garbage cut. Add/raise Simple Choker to adjust edge.";
         mergedLayer.startTime = 0;
-        mergedLayer.enabled = !_useMasterDefault;              // OFF when CK MASTER is the default
+        mergedLayer.enabled = true;
         try {
             var mergedChoke = mergedLayer.property("ADBE Effect Parade").addProperty("ADBE Simple Choker");
             mergedChoke.property("Choke Matte").setValue(0);   // neutral; tune per shot
         } catch (eMergedChoke) {}
-
-        // GARBAGE MASK — SAM_JUNK matte source; LUMA-INVERTED track matte for the CK+SAM alternate.
+        // GARBAGE MASK — SAM matte source; LUMA-INVERTED track matte for CK + SAM AI OUTPUT only
         var tightSamLayer = null;
         if (tightSamSeq) {
             try {
-                tightSamLayer = ckComp.layers.add(tightSamSeq); // added 4th → top
+                tightSamLayer = ckComp.layers.add(tightSamSeq); // added 3rd → above CK + SAM AI OUTPUT
                 tightSamLayer.name = "GARBAGE MASK";
-                tightSamLayer.comment = "SAM junk mask (track matte for the CK+SAM alternate). Enable + trim to cut off-green junk.";
+                tightSamLayer.comment = "SAM junk mask (track matte for AUTO). Enable + trim to bad frames to cut off-green junk.";
                 tightSamLayer.startTime = 0;
                 tightSamLayer.enabled = false;
             } catch (eTsl) {}
         }
         // Per-layer instructions live in each layer's .comment (Comment column), set above.
+        // No on-screen guide layer (Berto 2026-06-21: notes belong ON the layer, not a text layer).
 
-        // Wire track mattes (LUMA-INVERTED: white = cut).
-        var _lumaInv = TrackMatteType.LUMA_INVERTED;
-        // CK MASTER <- GARBAGE MASK (SAM) by DEFAULT — it cuts the off-green wall/junk the
-        // green-aware GARBAGE MATTE leaves around shoulder/hair. Falls back to GARBAGE MATTE
-        // when SAM_JUNK is absent (fusion path). User can switch to GARBAGE MATTE per shot.
-        var _ckMatteLayer = tightSamLayer ? tightSamLayer : garbageMatteLayer;
-        if (ckoLayer && _ckMatteLayer) {
+        // Wire GARBAGE MASK as LUMA-INVERTED track matte on CK + SAM AI OUTPUT only.
+        // CK MASTER has NO track matte — it is the raw plain CK clip.
+        if (tightSamLayer) {
+            var _lumaInv = TrackMatteType.LUMA_INVERTED;
             try {
-                if (typeof ckoLayer.setTrackMatte === "function") {
-                    ckoLayer.setTrackMatte(_ckMatteLayer, _lumaInv);
+                if (typeof mergedLayer.setTrackMatte === "function") {
+                    mergedLayer.setTrackMatte(tightSamLayer, _lumaInv);
                 } else {
-                    ckoLayer.trackMatteType = _lumaInv;
-                    _warnings.push("Old AE: setTrackMatte missing — CK MASTER matte wired by adjacency (may pick the adjacent layer, not GARBAGE MASK).");
+                    // Pre-2023 AE: GARBAGE MASK sits directly above CK + SAM AI OUTPUT for adjacency
+                    mergedLayer.trackMatteType = _lumaInv;
+                    _warnings.push("Old AE: setTrackMatte missing — GARBAGE MASK wired by adjacency.");
                 }
-            } catch (etmM) {
-                _warnings.push("CK MASTER setTrackMatte failed: " + String(etmM));
-                try { $.writeln("CK MASTER setTrackMatte error: " + etmM); } catch (_wM) {}
+            } catch (etm) {
+                _warnings.push("setTrackMatte failed: " + String(etm));
+                try { $.writeln("CK setTrackMatte error: " + etm); } catch (_w) {}
             }
         }
-        // CK + SAM AI OUTPUT stays an OFF alternate with no track matte (GARBAGE MASK is now
-        // CK MASTER's default matte; a layer can only be one layer's track matte).
 
         // Drop precomp in main comp above source, hide source
         var precompLayer = comp.layers.add(ckComp);
