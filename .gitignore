@@ -12,3 +12,17 @@ _backup_working/
 .deploy_backups/
 .env
 fusion_v2_weights/
+
+# Broker secret — machine-local, auto-generated on first run; never commit
+ae_plugin/cep_panel/ck_broker_config.json
+
+# --- heavy binaries: never belong in git (2026-06-28, accidental ComfyUI/SAM sweep) ---
+.venv-sam3-merged-DEFERRED/
+ClipsForInference/
+sam2_weights/
+CorridorKeyModule/checkpoints/
+*.pth
+*.onnx
+*.pt
+*.mov
+*.mp4
