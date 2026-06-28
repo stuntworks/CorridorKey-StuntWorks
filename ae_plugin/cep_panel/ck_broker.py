@@ -415,6 +415,10 @@ def _run_via_sam_subprocess(conn, args, cwd, env, timeout):
                 continue
             if line is None:
                 break
+            # ponytail: progress = alive. Reset deadline on every line so timeout
+            # is a stall watchdog, not a wall-clock cap. Clip length stops mattering;
+            # a genuinely frozen engine (no output for `timeout`s) still gets killed.
+            deadline = time.monotonic() + timeout
             try:
                 _send(conn, {"type": "line", "data": line.rstrip("\n")})
             except (BrokenPipeError, ConnectionError):

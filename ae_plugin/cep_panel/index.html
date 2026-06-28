@@ -430,8 +430,9 @@
     display: flex; flex-direction: column; align-items: center; gap: 3px;
   }
   #ck-busy-promo {
-    font-size: 9px; letter-spacing: 0.10em; color: rgba(40,220,228,0.40);
-    text-transform: none; font-weight: 400;
+    font-size: 13px; letter-spacing: 0.08em; color: rgba(120,238,242,0.98);
+    text-transform: none; font-weight: 600;
+    text-shadow: 0 0 10px rgba(40,220,228,0.7), 0 1px 2px #000;
   }
 
   .vw-proc .scan {
@@ -1449,8 +1450,8 @@
             <span class="pl" id="procLabel">Keying frame</span>
             <!-- Credits shown while it renders (Berto 2026-06-17: captive audience during the wait). -->
             <div id="vwProcCredit" style="margin-top:12px;text-align:center;line-height:1.55;pointer-events:auto;">
-              <a href="#" title="StuntWorks Cinema on YouTube" onclick="ckOpenURL('https://www.youtube.com/@StuntWorksCinema');return false;" style="display:block;font:800 15px system-ui;color:#e23cf0;text-decoration:none;cursor:pointer;">StuntWorks Cinema&nbsp;&nbsp;↗</a>
-              <a href="#" title="CorridorKey engine by Niko Pueringer / Corridor Digital" onclick="ckOpenURL('https://corridordigital.com');return false;" style="display:block;font:800 15px system-ui;color:#3ee84e;text-decoration:none;cursor:pointer;margin-top:4px;">CorridorKey&nbsp;·&nbsp;by Niko Pueringer&nbsp;&nbsp;↗</a>
+              <a href="#" title="StuntWorks Cinema on YouTube" onclick="ckOpenURL('https://www.youtube.com/@StuntWorksCinema');return false;" style="display:block;font:800 16px system-ui;color:#fa57ff;text-decoration:none;cursor:pointer;text-shadow:0 0 12px rgba(226,60,240,0.95),0 0 3px rgba(0,0,0,0.9),0 1px 2px #000;">StuntWorks Cinema&nbsp;&nbsp;↗</a>
+              <a href="#" title="CorridorKey engine by Niko Pueringer / Corridor Digital" onclick="ckOpenURL('https://corridordigital.com');return false;" style="display:block;font:800 16px system-ui;color:#5cff6b;text-decoration:none;cursor:pointer;margin-top:4px;text-shadow:0 0 12px rgba(62,232,78,0.95),0 0 3px rgba(0,0,0,0.9),0 1px 2px #000;">CorridorKey&nbsp;·&nbsp;by Niko Pueringer&nbsp;&nbsp;↗</a>
             </div>
           </div>
           <span id="vwZoomBadge">1.0x</span>
@@ -2752,7 +2753,35 @@
   // KEY: short processing beat, then show the keyed preview on this one frame
   // KEY: real pipeline (extract -> cache -> [sam-apply if points] -> postproc -> show),
   // wired to the engine bridge below. doKey() owns the busy state + keyed transition.
+  var _onePushPending = false;
   keyBtn.addEventListener('click', () => {
+    // ponytail: startup view = one push. The panel auto-keys a preview on open, so the
+    // green button renders straight to the timeline — no preview-first beat. Working /
+    // cockpit (SAM-dotting) keep doKey so you can preview + eyeball dots before committing.
+    const _u = document.querySelector('.unit');
+    const _startup = !_u || (!_u.classList.contains('working') && !_u.classList.contains('cockpit'));
+    if (_startup && typeof doCommit === 'function') {
+      // The open auto-key holds the button busy (slow on 4K). A click during it must NOT
+      // be dropped — queue it and render the instant the preview frees the GPU. Ceiling
+      // 60s so a wedged job can never loop forever. (Berto: first click must just work.)
+      if (keyBtn.dataset.busy || CK_BATCH_IN_PROGRESS) {
+        if (_onePushPending) return;
+        _onePushPending = true;
+        ckLog('one-push: queued behind open preview');
+        var _t0 = Date.now();
+        var _wait = setInterval(function () {
+          if (!keyBtn.dataset.busy && !CK_BATCH_IN_PROGRESS) {
+            clearInterval(_wait); _onePushPending = false;
+            ckLog('one-push: green button -> render (queued)'); doCommit();
+          } else if (Date.now() - _t0 > 60000) {
+            clearInterval(_wait); _onePushPending = false;
+            ckLog('one-push: queue gave up after 60s', true);
+          }
+        }, 150);
+        return;
+      }
+      ckLog('one-push: green button -> render'); doCommit(); return;
+    }
     if (keyBtn.dataset.busy) return;
     if (typeof doKey === 'function') doKey();
   });
@@ -2883,19 +2912,26 @@ function ckStatus(msg) { try { const g = document.getElementById('gateStatus'); 
     var _msg = document.getElementById('ck-busy-msg');
     var _promo = document.getElementById('ck-busy-promo');
     var _active = false;
+    // Render-time ad (Berto 2026-06-27): captive audience watches the render, so sell.
+    // Links are real <a> with ckOpenURL — clickable straight out of the busy strip.
+    var _SW = 'https://www.youtube.com/@StuntWorksCinema';
+    var _swLink = function (label) {
+        return '<a href="#" onclick="ckOpenURL(\'' + _SW + '\');return false;" ' +
+               'style="color:#fa57ff;text-decoration:underline;cursor:pointer;pointer-events:auto;text-shadow:0 0 10px rgba(226,60,240,0.75),0 1px 2px #000;">' +
+               label + '</a>';
+    };
     var _PROMO = [
-        'STUNTWORKS CINEMA — youtube.com/@StuntWorksCinema',
-        'github.com/stuntworks/CorridorKey-Plugin',
-        'AI: Niko Pueringer / Corridor Digital  •  Plugin: Roberto & Elvis Lopez / StuntWorks',
-        '☕ ko-fi.com/stuntworks'
+        'One of the most powerful green screen engines &middot; by Niko Pueringer',
+        'Brought to you by ' + _swLink('StuntWorks Cinema'),
+        'For tutorials, visit ' + _swLink('StuntWorks Cinema &nbsp;&#8599;')
     ];
     var _promoIdx = 0; var _promoTimer = null;
     function _promoStart() {
         if (!_promo) return;
-        _promoIdx = 0; _promo.textContent = _PROMO[0];
+        _promoIdx = 0; _promo.innerHTML = _PROMO[0];
         _promoTimer = setInterval(function () {
             _promoIdx = (_promoIdx + 1) % _PROMO.length;
-            _promo.textContent = _PROMO[_promoIdx];
+            _promo.innerHTML = _PROMO[_promoIdx];
         }, 8000);
     }
     function _promoStop() {
@@ -3442,9 +3478,18 @@ function doKey(auto) {
                             if (viewer) viewer.classList.add('keyed');
                             if (ringLabel) ringLabel.textContent = 'Preview';
                             if (kbSub) kbSub.textContent = 'Preview';
-                            const approveGate = document.getElementById('approveGate'); if (approveGate) approveGate.classList.add('show');
-                            if (typeof syncStageFromViewer === 'function') syncStageFromViewer();
-                            if (typeof syncStageSamMode === 'function') syncStageSamMode();
+                            // ponytail: startup view = one push. The panel auto-keys a preview
+                            // on open, so the green button renders STRAIGHT to the timeline (see
+                            // keyBtn handler) — no preview-first beat, no approve gate. The gate
+                            // stays only for working (SAM-dotting) / cockpit, where you eyeball
+                            // your dots before committing. (Berto, 2026-06-27)
+                            const _u = document.querySelector('.unit');
+                            const _startupView = !_u || (!_u.classList.contains('working') && !_u.classList.contains('cockpit'));
+                            if (!_startupView) {
+                                const approveGate = document.getElementById('approveGate'); if (approveGate) approveGate.classList.add('show');
+                                if (typeof syncStageFromViewer === 'function') syncStageFromViewer();
+                                if (typeof syncStageSamMode === 'function') syncStageSamMode();
+                            }
                         }
                         keyDone((auto ? 'Auto-key ready' : 'Preview ready') + (spPayload ? ' (SAM applied)' : ''));
                     }, e => keyDone('Composite failed: ' + e.message, true));

@@ -434,6 +434,7 @@ function ae_importSequence(firstFramePath, fps, compStartTime, hideSource, lockH
                 var ckmLayer = ckComp.layers.add(ckMatteImported);
                 ckmLayer.name = "CK MATTE";
                 ckmLayer.startTime = 0;
+                ckmLayer.enabled = false;  // Berto: matte is reference only — once it lands, only CK KEY shows
             } catch (eCkm) { _warnings.push("CK matte layer: " + String(eCkm)); }
         }
         if (samJunkImported) {
