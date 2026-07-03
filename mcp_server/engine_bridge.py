@@ -20,9 +20,8 @@ logger = logging.getLogger("corridorkey_sw")
 #   1. CORRIDORKEY_ROOT env var
 #   2. corridorkey_path.txt next to this file
 #   3. parent folder check (mcp_server/ lives inside the repo)
-#   4. hardcoded dev fallback  (REMOVE before any public release)
+#   4. ~/CorridorKey home fallback
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_DEV_FALLBACK = r"D:\New AI Projects\CorridorKey"  # TODO: strip before public ship
 
 
 def _discover_root() -> str | None:
@@ -44,9 +43,6 @@ def _discover_root() -> str | None:
     parent = os.path.dirname(_HERE)
     if os.path.isdir(os.path.join(parent, "CorridorKeyModule")):
         return parent
-
-    if os.path.isdir(os.path.join(_DEV_FALLBACK, "CorridorKeyModule")):
-        return _DEV_FALLBACK
 
     home = os.path.join(os.path.expanduser("~"), "CorridorKey")
     if os.path.isdir(home):

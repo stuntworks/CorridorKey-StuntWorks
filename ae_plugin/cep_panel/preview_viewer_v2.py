@@ -45,6 +45,7 @@ from PySide6 import QtWidgets, QtGui, QtCore
 # ae_plugin/cep_panel/preview_viewer_v2.py -> ae_plugin/cep_panel -> ae_plugin -> repo root.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from sam2_combine import apply_sam2_gate, apply_sam2_gate_additive, apply_sam2_gate_weighted, apply_sam2_gate_subtract, trim_gate_by_chroma, fill_holes_color_aware
+from ae_processor import apply_matte_postproc, DEFAULT_SETTINGS
 
 # WHAT IT DOES: Installs diagnostic crash / exception loggers as early as possible.
 #   faulthandler dumps Python tracebacks on native signals (SIGSEGV, stack overflow,
@@ -330,6 +331,7 @@ class Session:
 #   composite_straight), a loaded Session.
 # AFFECTS: returns a fresh uint8 RGB image for display. Session state unchanged.
 def render_composite(cu, session: Session, params: dict, override_alpha=None):
+    params = {**DEFAULT_SETTINGS, **params}
     despill_strength = float(params.get("despill", 1.0))
     despeckle_on = bool(params.get("despeckle", True))
     despeckle_size = int(params.get("despeckleSize", 400))
@@ -374,61 +376,16 @@ def render_composite(cu, session: Session, params: dict, override_alpha=None):
             softness_sigma=float(sam2_soften),
             fill_kernel_px=int(fill_holes),
         )
-    # Live preview shows the picture WITH SAM applied (CK x SAM) — restored to the
-    # pre-3ebc4ee9 behavior, exactly as git did it: synchronously, inline. (An
-    # off-thread version crashed the viewer, so we keep the proven inline merge.)
-    if session.alpha_nn is not None and session.sam2_gate_raw is not None and not sam2_bypass:
-        from corridorkey_sam_merge import binarize_sam_silhouette, merge_ck_with_sam_active
-        _src_rgb = session.original_rgb if getattr(session, "original_rgb", None) is not None else session.fg_rgb
-        _gate_c = session.sam2_gate_raw.copy()
-        if _gate_c.shape != session.alpha_nn.shape:
-            _gate_c = cv2.resize(_gate_c, (session.alpha_nn.shape[1], session.alpha_nn.shape[0]),
-                                 interpolation=cv2.INTER_LINEAR)
-        alpha = merge_ck_with_sam_active(session.alpha_nn, binarize_sam_silhouette(_gate_c),
-                                         source_rgb=_src_rgb, proximity_px=edge_guard_px,
-                                         carve_points=params.get("sam_negative") or None)  # FIX: preview/render parity
-    else:
-        alpha = session.alpha.copy()
-    if choke_px > 0:
-        int_choke = int(choke_px)
-        frac = choke_px - int_choke
-        a8 = (np.clip(alpha, 0, 1) * 255).astype(np.uint8)
-        alpha_lo = cv2.erode(a8, cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE, (int_choke * 2 + 1, int_choke * 2 + 1)
-        )).astype(np.float32) / 255.0 if int_choke > 0 else alpha.copy()
-        if frac > 0:
-            k2 = (int_choke + 1) * 2 + 1
-            alpha_hi = cv2.erode(a8, cv2.getStructuringElement(
-                cv2.MORPH_ELLIPSE, (k2, k2)
-            )).astype(np.float32) / 255.0
-            alpha = alpha_lo * (1.0 - frac) + alpha_hi * frac
-        else:
-            alpha = alpha_lo
-    if despeckle_on and despeckle_size > 0:
-        # clean_matte_opencv expects area threshold in pixels
-        alpha = cu.clean_matte_opencv(alpha, area_threshold=despeckle_size)
-
-    # FG SOURCE — substitute the model's FG color with the original source plate
-    # (or a 50/50 blend) BEFORE despill. The matte is unchanged. Used to rescue
-    # warm wardrobe (yellow shirts) that the NN paints pink. Default "nn" keeps
-    # current behavior. Falls through silently when original_rgb wasn't loaded
-    # (AE host doesn't write original.png today — toggle has no effect there).
-    fg_source = str(params.get("fg_source", "nn")).lower()
-    if fg_source != "nn" and getattr(session, "original_rgb", None) is not None:
-        _orig = session.original_rgb
-        if _orig.shape[:2] != session.fg_rgb.shape[:2]:
-            _orig = cv2.resize(_orig, (session.fg_rgb.shape[1], session.fg_rgb.shape[0]),
-                               interpolation=cv2.INTER_LINEAR)
-        if fg_source == "source":
-            fg_rgb = _orig.astype(np.float32, copy=True)
-        elif fg_source == "blend":
-            fg_rgb = (0.5 * session.fg_rgb + 0.5 * _orig).astype(np.float32)
-        else:
-            fg_rgb = session.fg_rgb.copy()
-    else:
-        fg_rgb = session.fg_rgb.copy()
-    if despill_strength > 0:
-        fg_rgb = cu.despill_opencv(fg_rgb, green_limit_mode="average", strength=despill_strength)
+    # Preview routes through the canonical shared post-proc — preview == render by construction.
+    _src_rgb = session.original_rgb if getattr(session, "original_rgb", None) is not None else session.fg_rgb
+    fg_rgb, alpha = apply_matte_postproc(
+        session.fg_rgb,
+        session.alpha_nn,
+        params,
+        sam_soft=session.sam2_gate_raw,
+        source_rgb=_src_rgb,
+        screen_type=str(params.get("screenType", "green")),
+    )
 
     # Background
     if background == "black":

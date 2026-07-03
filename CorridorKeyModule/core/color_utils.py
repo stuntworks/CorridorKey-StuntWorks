@@ -437,3 +437,49 @@ def get_checkerboard_linear_torch(w: int, h: int, device: torch.device) -> torch
     bg_srgb = checker * 0.4 + 0.15  # [H, W]
     bg_srgb_3 = bg_srgb.unsqueeze(0).expand(3, -1, -1)
     return srgb_to_linear(bg_srgb_3)
+
+
+# ---------------------------------------------------------------------------
+# Edge decontamination — FB blur-fusion foreground estimator
+# Ported verbatim from BiRefNetModule handler.py (Photoroom algo).
+# Pure numpy/cv2: no torch, no PIL. Channel-order-agnostic (works BGR or RGB).
+# ---------------------------------------------------------------------------
+
+def _fb_blur_fusion_foreground_estimator(
+    image: np.ndarray,
+    F: np.ndarray,
+    B: np.ndarray,
+    alpha: np.ndarray,
+    r: int = 90,
+) -> tuple:
+    """Inner blur-fusion solve step. alpha must be (H,W,1) float 0..1."""
+    blurred_alpha = cv2.blur(alpha, (r, r))[:, :, None]
+    blurred_FA = cv2.blur(F * alpha, (r, r))
+    blurred_F = blurred_FA / (blurred_alpha + 1e-5)
+    blurred_B1A = cv2.blur(B * (1 - alpha), (r, r))
+    blurred_B = blurred_B1A / ((1 - blurred_alpha) + 1e-5)
+    F = blurred_F + alpha * (image - alpha * blurred_F - (1 - alpha) * blurred_B)
+    F = np.clip(F, 0, 1)
+    return F, blurred_B
+
+
+def _fb_blur_fusion_foreground_estimator_2(
+    image: np.ndarray, alpha: np.ndarray, r: int = 90
+) -> np.ndarray:
+    """Two-pass FB blur-fusion (coarse r then fine r=6). alpha: (H,W) float 0..1."""
+    alpha = alpha[:, :, None]  # expand to (H,W,1) for broadcasting
+    F, blur_B = _fb_blur_fusion_foreground_estimator(image, image, image, alpha, r)
+    return _fb_blur_fusion_foreground_estimator(image, F, blur_B, alpha, r=6)[0]
+
+
+def fb_foreground_estimate(image: np.ndarray, alpha: np.ndarray, r: int = 90) -> np.ndarray:
+    """Color-agnostic edge decontamination (FB blur-fusion, Photoroom algo).
+
+    image: (H,W,3) float 0..1 (BGR or RGB — channel-order-agnostic).
+    alpha: (H,W) or (H,W,1) float 0..1.
+    Returns decontaminated foreground (H,W,3) float 0..1.
+    """
+    # Squeeze alpha to 2D if needed
+    if alpha.ndim == 3:
+        alpha = alpha[:, :, 0]
+    return _fb_blur_fusion_foreground_estimator_2(image, alpha, r=r)

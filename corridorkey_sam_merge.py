@@ -1162,9 +1162,14 @@ def merge_ck_with_garbage_matte(
             if screen_type == "blue":
                 _lower, _upper = np.array([100, 50, 50]), np.array([130, 255, 255])
             else:
-                # RESTORED to 06-12 value floor=50. Value floor 20 added post-06-12
-                # to catch shadowed green — reverted for 06-12 parity test.
-                _lower, _upper = np.array([35, 50, 50]), np.array([85, 255, 255])
+                # Value floor 20 RESTORED 2026-07-02 (was 50 since the 06-12 parity
+                # test). Floor 50 misses SHADOWED green (subject's own shadow on the
+                # screen) -> those zones read as off-green -> garbage matte hugs SAM
+                # tight -> CK pixels beyond it amputated (the "lost butt"). Floor 20
+                # classes dark green as green: wide protection + chroma escape apply.
+                # Verified 2026-07-02 on 4K session: body-zone loss 32k->28k px,
+                # zero far-junk regression. Hue stays 35-85 (green only).
+                _lower, _upper = np.array([35, 50, 20]), np.array([85, 255, 255])
             _green_bin = cv2.inRange(hsv_map, _lower, _upper)
             on_green_hsv = _green_bin.astype(np.float32) / 255.0
             _rc = max(3, int(round(9 * _scale)) | 1)

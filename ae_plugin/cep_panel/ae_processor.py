@@ -680,7 +680,7 @@ def apply_matte_postproc(fg_rgb, alpha_raw, settings, sam_soft=None, source_rgb=
             _zone_mask = _zone_cut_from_sam(
                 (_sam_r > 0.5).astype(_np_r.uint8), settings, _w_z, _h_z, _w_z / 1920.0)
             alpha = _np_r.clip(alpha * _zone_mask, 0.0, 1.0)
-        if settings.get('fill_body_holes', True) and _sam_r is not None:
+        if settings.get('fill_body_holes', False) and _sam_r is not None:
             alpha = _fill_body_holes(alpha, _sam_r)
         # adaptive_green_kill CALL DISABLED (06-12 restore): function remains defined
         # in corridorkey_sam_merge; call disabled per 06-12 parity (did not exist then).
@@ -1351,7 +1351,7 @@ def cmd_batch(source_video, output_folder, settings,
                                 _sf_abs = int(_sf_entry["frame"])
                                 if not (start_frame <= _sf_abs < end_frame):
                                     continue  # outside this render range
-                                _sf_rel = _sf_abs - int(start_frame)
+                                _sf_rel = _sf_abs - int(start_frame) + _actual_preroll
                                 if _sf_rel == sam_anchor_rel:
                                     continue  # already registered as anchor
                                 _sf_pos = _sf_entry.get("positive", [])
@@ -1631,7 +1631,7 @@ def cmd_batch(source_video, output_folder, settings,
                     # ran for every branch. The default branch now gets it INSIDE
                     # apply_matte_postproc; the non-default branches must run the same
                     # sequence here to stay byte-identical to the pre-unification render.
-                    if settings.get('fill_body_holes', True) and _sam_frame is not None:
+                    if settings.get('fill_body_holes', False) and _sam_frame is not None:
                         alpha = _fill_body_holes(alpha, _sam_frame)
                     # adaptive_green_kill CALL DISABLED (06-12 restore)
                     # if settings.get('green_kill', False):
@@ -1684,7 +1684,7 @@ def cmd_batch(source_video, output_folder, settings,
                                 (_sz > 0.5).astype(np.uint8), settings, _w_z, _h_z, _w_z / 1920.0)
                             alpha = np.clip(alpha * _zone_mask, 0.0, 1.0)
                         log.info(f'fusion_v2 batch frame {frame_idx}: hybrid solve done')
-                        if settings.get('fill_body_holes', True) and _sam_frame is not None:
+                        if settings.get('fill_body_holes', False) and _sam_frame is not None:
                             alpha = _fill_body_holes(alpha, _sam_frame)
                         # adaptive_green_kill CALL DISABLED (06-12 restore)
                         # if settings.get('green_kill', False):
@@ -2051,6 +2051,38 @@ def cmd_batch_scrub(source_video, scrub_folder, settings,
                         softness_sigma=float(sam_soften),
                         fill_kernel_px=int(sam_fill),
                     )
+                # Empty / collapsed-mask post-pass — ported from cmd_batch (~1404-1460)
+                # / CorridorKey_Pro.py. SAM2 yields a near-empty mask on hard frames
+                # (fast spin); without this the scrub multiplies CK by ~0 = black frame.
+                #   INTERIOR collapse -> ones-mask (CK keys solo, no black).
+                #   TAIL/HEAD empties -> hold nearest substantial mask.
+                _sorted_keys = sorted(sam_video_masks.keys())
+                if _sorted_keys:
+                    _first_sub = next(
+                        (f for f in _sorted_keys if (sam_video_masks[f] > 0.5).sum() >= 100), None)
+                    _last_sub = next(
+                        (f for f in reversed(_sorted_keys) if (sam_video_masks[f] > 0.5).sum() >= 100), None)
+                    _collapsed = 0
+                    _held = 0
+                    if _first_sub is not None and _last_sub is not None:
+                        for _f in _sorted_keys:
+                            if (sam_video_masks[_f] > 0.5).sum() >= 100:
+                                continue
+                            if _first_sub <= _f <= _last_sub:
+                                sam_video_masks[_f] = np.ones_like(sam_video_masks[_f])
+                                _collapsed += 1
+                            elif _f > _last_sub:
+                                sam_video_masks[_f] = sam_video_masks[_last_sub].copy()
+                                _held += 1
+                            else:
+                                sam_video_masks[_f] = sam_video_masks[_first_sub].copy()
+                                _held += 1
+                    log.info(f"SAM2 scrub post-pass: {_collapsed} interior empties -> NN fallback, "
+                             f"{_held} tail/head empties held.")
+                    if _actual_preroll == 0 and 0 in sam_video_masks and 1 in sam_video_masks \
+                            and (sam_video_masks[1] > 0.5).sum() >= 100:
+                        sam_video_masks[0] = sam_video_masks[1].copy()
+                        log.info("SAM2 scrub first-frame fix: copied frame 1 -> frame 0.")
                 # VRAM teardown — ported from CorridorKey_Pro.py (1849-1862).
                 # reset_state releases SAM2's internal CUDA buffers BEFORE we drop the
                 # predictor (fixes the GPU memory leak on Windows, issue #258). Delete

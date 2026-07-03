@@ -2353,9 +2353,10 @@
 
   // wheel: zoom 1..8, ~1.15/notch, ANCHORED at the cursor (point under cursor stays put)
   viewer.addEventListener('wheel', (e) => {
-    // Plain wheel must NOT zoom — a stray scroll was accidentally zooming the viewer to
-    // ~1.3x and cropping the clip ("sometimes good, sometimes not"). Require Ctrl to zoom.
-    if (!e.ctrlKey) return;
+    // Plain wheel zooms. HISTORY (Berto 2026-07-02): the 06-27 Ctrl-to-zoom gate
+    // was a MISDIAGNOSIS — his actual complaint was the viewer CROPPING the video
+    // at startup (fix = fit full video on open), never accidental wheel zoom.
+    // Do not re-add modifier gates on zoom.
     e.preventDefault();                                      // {passive:false} below
     const rect = viewer.getBoundingClientRect();             // #viewer itself is NOT transformed
     const mx = e.clientX - rect.left, my = e.clientY - rect.top;
@@ -3247,6 +3248,11 @@ function ckExitScrubView() {
     try { _scrubCheckerPat = null; } catch (_) {}
     try { var _sc2 = document.getElementById('ckScrubCanvas'); if (_sc2) _sc2.style.pointerEvents = 'none'; } catch (_) {}
     try { var _pb = document.getElementById('ckProxyBadge'); if (_pb) _pb.style.display = 'none'; } catch (_) {}
+    // QUAD may have been showing stale scrub-slot imagery — reload it from the session files now that CK_SCRUB_VIEW is false.
+    try {
+        var _svQ = document.getElementById('viewer');
+        if (_svQ && _svQ.classList.contains('ck-quad-view') && window.ckRefreshQuad) window.ckRefreshQuad();
+    } catch (_) {}
 }
 
 // Live slider feedback: re-run ONLY the fast post-step (despill/choke/SAM merge) on the
@@ -3254,7 +3260,7 @@ function ckExitScrubView() {
 // effect on release WITHOUT a full neural re-key. Needs a prior PREVIEW (cached session).
 let _repreviewT = null;
 let _ckRepreviewBusy = false;
-let CK_PREVIEW_BG = 'checker';   // 'checker' | 'matte' — MATTE view toggle drives all postproc previews
+let CK_PREVIEW_BG = 'checker';   // 'checker' | 'matte' | 'matte-ck' | 'matte-sam' — MATTE view toggle drives all postproc previews
 window.CK_SCRUB_GEN = 0;        // bumped on slider change; invalidates per-mode scrub frame cache
 function ckRepreview() {
     if (!window.CK_SCRUB_VIEW) { try { var _sv = document.getElementById('viewer'); if (_sv) _sv.classList.remove('scrub'); } catch (_) {} }
@@ -3497,6 +3503,12 @@ function doKey(auto) {
 
                 if (samPayload) {
                     // STEP 3: sam-apply (only when SAM points exist)
+                    // sourceVideo + sourceFrame unlock cmd_sam_apply's VIDEO-predictor
+                    // pre-roll branch (same gate math as render/review). Without them it
+                    // silently falls back to the image predictor on fg.png — visibly
+                    // worse gate (helmet hair, face bites) that lies about the render.
+                    samPayload.sourceVideo = info.sourceFile;
+                    samPayload.sourceFrame = info.sourceFrame;
                     ckLog('KEY: running SAM (' + samPayload.sam_positive.length + ' incl / ' + samPayload.sam_negative.length + ' excl)');
                     try { fs.writeFileSync(path.join(sess, 'live_params.json'), JSON.stringify(samPayload)); } catch (_) {}
                     const samParams = writeParamsFile(samPayload);
@@ -4608,6 +4620,8 @@ function ckResizePanel(w, h) {
             }
             _vQ.classList.remove('ck-view-sam');
             _vQ.classList.add('ck-quad-view');
+            // Scrub canvas sits over the viewer — hide it so the grid shows underneath.
+            if (window.CK_SCRUB_VIEW) { try { var _scQ = document.getElementById('ckScrubCanvas'); if (_scQ) _scQ.style.display = 'none'; } catch (_) {} }
             if (_ckQuadBtn) { _ckQuadBtn.style.background = 'linear-gradient(180deg,#fff8e6,#cdb87e)'; _ckQuadBtn.style.color = '#1c1303'; }
             for (var _qi = 0; _qi < _mvBtns.length; _qi++) {
                 _mvBtns[_qi].style.background = 'linear-gradient(180deg,#34383d,#222528)';
@@ -4616,6 +4630,7 @@ function ckResizePanel(w, h) {
             ckRefreshQuad();
         }
         function ckRefreshQuad() {
+            if (window.CK_SCRUB_VIEW) { ckRefreshQuadScrub(); return; }
             var _t = Date.now();
             var _pm = { ckQpSrc: '_ck_source.png', ckQpSam: '_ck_gate.png', ckQpCk: '_ck_alpha.png', ckQpRes: '_ck_preview.png' };
             Object.keys(_pm).forEach(function (id) {
@@ -4624,6 +4639,69 @@ function ckResizePanel(w, h) {
             });
         }
         window.ckRefreshQuad = ckRefreshQuad;
+
+        // file:/// URL for an absolute path (forward slashes), + cache-bust query.
+        function _ckQuadFileUrl(absPath, ts) {
+            return 'file:///' + absPath.replace(/\\/g, '/') + '?t=' + ts;
+        }
+        // Sets (or clears, if missing and clearIfMissing) one QUAD pane's background from an absolute file path.
+        function _ckSetQuadPaneFile(paneId, absPath, ts, clearIfMissing) {
+            var _p = document.getElementById(paneId);
+            if (!_p) return;
+            if (!fs.existsSync(absPath)) { if (clearIfMissing) _p.style.backgroundImage = 'none'; return; }
+            _p.style.backgroundImage = 'url("' + _ckQuadFileUrl(absPath, ts) + '")';
+        }
+        // QUAD during SCRUB: read the 4 panes from the current scrub slot dir instead of the session _ck_*.png files.
+        function ckRefreshQuadScrub() {
+            try {
+                if (!CK_SCRUB.dir) return;
+                var idx = CK_SCRUB.cur || 0;
+                var frameDir = path.join(CK_SCRUB.dir, String(idx).padStart(3, '0'));
+                var _t = Date.now();
+                _ckSetQuadPaneFile('ckQpSrc', path.join(frameDir, 'plate.png'), _t);
+                _ckSetQuadPaneFile('ckQpSam', path.join(frameDir, 'sam2_gate_raw.png'), _t, true);
+                var _ckFile = path.join(frameDir, 'alpha_nn.png');
+                if (!fs.existsSync(_ckFile)) _ckFile = path.join(frameDir, 'alpha.png');
+                _ckSetQuadPaneFile('ckQpCk', _ckFile, _t);
+                _ckRefreshQuadResultPane(idx);
+            } catch (e) { ckLog('quad scrub refresh failed: ' + (e && e.message ? e.message : e), true); }
+        }
+        // RESULT pane during scrub: fg×alpha composite over checker, built offscreen (long edge capped ~640px), set as a data URL.
+        function _ckRefreshQuadResultPane(idx) {
+            var _pane = document.getElementById('ckQpRes');
+            if (!_pane) return;
+            _scrubLoadFrame(idx).then(function (bitmaps) {
+                if (idx !== CK_SCRUB.cur) return;   // stale guard: slider moved while loading
+                var fg = bitmaps.fg, alpha = bitmaps.alpha;
+                var oc = document.createElement('canvas');
+                oc.width = fg.width; oc.height = fg.height;
+                var octx = oc.getContext('2d');
+                octx.drawImage(fg, 0, 0);
+                var ocData = octx.getImageData(0, 0, oc.width, oc.height);
+                var oa = document.createElement('canvas');
+                oa.width = alpha.width || fg.width; oa.height = alpha.height || fg.height;
+                var oactx = oa.getContext('2d');
+                oactx.drawImage(alpha, 0, 0, oa.width, oa.height);
+                var oaData = oactx.getImageData(0, 0, oa.width, oa.height);
+                var len = ocData.data.length / 4;
+                for (var i = 0; i < len; i++) { ocData.data[i * 4 + 3] = oaData.data[i * 4]; }
+                octx.putImageData(ocData, 0, 0);
+                var _maxEdge = 640;
+                var _scale = Math.min(1, _maxEdge / Math.max(fg.width, fg.height));
+                var _ow = Math.max(2, Math.round(fg.width * _scale)), _oh = Math.max(2, Math.round(fg.height * _scale));
+                var out = document.createElement('canvas');
+                out.width = _ow; out.height = _oh;
+                var outctx = out.getContext('2d');
+                var checker = _scrubGetChecker(outctx);
+                outctx.fillStyle = checker || '#3a3a3a';
+                outctx.fillRect(0, 0, _ow, _oh);
+                outctx.imageSmoothingEnabled = true;
+                outctx.drawImage(oc, 0, 0, oc.width, oc.height, 0, 0, _ow, _oh);
+                _pane.style.backgroundImage = 'url("' + out.toDataURL('image/png') + '")';
+            }).catch(function (err) {
+                ckLog('quad result pane load failed: ' + (err && err.message ? err.message : err), true);
+            });
+        }
         _ckQuadBtn = ckChromeBtn('ckQuadBtn', 0, quadSvg, 'QUAD',
             'QUAD: 2x2 overview — source / SAM gate / CK matte / combined result. Click pane to jump to that single view.',
             ckEnterQuadView);
@@ -4661,9 +4739,19 @@ function ckResizePanel(w, h) {
         // ── Canvas compositor (v1): subject over transparency checker, zero Python per frame ──
         // Seam: despill live slider, matte/plate background modes, WebGL shader → hook here (v2+).
 
-        // LRU bitmap cache: frame idx → {fg: ImageBitmap, alpha: ImageBitmap}
+        // LRU bitmap cache: frame idx → {fg: ImageBitmap, alpha: ImageBitmap} (checker mode)
+        //                   OR 'idx|mode' → {img: ImageBitmap} (matte/matte-ck/matte-sam modes)
         var _scrubBmps = new Map();
         var _SCRUB_CACHE_CAP = 60;
+        function _scrubEvictIfNeeded() {
+            if (_scrubBmps.size < _SCRUB_CACHE_CAP) return;
+            var firstKey = _scrubBmps.keys().next().value;
+            var evicted  = _scrubBmps.get(firstKey);
+            try { if (evicted.fg    && evicted.fg.close)    evicted.fg.close();    } catch (_) {}
+            try { if (evicted.alpha && evicted.alpha.close) evicted.alpha.close(); } catch (_) {}
+            try { if (evicted.img   && evicted.img.close)   evicted.img.close();   } catch (_) {}
+            _scrubBmps.delete(firstKey);
+        }
 
         // Checker pattern canvas, built once.
         var _scrubCheckerPat = null;
@@ -4701,91 +4789,178 @@ function ckResizePanel(w, h) {
                 createImageBitmap(alphaBlob)
             ]).then(function (bitmaps) {
                 var entry = { fg: bitmaps[0], alpha: bitmaps[1] };
-                // Evict oldest if over cap.
-                if (_scrubBmps.size >= _SCRUB_CACHE_CAP) {
-                    var firstKey = _scrubBmps.keys().next().value;
-                    var evicted  = _scrubBmps.get(firstKey);
-                    try { if (evicted.fg.close)    evicted.fg.close();    } catch (_) {}
-                    try { if (evicted.alpha.close) evicted.alpha.close(); } catch (_) {}
-                    _scrubBmps.delete(firstKey);
-                }
+                _scrubEvictIfNeeded();
                 _scrubBmps.set(idx, entry);
                 return entry;
             });
         }
 
-        // Core compositor: draws checker + fg×alpha onto #ckScrubCanvas.
+        // Load a single grayscale-mode bitmap (matte/matte-ck/matte-sam) for a frame slot.
+        // Cache key includes the mode so switching views doesn't thrash the checker-mode entry. Rejects if the file is missing.
+        function _scrubLoadSingle(idx, mode, filePath) {
+            var key = idx + '|' + mode;
+            if (_scrubBmps.has(key)) { return Promise.resolve(_scrubBmps.get(key)); }
+            if (!fs.existsSync(filePath)) { return Promise.reject(new Error('missing')); }
+            var buf  = fs.readFileSync(filePath);
+            var blob = new Blob([buf], { type: 'image/png' });
+            return createImageBitmap(blob).then(function (bmp) {
+                var entry = { img: bmp };
+                _scrubEvictIfNeeded();
+                _scrubBmps.set(key, entry);
+                return entry;
+            });
+        }
+
+        // Shows the canvas and sizes its backing store to the VIEWER box (not the source) — explicit
+        // CONTAIN fit so nothing crops, independent of aspect/zoom. Returns {canvas, ctx, cw, ch} or null.
+        function _scrubPrepCanvas() {
+            var canvas = document.getElementById('ckScrubCanvas');
+            if (!canvas) return null;
+            canvas.style.display = 'block';
+            var _vEl = document.getElementById('viewer');
+            var _vr = _vEl ? _vEl.getBoundingClientRect() : { width: 2, height: 2 };
+            var _cw = Math.max(2, Math.round(_vr.width)), _ch = Math.max(2, Math.round(_vr.height));
+            canvas.width  = _cw;
+            canvas.height = _ch;
+            return { canvas: canvas, ctx: canvas.getContext('2d'), cw: _cw, ch: _ch };
+        }
+
+        // checker mode: fg×alpha composite over the transparency checker.
+        function _scrubDrawComposite(fg, alpha, idx) {
+            var p = _scrubPrepCanvas();
+            if (!p) return;
+            var ctx = p.ctx, _cw = p.cw, _ch = p.ch;
+
+            // Step 1: composite fg×alpha onto an offscreen canvas to apply the matte.
+            var oc = document.createElement('canvas');
+            oc.width  = fg.width;
+            oc.height = fg.height;
+            var octx = oc.getContext('2d');
+            octx.drawImage(fg, 0, 0);
+            var ocData = octx.getImageData(0, 0, oc.width, oc.height);
+
+            var oa = document.createElement('canvas');
+            oa.width  = alpha.width  || fg.width;
+            oa.height = alpha.height || fg.height;
+            var oactx = oa.getContext('2d');
+            oactx.drawImage(alpha, 0, 0, oa.width, oa.height);
+            var oaData = oactx.getImageData(0, 0, oa.width, oa.height);
+
+            // Copy alpha luminance (R channel of grayscale alpha map) into fg alpha.
+            var len = ocData.data.length / 4;
+            for (var i = 0; i < len; i++) {
+                ocData.data[i * 4 + 3] = oaData.data[i * 4];
+            }
+            octx.putImageData(ocData, 0, 0);
+            // Gate multiply removed: alpha.png is now finalized in Python
+            // (apply_matte_postproc: SAM combine + cleanup already baked in).
+            // Drawing alpha luminance directly above is sufficient.
+
+            // Step 2: checker over the WHOLE canvas (opaque → fully covers the zoomed
+            // preview + SAM dots underneath), then the masked fg CONTAIN-fit centered.
+            var checker = _scrubGetChecker(ctx);
+            ctx.fillStyle = checker || '#3a3a3a';
+            ctx.fillRect(0, 0, _cw, _ch);
+            var _scale = Math.min(_cw / fg.width, _ch / fg.height);
+            var _dw = Math.round(fg.width * _scale), _dh = Math.round(fg.height * _scale);
+            var _dx = Math.round((_cw - _dw) / 2), _dy = Math.round((_ch - _dh) / 2);
+            ctx.imageSmoothingEnabled = true;
+            ctx.drawImage(oc, 0, 0, fg.width, fg.height, _dx, _dy, _dw, _dh);
+            // Store contain rect for the canvas click handler (dot placement).
+            CK_SCRUB.fit = { dx: _dx, dy: _dy, dw: _dw, dh: _dh, fgw: fg.width, fgh: fg.height };
+            p.canvas.style.pointerEvents = 'auto';
+            var _absF = _scrubAbsFrame(idx);
+            ckStatus('Scrub ' + (idx + 1) + '/' + CK_SCRUB.count + '  (frame ' + _absF + ')');
+        }
+
+        // matte / matte-ck / matte-sam modes: single grayscale mask CONTAIN-fit on black.
+        function _scrubDrawGrayscale(img, idx) {
+            var p = _scrubPrepCanvas();
+            if (!p) return;
+            var ctx = p.ctx, _cw = p.cw, _ch = p.ch;
+            ctx.fillStyle = '#000000';
+            ctx.fillRect(0, 0, _cw, _ch);
+            var _scale = Math.min(_cw / img.width, _ch / img.height);
+            var _dw = Math.round(img.width * _scale), _dh = Math.round(img.height * _scale);
+            var _dx = Math.round((_cw - _dw) / 2), _dy = Math.round((_ch - _dh) / 2);
+            ctx.imageSmoothingEnabled = true;
+            ctx.drawImage(img, 0, 0, img.width, img.height, _dx, _dy, _dw, _dh);
+            CK_SCRUB.fit = { dx: _dx, dy: _dy, dw: _dw, dh: _dh, fgw: img.width, fgh: img.height };
+            p.canvas.style.pointerEvents = 'auto';
+            var _absF = _scrubAbsFrame(idx);
+            ckStatus('Scrub ' + (idx + 1) + '/' + CK_SCRUB.count + '  (frame ' + _absF + ')');
+        }
+
+        // matte-sam mode when this frame has no SAM mask at all: plain black frame, no dot-placement fit.
+        function _scrubDrawBlack(idx) {
+            var p = _scrubPrepCanvas();
+            if (!p) return;
+            p.ctx.fillStyle = '#000000';
+            p.ctx.fillRect(0, 0, p.cw, p.ch);
+            CK_SCRUB.fit = null;
+            p.canvas.style.pointerEvents = 'auto';
+        }
+
+        // Core compositor: honors CK_PREVIEW_BG (checker / matte / matte-ck / matte-sam) and draws onto #ckScrubCanvas.
         function ckScrubComposite(idx) {
             try { if (window.ckVwReset) window.ckVwReset(); } catch (_) {}
             var lab = document.getElementById('ckScrubLabel');
             if (lab) lab.textContent = (idx + 1) + '/' + CK_SCRUB.count;
             CK_SCRUB.cur = idx;
             if (!CK_SCRUB.dir) return;
+            // QUAD is active during scrub — refresh the grid instead of the single-frame canvas.
+            var _vElQ = document.getElementById('viewer');
+            if (_vElQ && _vElQ.classList.contains('ck-quad-view')) { ckRefreshQuad(); return; }
             var frameDir  = path.join(CK_SCRUB.dir, String(idx).padStart(3, '0'));
             var alphaPath = path.join(frameDir, 'alpha.png');
             if (!fs.existsSync(alphaPath)) { ckStatus('Frame ' + (idx + 1) + ' still keying…'); return; }
-            _scrubLoadFrame(idx).then(function (bitmaps) {
-                // Stale guard: user moved the slider while we were loading.
+
+            var _mode = CK_PREVIEW_BG || 'checker';
+            if (_mode === 'checker') {
+                _scrubLoadFrame(idx).then(function (bitmaps) {
+                    if (idx !== CK_SCRUB.cur) return;   // stale guard: user moved the slider while loading
+                    _scrubDrawComposite(bitmaps.fg, bitmaps.alpha, idx);
+                }).catch(function (err) {
+                    ckLog('scrub composite frame ' + (idx + 1) + ' failed: ' + (err && err.message ? err.message : err), true);
+                    ckStatus('Frame ' + (idx + 1) + ' not ready');
+                });
+                return;
+            }
+
+            var _file, _fallbackFile, _note;
+            if (_mode === 'matte') {
+                _file = alphaPath;
+            } else if (_mode === 'matte-ck') {
+                _file = path.join(frameDir, 'alpha_nn.png');
+                _fallbackFile = alphaPath;
+                _note = 'CK-only matte needs SAM active for this clip';
+            } else if (_mode === 'matte-sam') {
+                _file = path.join(frameDir, 'sam2_gate_raw.png');
+                _note = 'This frame has no SAM mask';
+            } else {
+                _file = alphaPath;
+            }
+
+            _scrubLoadSingle(idx, _mode, _file).then(function (entry) {
                 if (idx !== CK_SCRUB.cur) return;
-                var canvas = document.getElementById('ckScrubCanvas');
-                if (!canvas) return;
-                var fg    = bitmaps.fg;
-                var alpha = bitmaps.alpha;
-                // Show first so the element has layout dims, then size the backing store to
-                // the VIEWER box (not the source) and draw the frame CONTAIN-fit into it —
-                // explicit fit so nothing crops, independent of aspect/zoom.
-                canvas.style.display = 'block';
-                var _vEl = document.getElementById('viewer');
-                var _vr = _vEl ? _vEl.getBoundingClientRect() : { width: fg.width, height: fg.height };
-                var _cw = Math.max(2, Math.round(_vr.width)), _ch = Math.max(2, Math.round(_vr.height));
-                canvas.width  = _cw;
-                canvas.height = _ch;
-                var ctx = canvas.getContext('2d');
-
-                // Step 1: composite fg×alpha onto an offscreen canvas to apply the matte.
-                var oc = document.createElement('canvas');
-                oc.width  = fg.width;
-                oc.height = fg.height;
-                var octx = oc.getContext('2d');
-                octx.drawImage(fg, 0, 0);
-                var ocData = octx.getImageData(0, 0, oc.width, oc.height);
-
-                var oa = document.createElement('canvas');
-                oa.width  = alpha.width  || fg.width;
-                oa.height = alpha.height || fg.height;
-                var oactx = oa.getContext('2d');
-                oactx.drawImage(alpha, 0, 0, oa.width, oa.height);
-                var oaData = oactx.getImageData(0, 0, oa.width, oa.height);
-
-                // Copy alpha luminance (R channel of grayscale alpha map) into fg alpha.
-                var len = ocData.data.length / 4;
-                for (var i = 0; i < len; i++) {
-                    ocData.data[i * 4 + 3] = oaData.data[i * 4];
+                _scrubDrawGrayscale(entry.img, idx);
+            }).catch(function () {
+                if (idx !== CK_SCRUB.cur) return;
+                if (_fallbackFile) {
+                    _scrubLoadSingle(idx, _mode + '-fallback', _fallbackFile).then(function (entry) {
+                        if (idx !== CK_SCRUB.cur) return;
+                        _scrubDrawGrayscale(entry.img, idx);
+                        if (_note) ckStatus(_note);
+                    }).catch(function (err) {
+                        ckLog('scrub matte fallback frame ' + (idx + 1) + ' failed: ' + (err && err.message ? err.message : err), true);
+                        ckStatus('Frame ' + (idx + 1) + ' not ready');
+                    });
+                } else if (_mode === 'matte-sam') {
+                    _scrubDrawBlack(idx);
+                    ckStatus(_note);
+                } else {
+                    ckStatus('Frame ' + (idx + 1) + ' not ready');
                 }
-                octx.putImageData(ocData, 0, 0);
-                // Gate multiply removed: alpha.png is now finalized in Python
-                // (apply_matte_postproc: SAM combine + cleanup already baked in).
-                // Drawing alpha luminance directly above is sufficient.
-
-                // Step 2: checker over the WHOLE canvas (opaque → fully covers the zoomed
-                // preview + SAM dots underneath), then the masked fg CONTAIN-fit centered.
-                var checker = _scrubGetChecker(ctx);
-                ctx.fillStyle = checker || '#3a3a3a';
-                ctx.fillRect(0, 0, _cw, _ch);
-                var _scale = Math.min(_cw / fg.width, _ch / fg.height);
-                var _dw = Math.round(fg.width * _scale), _dh = Math.round(fg.height * _scale);
-                var _dx = Math.round((_cw - _dw) / 2), _dy = Math.round((_ch - _dh) / 2);
-                ctx.imageSmoothingEnabled = true;
-                ctx.drawImage(oc, 0, 0, fg.width, fg.height, _dx, _dy, _dw, _dh);
-                // Store contain rect for the canvas click handler (dot placement).
-                CK_SCRUB.fit = { dx: _dx, dy: _dy, dw: _dw, dh: _dh, fgw: fg.width, fgh: fg.height };
-                // Enable click interaction while scrub is active.
-                canvas.style.pointerEvents = 'auto';
-                var _absF = _scrubAbsFrame(idx);
-                ckStatus('Scrub ' + (idx + 1) + '/' + CK_SCRUB.count + '  (frame ' + _absF + ')');
-            }).catch(function (err) {
-                ckLog('scrub composite frame ' + (idx + 1) + ' failed: ' + (err && err.message ? err.message : err), true);
-                ckStatus('Frame ' + (idx + 1) + ' not ready');
             });
         }
 
