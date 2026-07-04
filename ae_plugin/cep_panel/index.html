@@ -910,6 +910,8 @@
     color: var(--ink-faint); text-align: center;
   }
   .gate-status.go { color: var(--cyan); text-shadow: 0 0 6px rgba(40,220,228,0.4); }
+  /* SAM guard non-blocking warning (Fix 3): amber, not red -- render still succeeded. */
+  .gate-status.warn { color: var(--amber); text-shadow: 0 0 6px rgba(255,178,62,0.4); }
 
   /* ============ ADVANCED PANEL (hinged hatch) =============== */
   .adv {
@@ -1606,6 +1608,22 @@
           </div>
         </div>
 
+        <!-- SAM Guard (Fix 3, 2026-07-04): temporal consistency check on SAM2 masks, batch render only. Default OFF. -->
+        <div class="cell" id="cellSamTemporalGuard" style="margin-top:12px">
+          <div class="cell-top">
+            <span class="cell-title">SAM GUARD</span>
+            <div class="cell-control">
+              <button class="pswitch" id="samTemporalGuard" type="button" aria-pressed="false" aria-label="SAM Guard — temporal consistency check, holds anomalous frames">
+                <span class="knob"></span>
+              </button>
+            </div>
+          </div>
+          <div class="ww">
+            <span class="w-row"><b>What.</b> Flags a frame whose SAM mask suddenly jumps in area AND barely overlaps the frame before it, then holds the nearest good mask instead.</span>
+            <span class="w-row"><b>Why.</b> Leave OFF by default. Turn ON as a safety net on shots with hand-placed correction dots — a stray dot can silently collapse one frame's mask.</span>
+          </div>
+        </div>
+
         <!-- Expand: band-room knob for Fusion V2 (shown when fusion toggle ON, Junk Kill hidden) -->
         <div class="matte-fader" id="faderFusionExpand" style="margin-top:12px;display:none">
           <div class="fader-head">
@@ -1922,6 +1940,13 @@
     const on = greenKillBtn.getAttribute('aria-pressed') === 'true';
     greenKillBtn.setAttribute('aria-pressed', on ? 'false' : 'true');
     if (typeof ckScheduleRepreview === 'function') ckScheduleRepreview();
+  });
+
+  // SAM Guard (Fix 3, 2026-07-04): render-only setting, no live re-preview to schedule.
+  const samTemporalGuardBtn = document.getElementById('samTemporalGuard');
+  if (samTemporalGuardBtn) samTemporalGuardBtn.addEventListener('click', () => {
+    const on = samTemporalGuardBtn.getAttribute('aria-pressed') === 'true';
+    samTemporalGuardBtn.setAttribute('aria-pressed', on ? 'false' : 'true');
   });
 
   const fusionV2Btn = document.getElementById('fusionV2');
@@ -2903,6 +2928,23 @@ try {
 } catch (_) {}
 function ckStatus(msg) { try { const g = document.getElementById('gateStatus'); if (g) g.textContent = msg; const p = document.getElementById('podStatus'); if (p) p.textContent = msg; } catch (_) {} }
 
+// Fix 3 (2026-07-04): batch_result.txt's optional 4th field is the SAM temporal
+// guard's held-frame count (ae_processor.py cmd_batch). NON-BLOCKING -- the render
+// already succeeded (the incomplete-render gate above already returned if it hadn't);
+// this only tells the operator to check the log. Amber, not red, on purpose.
+function ckSamGuardHeldCount(br) {
+    const n = (br && br.length > 3) ? parseInt(br[3], 10) : NaN;
+    return isNaN(n) ? 0 : n;
+}
+function ckShowSamGuardWarning(heldN) {
+    if (!heldN || heldN <= 0) return;
+    try {
+        ckLog('SAM guard: ' + heldN + ' frame(s) auto-held on this render — check corridorkey.log');
+        const g = document.getElementById('gateStatus');
+        if (g) g.classList.add('warn');
+    } catch (_) {}
+}
+
 // ============ BIG BUSY STRIP — mirrors all busy state to a panel-wide bar ============
 // Berto UX: the existing busy indicators (10px procLabel, tiny armLed) are invisible
 // across the room. This strip shows the same state at 20px in StuntWorks cyan.
@@ -3065,6 +3107,8 @@ function ckGetSettings() {
     const fusion_v2 = fusionV2El ? (fusionV2El.getAttribute('aria-pressed') === 'true') : false;
     const greenKillEl = document.getElementById('greenKill');
     const green_kill = greenKillEl ? (greenKillEl.getAttribute('aria-pressed') === 'true') : false;
+    const samTemporalGuardEl = document.getElementById('samTemporalGuard');
+    const sam2_temporal_guard_enabled = samTemporalGuardEl ? (samTemporalGuardEl.getAttribute('aria-pressed') === 'true') : false;
     const settings = {
         screenType: screenType,
         despill: despill,
@@ -3079,7 +3123,8 @@ function ckGetSettings() {
         zone_erode_px: zone_erode_px,
         fusion_v2: fusion_v2,
         fusion_expand: (function(){ var e=document.getElementById('fusionExpand'); return e ? (parseInt(e.value,10)||6) : 6; })(),
-        green_kill: green_kill
+        green_kill: green_kill,
+        sam2_temporal_guard_enabled: sam2_temporal_guard_enabled
     };
     ckLog('fusion_v2: ' + (fusion_v2 ? 'on' : 'off') + ' at settings build');
     if (window.CK_ZONE) {
@@ -3147,6 +3192,49 @@ function ckSamPayload(anchorFrame) {
         payload.sam_frames = framesList;
     }
     return payload;
+}
+
+// Fix 2a (2026-07-04, DOT FORENSICS): params files auto-purge in 24h, so a render's
+// exact dot placement was previously untraceable once the purge ran -- render
+// ck_batch_cc301ec99dd8 lost frame 17 to a stray dot and nobody could reconstruct
+// where it came from. This writes ONE persistent line (via ckLog -> corridorkey.log,
+// which does NOT get purged) listing the anchor frame and EVERY stamped dot as
+// (absFrame,x,y,sign). Pure/no DOM/no CEP deps -- unit-testable standalone.
+function ckFormatSamDotForensics(samPayload) {
+    if (!samPayload) return 'anchor=none dots=[]';
+    const dots = [];
+    const pushDots = (frame, pos, neg) => {
+        (pos || []).forEach(p => dots.push('(' + frame + ',' + p[0] + ',' + p[1] + ',+1)'));
+        (neg || []).forEach(p => dots.push('(' + frame + ',' + p[0] + ',' + p[1] + ',-1)'));
+    };
+    if (samPayload.sam_frames && samPayload.sam_frames.length) {
+        samPayload.sam_frames.forEach(f => pushDots(f.frame, f.positive, f.negative));
+    } else {
+        pushDots(samPayload.sam_anchor_frame, samPayload.sam_positive, samPayload.sam_negative);
+    }
+    return 'anchor=' + samPayload.sam_anchor_frame + ' dots=[' + dots.join(' ') + ']';
+}
+
+// Fix 2b (2026-07-04, STALE-DOT TRAP): samFrames is keyed by absolute frame NUMBER
+// only -- it carries no per-clip identity and is normally cleared only by the CLEAR
+// button (clearPoints(), other <script>). If an operator stamps a dot on clip A then
+// switches to clip B without hitting CLEAR, clip B's frame N would silently inherit
+// clip A's frame-N dot on the next render. Call this at the one lifecycle point that
+// already detects a clip switch (CK_LAST_SOURCE change, used above for zone
+// restore/clear) so stale dots are discarded the moment a NEW clip loads, and logged
+// so a future bisect doesn't face the same "untraceable" problem this fix set exists
+// to prevent.
+function ckClearStaleSamFramesOnClipChange(newSourceFile) {
+    try {
+        if (typeof samFrames === 'undefined') return;
+        const staleKeys = Object.keys(samFrames);
+        if (!staleKeys.length) return;
+        staleKeys.forEach(k => delete samFrames[k]);
+        if (typeof samFrameCount !== 'undefined') samFrameCount = 0;
+        if (typeof _updateAddFrameBtn === 'function') _updateAddFrameBtn();
+        ckLog('stale SAM dots discarded on clip change: ' + staleKeys.length +
+              ' frame(s) [' + staleKeys.join(',') + '] cleared before loading ' + newSourceFile);
+    } catch (e) { ckLog('ckClearStaleSamFramesOnClipChange failed: ' + e.message, true); }
 }
 
 // ===== SAM live overlay (cyan silhouette + magenta buffer edge) =====
@@ -3394,6 +3482,7 @@ function doKey(auto) {
         if (!info.ok) { keyDone(info.error || 'Select a clip first', true); return; }
         if (info.sourceFile && info.sourceFile !== CK_LAST_SOURCE) {
             CK_LAST_SOURCE = info.sourceFile;
+            if (typeof ckClearStaleSamFramesOnClipChange === 'function') ckClearStaleSamFramesOnClipChange(info.sourceFile);
             try {
                 const _saved = localStorage.getItem('ck_zone_' + info.sourceFile);
                 if (_saved) {
@@ -3672,6 +3761,7 @@ function autoKeyAsync() {
         if (typeof ckExitScrubView === 'function') ckExitScrubView();
         if (info.sourceFile && info.sourceFile !== CK_LAST_SOURCE) {
             CK_LAST_SOURCE = info.sourceFile;
+            if (typeof ckClearStaleSamFramesOnClipChange === 'function') ckClearStaleSamFramesOnClipChange(info.sourceFile);
             try {
                 const _saved = localStorage.getItem('ck_zone_' + info.sourceFile);
                 if (_saved) {
@@ -3899,6 +3989,7 @@ function doCommit() {
             // swallows per-frame errors and exits 0, so the exit code can't be trusted —
             // batch_result.txt (processed,total,failed) is the truth. Block the import
             // and say exactly how many frames made it.
+            let _samGuardHeld = 0;
             try {
                 const br = fs.readFileSync(path.join(outDir, 'batch_result.txt'), 'utf8').trim().split(',');
                 const done = parseInt(br[0], 10), expected = parseInt(br[1], 10), failedN = parseInt(br[2], 10);
@@ -3907,6 +3998,9 @@ function doCommit() {
                     return finish('Render incomplete: ' + done + ' of ' + expected + ' frames (' +
                                   failedN + ' failed). Nothing was placed — check disk space, then re-render.', true);
                 }
+                // Fix 3: optional 4th field = SAM temporal guard held-count. Non-blocking.
+                _samGuardHeld = ckSamGuardHeldCount(br);
+                if (_samGuardHeld > 0) ckShowSamGuardWarning(_samGuardHeld);
             } catch (_brErr) {
                 // No result file at all = Python died before writing the summary — incomplete.
                 return finish('Render produced no completion record — not importing. Re-render.', true);
@@ -3932,7 +4026,8 @@ function doCommit() {
                 const extras = [];
                 if (imp.ckMatteImported) extras.push('CK matte');
                 if (imp.samJunkImported) extras.push('SAM junk mask');
-                finish('Done. Keyed clip on your timeline' + (extras.length ? ' (+ ' + extras.join(' + ') + ')' : '') + '.');
+                finish('Done. Keyed clip on your timeline' + (extras.length ? ' (+ ' + extras.join(' + ') + ')' : '') +
+                       '.' + (_samGuardHeld > 0 ? ' ' + _samGuardHeld + ' frame(s) auto-held by SAM guard — check log.' : ''));
             });
         }, e => finish('Key failed: ' + e.message, true),
            line => {
@@ -4035,6 +4130,8 @@ function doSAMCommit(advanced) {
             : { startFrame: info.startFrame, endFrame: info.endFrame, fps: info.fps };
         const samPayload = (typeof ckSamPayload === 'function') ? ckSamPayload(CK_ANCHOR_FRAME) : null;
         if (samPayload) ckLog('samCommit: SAM -> batch (' + samPayload.sam_positive.length + ' incl, anchor ' + samPayload.sam_anchor_frame + ')');
+        // Fix 2a: persistent dot forensics -- survives the 24h params-file purge.
+        if (samPayload) ckLog('samCommit: DOT FORENSICS ' + ckFormatSamDotForensics(samPayload));
         const paramsPath = writeParamsFile(Object.assign({}, settings, rangeFields, samPayload || {}));
         const approxFrames = (HOST_APP === 'ppro')
             ? Math.round((info.endSeconds - info.startSeconds) * info.fps)
@@ -4046,12 +4143,16 @@ function doSAMCommit(advanced) {
             try { fs.unlinkSync(paramsPath); } catch (_) {}
             const firstFrame = path.join(outDir, 'output_00000.png');
             if (!fs.existsSync(firstFrame)) return finish('No output frames produced', true);
+            let _samGuardHeld = 0;
             try {
                 const br = fs.readFileSync(path.join(outDir, 'batch_result.txt'), 'utf8').trim().split(',');
                 const done = parseInt(br[0], 10), expected = parseInt(br[1], 10), failedN = parseInt(br[2], 10);
                 if (!isNaN(done) && !isNaN(expected) && (done < expected || failedN > 0)) {
                     return finish('Render incomplete: ' + done + ' of ' + expected + ' frames (' + failedN + ' failed). Nothing placed.', true);
                 }
+                // Fix 3: optional 4th field = SAM temporal guard held-count. Non-blocking.
+                _samGuardHeld = ckSamGuardHeldCount(br);
+                if (_samGuardHeld > 0) ckShowSamGuardWarning(_samGuardHeld);
             } catch (_brErr) {
                 return finish('Render produced no completion record — not importing. Re-render.', true);
             }
@@ -4095,7 +4196,8 @@ function doSAMCommit(advanced) {
                 ], (imp) => {
                     if (!imp || !imp.ok) return finish('Import failed: ' + (imp && imp.error ? imp.error : 'unknown'), true);
                     if (imp.via) ckLog('samCommit: import target resolved via ' + imp.via);
-                    finish('Done. Keyed clip on your timeline' + (samMattePath ? ' (+ SAM matte)' : '') + '.');
+                    finish('Done. Keyed clip on your timeline' + (samMattePath ? ' (+ SAM matte)' : '') + '.' +
+                           (_samGuardHeld > 0 ? ' ' + _samGuardHeld + ' frame(s) auto-held by SAM guard — check log.' : ''));
                 });
             } else {
             jsxCall('ae_createSAMPrecomp', [
@@ -4110,7 +4212,8 @@ function doSAMCommit(advanced) {
                 if (imp.warnings && imp.warnings.length) { imp.warnings.forEach(function (w) { ckLog('samCommit WARNING: ' + w, true); }); }
                 finish('Done. "' + imp.compName + '" on your timeline.' +
                        (!imp.ckMatte && !imp.samMatte ? ' (mattes not found — CK-only render)' : '') +
-                       (imp.ckFull ? '' : ' (CK FULL missing — restart AE if you expected it)'));
+                       (imp.ckFull ? '' : ' (CK FULL missing — restart AE if you expected it)') +
+                       (_samGuardHeld > 0 ? ' ' + _samGuardHeld + ' frame(s) auto-held by SAM guard — check log.' : ''));
             });
             }
         }, e => finish('Render failed: ' + e.message, true),

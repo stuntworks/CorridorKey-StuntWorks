@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# Last modified: 2026-05-29 | Change: CK_COMBINED merge in batch + surface silent SAM/merge fallbacks (CK_WARN); LIVE-FILE banner. | Full history: git log
+# Last modified: 2026-07-04 | Change: SAM2 temporal consistency guard (cmd_batch + cmd_batch_scrub), opt-in via sam2_temporal_guard_enabled, default OFF; batch_result.txt gains a 4th held-count field. | Full history: git log
 # ============================================================================
 # LIVE FILE — THIS is the canonical CorridorKey AE/Premiere processor (1180 lines,
 # full SAM2 batch). The CEP panel runs THIS copy via a Windows junction:
@@ -680,6 +680,9 @@ def apply_matte_postproc(fg_rgb, alpha_raw, settings, sam_soft=None, source_rgb=
             _zone_mask = _zone_cut_from_sam(
                 (_sam_r > 0.5).astype(_np_r.uint8), settings, _w_z, _h_z, _w_z / 1920.0)
             alpha = _np_r.clip(alpha * _zone_mask, 0.0, 1.0)
+        # fill_body_holes stays OFF: A/B 2026-07-03 (Berto verdict) — ON refills junk
+        # inside the arm on motion-blur frames (patches REAL see-through gaps, not just
+        # NN dropouts). Same reason as the silent 07-01 flip. Do not re-enable.
         if settings.get('fill_body_holes', False) and _sam_r is not None:
             alpha = _fill_body_holes(alpha, _sam_r)
         # adaptive_green_kill CALL DISABLED (06-12 restore): function remains defined
@@ -1125,6 +1128,82 @@ def _write_fusion_sidecars(ck_alpha, sam_union,
         log.warning(f"Sidecar write failed frame {seq_num}: {_sc_err}")
 
 
+# ── SAM2 temporal consistency guard (Fix 3, 2026-07-04) ────────────
+# WHAT IT DOES: two-signal AND-gate over a finished sam_video_masks dict (same dict
+#   cmd_batch and cmd_batch_scrub already build). Catches an isolated frame where
+#   SAM2's mask has warped/collapsed WITHOUT going near-empty -- so the empty-mask
+#   post-pass above (which owns "nothing there") never sees it. Design locked on an
+#   approved trade sheet; proven case: render ck_batch_cc301ec99dd8 lost frame 17 to
+#   a stray correction dot registered on the wrong frame (SAM2 issue #479 class),
+#   deterministic via D:\CLAUDE_JUNK\ck_frame3_bisect\repro_runner.py.
+# DEPENDS-ON: must run AFTER the empty-mask post-pass, BEFORE VRAM teardown.
+# AFFECTS: mutates sam_video_masks in place (held frames get a .copy() of the
+#   nearest accepted mask); writes one log.info line when >=1 frame is held.
+# GUARDED: settings.get('sam2_temporal_guard_enabled', False) -- OFF unless the
+#   caller opts in; absent/false settings never enter this function's body.
+def _apply_sam_temporal_guard(sam_video_masks, sorted_keys, settings):
+    """Flag frame f only when BOTH fire, then hold the nearest earlier accepted mask:
+      - area anomaly: abs(area_frac[f] - rolling_median) > max(AREA_PCT, MAD_K * rolling_MAD),
+        rolling stats over the last WINDOW *accepted* (non-held) frames only.
+      - IoU anomaly: IoU(mask[f], last accepted mask) < IOU_FLOOR.
+    Held frames never enter the rolling window and never become the "previous"
+    comparison frame for later frames -- a run of held frames doesn't cascade into
+    a false consensus of anomalies. All thresholds are resolution-relative
+    (area_frac is a fraction of working_w*working_h) by construction.
+
+    Returns the sorted list of held frame indices (empty if the guard is off, there
+    are no frames, or nothing fired).
+    """
+    import numpy as np
+    if not settings.get('sam2_temporal_guard_enabled', False) or not sorted_keys:
+        return []
+    area_pct  = float(settings.get('sam2_temporal_area_pct', 0.10))
+    mad_k     = float(settings.get('sam2_temporal_mad_k', 4.0))
+    iou_floor = float(settings.get('sam2_temporal_iou_floor', 0.35))
+    window    = int(settings.get('sam2_temporal_window', 7))
+
+    working_h, working_w = sam_video_masks[sorted_keys[0]].shape[:2]
+    area_denom = float(working_h * working_w) or 1.0
+
+    recent_areas = []   # rolling window of ACCEPTED (non-held) area_frac values
+    prev_bin = None      # binarized mask of the last ACCEPTED frame
+    flagged = []
+
+    for i, f in enumerate(sorted_keys):
+        mask = sam_video_masks[f]
+        binm = mask > 0.5
+        area_frac = float(binm.sum()) / area_denom
+
+        is_anomaly = False
+        if recent_areas:
+            med = float(np.median(recent_areas))
+            mad = float(np.median(np.abs(np.array(recent_areas) - med)))
+            area_bad = abs(area_frac - med) > max(area_pct, mad_k * mad)
+            iou_bad = False
+            if prev_bin is not None:
+                inter = float(np.logical_and(binm, prev_bin).sum())
+                union = float(np.logical_or(binm, prev_bin).sum())
+                iou = (inter / union) if union > 0 else 1.0
+                iou_bad = iou < iou_floor
+            is_anomaly = area_bad and iou_bad
+
+        if is_anomaly:
+            hold_from = sorted_keys[i - 1] if i > 0 else f
+            sam_video_masks[f] = sam_video_masks[hold_from].copy()
+            flagged.append(f)
+            continue  # held frames skip the rolling window AND the prev_bin update
+
+        recent_areas.append(area_frac)
+        if len(recent_areas) > window:
+            recent_areas.pop(0)
+        prev_bin = binm
+
+    if flagged:
+        log.info(f"SAM2 temporal guard: {len(flagged)} frame(s) flagged (area/IoU anomaly) "
+                 f"-> held to nearest good mask: frames {flagged}")
+    return flagged
+
+
 # ── Subcommand: batch ─────────────────────────────────────────
 def cmd_batch(source_video, output_folder, settings,
               start_frame=None, end_frame=None, fps=None,
@@ -1206,6 +1285,7 @@ def cmd_batch(source_video, output_folder, settings,
 
     sam_active = (len(sam_pos) + len(sam_neg)) > 0
     sam_video_masks = {}  # {seq_num: float32 mask 0..1}
+    _tg_held_frames = []  # SAM2 temporal guard (Fix 3): frames held this render; stays [] when OFF
 
     # SAM temp-frame resolution cap — mirrors cmd_batch_scrub so preview and render
     # produce identical SAM masks. CK neural-net keying and all outputs stay full-res;
@@ -1472,6 +1552,12 @@ def cmd_batch(source_video, output_folder, settings,
                             and (sam_video_masks[1] > 0.5).sum() >= 100:
                         sam_video_masks[0] = sam_video_masks[1].copy()
                         log.info("SAM2 first-frame fix: copied frame 1 -> frame 0 (video cold-start, no pre-roll)")
+
+                    # SAM2 temporal consistency guard (Fix 3, 2026-07-04). Must run AFTER
+                    # the empty-mask post-pass above (this owns "something there but
+                    # wrong", not "nothing there") and BEFORE the VRAM teardown below.
+                    # OFF by default -- settings.get('sam2_temporal_guard_enabled', False).
+                    _tg_held_frames = _apply_sam_temporal_guard(sam_video_masks, _sorted_keys, settings)
 
                 # VRAM teardown — free per-clip state buffers but keep the predictor
                 # warm in _SAM_VIDEO_CACHE. reset_state releases SAM2's internal CUDA
@@ -1777,7 +1863,10 @@ def cmd_batch(source_video, output_folder, settings,
             except Exception:
                 pass
 
-    (out_dir / "batch_result.txt").write_text(f"{processed},{total},{len(failed)}")
+    # 4th field = SAM2 temporal guard held-count (Fix 3). Panel parses batch_result.txt
+    # POSITIONALLY (index.html ~3903 doCommit, ~4050 doSAMCommit read br[0]/br[1]/br[2]
+    # only) so appending a 4th field is additive/safe for both existing parsers.
+    (out_dir / "batch_result.txt").write_text(f"{processed},{total},{len(failed)},{len(_tg_held_frames)}")
     log.info(f"Done: {processed}/{total} ({len(failed)} failed)")
     # LOUD fallback surfacing: if a merge crash file was (re)written during this run, the
     # CK_COMBINED merge faulted and silently fell back to plain CK on >=1 frame. Tell the
@@ -2083,6 +2172,11 @@ def cmd_batch_scrub(source_video, scrub_folder, settings,
                             and (sam_video_masks[1] > 0.5).sum() >= 100:
                         sam_video_masks[0] = sam_video_masks[1].copy()
                         log.info("SAM2 scrub first-frame fix: copied frame 1 -> frame 0.")
+                    # SAM2 temporal consistency guard (Fix 3, 2026-07-04) -- same helper
+                    # cmd_batch uses, same insertion rule (after empty-mask post-pass,
+                    # before VRAM teardown). OFF by default. Scrub is a preview only (no
+                    # batch_result.txt here), so this only affects what the scrub shows.
+                    _apply_sam_temporal_guard(sam_video_masks, _sorted_keys, settings)
                 # VRAM teardown — ported from CorridorKey_Pro.py (1849-1862).
                 # reset_state releases SAM2's internal CUDA buffers BEFORE we drop the
                 # predictor (fixes the GPU memory leak on Windows, issue #258). Delete
