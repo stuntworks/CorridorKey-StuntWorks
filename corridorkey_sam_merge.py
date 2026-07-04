@@ -1169,7 +1169,7 @@ def merge_ck_with_garbage_matte(
                 # classes dark green as green: wide protection + chroma escape apply.
                 # Verified 2026-07-02 on 4K session: body-zone loss 32k->28k px,
                 # zero far-junk regression. Hue stays 35-85 (green only).
-                _lower, _upper = np.array([35, 50, 20]), np.array([85, 255, 255])
+                _lower, _upper = np.array([35, 50, 50]), np.array([85, 255, 255])  # A/B 2026-07-03: floor 50 under test vs 20 (hair-bite suspect)
             _green_bin = cv2.inRange(hsv_map, _lower, _upper)
             on_green_hsv = _green_bin.astype(np.float32) / 255.0
             _rc = max(3, int(round(9 * _scale)) | 1)
@@ -1215,8 +1215,23 @@ def merge_ck_with_garbage_matte(
         # Only hug raw SAM at the feet when feet are actually in frame. On a waist
         # crop this zone lands on the lower torso and squares off the bottom edge.
         _feet_zone[feet_start:, :] = 1.0
+        # Feet hug erosion (Berto 2026-07-04): raw-SAM hug still left a 1-2px fat
+        # rim on shoes — but ONLY over NON-green ground (Berto's observation: over
+        # green CK rules and is already tight; over floor/off-green the SAM binary
+        # edge rules, and THAT edge is the fat). Erode the hug 1px@1920 (≈2px at
+        # 4K) on off-green pixels only; green-side keeps raw SAM so CK's soft
+        # motion blur is never clipped. Feet zone only — body/hair untouched.
+        _feet_erode_r = max(1, int(round(1.0 * _scale)))
+        _se_feet = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (_feet_erode_r * 2 + 1, _feet_erode_r * 2 + 1))
+        _sam_feet_eroded = cv2.erode(sam.astype(np.float32), _se_feet)
+        if on_green_hsv is not None:
+            _sam_feet_hug = (sam.astype(np.float32) * on_green_hsv
+                             + _sam_feet_eroded * (1.0 - on_green_hsv))
+        else:
+            _sam_feet_hug = _sam_feet_eroded
         garbage_matte = (garbage_matte * (1.0 - _feet_zone)
-                         + np.minimum(garbage_matte, sam.astype(np.float32)) * _feet_zone)
+                         + np.minimum(garbage_matte, _sam_feet_hug) * _feet_zone)
 
     # Feather gate edges — converts hard sam_tight wall into gradient so CK
     # soft alpha is never clipped by a binary cliff where green detection missed.
