@@ -693,7 +693,7 @@ function ae_createSAMPrecomp(mergedFirstFramePath, ckMatteFirstFramePath, samMat
             try {
                 ckoLayer = ckComp.layers.add(ckOnlySeq);        // added 1st → bottom
                 ckoLayer.name = "CK MASTER (edit me)";
-                ckoLayer.comment = "Raw CK key. No SAM. All hair + junk kept. Mask junk by hand.";
+                ckoLayer.comment = "Raw CK key (full hair), junk cut by GARBAGE MASK track matte. Same treatment as AUTO.";
                 ckoLayer.startTime = 0;
                 ckoLayer.enabled = false;
                 try {
@@ -718,7 +718,7 @@ function ae_createSAMPrecomp(mergedFirstFramePath, ckMatteFirstFramePath, samMat
             try {
                 tightSamLayer = ckComp.layers.add(tightSamSeq); // added 3rd → above CK + SAM AI OUTPUT
                 tightSamLayer.name = "GARBAGE MASK";
-                tightSamLayer.comment = "SAM junk mask (track matte for AUTO). Enable + trim to bad frames to cut off-green junk.";
+                tightSamLayer.comment = "SAM junk mask (track matte for AUTO + CK MASTER). Enable + trim to bad frames to cut off-green junk.";
                 tightSamLayer.startTime = 0;
                 tightSamLayer.enabled = false;
             } catch (eTsl) {}
@@ -726,17 +726,19 @@ function ae_createSAMPrecomp(mergedFirstFramePath, ckMatteFirstFramePath, samMat
         // Per-layer instructions live in each layer's .comment (Comment column), set above.
         // No on-screen guide layer (Berto 2026-06-21: notes belong ON the layer, not a text layer).
 
-        // Wire GARBAGE MASK as LUMA-INVERTED track matte on CK + SAM AI OUTPUT only.
-        // CK MASTER has NO track matte — it is the raw plain CK clip.
+        // Wire GARBAGE MASK as LUMA-INVERTED track matte on BOTH CK + SAM AI OUTPUT
+        // and CK MASTER (Berto 2026-07-03: both get the same treatment).
         if (tightSamLayer) {
             var _lumaInv = TrackMatteType.LUMA_INVERTED;
             try {
                 if (typeof mergedLayer.setTrackMatte === "function") {
                     mergedLayer.setTrackMatte(tightSamLayer, _lumaInv);
+                    if (ckoLayer) ckoLayer.setTrackMatte(tightSamLayer, _lumaInv);
                 } else {
-                    // Pre-2023 AE: GARBAGE MASK sits directly above CK + SAM AI OUTPUT for adjacency
+                    // Pre-2023 AE: adjacency matting — one matte layer can only drive the
+                    // layer directly below, so CK MASTER stays unmatted here.
                     mergedLayer.trackMatteType = _lumaInv;
-                    _warnings.push("Old AE: setTrackMatte missing — GARBAGE MASK wired by adjacency.");
+                    _warnings.push("Old AE: setTrackMatte missing — GARBAGE MASK wired by adjacency (CK + SAM only; CK MASTER unmatted).");
                 }
             } catch (etm) {
                 _warnings.push("setTrackMatte failed: " + String(etm));
