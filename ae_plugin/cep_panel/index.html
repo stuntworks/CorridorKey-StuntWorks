@@ -1791,6 +1791,21 @@
                 <span class="w-row"><b>Why.</b> Cleaner hair and semitransparent edges on mixed-light green screens. Requires SAM. Default OFF.</span>
               </div>
             </div>
+
+            <div class="cell">
+              <div class="cell-top">
+                <span class="cell-title">Edge V2</span>
+                <div class="cell-control">
+                  <button class="pswitch" id="unifiedBandV2" type="button" aria-pressed="false" aria-label="Edge V2 — unified band distance-field merge">
+                    <span class="knob"></span>
+                  </button>
+                </div>
+              </div>
+              <div class="ww">
+                <span class="w-row"><b>What.</b> P1 build of the new distance-field edge merge (UNIFIED_EDGE_PLAN_2026-07-05) — replaces the tight/wide dual-mask blend with a continuous width + confidence field.</span>
+                <span class="w-row"><b>Why.</b> Targets the detached-rim crease defect without re-opening wire/strap bites. Requires SAM. Default OFF — not yet corpus-gated (P2) or Berto eye-test approved (P3).</span>
+              </div>
+            </div>
           </div>
 
         </div>
@@ -1996,6 +2011,14 @@
       fusionV2Btn.setAttribute('aria-pressed', fOn ? 'false' : 'true');
       localStorage.setItem('ck_global_fusion_v2', fOn ? 'false' : 'true');
       ckLog('fusion_v2 toggle: ' + (fOn ? 'off' : 'on'));
+      // F1 (2026-07-05): Fusion V2 / Edge V2 are mutually exclusive engines — turning
+      // this ON forces Edge V2 off via ITS OWN toggle handler (a real .click(), so its
+      // own localStorage key + aria-pressed get set exactly like a user click would;
+      // see _ckFlipUnifiedBand's matching cross-clear below).
+      if (!fOn) {
+        const _ub = document.getElementById('unifiedBandV2');
+        if (_ub && _ub.getAttribute('aria-pressed') === 'true') _ub.click();
+      }
       _ckApplyFusionFaderState();
       _ckSyncFusionMain();
     }
@@ -2003,6 +2026,30 @@
     if (fusionV2Main) fusionV2Main.addEventListener('click', _ckFlipFusion);
     _ckApplyFusionFaderState();  // apply restored state on load
     _ckSyncFusionMain();
+  }
+
+  // EDGE V2 / unified_band (P1, 2026-07-05) — cloned from the fusion_v2 toggle
+  // pattern directly above. One toggle, global persisted state, DEFAULT OFF (not
+  // yet corpus-gated [P2] or Berto eye-test approved [P3] — UNIFIED_EDGE_PLAN_2026-07-05.md).
+  const unifiedBandBtn = document.getElementById('unifiedBandV2');
+  if (unifiedBandBtn) {
+    var _ubSaved = localStorage.getItem('ck_global_unified_band_v2');
+    if (_ubSaved === 'true') {
+      unifiedBandBtn.setAttribute('aria-pressed', 'true');
+    }
+    function _ckFlipUnifiedBand() {
+      const uOn = unifiedBandBtn.getAttribute('aria-pressed') === 'true';
+      unifiedBandBtn.setAttribute('aria-pressed', uOn ? 'false' : 'true');
+      localStorage.setItem('ck_global_unified_band_v2', uOn ? 'false' : 'true');
+      ckLog('unified_band toggle: ' + (uOn ? 'off' : 'on'));
+      // F1 (2026-07-05): mutually exclusive with Fusion V2 — same real-.click()
+      // cross-clear pattern as _ckFlipFusion's own block above.
+      if (!uOn) {
+        const _fv2 = document.getElementById('fusionV2');
+        if (_fv2 && _fv2.getAttribute('aria-pressed') === 'true') _fv2.click();
+      }
+    }
+    unifiedBandBtn.addEventListener('click', _ckFlipUnifiedBand);
   }
 
   // ---- Advanced = EXPAND TO COCKPIT (not an accordion) ----
@@ -3105,6 +3152,8 @@ function ckGetSettings() {
     const zone_erode_px = isNaN(_zeParsed) ? 1 : _zeParsed;
     const fusionV2El = document.getElementById('fusionV2');
     const fusion_v2 = fusionV2El ? (fusionV2El.getAttribute('aria-pressed') === 'true') : false;
+    const unifiedBandEl = document.getElementById('unifiedBandV2');
+    const unified_band = unifiedBandEl ? (unifiedBandEl.getAttribute('aria-pressed') === 'true') : false;
     const greenKillEl = document.getElementById('greenKill');
     const green_kill = greenKillEl ? (greenKillEl.getAttribute('aria-pressed') === 'true') : false;
     const samTemporalGuardEl = document.getElementById('samTemporalGuard');
@@ -3124,9 +3173,19 @@ function ckGetSettings() {
         fusion_v2: fusion_v2,
         fusion_expand: (function(){ var e=document.getElementById('fusionExpand'); return e ? (parseInt(e.value,10)||6) : 6; })(),
         green_kill: green_kill,
-        sam2_temporal_guard_enabled: sam2_temporal_guard_enabled
+        sam2_temporal_guard_enabled: sam2_temporal_guard_enabled,
+        unified_band: unified_band
     };
     ckLog('fusion_v2: ' + (fusion_v2 ? 'on' : 'off') + ' at settings build');
+    ckLog('unified_band: ' + (unified_band ? 'on' : 'off') + ' at settings build');
+    // F1 (2026-07-05): the two toggle handlers keep these mutually exclusive, but
+    // settings can also come from a stale localStorage state written before that
+    // fix — warn loudly if both somehow read true so it's never a silent surprise
+    // which engine cmd_batch/cmd_postproc actually picked (unified_band wins there).
+    if (fusion_v2 && unified_band) {
+        console.warn('CK: fusion_v2 AND unified_band both true at settings-build time — ' +
+                      'engine precedence: unified_band wins (F1 fix, 2026-07-05).');
+    }
     if (window.CK_ZONE) {
         settings.zone = window.CK_ZONE;
         if (window.CK_ZONE_ANCHOR_FRAME != null) settings.zone_anchor_frame = window.CK_ZONE_ANCHOR_FRAME;
@@ -3994,9 +4053,16 @@ function doCommit() {
                 const br = fs.readFileSync(path.join(outDir, 'batch_result.txt'), 'utf8').trim().split(',');
                 const done = parseInt(br[0], 10), expected = parseInt(br[1], 10), failedN = parseInt(br[2], 10);
                 if (!isNaN(done) && !isNaN(expected) && (done < expected || failedN > 0)) {
-                    ckLog('commit BLOCKED: rendered ' + done + '/' + expected + ' (' + failedN + ' failed) — not importing', true);
-                    return finish('Render incomplete: ' + done + ' of ' + expected + ' frames (' +
-                                  failedN + ' failed). Nothing was placed — check disk space, then re-render.', true);
+                    // F4 (2026-07-05): a 5th field is a sanitized CK_ERROR: abort reason
+                    // written by cmd_batch (e.g. the unified_band engine faulted) — show
+                    // THAT instead of the generic disk-space guess when present.
+                    const _abortMsg = (br.length > 4 && br[4]) ? br[4] : null;
+                    ckLog('commit BLOCKED: rendered ' + done + '/' + expected + ' (' + failedN + ' failed)' +
+                          (_abortMsg ? ' — ' + _abortMsg : '') + ' — not importing', true);
+                    return finish(_abortMsg
+                        ? ('Render aborted: ' + _abortMsg)
+                        : ('Render incomplete: ' + done + ' of ' + expected + ' frames (' +
+                           failedN + ' failed). Nothing was placed — check disk space, then re-render.'), true);
                 }
                 // Fix 3: optional 4th field = SAM temporal guard held-count. Non-blocking.
                 _samGuardHeld = ckSamGuardHeldCount(br);
@@ -4148,7 +4214,12 @@ function doSAMCommit(advanced) {
                 const br = fs.readFileSync(path.join(outDir, 'batch_result.txt'), 'utf8').trim().split(',');
                 const done = parseInt(br[0], 10), expected = parseInt(br[1], 10), failedN = parseInt(br[2], 10);
                 if (!isNaN(done) && !isNaN(expected) && (done < expected || failedN > 0)) {
-                    return finish('Render incomplete: ' + done + ' of ' + expected + ' frames (' + failedN + ' failed). Nothing placed.', true);
+                    // F4 (2026-07-05): show the 5th-field sanitized abort reason when present
+                    // (same rule as doCommit above) instead of the generic incomplete message.
+                    const _abortMsg = (br.length > 4 && br[4]) ? br[4] : null;
+                    return finish(_abortMsg
+                        ? ('Render aborted: ' + _abortMsg)
+                        : ('Render incomplete: ' + done + ' of ' + expected + ' frames (' + failedN + ' failed). Nothing placed.'), true);
                 }
                 // Fix 3: optional 4th field = SAM temporal guard held-count. Non-blocking.
                 _samGuardHeld = ckSamGuardHeldCount(br);

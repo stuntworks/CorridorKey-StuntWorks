@@ -511,12 +511,14 @@ def load_sam2_gate(sam2_mask_path, target_h, target_w):
 # despill only touches the foreground, and the SAM merge only reads the source plate
 # (never the despilled fg), so despill being last is order-independent of the matte.
 def sam_garbage_merge(alpha, sam_soft, source_rgb, settings, screen_type="green",
-                      return_garbage=False):
+                      return_garbage=False, frame_idx=None):
     """CK x SAM garbage-matte merge via the shared engine (DaVinci-identical).
     sam_soft: soft 0..1 SAM silhouette, or None. Returns the merged 2D alpha.
     return_garbage (Berto 2026-06-14): when True, returns (alpha, garbage_matte_or_None)
     so cmd_batch can write the green-aware keep-gate as a stable garbage-matte sidecar.
-    Default False keeps the single-array return — the other caller (cmd_single) is safe."""
+    Default False keeps the single-array return — the other caller (cmd_single) is safe.
+    frame_idx (F11, 2026-07-05): optional frame/seq identifier, passed straight through
+    to the unified_band engine's debug-dump filenames when unified_band_debug is on."""
     import numpy as np, cv2
     def _ret(a, g=None):
         return (a, g) if return_garbage else a
@@ -532,6 +534,26 @@ def sam_garbage_merge(alpha, sam_soft, source_rgb, settings, screen_type="green"
         sg = sg[:, :, 0]
     if sg.shape != alpha.shape:
         sg = cv2.resize(sg, (alpha.shape[1], alpha.shape[0]), interpolation=cv2.INTER_LINEAR)
+
+    # UNIFIED BAND (P1, 2026-07-05) — per-session settings key, checked HERE, BEFORE
+    # the MERGE_MODE dispatch below. NOT the module constant (that ships to every
+    # host at once) — this key is AE-only and false by default = byte-identical old
+    # path (UNIFIED_EDGE_PLAN_2026-07-05.md). Loud failures: log.error + traceback to
+    # corridorkey.log, then RE-RAISE a labeled error. Never fall through silently to
+    # garbage_matte/path_b the way the MERGE_MODE dispatch below does.
+    if bool(settings.get("unified_band", False)):
+        try:
+            from corridorkey_sam_merge import binarize_sam_silhouette, dispatch_unified_band
+            return dispatch_unified_band(
+                alpha, binarize_sam_silhouette(sg), source_rgb=source_rgb, settings=settings,
+                screen_type=screen_type, carve_points=settings.get("sam_negative") or None,
+                return_garbage=return_garbage, frame_idx=frame_idx)
+        except Exception as e:
+            log.error(f"CK_ERROR: unified_band merge failed — {e}")
+            log.error(traceback.format_exc())
+            print(f"CK_ERROR: unified_band merge failed — {e}", flush=True)
+            raise RuntimeError(f"CK_ERROR: unified_band merge failed — {e}") from e
+
     try:
         # GARBAGE MASK buffer: the panel's samMargin fader drives the merge's actual
         # kill-zone (generous dilation + chroma-escape radius). Before 2026-06-06 the
@@ -632,15 +654,19 @@ def apply_shirt_rescue(alpha, sam_soft, src_rgb, settings):
 
 
 def apply_matte_postproc(fg_rgb, alpha_raw, settings, sam_soft=None, source_rgb=None,
-                         screen_type="green", return_garbage=False):
+                         screen_type="green", return_garbage=False, frame_idx=None):
     """Canonical CK post-proc shared by single / batch / postproc.
     Returns (fg_rgb, alpha) or (fg_rgb, alpha, green_garbage) when return_garbage=True.
 
-    simple_combine=True  (default): Resolve-identical path — binarize SAM at 0.5 →
+    simple_combine=False (default — F10 correction, 2026-07-05: this docstring
+        previously said "True (default)"; the actual default read a few lines
+        below is `simple_combine = bool(settings.get("simple_combine", False))`):
+        legacy
+        garbage-matte path — shirt_rescue → zone_cut → fill_body_holes (default
+        ON) → green_kill → choke → despeckle → despill.
+    simple_combine=True: Resolve-identical path — binarize SAM at 0.5 →
         GaussianBlur(11×11, σ=2.5) → alpha × gate. Skips shirt_rescue, zone_cut,
         green_kill. fill_body_holes defaults OFF. Despill still runs (cosmetic).
-    simple_combine=False: legacy garbage-matte path — shirt_rescue → zone_cut →
-        fill_body_holes (default ON) → green_kill → choke → despeckle → despill.
 
     Flip settings["simple_combine"] to A/B between Resolve math and the old path."""
     import cv2 as _cv2_r
@@ -673,7 +699,7 @@ def apply_matte_postproc(fg_rgb, alpha_raw, settings, sam_soft=None, source_rgb=
     else:
         # Legacy garbage-matte path (simple_combine=False or no SAM active).
         alpha, _green_garbage = sam_garbage_merge(alpha, sam_soft, src, settings, screen_type,
-                                                  return_garbage=True)
+                                                  return_garbage=True, frame_idx=frame_idx)
         alpha = apply_shirt_rescue(alpha, _sam_r, src, settings)
         if settings.get('zone') and _sam_r is not None:
             _h_z, _w_z = alpha.shape[:2]
@@ -1629,6 +1655,23 @@ def cmd_batch(source_video, output_folder, settings,
     processed = 0
     failed = []
     total = max(1, end_frame - start_frame)
+    _ck_error_abort = None  # F4 (2026-07-05): set to the sanitized CK_ERROR: message
+                            # that aborted the batch, if any per-frame exception was
+                            # one of the engine's own loud CK_ERROR: failures.
+
+    # F1 (2026-07-05): unified_band WINS over fusion_v2/experimental_recipe — log the
+    # engine ONCE per batch (settings don't change per frame) instead of per-frame,
+    # so a long render doesn't spam this line thousands of times.
+    if settings.get('unified_band'):
+        _ck_engine = 'unified_band'
+    elif settings.get('experimental_recipe'):
+        _ck_engine = 'experimental_recipe'
+    elif settings.get('fusion_v2'):
+        _ck_engine = 'fusion_v2'
+    else:
+        _ck_engine = 'default'
+    log.info(f"engine: {_ck_engine}")
+    print(f"CK_LOG: engine: {_ck_engine}", flush=True)
 
     # Disk preflight — refuse to start a render the volume can't hold. Measured
     # cost on 4K is ~30 MB/frame across output+sidecars; estimate from actual
@@ -1708,7 +1751,17 @@ def cmd_batch(source_video, output_folder, settings,
                 # informed + stable. Set only by the default branch; stays None on the
                 # fusion path so the sidecar write falls back to inverted-SAM.
                 _green_garbage = None
-                if settings.get('experimental_recipe'):
+                # F1 (2026-07-05): unified_band WINS over fusion_v2 AND experimental_recipe
+                # — route straight to apply_matte_postproc (the only path that reaches
+                # sam_garbage_merge/dispatch_unified_band) regardless of those other two
+                # flags. Engine choice is logged ONCE per batch above (not here — this is
+                # per-frame and would spam the log on a long render).
+                if settings.get('unified_band'):
+                    fg, alpha, _green_garbage = apply_matte_postproc(
+                        fg, alpha_raw, settings, sam_soft=_sam_frame, source_rgb=img_rgb,
+                        screen_type=settings["screenType"], return_garbage=True,
+                        frame_idx=seq_num)
+                elif settings.get('experimental_recipe'):
                     alpha, _garbage_gate = apply_recipe_composite(
                         alpha_raw, _sam_frame, alpha.shape[1], settings)
                     # Finishing tail. Before the 2026-06-18 apply_matte_postproc
@@ -1783,7 +1836,8 @@ def cmd_batch(source_video, output_folder, settings,
                         # Default: canonical merge chain via apply_matte_postproc
                         fg, alpha, _green_garbage = apply_matte_postproc(
                             fg, alpha_raw, settings, sam_soft=_sam_frame, source_rgb=img_rgb,
-                            screen_type=settings["screenType"], return_garbage=True)
+                            screen_type=settings["screenType"], return_garbage=True,
+                            frame_idx=seq_num)
                 fg_uint16 = (np.clip(fg, 0, 1) * 65535).astype(np.uint16)
                 alpha_uint16 = (np.clip(alpha, 0, 1) * 65535).astype(np.uint16)
                 fg_bgr = cv2.cvtColor(fg_uint16, cv2.COLOR_RGB2BGR)
@@ -1851,6 +1905,14 @@ def cmd_batch(source_video, output_folder, settings,
             except Exception as e:
                 failed.append(frame_idx)
                 log.warning(f"Frame {frame_idx}: {e}")
+                # F4 (2026-07-05): the unified_band engine's own failures are prefixed
+                # "CK_ERROR:" (corridorkey_sam_merge.sam_garbage_merge's re-raise) — a
+                # loud, labeled failure class that must abort the WHOLE batch immediately
+                # rather than limping on frame-by-frame with a silently degraded key.
+                if str(e).startswith("CK_ERROR:"):
+                    _ck_error_abort = str(e)
+                    print(f"PROGRESS {processed}/{total}", flush=True)
+                    break
             print(f"PROGRESS {processed}/{total}", flush=True)
     finally:
         cap.release()
@@ -1866,6 +1928,18 @@ def cmd_batch(source_video, output_folder, settings,
     # 4th field = SAM2 temporal guard held-count (Fix 3). Panel parses batch_result.txt
     # POSITIONALLY (index.html ~3903 doCommit, ~4050 doSAMCommit read br[0]/br[1]/br[2]
     # only) so appending a 4th field is additive/safe for both existing parsers.
+    if _ck_error_abort is not None:
+        # F4 (2026-07-05): a 5th field carries the sanitized CK_ERROR: abort reason.
+        # Commas/newlines are stripped so the panel's `.split(',')` positional parse
+        # (index.html doCommit ~4031, doSAMCommit ~4185 — both read br[0..2] only, an
+        # unindexed extra field is safe) can't be corrupted by punctuation inside the
+        # error text, and the 5th field stays exactly one CSV cell.
+        _err_sanitized = _ck_error_abort.replace(",", ";").replace("\n", " ").replace("\r", " ").strip()
+        (out_dir / "batch_result.txt").write_text(
+            f"{processed},{total},{len(failed)},{len(_tg_held_frames)},{_err_sanitized}")
+        log.error(f"Batch ABORTED — {_err_sanitized}")
+        print(f"CK_ERROR: batch aborted — {_err_sanitized}", flush=True)
+        sys.exit(1)  # nonzero regardless of `processed` — main()'s `n > 0` check must not mask this
     (out_dir / "batch_result.txt").write_text(f"{processed},{total},{len(failed)},{len(_tg_held_frames)}")
     log.info(f"Done: {processed}/{total} ({len(failed)} failed)")
     # LOUD fallback surfacing: if a merge crash file was (re)written during this run, the
@@ -2273,13 +2347,34 @@ def cmd_batch_scrub(source_video, scrub_folder, settings,
                         cv2.imwrite(str(out_dir / "sam2_gate_raw.png"), _gate_u16)
                         # Preserve raw NN alpha for debugging.
                         cv2.imwrite(str(out_dir / "alpha_nn.png"), alpha_u16)
+                        # F3 (2026-07-05): sam_negative/sam_positive dots live in FULL
+                        # SOURCE-RESOLUTION coordinates (same space settings['sam_negative']
+                        # is read in everywhere else), but this frame (img_rgb/alpha) is at
+                        # SCRUB resolution when _scrub_scale != 1.0. carve_points reaching
+                        # merge_ck_unified_band's dot-kill/solidify-carve must be in the SAME
+                        # coordinate space as the alpha they index — exactly like the SAM2
+                        # video-predictor points are scaled at line ~2160 above
+                        # (`_all_pts = [[p[0] * _scrub_scale, p[1] * _scrub_scale] ...]`).
+                        # Build a scaled COPY of settings (never mutate live_params on disk
+                        # or the caller's settings dict — this batch-scrub call is the only
+                        # consumer that needs scrub-space coordinates).
+                        _settings_scrub = settings
+                        if _scrub_scale != 1.0 and (settings.get('sam_negative') or settings.get('sam_positive')):
+                            _settings_scrub = dict(settings)
+                            if settings.get('sam_negative'):
+                                _settings_scrub['sam_negative'] = [
+                                    [p[0] * _scrub_scale, p[1] * _scrub_scale] for p in settings['sam_negative']]
+                            if settings.get('sam_positive'):
+                                _settings_scrub['sam_positive'] = [
+                                    [p[0] * _scrub_scale, p[1] * _scrub_scale] for p in settings['sam_positive']]
                         # Finalize: mirror cmd_batch's canonical merge chain.
                         _fg_final, _alpha_final, _ = apply_matte_postproc(
-                            fg, alpha, settings,
+                            fg, alpha, _settings_scrub,
                             sam_soft=_gate_soft,
                             source_rgb=img_rgb,
                             screen_type=settings.get("screenType", "green"),
                             return_garbage=True,
+                            frame_idx=frame_offset,
                         )
                         alpha_u16 = (np.clip(_alpha_final, 0, 1) * 65535.0).astype(np.uint16)
                     except Exception as _se:
@@ -2521,7 +2616,14 @@ def cmd_postproc(session_dir, output_path, settings, background="checker", v1_pa
 
     # cu is also used by the background/composite section below.
     from CorridorKeyModule.core import color_utils as cu
-    if settings.get('experimental_recipe'):
+    # F1 (2026-07-05): unified_band WINS over fusion_v2 AND experimental_recipe — same
+    # precedence fix as cmd_batch above, routed straight to apply_matte_postproc (the
+    # only path that reaches sam_garbage_merge/dispatch_unified_band).
+    if settings.get('unified_band'):
+        fg_rgb, alpha = apply_matte_postproc(
+            fg_rgb, alpha, settings, sam_soft=sam_soft, source_rgb=_source_rgb,
+            screen_type=settings.get("screenType", "green"))
+    elif settings.get('experimental_recipe'):
         if sam_soft is not None and not bool(settings.get("sam2_bypass", False)):
             alpha, _ = apply_recipe_composite(alpha, sam_soft, fg_rgb.shape[1], settings)
         alpha = apply_choke(alpha, settings)
