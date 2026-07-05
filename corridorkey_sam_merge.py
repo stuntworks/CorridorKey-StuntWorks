@@ -1133,8 +1133,12 @@ def merge_ck_with_garbage_matte(
     se_gen[:k_gen, :] = 0
     sam_wide = cv2.dilate(sam, se_gen).astype(np.float32)
 
-    # --- sam_tight: 5px lateral-only dilation (no vertical), scaled ---
-    _tight_r = max(1, int(round(5 * _scale)))
+    # --- sam_tight: lateral-only dilation (no vertical), scaled ---
+    # 5 -> 5.5 (Berto 2026-07-04): floor-50 classes shadowed butt-green as
+    # off-green -> tight hug rolled the butt vs raw CK (CK MASTER A/B).
+    # +0.5@1920 = ~+1px at 4K on the off-green hug; bump to 6 if butt still
+    # shaved. Feet zone unaffected (hugs raw/eroded SAM separately below).
+    _tight_r = max(1, int(round(5.5 * _scale)))
     se_tight = np.zeros((1, _tight_r * 2 + 1), dtype=np.uint8)
     se_tight[0, :] = 1
     sam_tight = cv2.dilate(sam, se_tight).astype(np.float32)
@@ -1507,3 +1511,1265 @@ def apply_chroma_kill_to_matte(
     if mt.ndim == 3:
         return result[..., np.newaxis]
     return result
+
+
+# ============================================================================
+# UNIFIED BAND EDGE ENGINE — P1 build (2026-07-05), pure ADDITION as far as THIS
+# builder's own diff goes — this build itself touches nothing above this line.
+# (F10 correction, 2026-07-05: this banner previously claimed flatly that
+# nothing above this line is touched — not literally true of the working
+# tree: the sam_tight 5->5.5 change at line ~1141, dated 2026-07-04, is a
+# real, separate, Berto-approved edit riding in the same uncommitted tree,
+# one day ahead of this P1 build. It is not part of this builder's changes.)
+# Per UNIFIED_EDGE_PLAN_2026-07-05.md (twice adversarially
+# reviewed). Selected by a PER-SESSION SETTINGS KEY (settings["unified_band"]),
+# checked in ae_processor.sam_garbage_merge BEFORE the MERGE_MODE dispatch above —
+# NOT the MERGE_MODE module constant (shared by AE, DaVinci [6 call sites] and
+# ComfyUI [engine_bridge imports]; flipping it ships to every host at once).
+# Default OFF = the old garbage_matte path is byte-identical; this is a real
+# one-click AE-only rollback.
+#
+# LAW for this builder (from the plan): merge_ck_with_garbage_matte (above,
+# lines ~1063-1308) is the SPEC of behaviors to re-express or deliberately
+# retire with proof — see the COVERAGE MATRIX comment block directly above
+# merge_ck_unified_band below.
+#
+# Design (v2):
+#   D(p) — exterior distance transform from the POST-solidify/POST-carve
+#          silhouette (solidify_sam_silhouette, the SAME shared helper the old
+#          merge and the panel's SAM view use — carve holes are real background
+#          here, so D(p) collapses to 0 across an operator exclusion and that
+#          zone can never be re-widened).
+#   C(p) — continuous HSV chroma confidence, screen_type branched (green AND
+#          blue). Smoothed with cv2.bilateralFilter (INSTALLED, verified).
+#          cv2.ximgproc guided filter is CONFIRMED NOT INSTALLED in the CK venv —
+#          do not import it, ever, in this function.
+#   W(p) — width field: tight + (wide-tight)*smoothstep(C), no-down directional
+#          bias (masked term — any exterior pixel directly below the body's own
+#          lowest SAM pixel in its column gets W forced to ZERO, not tight,
+#          regardless of confidence — see downward_zone below; F10 correction,
+#          2026-07-05, this previously said "forced to tight"), continuous feet
+#          taper (disabled by the framing guard, kept verbatim), low-passed.
+#          All resolution-relative (_scale pattern).
+#   support(p) = smoothstep((W-D)/feather_px) — ONE monotonic transition per
+#          outward direction, by construction. This is what removes the
+#          high-low-high double-boundary rim defect the old dual-mask
+#          (sam_tight/sam_wide) blend produced.
+#   keep/kill/band: inside eroded SAM -> keep (alpha = max(CK, off-green body
+#          fill) — the fill is a LOAD-BEARING RESCUE, not a bypass); beyond W ->
+#          kill (support -> 0 handles this); band between -> alpha = CK * support.
+# ============================================================================
+
+UNIFIED_BAND_TIGHT_PX_BASE = 5.5   # matches merge_ck_with_garbage_matte's sam_tight
+                                    # radius (feet/lateral hug) at 1920px wide — kept
+                                    # identical so on-green baseline pixel counts don't
+                                    # drift for free. TRIED 3.0 during P1 verification
+                                    # to fight wire-bite resurrection (see the coverage
+                                    # matrix / build report's honest-miss section) — it
+                                    # measurably DEGRADED the named forensic crease fix
+                                    # (introduced a partial dip, non-monotonic, peak
+                                    # alpha dropped from 0.9998 to 0.85) for only a small
+                                    # reduction in wire resurrection. Reverted: the
+                                    # crease fix is the headline requirement and is not
+                                    # traded away to partially help a metric that a
+                                    # width/confidence-only field cannot fully solve
+                                    # anyway (see honest miss below).
+UNIFIED_BAND_WIDE_PX_BASE = 20.0   # matches sam_wide's generous head/body radius.
+UNIFIED_BAND_FEATHER_PX_BASE = 6.0  # support transition half-width at 1920px wide.
+                                     # Tuned against the P0 corpus gate (V2-V7,
+                                     # UNIFIED_EDGE_PLAN_2026-07-05.md P1 section) —
+                                     # see the P1 build report for the exact numbers
+                                     # this value was chosen against.
+UNIFIED_BAND_ERODE_PX_BASE = 2.0   # eroded-SAM "always fully keep" interior margin —
+                                    # the safety rail that guarantees deep-body alpha
+                                    # is never attenuated by the support field.
+UNIFIED_BAND_W_LOWPASS_SIGMA_BASE = 1.0   # kills local W wobble from C gradients +
+                                           # the distance-transform's own quantization.
+                                           # 3.0 (tried first) bled ~2x the tight width
+                                           # from a nearby genuinely-on-green patch all
+                                           # the way out to real wire/strap pixels
+                                           # 15-19px away (found via direct diagnostic
+                                           # during P1 verification — W went from ~11.7
+                                           # pre-blur to ~19-23 post-blur at the y700-1400
+                                           # wire-bite zone, resurrecting 508/625 wire
+                                           # pixels). 1.0 keeps the intended local-wobble
+                                           # smoothing without bleeding across a
+                                           # green-vs-not-green spatial discontinuity.
+UNIFIED_BAND_BILATERAL_SIGMA_SPACE_BASE = 8.0
+UNIFIED_BAND_BILATERAL_SIGMA_COLOR = 0.20  # chroma-score units [0,1] — NOT pixels,
+                                            # not resolution-scaled.
+UNIFIED_BAND_HUE_GREEN_CENTER = 60.0
+UNIFIED_BAND_HUE_GREEN_HALF_WIDTH = 25.0    # matches on_green_hsv's hard hue cutoff [35,85]
+UNIFIED_BAND_HUE_BLUE_CENTER = 115.0
+UNIFIED_BAND_HUE_BLUE_HALF_WIDTH = 15.0     # matches the blue hard hue cutoff [100,130]
+UNIFIED_BAND_SAT_FLOOR = 0.20                # soft ramp, centered near value_floor=50/255
+UNIFIED_BAND_SAT_CEIL = 0.35
+UNIFIED_BAND_VAL_FLOOR = 0.20
+UNIFIED_BAND_VAL_CEIL = 0.35
+UNIFIED_BAND_FEET_ZONE_START_PCT = 0.70   # matches merge_ck_with_garbage_matte's feet_start
+UNIFIED_BAND_SHADOW_KILL_VAL = 52.0 / 255.0  # matches the old shadow_kill value threshold
+UNIFIED_BAND_SHADOW_CUT_PCT = 0.92          # matches the old 92% "shadow below feet" cut
+UNIFIED_BAND_FEET_ERODE_PX_BASE = 1.0  # matches merge_ck_with_garbage_matte's feet-hug
+                                        # erosion radius — see the feet-erosion note
+                                        # above D(p)'s computation in merge_ck_unified_band.
+UNIFIED_BAND_FEET_TIGHT_PX_BASE = 1.0  # feet-zone width TAPER TARGET — deliberately
+                                        # NOT the general tight_px (5.5). The old
+                                        # feet-ring-kill hugs a near-eroded silhouette
+                                        # there (~1px margin), not a 5.5px lateral
+                                        # dilation; taper-to-5.5 measurably leaked
+                                        # diagonal floor pixels beside the feet during
+                                        # P1 verification (isotropic D(p) treats a
+                                        # diagonal 8px gap as "close", where the old
+                                        # code's SINGLE-ROW tight kernel — zero
+                                        # diagonal reach by construction — did not).
+UNIFIED_BAND_FEATHER_TIGHT_FLOOR_PX_BASE = 1.5  # px @1920 (F8, 2026-07-05: hoisted
+    # from a bare 1.5 literal). Feather half-width floor in the no-down zone and
+    # the feet taper — restores near-binary precision there without touching the
+    # body/hair transition (see feather_field's own comment below).
+UNIFIED_BAND_FEET_TRANSITION_PX_BASE = 30.0  # px @1920 (F8, 2026-07-05: hoisted
+    # from a bare 30.0 literal). SHORT feet-taper ramp width — matches the old
+    # merge_ck_with_garbage_matte's own transition_px=30 constant (see the feet
+    # taper's own comment below).
+UNIFIED_BAND_OFF_GREEN_FEATHER_SIGMA_PX_BASE = 2.5  # px @1920 (F8, 2026-07-05:
+    # hoisted from a bare 2.5 literal). GaussianBlur sigma feathering the
+    # off-green body-fill rescue before it's maxed into keep_alpha.
+
+# ----------------------------------------------------------------------------
+# SHAPE-DISCRIMINATION PASS constants (P1b, 2026-07-05/06). Forensic finding
+# (D:\CLAUDE_JUNK\ck_p1b_wire\explore_*.py, sessA
+# ck_session_db1e94240509907cf0f87d1a): the wire's resurrected pixels and the
+# named forensic crease (row y=1190) are NOT separable by distance from the
+# body or by chroma/darkness — task brief confirmed this and forbade further
+# width/confidence knob-tuning (already tried, traded the crease fix away for
+# a partial wire win — see UNIFIED_BAND_TIGHT_PX_BASE's honest-miss comment).
+# 84% of the 465 resurrected wire px sit within ~2px@1920 of the raw
+# silhouette (same immediate zone real hair/crease occupies), so this pass
+# cannot rely on a distance cutoff either. What DOES separate them in this
+# frame: the crease's own local component (once the continuous body-hugging
+# band is fragmented at a small attach margin so it can be scored piece by
+# piece) measures thickness coefficient-of-variation ~0.47-0.54 (a diffuse
+# photometric gradient, width varies) while genuine wire fragments elsewhere
+# in the same shot measure CV comfortably below 0.35 (near-constant caliber —
+# a manufactured object's diameter doesn't wander). Elongation + a minimum
+# tangential length keep this from firing on small blobby noise.
+UNIFIED_BAND_SHAPE_ATTACH_MARGIN_PX_BASE = 2.0  # px @1920. Fragments the
+    # continuous body-hugging band into locally scoreable pieces before CC —
+    # matches UNIFIED_BAND_ERODE_PX_BASE's order (the keep-zone margin), not
+    # a re-tuned width knob: this margin never grants trust, it only decides
+    # what counts as one "piece" for shape scoring.
+UNIFIED_BAND_SHAPE_MIN_AREA_PX = 4          # ignore fragments too small for a
+                                              # reliable minAreaRect/thickness read.
+UNIFIED_BAND_SHAPE_MIN_TANGENT_LEN_PX_BASE = 8.0  # px @1920. Long-side floor —
+    # single-pixel chroma noise must not trigger a kill.
+UNIFIED_BAND_SHAPE_ASPECT_MIN = 4.0          # minAreaRect long/short >= this to
+                                               # read as "linear," not blobby.
+UNIFIED_BAND_SHAPE_THICKNESS_CV_MAX = 0.35   # near-constant-caliber threshold —
+    # see the forensic finding above (crease-adjacent component measured
+    # ~0.47-0.54, comfortably above this; most genuine wire fragments in the
+    # same shot measured <=0.32).
+UNIFIED_BAND_SHAPE_RECOVER_MARGIN_PX_BASE = 3.0  # px @1920. After a fragment
+    # is classified wire, its kill is grown back out by this margin (>
+    # attach margin) so the immediate near-body stub that attach-stripping
+    # removed for scoring purposes is killed too — the wire doesn't stop
+    # existing just because it grazes close to the silhouette for a few px.
+    # Never grows past the band_mask itself (see kill_mask &= band_mask).
+
+# ----------------------------------------------------------------------------
+# SECOND SIGNAL: Hessian ridge/line strength on the SOURCE PLATE (P1b round 3,
+# 2026-07-06). The elongation+CV signal above is scored on tiny alpha-mask CC
+# fragments and, per direct diagnostic (D:\CLAUDE_JUNK\ck_p1b_wire\
+# explore_closing.py, explore_ridge*.py), only recovers a small slice of the
+# resurrection because 84% of resurrected px sit within ~2px@1920 of the raw
+# silhouette where fragment-level shape stats are dominated by quantization
+# noise, not real geometry. A genuine wire is a thin manufactured LINE in the
+# plate photograph — two close parallel edges, i.e. high local curvature
+# (large Hessian eigenvalue) — while a step edge (the real body silhouette,
+# or a soft shadow/crease gradient) has ONE transition and much lower
+# curvature away from the silhouette's own 1-2px. Measured directly
+# (explore_ridge_full.py, explore_ridge_grid.py, sessA): sigma=3.0px
+# (unscaled — this is a plate-texture-scale measurement, not a body-relative
+# one, so it is NOT multiplied by the resolution _scale factor the way
+# geometry constants are), tiny 1px@1920 near-silhouette exclusion (much
+# smaller than UNIFIED_BAND_SHAPE_ATTACH_MARGIN_PX_BASE — this signal does
+# not need to give up the near-body zone).
+#
+# THRESHOLD — chosen against G3 (rim<20), not just against wire recall.
+# threshold=7.0 was the most permissive value with ZERO hits on the crease's
+# 16px test window and ZERO hits on a real hair-whip band (grid search), and
+# recovered 105/465 resurrected px on sessA -- but it also KILLS scattered
+# fragments in the *middle* of an otherwise-continuous band-alpha ring,
+# which punches new high-low-high transitions into the ring itself (rim_
+# detector_scan's own defect signature) — rim_profile_count jumped from the
+# pre-shape-pass baseline of 7 to 64 (sessA) / 53 (sessB), a NEW regression
+# that did not exist before this pass and directly fails G3. Swept 7/9/11/14/
+# 18/24/32 (D:\CLAUDE_JUNK\ck_p1b_wire\sweep_ridge_thresh.py): rim_count only
+# drops back under the G3 gate (<20) at threshold>=11 (rim=8, both sessions).
+# SHIPPING 11.0 — the highest-recall value that keeps G3 green. This caps
+# recall at 404/465 resurrected remaining on sessA (test-suite honest number;
+# see the P1b build report) — most of the reachable win from this signal
+# specifically requires threshold<11, which is unshippable. Do not lower this
+# without re-running the rim sweep.
+UNIFIED_BAND_SHAPE_RIDGE_SIGMA_PX = 3.0       # plate-texture scale, NOT
+                                                # resolution-scaled (see above).
+UNIFIED_BAND_SHAPE_RIDGE_THRESH = 11.0         # Hessian |lambda1| cutoff.
+UNIFIED_BAND_SHAPE_RIDGE_TINY_EXCLUDE_PX_BASE = 1.0  # px @1920 — a much
+    # smaller near-silhouette exclusion than the CC pass's attach margin;
+    # this signal is precise enough close to the body to not need the wider
+    # margin (grid-searched safe at this value).
+UNIFIED_BAND_SHAPE_RIDGE_MIN_AREA_PX = 3       # drop single/double-pixel
+                                                 # ridge noise before CC.
+
+# ----------------------------------------------------------------------------
+# NEGATIVE-DOT BAND KILL constants (P1c, 2026-07-05). Operator escape hatch —
+# the shape-discrimination pass above still leaves an honest miss (404/465
+# resurrected wire px on the forensic session, sessA ck_session_db1e94240509
+# 907cf0f87d1a — see UNIFIED_BAND_SHAPE_RIDGE_THRESH's comment) because the
+# wire and the real body crease are not separable by shape/CV at automation's
+# reach. Berto's law: operator dots are the universal escape hatch when
+# automation hits a physics-proven limit — a negative dot placed directly on
+# the surviving wire fragment kills it with zero ambiguity, no knob-tuning.
+#
+# CONFIRMED (D:\CLAUDE_JUNK\ck_p1c_dotkill\00_locate_wire_remnant.py, sessA):
+# the UNSTRIPPED band (band_alpha>0.3 & ~eroded_sam) is not a set of separate
+# blobs — it is ONE continuous ring hugging the whole silhouette (a single
+# connected component, 15194px, spans the crease AND the wire remnant). A
+# naive "kill the whole connected component under the dot" would erase the
+# entire band edge (hair, crease, everything) on one click. This pass MUST
+# fragment the band the same way the shape pass's Signal A does before
+# connected-components — reusing UNIFIED_BAND_SHAPE_ATTACH_MARGIN_PX_BASE and
+# UNIFIED_BAND_SHAPE_RECOVER_MARGIN_PX_BASE verbatim (not new tuned numbers):
+# the attach margin fragments the ring into locally scoreable pieces, the dot
+# picks ONE piece, and the recover margin grows that piece's kill back toward
+# the body — clamped to band_mask (which already excludes eroded_sam), so a
+# kill can never cross into the keep zone regardless of how far it grows.
+UNIFIED_BAND_MASK_ALPHA_THRESH = 0.3  # shared band-alpha component threshold —
+    # the SAME cut both the shape pass's band_mask AND the dot-kill pass's
+    # band_mask use, so a dot-killed component boundary always matches what
+    # the shape pass already treats as "band" (F8, 2026-07-05: this was two
+    # independently hardcoded 0.3 literals — _ub_shape_kill_wire_components
+    # had its own bare `> 0.3` — now one named constant for both).
+UNIFIED_BAND_DOTKILL_ALPHA_THRESH = UNIFIED_BAND_MASK_ALPHA_THRESH  # back-compat alias
+UNIFIED_BAND_DOTKILL_SNAP_RADIUS_PX_BASE = 12.0  # px @1920. If a dot lands on
+    # a pixel the attach-margin strip excluded (near-silhouette rim) or just
+    # off a component's edge (~2px user aim error is typical), snap to the
+    # NEAREST stripped component within this radius rather than doing nothing
+    # on a near-miss click. F2 (2026-07-05): inside the feet zone a snap is
+    # REJECTED (treated as a miss) when the found distance exceeds half this
+    # radius — the feet zone's own band fragments are thin/small, so a full-
+    # radius snap there is far more likely to grab the wrong sliver than a
+    # genuine near-miss on the intended one.
+
+
+def _nearest_component_label(labels, stats, ix, iy, radius, n_lbl):
+    """Nearest connectedComponentsWithStats label to (ix, iy) within radius
+    px, or (None, None) if nothing qualifies. Bbox pre-filter (cheap reject) before an
+    exact per-pixel distance check only on surviving candidates — stays cheap
+    even with dozens of band components (P1c dot-kill snap-fallback, 2026-07-05).
+
+    Returns (label, distance_px) — F2 (2026-07-05) added the distance return
+    so the feet-zone snap-clamp can reject a match that is technically within
+    `radius` but further than the feet zone's tighter half-radius tolerance.
+    """
+    best_lbl, best_d2 = None, radius * radius
+    r = int(np.ceil(radius))
+    h, w = labels.shape
+    for lbl in range(1, n_lbl):
+        x0, y0, ww, hh, _area = stats[lbl]
+        if ix < x0 - r or ix > x0 + ww + r or iy < y0 - r or iy > y0 + hh + r:
+            continue
+        y_lo, y_hi = max(0, y0 - r), min(h, y0 + hh + r)
+        x_lo, x_hi = max(0, x0 - r), min(w, x0 + ww + r)
+        sub = labels[y_lo:y_hi, x_lo:x_hi]
+        comp_ys, comp_xs = np.where(sub == lbl)
+        if comp_ys.size == 0:
+            continue
+        dy = (comp_ys + y_lo) - iy
+        dx = (comp_xs + x_lo) - ix
+        d2 = dx * dx + dy * dy
+        m = int(np.argmin(d2))
+        if float(d2[m]) < best_d2:
+            best_d2 = float(d2[m])
+            best_lbl = lbl
+    if best_lbl is None:
+        return None, None
+    return best_lbl, float(np.sqrt(best_d2))
+
+
+def _ub_recover_kernel(margin_px_base, scale, plus_one=True):
+    """Shared MORPH_ELLIPSE structuring-element builder for the recover-margin
+    regrowth step used by BOTH the shape-kill pass (Signal A/B) and the
+    dot-kill pass (F9, 2026-07-05 fix batch — was three separately inlined
+    copies of the same `getStructuringElement(ELLIPSE, (r*2+1, r*2+1))` math).
+
+    plus_one=True (Signal A / dot-kill's own recover margin): r = round(margin_px_base
+    * scale) + 1 — the "+1" the original inline code always added.
+    plus_one=False (Signal B's tiny 1px anti-aliasing pad): r = int(margin_px_base)
+    taken as an already-final pixel radius, no scale, no +1 — matches Signal B's
+    original `recover_margin_b_px = 1` (unscaled, un-padded) exactly.
+    """
+    import cv2
+    r = (int(round(margin_px_base * scale)) + 1) if plus_one else int(margin_px_base)
+    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (r * 2 + 1, r * 2 + 1))
+
+
+def _ub_fragment_band(band_mask, D, attach_margin_px):
+    """Shared band-fragmentation step used by BOTH the shape-kill pass
+    (Signal A) and the dot-kill pass (F9, 2026-07-05 fix batch — was two
+    independently inlined copies of the same strip+connected-components
+    sequence). Strips the near-silhouette attach margin off band_mask (so a
+    continuous body-hugging ring becomes locally scoreable pieces) then runs
+    cv2.connectedComponentsWithStats on what survives.
+
+    attach_margin_px may be a scalar OR a per-pixel array (F2, 2026-07-05:
+    the feet-zone-tightened margin field) — `D > attach_margin_px` broadcasts
+    either way.
+
+    Returns (stripped, n_lbl, labels, stats). When nothing survives stripping,
+    returns (stripped, 0, None, None) without calling cv2 — callers already
+    treat `not stripped.any()` / `n_lbl <= 1` as the same "nothing to do" case,
+    so this short-circuit is behavior-identical to always calling cv2 and
+    getting n_lbl==1 (background only) back."""
+    import cv2
+    stripped = band_mask & (D > attach_margin_px)
+    if not stripped.any():
+        return stripped, 0, None, None
+    n_lbl, labels, stats, _ = cv2.connectedComponentsWithStats(
+        stripped.astype(np.uint8), connectivity=8)
+    return stripped, n_lbl, labels, stats
+
+
+def _ub_dbg_name(stem, frame_idx):
+    """Suffix a debug-dump filename stem with the frame/seq identifier when
+    known (F11, 2026-07-05). frame_idx=None (the default — cmd_single and
+    cmd_postproc have no per-frame identifier) keeps the OLD unsuffixed name;
+    a batch/scrub caller passing its seq_num/frame_idx gets a distinct file
+    per frame instead of every frame overwriting the last one's dump."""
+    return stem if frame_idx is None else f"{stem}_{int(frame_idx):05d}"
+
+
+def _ub_dump_dotkill_debug(debug_dir, band_mask, kill_mask, log_lines, frame_idx=None):
+    """Debug overlay for the negative-dot band-kill pass — DISTINCT color from
+    the shape-kill overlay (_ub_dump_shape_debug uses red for automation
+    kills; this uses magenta so an operator can tell 'automation killed this'
+    from 'my dot killed this' at a glance). Diagnostics only — caller wraps
+    this in try/except (never break a real render).
+
+    frame_idx (F11, 2026-07-05): optional frame/seq identifier, suffixed onto
+    every dumped filename via _ub_dbg_name so a batch run doesn't have every
+    frame's dump overwrite the last one. None (default) keeps the old names."""
+    import cv2
+    import json as _json_dk
+    h, w = band_mask.shape
+    overlay = np.zeros((h, w, 3), dtype=np.uint8)
+    overlay[band_mask] = (0, 160, 0)       # green = band, kept
+    overlay[kill_mask] = (220, 0, 220)     # magenta = operator dot-kill
+    cv2.imwrite(str(debug_dir / f"{_ub_dbg_name('unified_band_dotkill_overlay', frame_idx)}.png"), overlay)
+    (debug_dir / f"{_ub_dbg_name('unified_band_dotkill_log', frame_idx)}.txt").write_text(
+        "\n".join(log_lines) + ("\n" if log_lines else ""), encoding="utf-8")
+    (debug_dir / f"{_ub_dbg_name('unified_band_dotkill_log', frame_idx)}.json").write_text(
+        _json_dk.dumps(log_lines, indent=2), encoding="utf-8")
+
+
+def _ub_dot_kill_band_components(band_alpha, eroded_sam, D, scale, carve_points,
+                                  feet_start=None, feet_floor_px=None,
+                                  debug_dir=None, frame_idx=None):
+    """OPERATOR ESCAPE HATCH (P1c, 2026-07-05) — negative-dot band-alpha
+    component kill. See the UNIFIED_BAND_DOTKILL_* constants above for the
+    forensic finding this exists for and why the band must be fragmented by
+    the shape pass's attach margin before connected-components.
+
+    Runs AFTER the shape-discrimination pass, on whatever band_alpha
+    automation left behind (the honest-miss wire remnant the shape pass's own
+    comments document as unshippable to chase further with knobs alone).
+
+    Only band-zone dots are handled here — a dot landing inside eroded_sam
+    (the keep zone) is left alone; solidify_sam_silhouette's own
+    carve-reassert already owns dots there (interior SAM holes from the raw
+    SAM detection), a different mechanism for a different zone entirely.
+
+    This pass can only REMOVE alpha the band already has; it never adds any,
+    and every kill is clamped to band_mask (== outside eroded_sam by
+    definition) so a dot can never erase anything inside the keep zone.
+
+    feet_start / feet_floor_px (F2, 2026-07-05): same feet_start row + feet
+    taper-floor width merge_ck_unified_band already computes. Inside the feet
+    zone (row >= feet_start) the attach margin used to fragment the band is
+    capped to min(attach_margin_px, max(1, feet_floor_px)) instead of the
+    general attach margin — the feet-zone band is already narrower than the
+    general attach margin there, so stripping at the general margin left
+    nothing for a feet-zone dot to hit (band starved). A feet-zone snap is
+    also rejected past half the standard snap radius (tighter geometry there
+    makes a full-radius snap likelier to grab the wrong sliver).
+
+    frame_idx (F11, 2026-07-05): optional frame/seq identifier threaded to the
+    debug dump so a batch run's per-frame dumps don't overwrite each other.
+
+    Returns (band_alpha_out, kill_mask, log_lines) — log_lines has exactly one
+    outcome line per carve_points entry (killed / snapped+killed / inside
+    keep zone / band already clear / out of bounds / miss — F7, 2026-07-05),
+    for the caller to surface via logging/print.
+    """
+    import cv2
+    h, w = band_alpha.shape
+    empty_kill = np.zeros((h, w), dtype=bool)
+    log_lines = []
+    if not carve_points:
+        return band_alpha, empty_kill, log_lines
+
+    band_mask = (band_alpha > UNIFIED_BAND_MASK_ALPHA_THRESH) & (~eroded_sam)
+
+    # Fragment the (often continuous, body-hugging) band into locally
+    # scoreable pieces BEFORE connected-components — the SAME attach-margin
+    # strip the shape pass's Signal A uses (shared via _ub_fragment_band,
+    # F9). Without this, a dot on one wire fragment would identify the WHOLE
+    # band ring as "the component" (see the constants-block comment above —
+    # confirmed directly on sessA).
+    attach_margin_px = UNIFIED_BAND_SHAPE_ATTACH_MARGIN_PX_BASE * scale
+    if feet_start is not None and feet_floor_px is not None:
+        _feet_attach_margin = min(attach_margin_px, max(1.0, float(feet_floor_px)))
+        attach_margin_field = np.where(
+            np.arange(h, dtype=np.float32)[:, None] >= feet_start,
+            np.float32(_feet_attach_margin), np.float32(attach_margin_px),
+        ).astype(np.float32)
+    else:
+        attach_margin_field = attach_margin_px
+    _stripped, n_lbl, labels, stats = _ub_fragment_band(band_mask, D, attach_margin_field)
+
+    snap_radius = UNIFIED_BAND_DOTKILL_SNAP_RADIUS_PX_BASE * scale
+    # SAME recover margin the shape pass's Signal A regrows a classified kill
+    # by (reused verbatim via the shared _ub_recover_kernel, F9 — not a new
+    # tuned number) — clamped to band_mask below, which already excludes
+    # eroded_sam, so growth can approach but never cross the keep-zone
+    # boundary (the "sever at attach margin" rule).
+    se_recover = _ub_recover_kernel(UNIFIED_BAND_SHAPE_RECOVER_MARGIN_PX_BASE, scale)
+
+    kill_mask = np.zeros((h, w), dtype=bool)
+    hit_labels = set()
+
+    for pt in carve_points:
+        try:
+            px, py = float(pt[0]), float(pt[1])
+        except (TypeError, IndexError, ValueError):
+            log_lines.append(f"band-kill: dot (unparseable {pt!r}) skipped — malformed point")
+            continue
+        ix, iy = int(round(px)), int(round(py))
+        if not (0 <= ix < w and 0 <= iy < h):
+            log_lines.append(f"band-kill: dot ({ix},{iy}) out of bounds — ignored")
+            continue
+        if eroded_sam[iy, ix]:
+            log_lines.append(
+                f"band-kill: dot ({ix},{iy}) inside keep zone — ignored (SAM carve owns interior)")
+            continue  # keep-zone dot — owned by the SAM carve, not this pass
+        if not band_mask[iy, ix]:
+            log_lines.append(f"band-kill: dot ({ix},{iy}) band already clear at dot — no-op")
+            continue  # not live band alpha here — nothing for this pass to kill
+
+        _in_feet = feet_start is not None and iy >= feet_start
+        _snap_note = ""
+        lbl = int(labels[iy, ix]) if labels is not None else 0
+        if lbl == 0:
+            if labels is None:
+                log_lines.append(
+                    f"band-kill: dot ({ix},{iy}) missed all components (attach margin "
+                    f"stripped the entire band — none survived to score; feet-zone "
+                    f"geometry may still starve this dot)")
+                continue
+            snap_lbl, snap_dist = _nearest_component_label(labels, stats, ix, iy, snap_radius, n_lbl)
+            if snap_lbl is None:
+                log_lines.append(
+                    f"band-kill: dot ({ix},{iy}) missed all components "
+                    f"(no match within {snap_radius:.1f}px)")
+                continue
+            if _in_feet and snap_dist > (snap_radius / 2.0):
+                log_lines.append(
+                    f"band-kill: dot ({ix},{iy}) snap rejected in feet zone "
+                    f"({snap_dist:.1f}px > {snap_radius / 2.0:.1f}px half-radius limit) — ignored")
+                continue
+            lbl = snap_lbl
+            _snap_note = f"snapped {snap_dist:.1f}px to component {lbl} — "
+        if lbl in hit_labels:
+            log_lines.append(
+                f"band-kill: dot ({ix},{iy}) {_snap_note}component {lbl} "
+                f"already killed by an earlier dot — no-op")
+            continue
+        hit_labels.add(lbl)
+
+        comp = (labels == lbl)
+        comp_size_stripped = int(stats[lbl, cv2.CC_STAT_AREA])
+        grown = cv2.dilate(comp.astype(np.uint8), se_recover) > 0
+        grown = grown & band_mask
+        comp_size_grown = int(grown.sum())
+        kill_mask |= grown
+        log_lines.append(
+            f"band-kill: dot ({ix},{iy}) {_snap_note}killed {comp_size_grown}px component "
+            f"(label {lbl}, {comp_size_stripped}px before recover-margin regrowth)")
+
+    if not kill_mask.any():
+        if debug_dir is not None:
+            try:
+                _ub_dump_dotkill_debug(debug_dir, band_mask, empty_kill, log_lines, frame_idx=frame_idx)
+            except Exception:
+                pass
+        return band_alpha, empty_kill, log_lines
+
+    band_alpha_out = band_alpha.copy()
+    band_alpha_out[kill_mask] = 0.0
+
+    if debug_dir is not None:
+        try:
+            _ub_dump_dotkill_debug(debug_dir, band_mask, kill_mask, log_lines, frame_idx=frame_idx)
+        except Exception:
+            pass
+
+    return band_alpha_out, kill_mask, log_lines
+
+
+def _ub_smoothstep(edge0, edge1, x):
+    """Classic Hermite smoothstep: monotonic non-decreasing in x by construction.
+    Shared by every continuous field below (C, W-blend, support) so 'monotonic by
+    construction' (design point 4) is one audited implementation, not four.
+    edge0/edge1 may be scalars OR per-pixel arrays (the feet/no-down feather taper
+    needs array edges) — np.maximum keeps both forms working."""
+    denom = np.maximum(np.asarray(edge1, dtype=np.float32) - np.asarray(edge0, dtype=np.float32), 1e-6)
+    t = np.clip((x - edge0) / denom, 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def rim_detector_scan(alpha_map, sam_bin, window=40, hi=0.5, lo=0.1):
+    """High-low-high outward-normal profile scan — row-wise (left/right body edges
+    per scanline) AND column-wise (top/bottom, e.g. head/feet rims). Ships as a P1
+    debug output (see merge_ck_unified_band's unified_band_debug dump) and is kept
+    forever as regression tooling — a P2 gate metric and reusable by the corpus
+    harness (design point 7). Returns (count, hits); hits is a list of
+    (y, x, direction) tuples for overlay plotting.
+    """
+    h, w = sam_bin.shape
+    hits = []
+
+    def _is_hlh(profile):
+        if profile.size < 3:
+            return False
+        seen_high1 = seen_low = seen_high2 = False
+        for v in profile:
+            if not seen_high1:
+                if v > hi:
+                    seen_high1 = True
+            elif not seen_low:
+                if v < lo:
+                    seen_low = True
+            elif not seen_high2:
+                if v > hi:
+                    seen_high2 = True
+        return seen_high1 and seen_low and seen_high2
+
+    for y in range(h):
+        xs = np.where(sam_bin[y] > 0)[0]
+        if xs.size == 0:
+            continue
+        xmin, xmax = int(xs.min()), int(xs.max())
+        lo_x = max(0, xmin - window)
+        if _is_hlh(alpha_map[y, lo_x:xmin][::-1]):
+            hits.append((y, xmin, "row_left"))
+        hi_x = min(w, xmax + window)
+        if _is_hlh(alpha_map[y, xmax:hi_x]):
+            hits.append((y, xmax, "row_right"))
+
+    for x in range(w):
+        ys = np.where(sam_bin[:, x] > 0)[0]
+        if ys.size == 0:
+            continue
+        ymin, ymax = int(ys.min()), int(ys.max())
+        lo_y = max(0, ymin - window)
+        if _is_hlh(alpha_map[lo_y:ymin, x][::-1]):
+            hits.append((ymin, x, "col_top"))
+        hi_y = min(h, ymax + window)
+        if _is_hlh(alpha_map[ymax:hi_y, x]):
+            hits.append((ymax, x, "col_bottom"))
+
+    return len(hits), hits
+
+
+def _ub_ridge_kill_seed(band_mask, D, scale, source_rgb, h, w):
+    """Second shape signal (P1b round 3): Hessian ridge/line strength on the
+    SOURCE PLATE. See the UNIFIED_BAND_SHAPE_RIDGE_* constants for the
+    forensic finding — a manufactured wire is a thin LINE (two close parallel
+    edges = high local curvature); a step edge (real silhouette) or a soft
+    shadow/crease gradient has one transition and much lower curvature away
+    from the silhouette's own 1-2px. Returns a boolean seed mask (pre-CC,
+    pre-recover-growth — caller unions this with the elongation/CV seed
+    before the shared recover+clip step). Returns None if source_rgb is
+    unavailable (no plate = no ridge signal; caller falls back to signal A
+    alone, same degraded posture as the rest of merge_ck_unified_band without
+    a plate)."""
+    import cv2
+    if source_rgb is None:
+        return None
+    try:
+        rgb_in = np.asarray(source_rgb)
+        if rgb_in.dtype != np.float32:
+            img_u8 = np.clip(rgb_in, 0, 255).astype(np.uint8)
+        else:
+            img_u8 = (np.clip(rgb_in, 0.0, 1.0) * 255).astype(np.uint8)
+        if img_u8.ndim == 2:
+            img_u8 = np.stack([img_u8, img_u8, img_u8], axis=-1)
+        if img_u8.shape[:2] != (h, w):
+            img_u8 = cv2.resize(img_u8, (w, h), interpolation=cv2.INTER_AREA)
+        gray = cv2.cvtColor(img_u8, cv2.COLOR_RGB2GRAY).astype(np.float32)
+        blurred = cv2.GaussianBlur(gray, (0, 0), UNIFIED_BAND_SHAPE_RIDGE_SIGMA_PX)
+        Ixx = cv2.Sobel(blurred, cv2.CV_32F, 2, 0, ksize=3)
+        Iyy = cv2.Sobel(blurred, cv2.CV_32F, 0, 2, ksize=3)
+        Ixy = cv2.Sobel(blurred, cv2.CV_32F, 1, 1, ksize=3)
+        tr = Ixx + Iyy
+        det = Ixx * Iyy - Ixy * Ixy
+        disc = np.sqrt(np.clip((tr * tr) / 4.0 - det, 0.0, None))
+        ridge = np.abs(tr / 2.0 + disc)
+        tiny_exclude = UNIFIED_BAND_SHAPE_RIDGE_TINY_EXCLUDE_PX_BASE * scale
+        return band_mask & (D > tiny_exclude) & (ridge >= UNIFIED_BAND_SHAPE_RIDGE_THRESH)
+    except Exception:
+        return None
+
+
+def _ub_shape_kill_wire_components(band_alpha, eroded_sam, D, scale, source_rgb=None,
+                                    debug_dir=None, frame_idx=None):
+    """SHAPE-DISCRIMINATION PASS (P1b, 2026-07-05/06) — kills wire-shaped
+    regions inside merge_ck_unified_band's band zone (outside the eroded-SAM
+    keep interior, wherever the width/support field already granted trust).
+    See the UNIFIED_BAND_SHAPE_* / UNIFIED_BAND_SHAPE_RIDGE_* constants above
+    for the forensic finding this is built from and why width/confidence
+    knobs cannot do this job.
+
+    This pass can only REMOVE alpha the band already has; it never adds any.
+    Operates on band_alpha directly (pre keep-merge) so the kill is in effect
+    before `final = np.where(eroded_sam, keep_alpha, band_alpha)` composites it.
+
+    TWO independent signals feed one shared kill mask (OR'd, per the P1b
+    build report's round-by-round findings — neither alone clears enough of
+    the resurrection, and each is safe on its own so combining is safe):
+      A. Elongation + thickness-CV on attach-margin-stripped CC fragments
+         (round 1). Catches genuinely elongated, near-constant-caliber
+         fragments once the continuous body-hugging band is fragmented at a
+         small attach margin so it can be scored piece by piece.
+      B. Hessian ridge/line strength on the source plate (round 3, see
+         _ub_ridge_kill_seed) — reaches closer to the silhouette than (A)
+         because it does not need the attach-margin strip, catching thin
+         manufactured lines (A) is structurally blind to (tiny fragments,
+         noisy CV at that scale).
+    Both seeds are grown back out by RECOVER_MARGIN (clamped to the band
+    zone) so a kill isn't truncated at whatever stripping/exclusion each
+    signal used for scoring — the wire doesn't stop being wire where it
+    grazes the body.
+
+    HONEST MISS (P1b build report): even combined, these two signals do not
+    catch the full resurrection on the named forensic session — most of the
+    remainder sits within ~1-2px of the raw silhouette where ridge response
+    and fragment shape stats are not reliably distinguishable from the real
+    crease/hair's own near-silhouette response. Verified safe (zero hits on
+    the crease's 16px test window, zero hits on a real hair-whip band) at the
+    thresholds shipped; NOT tunable tighter without risking G1/G8 — see
+    D:\\CLAUDE_JUNK\\ck_p1b_wire\\explore_ridge_grid.py.
+
+    Returns (band_alpha_out, kill_mask). debug_dir (Path or None): when given,
+    dumps a keep/kill component overlay + per-component feature table —
+    failures here must never break a real render (caller wraps in try/except
+    same as the existing unified_band_debug block).
+    """
+    import cv2
+    h, w = band_alpha.shape
+    band_mask = (band_alpha > UNIFIED_BAND_MASK_ALPHA_THRESH) & (~eroded_sam)
+    empty_kill = np.zeros((h, w), dtype=bool)
+    if not band_mask.any():
+        return band_alpha, empty_kill
+
+    kill_seed_a = np.zeros((h, w), dtype=bool)
+    kill_seed_b = np.zeros((h, w), dtype=bool)
+    _debug_rows = [] if debug_dir is not None else None
+
+    # --- Signal A: elongation + thickness-CV on attach-stripped CC fragments.
+    # Fragmentation shared with the dot-kill pass via _ub_fragment_band (F9).
+    attach_margin = UNIFIED_BAND_SHAPE_ATTACH_MARGIN_PX_BASE * scale
+    stripped, n_lbl, labels, stats = _ub_fragment_band(band_mask, D, attach_margin)
+    if stripped.any():
+        min_len_px = UNIFIED_BAND_SHAPE_MIN_TANGENT_LEN_PX_BASE * scale
+
+        for lbl in range(1, n_lbl):
+            x0, y0, ww, hh, area = stats[lbl]
+            if area < UNIFIED_BAND_SHAPE_MIN_AREA_PX:
+                continue
+            # Crop to the component's own bbox — keeps minAreaRect/
+            # distanceTransform cheap regardless of frame size (G6 budget).
+            sub = (labels[y0:y0 + hh, x0:x0 + ww] == lbl)
+            ys_sub, xs_sub = np.where(sub)
+            pts = np.column_stack([xs_sub, ys_sub]).astype(np.float32)
+            (rw, rh) = cv2.minAreaRect(pts)[1]
+            long_side, short_side = max(rw, rh), max(min(rw, rh), 1e-6)
+            aspect = long_side / short_side
+            # 1px zero-border pad before the distance transform — a component
+            # whose bbox it fills COMPLETELY (a straight 1px-wide line, e.g. a
+            # single column) has no background pixel inside the crop for
+            # distanceTransform to measure against, which returns the float32
+            # sentinel max (~3.4e38) instead of a real distance. Found via
+            # direct diagnostic during P1b build (component bbox 1x12,
+            # dt.max()==3.4028235e+38, silent overflow on the *2.0 thickness
+            # multiply). The 1px pad guarantees a real zero boundary exists.
+            sub_padded = np.pad(sub, 1, mode="constant", constant_values=False)
+            dt_padded = cv2.distanceTransform(sub_padded.astype(np.uint8), cv2.DIST_L2, 5)
+            dt = dt_padded[1:-1, 1:-1]
+            thickness = dt[sub] * 2.0
+            mean_th = float(thickness.mean())
+            cv_th = float(thickness.std() / max(mean_th, 1e-6))
+            is_wire = (
+                long_side >= min_len_px
+                and aspect >= UNIFIED_BAND_SHAPE_ASPECT_MIN
+                and cv_th <= UNIFIED_BAND_SHAPE_THICKNESS_CV_MAX
+            )
+            if is_wire:
+                kill_seed_a[y0:y0 + hh, x0:x0 + ww] |= sub
+            if _debug_rows is not None:
+                _debug_rows.append(dict(
+                    signal="A_elongation_cv", lbl=int(lbl), area=int(area),
+                    aspect=round(float(aspect), 2), mean_thickness=round(mean_th, 2),
+                    thickness_cv=round(cv_th, 3), long_side=round(float(long_side), 1),
+                    killed=bool(is_wire), bbox=[int(x0), int(y0), int(x0 + ww), int(y0 + hh)],
+                ))
+
+    # --- Signal B: Hessian ridge/line strength on the source plate, then a
+    # light CC + min-area filter so single/double-pixel ridge noise can't fire.
+    ridge_raw_seed = _ub_ridge_kill_seed(band_mask, D, scale, source_rgb, h, w)
+    if ridge_raw_seed is not None and ridge_raw_seed.any():
+        n_r, labels_r, stats_r, _ = cv2.connectedComponentsWithStats(
+            ridge_raw_seed.astype(np.uint8), connectivity=8)
+        for lbl in range(1, n_r):
+            x0, y0, ww, hh, area = stats_r[lbl]
+            if area < UNIFIED_BAND_SHAPE_RIDGE_MIN_AREA_PX:
+                continue
+            sub = (labels_r[y0:y0 + hh, x0:x0 + ww] == lbl)
+            kill_seed_b[y0:y0 + hh, x0:x0 + ww] |= sub
+            if _debug_rows is not None:
+                _debug_rows.append(dict(
+                    signal="B_ridge", lbl=int(lbl), area=int(area), killed=True,
+                    bbox=[int(x0), int(y0), int(x0 + ww), int(y0 + hh)],
+                ))
+
+    if not kill_seed_a.any() and not kill_seed_b.any():
+        if debug_dir is not None:
+            _ub_dump_shape_debug(debug_dir, band_mask, empty_kill, empty_kill, _debug_rows, frame_idx=frame_idx)
+        return band_alpha, empty_kill
+
+    # Signal A needs the RECOVER_MARGIN growth to reclaim the near-body stub
+    # the attach-strip removed for scoring purposes (round 1 design).
+    #
+    # Signal B does NOT get that same growth — round-3 diagnostic (P1b build
+    # report) showed the wide recover margin, applied to ridge-seed pixels
+    # found just outside the crease's own 16px test window, dilated FAR
+    # enough (attach margin + 1 =~7px@4K) to reach back INTO the window and
+    # zero real crease alpha there (broke G1). Signal B's own tiny near-
+    # silhouette exclusion (UNIFIED_BAND_SHAPE_RIDGE_TINY_EXCLUDE_PX_BASE,
+    # much smaller than signal A's attach margin) means it barely needs any
+    # regrowth in the first place; it gets a MUCH smaller pad instead, just
+    # enough to close 1px anti-aliasing gaps at a kill/keep boundary.
+    # Recover-kernel building shared with the dot-kill pass via _ub_recover_kernel (F9).
+    se_recover_a = _ub_recover_kernel(UNIFIED_BAND_SHAPE_RECOVER_MARGIN_PX_BASE, scale)
+    kill_mask_a = cv2.dilate(kill_seed_a.astype(np.uint8), se_recover_a) > 0 if kill_seed_a.any() else empty_kill
+
+    se_recover_b = _ub_recover_kernel(1, 1.0, plus_one=False)
+    kill_mask_b = cv2.dilate(kill_seed_b.astype(np.uint8), se_recover_b) > 0 if kill_seed_b.any() else empty_kill
+
+    kill_mask = (kill_mask_a | kill_mask_b) & band_mask  # never reach beyond the band zone
+
+    out = band_alpha.copy()
+    out[kill_mask] = 0.0
+
+    if debug_dir is not None:
+        _ub_dump_shape_debug(debug_dir, band_mask, kill_seed_a | kill_seed_b, kill_mask, _debug_rows,
+                              frame_idx=frame_idx)
+
+    return out, kill_mask
+
+
+def _ub_dump_shape_debug(debug_dir, band_mask, stripped, kill_mask, debug_rows, frame_idx=None):
+    """Debug-mode overlay: green = band pixels kept, red = shape-pass killed.
+    Diagnostics only — caller wraps this in try/except (never break a render).
+    frame_idx (F11, 2026-07-05): see _ub_dbg_name — None keeps the old names."""
+    import cv2
+    import json as _json_shp
+    h, w = band_mask.shape
+    overlay = np.zeros((h, w, 3), dtype=np.uint8)
+    overlay[band_mask] = (0, 160, 0)      # green = band, kept
+    overlay[kill_mask] = (0, 0, 220)      # red = shape-pass kill
+    cv2.imwrite(str(debug_dir / f"{_ub_dbg_name('unified_band_shape_kill_overlay', frame_idx)}.png"), overlay)
+    (debug_dir / f"{_ub_dbg_name('unified_band_shape_features', frame_idx)}.json").write_text(
+        _json_shp.dumps(debug_rows or [], indent=2), encoding="utf-8")
+
+
+# ----------------------------------------------------------------------------
+# RETIRED-RULE COVERAGE MATRIX (P1 deliverable, gate for P2 entry per the plan).
+# Every rule the plan's own text attributes to merge_ck_with_garbage_matte,
+# audited against the ACTUAL source at lines ~1063-1308 (the SPEC, per the
+# builder's law) rather than assumed from the plan prose alone:
+#
+#   tight/wide (sam_tight/sam_wide)      -> COVERED: W(p) tight/wide blend (this fn)
+#   G_soft (confidence blend weight)      -> COVERED: C(p) bilateral-smoothed HSV score
+#   feet override (feet ring kill)        -> COVERED: continuous feet taper, same
+#                                            feet_start=70% bbox_h boundary
+#   feet erosion                          -> COVERED: subsumed by the feet taper driving
+#                                            W down to tight (no separate raw-SAM erode
+#                                            needed — the taper already removes the ring
+#                                            continuously instead of via a binary hug)
+#   escape valve (chroma near-SAM pass)   -> COVERED: C(p)'s on-green confidence feeding
+#                                            W(p) IS the escape valve, generalized from a
+#                                            fixed-radius proximity test to the same
+#                                            continuous field driving the whole edge
+#   off-green body fill                   -> COVERED verbatim: same HSV threshold, same
+#                                            92% shadow cut, gated to the eroded-SAM
+#                                            keep zone per design point 5 (LOAD-BEARING
+#                                            RESCUE, not a bypass)
+#   shadow_kill                           -> COVERED verbatim: same val<52/255 threshold,
+#                                            same off-green/outside-SAM gating
+#   framing guards (_body_exits_bottom)   -> COVERED verbatim: identical bbox_y1>=97%*h
+#                                            test, disables the feet taper AND the 92%
+#                                            shadow cut exactly like the old function
+#   no-down kernels (sam_wide top-zeroed) -> COVERED, re-derived: masked term forcing
+#                                            W to ZERO (not tight — F10 correction,
+#                                            2026-07-05) for any exterior pixel directly
+#                                            below the lowest SAM pixel in its own column
+#   92% cut (shadow-below-feet)           -> COVERED verbatim (see off-green body fill)
+#   largest-blob / carve                  -> COVERED verbatim: solidify_sam_silhouette
+#                                            is reused unchanged (same shared helper)
+#   blue branch (screen_type)             -> COVERED: C(p) and on_green_hsv both branch
+#                                            on screen_type=="blue" with the same hue
+#                                            ranges as the old function
+#
+#   The following rules the PLAN TEXT lists as "every rule of
+#   merge_ck_with_garbage_matte" do NOT actually exist in that function's source
+#   (lines 1063-1308, read in full for this build). They live ONLY in the DORMANT
+#   merge_ck_with_sam_chroma_gated function (~line 505), which MERGE_MODE has not
+#   selected since 2026-05-27 (MERGE_MODE = "garbage_matte" at module top) — i.e.
+#   they are not part of the ACTUAL spec per the builder's law ("the current
+#   garbage_matte implementation is the SPEC"). Flagging the plan-vs-code
+#   discrepancy explicitly rather than silently re-implementing dead code:
+#     wing filter              -> DELIBERATELY NOT RE-EXPRESSED. Not in the active
+#                                  spec (merge_ck_with_garbage_matte). Lives only in
+#                                  the dormant chroma_gated function. No action.
+#     ridge kill                -> same as above — dormant-function-only, not in the
+#                                  active spec.
+#     proximity / EDGE GUARD slider -> same — dormant-function-only. Note:
+#                                  ae_processor.sam_garbage_merge still threads
+#                                  sam2_margin/edge_guard_px into proximity_px for the
+#                                  OLD dispatch path; merge_ck_unified_band does not
+#                                  accept a proximity_px parameter because the active
+#                                  spec it re-expresses never used it either.
+#     seam suppression          -> same — dormant-function-only, not in the active spec.
+#   No silent drops of anything that IS in the active spec above.
+# ----------------------------------------------------------------------------
+def merge_ck_unified_band(
+    ck_alpha: np.ndarray,
+    sam_soft: Optional[np.ndarray],
+    source_rgb: Optional[np.ndarray] = None,
+    settings: Optional[dict] = None,
+    screen_type: str = "green",
+    carve_points=None,
+    return_garbage: bool = False,
+    frame_idx=None,
+):
+    """UNIFIED BAND edge engine (P1, 2026-07-05) — distance-field + confidence-field
+    merge. Continuous D(p)/C(p)/W(p)/support fields replace the old dual-mask
+    (sam_tight/sam_wide) blend so the edge has exactly ONE monotonic transition per
+    outward direction. See UNIFIED_EDGE_PLAN_2026-07-05.md for the full design and
+    the coverage matrix comment block directly above this function.
+
+    settings: per-session dict. Only unified_band_debug (bool) is read here — the
+    "unified_band" selector key itself is checked by the CALLER
+    (ae_processor.sam_garbage_merge), not by this function.
+
+    No internal try/except around the core math (design point 6, "loud failures").
+    A real failure must surface to the caller so it can log + re-raise a labeled
+    error — this function must never silently degrade to a different merge.
+    The optional debug PNG dump IS wrapped in try/except: diagnostics failing must
+    never break a real render.
+
+    return_garbage: when True, returns (alpha, band_gate) — band_gate uses the SAME
+    multiplicative-gate semantics as merge_ck_with_garbage_matte's garbage_matte
+    return (white=keep body, black=kill junk): 1.0 inside the eroded-SAM keep zone,
+    `support` in the band, tending to 0 beyond W. The off-green body fill (like the
+    old function's) is layered on top of this gate, not represented inside it.
+
+    frame_idx: optional frame/seq identifier (F11, 2026-07-05) — threaded down to
+    the debug-dump filenames only, so a batch run's per-frame dumps don't overwrite
+    each other. None (default, single-frame callers) keeps the old unsuffixed names.
+    """
+    import cv2
+
+    settings = settings or {}
+    # F6 input guard (2026-07-05): capture the ORIGINAL dtype before the float32
+    # cast below erases it — needed to pick the right rescale divisor if ck_alpha
+    # turns out to still be in 0..255 / 0..65535 range (mirrors apply_shirt_rescue's
+    # own dtype-normalize house pattern, ae_processor.py:630-632, which always
+    # divides by 255 — this guard is the same idea, generalized to uint16 sources).
+    _ck_alpha_orig_dtype = np.asarray(ck_alpha).dtype
+    ck = np.asarray(ck_alpha, dtype=np.float32)
+    if ck.ndim == 3:
+        ck = ck[..., 0]
+    _ck_was_finite = bool(np.isfinite(ck).all())
+    ck = np.nan_to_num(ck, nan=0.0, posinf=1.0, neginf=0.0)
+    if not _ck_was_finite:
+        print("CK_LOG: unified_band: input guard sanitized non-finite ck alpha "
+              "(nan/posinf/neginf present)", flush=True)
+    if ck.size and float(ck.max()) > 1.5:
+        _ck_divisor = 65535.0 if _ck_alpha_orig_dtype == np.uint16 else 255.0
+        ck = ck / _ck_divisor
+        print(f"CK_LOG: unified_band: input guard rescaled ck alpha "
+              f"(max>1.5, divided by {_ck_divisor:.0f})", flush=True)
+    if sam_soft is None:
+        print("CK_LOG: unified_band: SAM absent (sam_soft is None) — "
+              "frame rendered CK-solo, no garbage protection", flush=True)
+        return (ck.copy(), None) if return_garbage else ck.copy()
+    sam_raw_bin = (np.asarray(sam_soft, dtype=np.float32) > 0.5).astype(np.uint8)
+    if sam_raw_bin.ndim == 3:
+        sam_raw_bin = sam_raw_bin[..., 0]
+    if ck.shape != sam_raw_bin.shape:
+        print(f"CK_LOG: unified_band: SAM shape mismatch (ck {ck.shape} vs "
+              f"sam {sam_raw_bin.shape}) — frame rendered CK-solo, no garbage "
+              f"protection", flush=True)
+        return (ck.copy(), None) if return_garbage else ck.copy()
+    h, w = ck.shape
+
+    # --- Post-solidify, post-carve silhouette. SAME shared helper the old merge and
+    # the panel's SAM view call — preview == render by construction, and carve holes
+    # are real background here so D(p) correctly collapses to 0 across an operator
+    # exclusion (design point 1).
+    sam = solidify_sam_silhouette(sam_raw_bin, carve_points)
+    sam_bool = sam > 0
+
+    ys = np.where(sam_bool)[0]
+    if ys.size == 0:
+        print("CK_LOG: unified_band: SAM empty after solidify (ys.size==0) — "
+              "frame rendered CK-solo, no garbage protection", flush=True)
+        return (ck.copy(), None) if return_garbage else ck.copy()
+    bbox_y0, bbox_y1 = int(ys.min()), int(ys.max())
+    bbox_h = max(bbox_y1 - bbox_y0, 1)
+    feet_start = bbox_y0 + int(bbox_h * UNIFIED_BAND_FEET_ZONE_START_PCT)
+
+    # Framing guard — KEPT VERBATIM from merge_ck_with_garbage_matte (Berto's
+    # waist-crop protection law). Disables the feet taper and the 92% shadow cut
+    # below exactly like it disables the feet-ring hug in the old function.
+    _body_exits_bottom = bbox_y1 >= int(h * 0.97)
+
+    _scale = float(w) / 1920.0
+    # Unconditional feet-floor width (F2, 2026-07-05): same UNIFIED_BAND_FEET_TIGHT_PX_BASE
+    # the feet taper below uses, but computed regardless of _body_exits_bottom so the
+    # dot-kill pass always has a feet-zone attach-margin cap available — the framing
+    # guard disables the feet TAPER (waist-crop protection), not the geometric fact
+    # that rows >= feet_start are the feet zone for dot-kill purposes.
+    _feet_floor_px_const = UNIFIED_BAND_FEET_TIGHT_PX_BASE * _scale
+
+    # --- C(p): continuous HSV chroma confidence, screen_type branched. Also builds
+    # on_green_hsv (binary-ish on-screen-color test), reused unchanged below by the
+    # off-green body fill and shadow_kill, exactly like the old function.
+    C = None
+    on_green_hsv = None
+    val = None
+    if source_rgb is not None:
+        try:
+            rgb_in = np.asarray(source_rgb)
+            if rgb_in.dtype != np.float32:
+                _img_u8 = np.clip(rgb_in, 0, 255).astype(np.uint8)
+            else:
+                _img_u8 = (np.clip(rgb_in, 0.0, 1.0) * 255).astype(np.uint8)
+            if _img_u8.ndim == 2:
+                _img_u8 = np.stack([_img_u8, _img_u8, _img_u8], axis=-1)
+            if _img_u8.shape[:2] != (h, w):
+                _img_u8 = cv2.resize(_img_u8, (w, h), interpolation=cv2.INTER_AREA)
+            img_bgr = cv2.cvtColor(_img_u8, cv2.COLOR_RGB2BGR)
+            hsv_map = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+            hue = hsv_map[..., 0].astype(np.float32)
+            sat = hsv_map[..., 1].astype(np.float32) / 255.0
+            val = hsv_map[..., 2].astype(np.float32) / 255.0
+
+            # F8 (2026-07-05): hue bounds DERIVED from the named UNIFIED_BAND_HUE_*
+            # constants instead of duplicated literals — verified analytically equal
+            # to the literals they replace before shipping: green 60.0-25.0=35.0,
+            # 60.0+25.0=85.0 (was [35,85]); blue 115.0-15.0=100.0, 115.0+15.0=130.0
+            # (was [100,130]). int(round()) matches the original int literals exactly
+            # (no fractional component in any of these four values).
+            if screen_type == "blue":
+                _hue_center = UNIFIED_BAND_HUE_BLUE_CENTER
+                _hue_half = UNIFIED_BAND_HUE_BLUE_HALF_WIDTH
+                _lower, _upper = (np.array([int(round(_hue_center - _hue_half)), 50, 50]),
+                                  np.array([int(round(_hue_center + _hue_half)), 255, 255]))
+            else:
+                _hue_center = UNIFIED_BAND_HUE_GREEN_CENTER
+                _hue_half = UNIFIED_BAND_HUE_GREEN_HALF_WIDTH
+                # Value floor 20 (~50/255) — matches merge_ck_with_garbage_matte's
+                # 2026-07-02 restore (floor 50 amputated the subject's own shadow-on-
+                # screen zones). Same reasoning applies to this fresh HSV pass.
+                _lower, _upper = (np.array([int(round(_hue_center - _hue_half)), 50, 50]),
+                                  np.array([int(round(_hue_center + _hue_half)), 255, 255]))
+            _green_bin = cv2.inRange(hsv_map, _lower, _upper)
+            on_green_hsv = _green_bin.astype(np.float32) / 255.0
+
+            hue_dist = np.abs(hue - _hue_center)
+            hue_dist = np.minimum(hue_dist, 180.0 - hue_dist)  # OpenCV hue wraps at 180
+            hue_score = 1.0 - np.clip(hue_dist / _hue_half, 0.0, 1.0)
+            sat_score = _ub_smoothstep(UNIFIED_BAND_SAT_FLOOR, UNIFIED_BAND_SAT_CEIL, sat)
+            val_score = _ub_smoothstep(UNIFIED_BAND_VAL_FLOOR, UNIFIED_BAND_VAL_CEIL, val)
+            raw_C = (hue_score * sat_score * val_score).astype(np.float32)
+
+            # Smoothing: bilateralFilter (INSTALLED, verified 2026-07-05). cv2.ximgproc
+            # guided filter is CONFIRMED NOT INSTALLED in the CK venv — never import it.
+            _sigma_space = max(1.0, UNIFIED_BAND_BILATERAL_SIGMA_SPACE_BASE * _scale)
+            _bilateral_d = max(3, int(round(_sigma_space)) | 1)
+            C = cv2.bilateralFilter(raw_C, _bilateral_d,
+                                     UNIFIED_BAND_BILATERAL_SIGMA_COLOR, _sigma_space)
+            C = np.clip(C, 0.0, 1.0).astype(np.float32)
+        except Exception:
+            C = None
+            on_green_hsv = None
+            val = None
+    if C is None:
+        # No source plate — no confidence signal available. Falls back to tight
+        # width everywhere: the SAME degraded posture merge_ck_with_garbage_matte
+        # takes when source_rgb is absent (there: Y-position blend; here: flat zero
+        # confidence collapses W(p) to tight_px uniformly).
+        C = np.zeros((h, w), dtype=np.float32)
+
+    # --- feet erosion (design point covered in the retirement matrix): the old
+    # feet-ring-kill didn't just narrow the WIDTH budget near the feet, it eroded
+    # the silhouette itself ~1px@1920 on the OFF-GREEN side only (green side keeps
+    # raw SAM — "over green CK rules and is already tight", same reasoning as the
+    # old function). Re-expressed here as sam_for_dist: the silhouette D(p) and the
+    # eroded-SAM keep-test are measured against, tightened in the feet zone on
+    # off-green pixels only. Discovered necessary during P1 verification — tapering
+    # W/feather alone left the feet-zone pixel budget ~19% over the ±5% tolerance;
+    # the silhouette itself has to shrink there too, not just the trust radius.
+    sam_for_dist = sam
+    if not _body_exits_bottom and on_green_hsv is not None:
+        _feet_erode_r = max(1, int(round(UNIFIED_BAND_FEET_ERODE_PX_BASE * _scale)))
+        _se_feet_ub = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (_feet_erode_r * 2 + 1, _feet_erode_r * 2 + 1))
+        _sam_feet_eroded_ub = cv2.erode(sam, _se_feet_ub)
+        _feet_rows_pre = np.broadcast_to(
+            np.arange(h, dtype=np.float32)[:, None] >= feet_start, (h, w))
+        _off_green_feet_ub = _feet_rows_pre & (on_green_hsv < 0.5)
+        sam_for_dist = np.where(_off_green_feet_ub, _sam_feet_eroded_ub, sam).astype(np.uint8)
+
+    # --- D(p): exterior distance transform from the (feet-corrected) silhouette.
+    D = cv2.distanceTransform((1 - sam_for_dist).astype(np.uint8), cv2.DIST_L2, 5).astype(np.float32)
+
+    # --- W(p): width field. tight + (wide-tight)*smoothstep(C), no-down bias, feet
+    # taper (guarded), low-passed. All resolution-relative (design point 3).
+    _tight_px = UNIFIED_BAND_TIGHT_PX_BASE * _scale
+    _wide_px = UNIFIED_BAND_WIDE_PX_BASE * _scale
+    W = _tight_px + (_wide_px - _tight_px) * _ub_smoothstep(0.0, 1.0, C)
+
+    # No-down directional bias: the old sam_tight/sam_wide dilation kernels used a
+    # SINGLE-ROW structuring element (height=1) for sam_tight and a top-half-zeroed
+    # ellipse for sam_wide — both give EXACTLY ZERO vertical extent downward, not
+    # just a smaller one. An isotropic width budget (even "tight") still lets the
+    # distance-field trust a few px straight down, which doesn't match that — it
+    # measurably leaked floor pixels below the feet during P1 verification (found
+    # via direct diff against the old baseline: extra alpha concentrated in the
+    # rows well below feet_start, i.e. below the body, not near its lateral edges).
+    # So: any exterior pixel directly below the LOWEST SAM pixel in its own column
+    # gets W FORCED TO ZERO (not tight) — matching the old kernels' zero downward
+    # budget exactly, regardless of confidence.
+    col_has_sam = sam_bool.any(axis=0)
+    _rows = np.arange(h, dtype=np.int64)[:, None]
+    _bottom_of_col = np.where(
+        col_has_sam,
+        h - 1 - np.argmax(sam_bool[::-1, :], axis=0),
+        -1,
+    )[None, :]
+    downward_zone = (_bottom_of_col >= 0) & (_rows > _bottom_of_col)
+    W = np.where(downward_zone, 0.0, W)
+
+    # Feather field — starts flat at _feather_px, then gets TIGHTENED (not just W)
+    # in the no-down zone and the feet taper below. A flat wide feather in those
+    # zones let a wide, wobbly ±feather transition band survive right at the feet/
+    # floor even after W collapsed to tight — that's what blew the feet-zone pixel
+    # budget ~19% over the ±5% Berto-tuned tolerance during P1 verification (the old
+    # feet-ring-kill was a near-binary hug, not a wide continuous ramp). Tapering
+    # feather alongside W restores that same near-binary precision at the feet/floor
+    # while leaving the body/hair transition (where the crease-fix lives) untouched.
+    _feather_px = max(1.0, UNIFIED_BAND_FEATHER_PX_BASE * _scale)
+    _feather_tight_floor = max(1.0, UNIFIED_BAND_FEATHER_TIGHT_FLOOR_PX_BASE * _scale)
+    feather_field = np.full((h, w), _feather_px, dtype=np.float32)
+    feather_field = np.where(downward_zone, _feather_tight_floor, feather_field)
+
+    # Continuous feet taper near bbox bottom — DISABLED by the framing guard exactly
+    # like the old feet-ring-kill (waist-crop protection kept verbatim). Transition
+    # width is a SHORT 30px@1920 ramp (matches the old function's own
+    # transition_px=30 constant, its Y-blend fallback's ramp width), NOT a taper
+    # across the full feet-zone span — the old feet-ring-kill is a near-immediate
+    # lockdown to the tight hug for the WHOLE feet zone, not a gradual full-span
+    # taper. A full-span linear taper (tried first during P1 verification) left
+    # ~16px of generous width for most of the feet zone on confidently-green floor
+    # pixels beside the legs/feet, which is exactly the old code's feet-zone
+    # override existed to prevent — found via direct diff against the old baseline
+    # (extra alpha traced to green-floor-beside-the-leg pixels at high confidence).
+    if not _body_exits_bottom:
+        _feet_floor_px = UNIFIED_BAND_FEET_TIGHT_PX_BASE * _scale
+        _feet_transition_px = max(1.0, UNIFIED_BAND_FEET_TRANSITION_PX_BASE * _scale)
+        _row_idx = np.arange(h, dtype=np.float32)
+        _feet_t = np.clip((_row_idx - feet_start) / _feet_transition_px, 0.0, 1.0)
+        _feet_taper = np.broadcast_to((1.0 - _feet_t)[:, None], (h, w))
+        _feet_rows = np.broadcast_to(_row_idx[:, None] >= feet_start, (h, w))
+        W = np.where(_feet_rows, _feet_floor_px + (W - _feet_floor_px) * _feet_taper, W)
+        feather_field = np.where(
+            _feet_rows,
+            _feather_tight_floor + (feather_field - _feather_tight_floor) * _feet_taper,
+            feather_field,
+        )
+
+    # Low-pass W — kills local wobble from C's gradients + the distance transform's
+    # own quantization (design point 3).
+    _w_lowpass_sigma = max(1.0, UNIFIED_BAND_W_LOWPASS_SIGMA_BASE * _scale)
+    W = cv2.GaussianBlur(W, (0, 0), _w_lowpass_sigma)
+
+    # --- support = smoothstep((W-D)/feather_px). Monotonic by construction — exactly
+    # ONE transition per outward direction (design point 4). This is what removes
+    # the high-low-high double-boundary rim defect the old dual-mask blend produced.
+    support = _ub_smoothstep(-feather_field, feather_field, W - D)
+
+    # --- Keep/kill/band rule (design point 5, both reviewers' amendment). Eroded
+    # from sam_for_dist (not raw sam) so the feet-zone off-green shrink above also
+    # narrows the "always fully keep" interior there, not just the band's D(p).
+    _erode_px = max(1, int(round(UNIFIED_BAND_ERODE_PX_BASE * _scale)))
+    _se_keep = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_erode_px * 2 + 1, _erode_px * 2 + 1))
+    eroded_sam = cv2.erode(sam_for_dist, _se_keep) > 0
+
+    band_alpha = np.clip(ck * support, 0.0, 1.0).astype(np.float32)
+
+    # --- SHAPE-DISCRIMINATION PASS (P1b, 2026-07-05/06) — kills wire-shaped
+    # components in the band zone. Runs BEFORE the keep/band composite below so
+    # a shape-killed pixel never survives via the eroded-SAM keep path either
+    # (it can't — the kill only ever touches band_alpha, outside eroded_sam,
+    # per _ub_shape_kill_wire_components's own band_mask scoping). See the
+    # UNIFIED_BAND_SHAPE_* constants for the forensic finding this replaces
+    # width/confidence knob-tuning with (that path was tried and reverted —
+    # see UNIFIED_BAND_TIGHT_PX_BASE's honest-miss comment).
+    _dbg_dir = None
+    if settings.get("unified_band_debug"):
+        try:
+            import tempfile as _tf_ub
+            from pathlib import Path as _P_ub
+            _dbg_dir = _P_ub(_tf_ub.gettempdir()) / "ck_unified_band_debug"
+            _dbg_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            _dbg_dir = None
+    band_alpha, _shape_kill_mask = _ub_shape_kill_wire_components(
+        band_alpha, eroded_sam, D, _scale, source_rgb=source_rgb, debug_dir=_dbg_dir,
+        frame_idx=frame_idx)
+
+    # --- NEGATIVE-DOT BAND KILL (P1c, 2026-07-05) — operator escape hatch.
+    # Runs on whatever band_alpha the shape pass left behind (the honest-miss
+    # wire remnant). carve_points is the SAME sam_negative list solidify_sam_
+    # silhouette already consumed above for interior-hole carving — dots inside
+    # eroded_sam are ignored here (that mechanism already owns them); only
+    # band-zone dots reach this pass. See UNIFIED_BAND_DOTKILL_* constants.
+    # feet_start / _feet_floor_px_const (F2, 2026-07-05): let the dot-kill pass
+    # tighten its attach margin in the feet zone so a feet-zone dot isn't starved.
+    band_alpha, _dot_kill_mask, _dot_kill_log = _ub_dot_kill_band_components(
+        band_alpha, eroded_sam, D, _scale, carve_points,
+        feet_start=feet_start, feet_floor_px=_feet_floor_px_const,
+        debug_dir=_dbg_dir, frame_idx=frame_idx)
+    for _dk_line in _dot_kill_log:
+        try:
+            print(f"CK_LOG: {_dk_line}", flush=True)
+        except Exception:
+            pass
+
+    off_green_body = None
+    if on_green_hsv is not None:
+        # Off-green body fill — LOAD-BEARING RESCUE (body parts past the green edge,
+        # dark fabric CK has zero signal on), NOT a bypass. Part of the keep rule,
+        # gated to the eroded-SAM interior only (design point 5) — never blended
+        # into the band. 92% shadow cut kept verbatim, disabled on waist-crop.
+        _no_shadow = np.ones((h, w), dtype=np.float32)
+        if not _body_exits_bottom:
+            _y_cut = bbox_y0 + int(bbox_h * UNIFIED_BAND_SHADOW_CUT_PCT)
+            _no_shadow[_y_cut:, :] = 0.0
+        off_green_body = sam.astype(np.float32) * (1.0 - on_green_hsv) * _no_shadow
+        _feather_sigma = max(1.0, UNIFIED_BAND_OFF_GREEN_FEATHER_SIGMA_PX_BASE * _scale)
+        off_green_body = cv2.GaussianBlur(off_green_body, (0, 0), _feather_sigma)
+
+    keep_alpha = np.maximum(ck, off_green_body) if off_green_body is not None else ck.copy()
+
+    final = np.where(eroded_sam, keep_alpha, band_alpha).astype(np.float32)
+    final = np.clip(final, 0.0, 1.0)
+
+    # shadow_kill — NOT re-expressed verbatim. The old function's formula (same
+    # val<52/255 * off-green * outside-SAM test, still used for the threshold) is
+    # gated by (1-support) here, and that gate is load-bearing, not cosmetic:
+    # verbatim (ungated) shadow_kill zeroed ANY dark, off-green, outside-raw-SAM
+    # pixel regardless of how close it sat to the body — which stomped on the
+    # continuous support field exactly at dark hair/crease pixels a few px outside
+    # SAM's hard boundary, RECREATING the named forensic crease defect (row y=1190)
+    # this whole engine exists to fix (confirmed by direct diagnostic during P1
+    # build: verbatim shadow_kill reproduced the identical 4px hard-zero gap).
+    # Gating by (1-support) preserves the ORIGINAL intent (kill dark background
+    # shadow far from the body, e.g. subject shadow on the screen/floor, where
+    # support is already ~0) while never overriding a pixel the width/support
+    # field has already decided to trust.
+    if on_green_hsv is not None and val is not None:
+        shadow_kill = (
+            (val < UNIFIED_BAND_SHADOW_KILL_VAL).astype(np.float32)
+            * (1.0 - on_green_hsv)
+            * (1.0 - sam.astype(np.float32))
+            * (1.0 - support)
+        )
+        final = np.clip(final * (1.0 - shadow_kill), 0.0, 1.0).astype(np.float32)
+
+    if _dbg_dir is not None:
+        try:
+            import json as _json_ub
+            _rim_count, _rim_hits = rim_detector_scan(final, sam.astype(np.uint8), window=40)
+            _dbg_bgr = cv2.cvtColor((np.clip(final, 0, 1) * 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
+            for (_ry, _rx, _kind) in _rim_hits[:20000]:
+                cv2.circle(_dbg_bgr, (int(_rx), int(_ry)), 2, (0, 255, 255), -1)
+            cv2.imwrite(str(_dbg_dir / f"{_ub_dbg_name('unified_band_rim_overlay', frame_idx)}.png"), _dbg_bgr)
+            cv2.imwrite(str(_dbg_dir / f"{_ub_dbg_name('unified_band_confidence_C', frame_idx)}.png"),
+                        (np.clip(C, 0, 1) * 255).astype(np.uint8))
+            cv2.imwrite(str(_dbg_dir / f"{_ub_dbg_name('unified_band_support', frame_idx)}.png"),
+                        (np.clip(support, 0, 1) * 255).astype(np.uint8))
+            (_dbg_dir / f"{_ub_dbg_name('unified_band_rim_count', frame_idx)}.json").write_text(
+                _json_ub.dumps({"rim_profile_count": _rim_count}), encoding="utf-8")
+        except Exception:
+            pass  # debug dump only — never let a diagnostics failure break a real render
+
+    if return_garbage:
+        band_gate = np.where(eroded_sam, 1.0, support).astype(np.float32)
+        # Reflect the shape-pass kill in the returned gate too, so any downstream
+        # consumer of band_gate (debug tooling, future gates) stays consistent
+        # with what `final` actually contains.
+        band_gate = np.where(_shape_kill_mask, 0.0, band_gate)
+        # Reflect the operator dot-kill too — same reasoning, keep band_gate
+        # consistent with what `final` actually contains.
+        band_gate = np.where(_dot_kill_mask, 0.0, band_gate)
+        return final, np.clip(band_gate, 0.0, 1.0).astype(np.float32)
+    return final
+
+
+def dispatch_unified_band(
+    ck_alpha: np.ndarray,
+    sam_soft: Optional[np.ndarray],
+    source_rgb: Optional[np.ndarray] = None,
+    settings: Optional[dict] = None,
+    screen_type: str = "green",
+    carve_points=None,
+    return_garbage: bool = False,
+    frame_idx=None,
+):
+    """Single entry point for the P1 unified_band merge — this is what
+    ae_processor.sam_garbage_merge calls when settings['unified_band'] is truthy,
+    BEFORE the MERGE_MODE dispatch (per-session settings key, not the module
+    constant — see UNIFIED_EDGE_PLAN_2026-07-05.md). Deliberately has NO internal
+    try/except: a failure here must surface loudly to the caller, never fall
+    through to a different merge silently (design point 6).
+
+    frame_idx (F11, 2026-07-05): optional frame/seq identifier, passed straight
+    through to merge_ck_unified_band's debug-dump filenames."""
+    return merge_ck_unified_band(
+        ck_alpha, sam_soft, source_rgb=source_rgb, settings=settings,
+        screen_type=screen_type, carve_points=carve_points,
+        return_garbage=return_garbage, frame_idx=frame_idx,
+    )
