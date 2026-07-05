@@ -1759,6 +1759,72 @@ UNIFIED_BAND_DOTKILL_SNAP_RADIUS_PX_BASE = 12.0  # px @1920. If a dot lands on
     # radius snap there is far more likely to grab the wrong sliver than a
     # genuine near-miss on the intended one.
 
+# ----------------------------------------------------------------------------
+# BBOX-CROP PERFORMANCE PATH (P2 perf, 2026-07-05/06). merge_ck_unified_band's
+# per-pixel passes (HSV+bilateral C(p), distanceTransform, W-field construction,
+# solidify_sam_silhouette, shape/ridge kill, dot-kill) all run full-frame today
+# even though the profiled bodies occupy ~11% of a 4K frame. Gated behind
+# settings['unified_band_crop'] (checked by merge_ck_unified_band itself, same
+# per-session-key pattern 'unified_band' uses) — default OFF until this file's
+# own V1 bit-exactness proof (crop ON vs OFF, max_abs_diff over final AND
+# band_gate) has been run and shows 0.0 on real sessions.
+UNIFIED_BAND_CROP_DEFAULT = False  # flip True only after a clean V1 bit-exact run.
+UNIFIED_BAND_CROP_MARGIN_SAFETY_FACTOR = 2.0  # generous headroom over the
+    # analytically-derived minimum margin below (task brief: "generously e.g. 2x").
+
+
+def _ub_crop_margin_px(scale):
+    """Safe crop-margin arithmetic, in px, for the GIVEN resolution scale
+    (scale = frame_width / 1920.0, same convention every other UNIFIED_BAND_*
+    constant uses). Returns the number of px the crop rectangle must extend
+    beyond the RAW (pre-solidify) SAM bounding box in every direction so that
+    merge_ck_unified_band, run entirely on that crop, produces BIT-IDENTICAL
+    output to running it on the full frame. Two components, summed then
+    doubled (UNIFIED_BAND_CROP_MARGIN_SAFETY_FACTOR):
+
+    R1 — max distance outside the (pre-solidify) silhouette where band_alpha /
+    band_gate can be NONZERO at all. support = smoothstep(-feather, feather,
+    W - D) is EXACTLY 0 once D >= W + feather (smoothstep's own floor, not an
+    approximation). W is built as tight_px + (wide_px-tight_px)*smoothstep(C)
+    then Gaussian-low-passed and only ever TIGHTENED by the feet taper / no-
+    down zero-clamp — a Gaussian blur is a convex combination of neighboring
+    samples, so low-passing can only pull the ceiling DOWN, never past its
+    pre-blur max. So W <= UNIFIED_BAND_WIDE_PX_BASE * scale everywhere, and
+    feather_field <= UNIFIED_BAND_FEATHER_PX_BASE * scale everywhere (same
+    taper-only-tightens argument). R1 = (WIDE + FEATHER) * scale. Every
+    downstream pass (shape-kill, ridge-kill, dot-kill) can only REMOVE alpha
+    the band already has (each is clamped `& band_mask` / `& ~eroded_sam` in
+    its own code) — none of them push nonzero output further out than R1.
+
+    R2 — extra buffer so every operator with its OWN spatial kernel sees, at
+    every pixel out to R1, the identical neighborhood it would see on the
+    full frame (distanceTransform itself needs NO buffer at all: cropping
+    only discards background=1 pixels the algorithm never treats as a
+    candidate nearest-zero, and the crop is guaranteed to contain every real
+    SAM foreground/zero pixel by construction of the raw bbox, so D(p) inside
+    the crop is identical to D(p) on the full frame for every retained pixel):
+      W low-pass Gaussian:            ~3 * UNIFIED_BAND_W_LOWPASS_SIGMA_BASE * scale
+      C(p) bilateral filter:          ~   UNIFIED_BAND_BILATERAL_SIGMA_SPACE_BASE * scale
+                                            (diameter ~= sigma_space -> radius ~= half that;
+                                             using the full sigma_space keeps this a generous over-count)
+      shape attach + recover margins: (UNIFIED_BAND_SHAPE_ATTACH_MARGIN_PX_BASE
+                                        + UNIFIED_BAND_SHAPE_RECOVER_MARGIN_PX_BASE) * scale
+      dot-kill snap radius:           UNIFIED_BAND_DOTKILL_SNAP_RADIUS_PX_BASE * scale
+      ridge Hessian pre-blur:         3 * UNIFIED_BAND_SHAPE_RIDGE_SIGMA_PX px, FLAT —
+                                            this sigma is explicitly NOT scale-multiplied
+                                            (see its own constant comment: plate-texture
+                                            scale, not a body-relative one).
+    """
+    r1 = (UNIFIED_BAND_WIDE_PX_BASE + UNIFIED_BAND_FEATHER_PX_BASE) * scale
+    r2 = (
+        3.0 * UNIFIED_BAND_W_LOWPASS_SIGMA_BASE * scale
+        + UNIFIED_BAND_BILATERAL_SIGMA_SPACE_BASE * scale
+        + (UNIFIED_BAND_SHAPE_ATTACH_MARGIN_PX_BASE + UNIFIED_BAND_SHAPE_RECOVER_MARGIN_PX_BASE) * scale
+        + UNIFIED_BAND_DOTKILL_SNAP_RADIUS_PX_BASE * scale
+        + 3.0 * UNIFIED_BAND_SHAPE_RIDGE_SIGMA_PX  # flat px, not scale-multiplied
+    )
+    return int(np.ceil(UNIFIED_BAND_CROP_MARGIN_SAFETY_FACTOR * (r1 + r2)))
+
 
 def _nearest_component_label(labels, stats, ix, iy, radius, n_lbl):
     """Nearest connectedComponentsWithStats label to (ix, iy) within radius
@@ -2433,6 +2499,49 @@ def merge_ck_unified_band(
         return (ck.copy(), None) if return_garbage else ck.copy()
     h, w = ck.shape
 
+    # --- BBOX-CROP (P2 perf, 2026-07-05/06) — see _ub_crop_margin_px's docstring
+    # for the full padding proof. Crops ck/sam_raw_bin/source_rgb (and offsets
+    # carve_points) to the RAW SAM bbox + a proven-safe margin BEFORE solidify,
+    # so solidify_sam_silhouette's own cost (morph close/fill/connectedComponents)
+    # scales with crop area too, not just the per-pixel field math below it.
+    # Gated by settings['unified_band_crop'] — same per-session-key pattern as
+    # 'unified_band' itself (checked by the caller, ae_processor.sam_garbage_merge).
+    _ck_full = ck            # kept for the (practically unreachable, but shape-
+    _full_h, _full_w = h, w  # -safe) "SAM empty after solidify" early-return below.
+    _ub_crop_oy, _ub_crop_ox = 0, 0
+    _ub_cropped = False
+    if bool(settings.get("unified_band_crop", UNIFIED_BAND_CROP_DEFAULT)):
+        _raw_ys, _raw_xs = np.where(sam_raw_bin > 0)
+        if _raw_ys.size:
+            _rb_y0, _rb_y1 = int(_raw_ys.min()), int(_raw_ys.max())
+            _rb_x0, _rb_x1 = int(_raw_xs.min()), int(_raw_xs.max())
+            _ub_margin_px = _ub_crop_margin_px(float(w) / 1920.0)
+            _cy0 = max(0, _rb_y0 - _ub_margin_px)
+            _cy1 = min(h, _rb_y1 + _ub_margin_px + 1)
+            _cx0 = max(0, _rb_x0 - _ub_margin_px)
+            _cx1 = min(w, _rb_x1 + _ub_margin_px + 1)
+            if (_cy1 - _cy0) < h or (_cx1 - _cx0) < w:
+                _ub_cropped = True
+                _ub_crop_oy, _ub_crop_ox = _cy0, _cx0
+                ck = ck[_cy0:_cy1, _cx0:_cx1]
+                sam_raw_bin = sam_raw_bin[_cy0:_cy1, _cx0:_cx1]
+                if source_rgb is not None:
+                    source_rgb = np.asarray(source_rgb)[_cy0:_cy1, _cx0:_cx1]
+                if carve_points:
+                    _carve_local = []
+                    for _pt in carve_points:
+                        try:
+                            _carve_local.append((float(_pt[0]) - _cx0, float(_pt[1]) - _cy0))
+                        except (TypeError, IndexError, ValueError):
+                            _carve_local.append(_pt)  # unparseable — let the
+                            # existing per-point try/except in solidify's carve
+                            # reassert / dot-kill log + skip it, same as today.
+                    carve_points = _carve_local
+                h, w = ck.shape
+                print(f"CK_LOG: unified_band: crop ON — bbox=({_rb_x0},{_rb_y0})-"
+                      f"({_rb_x1},{_rb_y1}) margin={_ub_margin_px}px crop={w}x{h} "
+                      f"(full {_full_w}x{_full_h})", flush=True)
+
     # --- Post-solidify, post-carve silhouette. SAME shared helper the old merge and
     # the panel's SAM view call — preview == render by construction, and carve holes
     # are real background here so D(p) correctly collapses to 0 across an operator
@@ -2444,7 +2553,7 @@ def merge_ck_unified_band(
     if ys.size == 0:
         print("CK_LOG: unified_band: SAM empty after solidify (ys.size==0) — "
               "frame rendered CK-solo, no garbage protection", flush=True)
-        return (ck.copy(), None) if return_garbage else ck.copy()
+        return (_ck_full.copy(), None) if return_garbage else _ck_full.copy()
     bbox_y0, bbox_y1 = int(ys.min()), int(ys.max())
     bbox_h = max(bbox_y1 - bbox_y0, 1)
     feet_start = bbox_y0 + int(bbox_h * UNIFIED_BAND_FEET_ZONE_START_PCT)
@@ -2452,9 +2561,23 @@ def merge_ck_unified_band(
     # Framing guard — KEPT VERBATIM from merge_ck_with_garbage_matte (Berto's
     # waist-crop protection law). Disables the feet taper and the 92% shadow cut
     # below exactly like it disables the feet-ring hug in the old function.
-    _body_exits_bottom = bbox_y1 >= int(h * 0.97)
+    # bbox_y1 is CROP-LOCAL when cropping is on — the "does the body run off
+    # the bottom of the FRAME" test must compare against the TRUE frame height
+    # and the body's ABSOLUTE row, not the crop's (task brief: "pass absolute
+    # frame h, don't recompute from crop"). feet_start/the taper/no-down zone
+    # below stay crop-local on purpose — those are pure offsets of bbox_y0/h,
+    # which commute with translation, so computing them locally already gives
+    # the same rows a full-frame run would (shifted by the same crop origin).
+    _body_exits_bottom = (bbox_y1 + _ub_crop_oy) >= int(_full_h * 0.97)
 
-    _scale = float(w) / 1920.0
+    # _scale MUST reflect the TRUE FRAME resolution, not the crop's own (smaller)
+    # width — every UNIFIED_BAND_*_PX_BASE constant is calibrated "at 1920px
+    # wide" against the SOURCE frame, so scaling them against the crop width
+    # would silently shrink every width/feather/bilateral/snap-radius constant
+    # whenever cropping shrank w below the full frame (caught by V1: it turned
+    # a ~0.66 vs ~0.69 confidence difference into a 33px vs 10px W difference —
+    # _full_w is the fix, _ub_cropped or not).
+    _scale = float(_full_w) / 1920.0
     # Unconditional feet-floor width (F2, 2026-07-05): same UNIFIED_BAND_FEET_TIGHT_PX_BASE
     # the feet taper below uses, but computed regardless of _body_exits_bottom so the
     # dot-kill pass always has a feet-zone attach-margin cap available — the framing
@@ -2745,8 +2868,30 @@ def merge_ck_unified_band(
         # Reflect the operator dot-kill too — same reasoning, keep band_gate
         # consistent with what `final` actually contains.
         band_gate = np.where(_dot_kill_mask, 0.0, band_gate)
-        return final, np.clip(band_gate, 0.0, 1.0).astype(np.float32)
-    return final
+        band_gate = np.clip(band_gate, 0.0, 1.0).astype(np.float32)
+    else:
+        band_gate = None
+
+    # --- BBOX-CROP paste-back. Everywhere OUTSIDE the crop: D(p) there is >=
+    # the crop margin, which is >= R1 = (WIDE_PX_BASE + FEATHER_PX_BASE) * scale
+    # by _ub_crop_margin_px's own construction, so support == 0 EXACTLY
+    # (smoothstep's hard floor) and eroded_sam is False (the crop fully
+    # contains raw SAM, so nothing outside it is ever inside the eroded keep
+    # zone) — band_alpha == 0 there and keep_alpha is never selected there.
+    # A full-frame run of this exact function produces final == 0.0 / band_gate
+    # == 0.0 at every such pixel too, so zero-initializing the full-size
+    # canvas and pasting the crop's own result into the crop rectangle is
+    # bit-exact, not an approximation.
+    if _ub_cropped:
+        _final_full = np.zeros((_full_h, _full_w), dtype=np.float32)
+        _final_full[_ub_crop_oy:_ub_crop_oy + h, _ub_crop_ox:_ub_crop_ox + w] = final
+        final = _final_full
+        if band_gate is not None:
+            _gate_full = np.zeros((_full_h, _full_w), dtype=np.float32)
+            _gate_full[_ub_crop_oy:_ub_crop_oy + h, _ub_crop_ox:_ub_crop_ox + w] = band_gate
+            band_gate = _gate_full
+
+    return (final, band_gate) if return_garbage else final
 
 
 def dispatch_unified_band(
