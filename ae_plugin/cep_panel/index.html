@@ -1708,6 +1708,7 @@
                   <button class="clear-btn" id="clearSam" type="button">Clear</button>
                   <button class="clear-btn" id="zoneModeBtn" type="button" aria-pressed="false" title="ZONE: click to ARM, then drag an ellipse on the picture around a body part that leaves the green (feet, hands). SAM cuts tight only inside it. (Restored 2026-06-16.)">Zone</button>
                   <button class="clear-btn" id="fusionV2Main" type="button" aria-pressed="false" title="FUSION V2: new keying engine — CK untouched on green, SAM kills junk, zoned hair/feet room. Click to switch engines.">Fusion V2</button>
+                  <button class="clear-btn" id="unifiedBandMain" type="button" aria-pressed="false" title="EDGE V2: unified distance-field edge merge — one monotonic boundary, no detached rims. Mutually exclusive with Fusion V2. Click to switch engines.">Edge V2</button>
                 </div>
               </div>
               <div class="ww">
@@ -2037,6 +2038,19 @@
     if (_ubSaved === 'true') {
       unifiedBandBtn.setAttribute('aria-pressed', 'true');
     }
+    // Main-toolbar twin (Berto 2026-07-05: drawer switch invisible again — the
+    // SAME trap the 06-12 comment above documents for Fusion V2. Twin lives next
+    // to fusionV2Main; both share ONE state: unifiedBandBtn's aria-pressed +
+    // localStorage, exactly the fusion twin pattern.)
+    var unifiedBandMain = document.getElementById('unifiedBandMain');
+    function _ckSyncUnifiedBandMain() {
+      if (!unifiedBandMain) return;
+      var on = unifiedBandBtn.getAttribute('aria-pressed') === 'true';
+      unifiedBandMain.setAttribute('aria-pressed', on ? 'true' : 'false');
+      unifiedBandMain.style.borderColor = on ? '#7db8ff' : '';
+      unifiedBandMain.style.color = on ? '#7db8ff' : '';
+      unifiedBandMain.style.boxShadow = on ? '0 0 8px rgba(125,184,255,.5)' : '';
+    }
     function _ckFlipUnifiedBand() {
       const uOn = unifiedBandBtn.getAttribute('aria-pressed') === 'true';
       unifiedBandBtn.setAttribute('aria-pressed', uOn ? 'false' : 'true');
@@ -2048,8 +2062,11 @@
         const _fv2 = document.getElementById('fusionV2');
         if (_fv2 && _fv2.getAttribute('aria-pressed') === 'true') _fv2.click();
       }
+      _ckSyncUnifiedBandMain();
     }
     unifiedBandBtn.addEventListener('click', _ckFlipUnifiedBand);
+    if (unifiedBandMain) unifiedBandMain.addEventListener('click', _ckFlipUnifiedBand);
+    _ckSyncUnifiedBandMain();  // apply restored state on load
   }
 
   // ---- Advanced = EXPAND TO COCKPIT (not an accordion) ----
