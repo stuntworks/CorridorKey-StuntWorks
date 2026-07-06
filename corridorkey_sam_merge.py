@@ -1574,7 +1574,11 @@ UNIFIED_BAND_TIGHT_PX_BASE = 5.5   # matches merge_ck_with_garbage_matte's sam_t
                                     # traded away to partially help a metric that a
                                     # width/confidence-only field cannot fully solve
                                     # anyway (see honest miss below).
-UNIFIED_BAND_WIDE_PX_BASE = 20.0   # matches sam_wide's generous head/body radius.
+UNIFIED_BAND_WIDE_PX_BASE = 21.0   # sam_wide's generous head/body radius +1px
+    # @1920 (~+2px @4K), Berto request 2026-07-06: give CK more room where the
+    # backing is solid green ("CK will do the rest"). Feet are exempt by
+    # construction — the feet-zone taper overrides W toward
+    # UNIFIED_BAND_FEET_TIGHT_PX_BASE regardless of this value.
 UNIFIED_BAND_FEATHER_PX_BASE = 6.0  # support transition half-width at 1920px wide.
                                      # Tuned against the P0 corpus gate (V2-V7,
                                      # UNIFIED_EDGE_PLAN_2026-07-05.md P1 section) —
