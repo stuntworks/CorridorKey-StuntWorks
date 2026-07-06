@@ -1663,10 +1663,19 @@ UNIFIED_BAND_SHAPE_MIN_TANGENT_LEN_PX_BASE = 8.0  # px @1920. Long-side floor �
     # single-pixel chroma noise must not trigger a kill.
 UNIFIED_BAND_SHAPE_ASPECT_MIN = 4.0          # minAreaRect long/short >= this to
                                                # read as "linear," not blobby.
-UNIFIED_BAND_SHAPE_THICKNESS_CV_MAX = 0.35   # near-constant-caliber threshold —
+UNIFIED_BAND_SHAPE_THICKNESS_CV_MAX = 0.25   # near-constant-caliber threshold —
     # see the forensic finding above (crease-adjacent component measured
-    # ~0.47-0.54, comfortably above this; most genuine wire fragments in the
-    # same shot measured <=0.32).
+    # ~0.47-0.54, comfortably above this). 0.35 -> 0.25 on 2026-07-05: at 0.35
+    # Signal A false-killed short straight segments of the performer's OWN
+    # silhouette edge (back grooves + below-butt blotch, P3 render
+    # ck_batch_db203eb3be9b; attribution in D:\CLAUDE_JUNK\ck_p3_artifacts\).
+    # Known, accepted cost: wire components with cv_th in (0.25, 0.32] now
+    # survive — measured +15px genuine-wire leak on the P1b wire session
+    # (wire_regression_check.md), remedied by an operator negative dot.
+    # Berto-approved trade 2026-07-05: "wire is easier to remove by hand than
+    # getting the butt back." ASPECT_MIN / distance-from-silhouette / min-length
+    # alternatives all tested and rejected (wire and body-edge overlap on every
+    # one) — do not re-tune those knobs to chase this.
 UNIFIED_BAND_SHAPE_RECOVER_MARGIN_PX_BASE = 3.0  # px @1920. After a fragment
     # is classified wire, its kill is grown back out by this margin (>
     # attach margin) so the immediate near-body stub that attach-stripping
