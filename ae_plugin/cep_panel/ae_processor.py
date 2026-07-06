@@ -566,7 +566,18 @@ def sam_garbage_merge(alpha, sam_soft, source_rgb, settings, screen_type="green"
             alpha, binarize_sam_silhouette(sg), source_rgb=source_rgb,
             screen_type=screen_type, proximity_px=int(_buffer_px),
             carve_points=settings.get("sam_negative") or None,
-            return_garbage=return_garbage)
+            return_garbage=return_garbage,
+            # CK AUTHORITY (Berto 2026-07-06): thread settings through so
+            # merge_ck_with_garbage_matte can see them — but NOTE this engine
+            # deliberately reads ONLY the hidden settings.get("ck_authority_
+            # force_gm") key (test-only, not wired to any panel control yet);
+            # plain settings.get("ck_authority") is a no-op HERE by design
+            # (v1 scope: unified_band above is the only ck_authority-enabled
+            # path — it reads plain "ck_authority" itself). When wiring the
+            # panel checkbox, bind it to unified_band's path, not this one.
+            # Falsy default (settings dict never sets either key today) keeps
+            # this call byte-identical to before.
+            settings=settings)
     except Exception as e:
         log.warning(f"SAM merge failed, using CK alpha: {e}")
         return _ret(alpha)

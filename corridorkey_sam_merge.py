@@ -1,4 +1,4 @@
-# Last modified: 2026-05-09 | Change: v1.0 strip — remove v2.2 trimap+CFM merge. Add process_sam_matte for two-mask output mode. CK and SAM are independent now; the plugin no longer merges them.
+# Last modified: 2026-07-06 | Change: CK AUTHORITY (settings.get("ck_authority"), default OFF) — shared _ck_authority_protect_mask helper, fixes SAM cutting CK where green evidence existed. v1 SCOPE (lead review): unified_band-only — merge_ck_with_garbage_matte gates on hidden "ck_authority_force_gm" instead (measured 83% wire-leak risk there, no shape discriminator). Perf: green-evidence dilate now pyrDown/dilate/pyrUp instead of full-res ellipse. Feet: protect_soft zeroed AFTER blur, not before. Full history: git log
 """v1.0 two-mask SAM matte processing.
 
 CK matte and SAM matte are independent in v1.0. The plugin no longer
@@ -1060,6 +1060,167 @@ def solidify_sam_silhouette(sam_soft, carve_points=None):
     return _selective_carve_reassert(sam, sam_raw, carve_points)
 
 
+# ============================================================================
+# CK AUTHORITY (Berto 2026-07-06) — "SAM may not cut a pixel where CK had
+# green-screen evidence." Fixes the harness-guy back-bite (mid-back, wire/
+# harness attach point): both merge engines cut CK unconditionally wherever
+# SAM's shape + on-plate green test say "background," even when CK's own raw
+# alpha is confidently solid there. Root cause: dark harness/wire-attach
+# fabric in shadow never tests green in HSV, so neither engine's chroma
+# escape valve ever fires for it — no code anywhere checked "only let SAM
+# cut where CK confidence is low" (see the 2026-07-06 diagnosis handoff).
+#
+# Scoped narrowly on purpose — this is NOT "CK always wins." SAM's whole job
+# is killing non-green junk (rigging, walls, off-frame edges) where CK is
+# ALSO solid for lack of green; a blanket CK-wins rule would swallow that
+# too. The rule only fires where CK is solid AND the plate had green
+# evidence nearby AND the pixel isn't in the feet zone (feet stay tight,
+# standing Berto rule, non-negotiable).
+#
+# Why this can't repeat the fill_body_holes trap (07-05 handoff, rejected for
+# refilling real arm gaps): PHYSICS rules it out. A real daylight gap shows
+# the green screen straight through it, so CK is already near-transparent
+# there — ck_solid (>= CK_AUTHORITY_SOLID_T, a HIGH floor) and a real gap
+# can never coexist at the same pixel. This rule can only ever protect
+# pixels CK already considers part of the subject.
+#
+# Gated end-to-end by settings.get("ck_authority") (falsy default, same
+# opt-in pattern as "unified_band" — settings is a dict of per-session panel
+# state, threaded down from ae_processor.sam_garbage_merge). OFF is the
+# byte-identical pre-authority path: the callers below short-circuit on the
+# settings check before touching a single new array, so the hot-path wall-
+# time budget is unaffected when the toggle is off.
+#
+# v1 SCOPE (lead review, 2026-07-06 follow-up): ships unified_band-only.
+# merge_ck_with_garbage_matte requires the SEPARATE, hidden
+# settings.get("ck_authority_force_gm") key — plain "ck_authority" is a
+# no-op in that engine. Reason: measured 521/625px (83%) real-wire
+# resurrection on the ck_session_db1e94240509907cf0f87d1a ground-truth clip
+# when this ran on that engine (see that function's own DANGER ZONE HIGH
+# comment for the full account) — unified_band is safe because its
+# post-band shape-kill/dot-kill passes (_ub_shape_kill_wire_components /
+# _ub_dot_kill_band_components) run AFTER this rule's support boost and
+# still catch real wire; garbage_matte has no equivalent discriminator, so
+# nothing there would stop a resurrected wire pixel from shipping. The
+# force_gm key exists only so this engine's path stays reachable for future
+# testing/debugging — it is NOT wired to any panel control.
+# ============================================================================
+CK_AUTHORITY_SOLID_T = 0.90  # ck_solid floor — CK's OWN raw alpha (pre-SAM-
+                              # gate, pre-garbage-matte) must be this confident
+                              # before it can override SAM. High on purpose:
+                              # this is an override of SAM's cut, not a normal
+                              # keep threshold, and a real gap's CK alpha sits
+                              # far below this (see the physics note above).
+CK_AUTHORITY_NEAR_BODY_PX_BASE = 12.0  # px @1920. Protection only reaches
+                                        # this far beyond the SAM silhouette —
+                                        # keeps the rule scoped to the body
+                                        # edge, not far-field junk that also
+                                        # happens to read CK-solid (e.g. a
+                                        # green-tinted wall column CK never
+                                        # touched).
+CK_AUTHORITY_GREEN_EVIDENCE_PX_BASE = 40.0  # px @1920. on_green_hsv dilation
+                                              # radius — the "had green
+                                              # evidence nearby" test. Wide on
+                                              # purpose: a harness pocket can
+                                              # sit well inside the green
+                                              # backing's own footprint
+                                              # without a single HSV-green
+                                              # pixel directly under it
+                                              # (local shadow eats the hue
+                                              # signal; the screen behind it
+                                              # did not stop being there).
+
+
+def _ck_authority_protect_mask(ck, dist_from_sam, on_green_hsv, scale,
+                                feet_start=None, edge_sigma=1.0):
+    # WHAT IT DOES: Builds the shared CK-authority protection field — the soft
+    #   [0,1] mask of pixels where SAM is NOT allowed to cut, because CK's own
+    #   raw alpha is solid AND there was green-screen evidence nearby AND the
+    #   pixel isn't in the feet zone. Both merge engines
+    #   (merge_ck_with_garbage_matte, merge_ck_unified_band) call this ONE
+    #   function and apply its output the same way: raise the SAM-side gate
+    #   to 1.0 where protected, so the final composite reduces to CK's own
+    #   alpha at those pixels.
+    # DEPENDS ON: CK_AUTHORITY_SOLID_T, CK_AUTHORITY_NEAR_BODY_PX_BASE,
+    #   CK_AUTHORITY_GREEN_EVIDENCE_PX_BASE. Caller supplies dist_from_sam
+    #   (exterior distance-transform from the binary SAM silhouette — 0
+    #   INSIDE the SAM silhouette by construction, since distanceTransform
+    #   measures distance to the nearest zero pixel and the silhouette's
+    #   interior IS the zero region of the (1 - sam) input both engines feed
+    #   it) and on_green_hsv (the raw binary-ish on-screen-color test each
+    #   engine already computes from source_rgb; None if no plate was
+    #   available). No raw SAM mask param needed here — dist_from_sam already
+    #   encodes everything this function needs from it.
+    # AFFECTS: only settings.get("ck_authority") (unified_band) / settings.get(
+    #   "ck_authority_force_gm") (garbage_matte, hidden/testing-only) sessions
+    #   — callers gate the call itself on those keys, this function has no
+    #   opinion on which one fired. When on_green_hsv is None this returns an
+    #   all-zero mask: no plate, no green-evidence signal, no authority
+    #   (never protects blind). When feet_start is given, rows >= feet_start
+    #   are always zeroed on the FINAL soft mask (see the feet-zone note
+    #   below — must happen AFTER the blur, not before).
+    import cv2
+    if on_green_hsv is None:
+        return np.zeros(ck.shape, dtype=np.float32)
+    ck_arr = np.asarray(ck)
+    h, w = ck_arr.shape[:2]
+    ck_solid = ck_arr >= CK_AUTHORITY_SOLID_T
+    near_body = np.asarray(dist_from_sam) < (CK_AUTHORITY_NEAR_BODY_PX_BASE * scale)
+
+    # PERF (lead follow-up, 2026-07-06): the exact full-res cv2.dilate here
+    # measured ~950ms alone at 4K (171x171 ellipse kernel, 40px@1920 radius —
+    # see D:\CLAUDE_JUNK\ck_authority\check6_walltime.py) and blew the 1.8s
+    # merge budget on its own. green_evidence is a COARSE "was there green
+    # nearby" neighborhood test, not a matte edge — a few px of drift at ITS
+    # OWN boundary (not the final matte edge, which is still set by the
+    # GaussianBlur feather below + the caller's own composite) is acceptable.
+    # pyrDown twice (~4x linear reduction, ~16x fewer pixels) before dilating
+    # at 1/4 the kernel radius on the shrunk image, then pyrUp twice and
+    # re-threshold. Approximates the full-res isotropic growth within ~1-4px
+    # at 4K (pyramid halving is the standard cheap approximation for a large
+    # morphological radius — see check6_walltime.py's before/after numbers
+    # for the measured wall-time win, and check2/bite_heal numbers for proof
+    # this doesn't change which pixels get protected in practice).
+    _green_soft = (np.asarray(on_green_hsv) >= 0.5).astype(np.float32)
+    _small = cv2.pyrDown(cv2.pyrDown(_green_soft))
+    _green_r_small = max(1, int(round(CK_AUTHORITY_GREEN_EVIDENCE_PX_BASE * scale / 4.0)))
+    _se_green_small = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (_green_r_small * 2 + 1, _green_r_small * 2 + 1))
+    # Low rebinarize threshold (0.25, not 0.5): pyrDown's gaussian pre-blur
+    # softens a hard binary blob's edges before the second halving — a 0.5
+    # cut there would erode small/thin green regions away before they ever
+    # reach the dilate. 0.25 keeps them, matching the "acceptable drift, not
+    # acceptable loss" instruction (a wider evidence radius is safe per the
+    # physics note above; a NARROWER one risks missing real evidence).
+    _small_bin = (_small > 0.25).astype(np.uint8)
+    _dilated_small = cv2.dilate(_small_bin, _se_green_small)
+    _up = cv2.pyrUp(cv2.pyrUp(_dilated_small.astype(np.float32)))
+    if _up.shape[:2] != (h, w):
+        _up = cv2.resize(_up, (w, h), interpolation=cv2.INTER_LINEAR)
+    green_evidence = _up >= 0.5
+
+    protect = ck_solid & near_body & green_evidence
+    protect_soft = cv2.GaussianBlur(protect.astype(np.float32), (0, 0), max(1.0, float(edge_sigma)))
+    protect_soft = np.clip(protect_soft, 0.0, 1.0).astype(np.float32)
+
+    # FEET (lead follow-up, 2026-07-06): zero the feet zone AFTER the blur,
+    # not before. Blurring a mask that was already hard-zeroed below
+    # feet_start still lets the Gaussian kernel smear a few residual px of
+    # soft protection PAST feet_start into the tight feet-hug zone (found on
+    # ck_session_5a4037a4: +307px / +0.38% on the P2 feet gate with the old
+    # before-blur ordering). Zeroing the already-blurred output is a hard cut
+    # with no further smear — feet-zone contribution is now exactly 0.0, not
+    # "mostly 0".
+    # feet_start <= 0 is degenerate — a near-empty/failed SAM bbox (SAM found
+    # no real subject), not a legit "feet start at the top row" case. Zeroing
+    # from row 0 there would silently disable authority frame-wide and mask
+    # the real SAM failure. Treat it as no-feet-info instead (same convention
+    # _body_exits_bottom already uses for the "skip the feet-only rules" case).
+    if feet_start is not None and feet_start > 0:
+        protect_soft[feet_start:, :] = 0.0
+    return protect_soft
+
+
 def merge_ck_with_garbage_matte(
     ck_alpha: np.ndarray,
     sam_silhouette: Optional[np.ndarray],
@@ -1068,6 +1229,7 @@ def merge_ck_with_garbage_matte(
     proximity_px: Optional[int] = None,
     carve_points=None,
     return_garbage: bool = False,
+    settings: Optional[dict] = None,
 ):
     """CK × zoned_dilated_SAM + chroma escape valve for hair.
 
@@ -1082,8 +1244,20 @@ def merge_ck_with_garbage_matte(
     of a tuple, so callers can surface it as a stable garbage-matte sidecar.
     Default False keeps the single-array return — every existing caller (the
     Resolve plugin's 6 call sites included) is untouched.
+
+    settings (Berto 2026-07-06, scope-narrowed by lead review same day):
+    optional per-session dict. Only settings.get("ck_authority_force_gm") is
+    read here — NOT plain "ck_authority" (that key is a no-op in THIS
+    engine; unified_band is the only ck_authority-enabled path in v1). See
+    the DANGER ZONE HIGH comment at this function's application block, and
+    the CK_AUTHORITY_* constants + _ck_authority_protect_mask above
+    solidify_sam_silhouette, for the full why. None (every existing caller —
+    Resolve x6, ComfyUI — never passes either key) keeps the exact
+    pre-authority behavior.
     """
     import cv2
+
+    settings = settings or {}
 
     # proximity_px accepted for API compat (Resolve caller signature unchanged).
     # No longer drives dilation width or escape radius — fixed+scaled constants below.
@@ -1247,6 +1421,12 @@ def merge_ck_with_garbage_matte(
     # Proximity-limited chroma escape valve — reuses on_green_hsv from above.
     # CK hair beyond the dilation boundary passes on green pixels near the body.
     # Distant walls with green tint are still killed by the near_sam distance gate.
+    # dist_from_sam initialized None here (CK AUTHORITY, Berto 2026-07-06): this
+    # try-block is the first place it gets computed from the identical `sam`; the
+    # authority block further down reuses it instead of recomputing, but this
+    # block can fail/skip, so the authority block still falls back to its own
+    # compute when it's still None.
+    dist_from_sam = None
     if on_green_hsv is not None:
         try:
             sam_inv = (1 - sam).astype(np.uint8)
@@ -1258,6 +1438,72 @@ def merge_ck_with_garbage_matte(
             garbage_matte = np.maximum(garbage_matte, on_green_hsv * near_sam)
         except Exception:
             pass
+
+    # CK AUTHORITY (Berto 2026-07-06) — HIDDEN/TESTING-ONLY key in this
+    # engine: settings.get("ck_authority_force_gm"), NOT plain "ck_authority"
+    # (lead review, same day, v1 SCOPE decision — see the module-level CK
+    # AUTHORITY banner above solidify_sam_silhouette). Own try/except,
+    # separate from the chroma-escape-valve's above: this rule must not
+    # depend on (or be able to break) that valve. Guarded on the settings key
+    # FIRST — sessions without ck_authority_force_gm never touch a new array
+    # here, keeping the hot-path wall-time budget unaffected (and plain
+    # "ck_authority" alone, without the _force_gm key, is ALSO a no-op here —
+    # this is intentional, not a bug). Raises the SAM-side gate to 1.0 where
+    # protected, so `final = ck * garbage_matte` below reduces to CK's own
+    # alpha at those pixels — SAM's cut is overridden, not blended.
+    # _protect_soft stays None when off (or on exception) — the shadow_kill
+    # pass further down checks this and only applies its own guard when it
+    # is a real array, so an off/failed session's shadow_kill is bit-identical
+    # to before this feature existed.
+    #
+    # DANGER ZONE HIGH (measured during 2026-07-06 verification — THIS IS WHY
+    # THE GATE ABOVE IS HIDDEN, not a leftover warning): on
+    # ck_session_db1e94240509907cf0f87d1a (the wire-regression ground-truth
+    # clip), turning this rule on in THIS engine resurrects 521 of 625
+    # ground-truth real-wire pixels — 83% — measured via
+    # D:\CLAUDE_JUNK\ck_authority\check3_wire_regression.py, wire_regression_
+    # results.json. Cause: real support wire runs close beside the body AND
+    # crosses in front of the green screen, so it can satisfy ck_solid +
+    # near_body + green_evidence exactly like a real harness bite does — this
+    # function has no shape/wire discriminator to tell them apart. The
+    # PREREQUISITE that makes plain "ck_authority" safe on unified_band is
+    # its post-band shape-kill/dot-kill pass
+    # (_ub_shape_kill_wire_components / _ub_dot_kill_band_components, run
+    # AFTER that engine's own support boost — see merge_ck_unified_band's own
+    # ck_authority block below in this file): that pass independently proved
+    # 0% new wire leak on the SAME ground-truth clip specifically because it
+    # re-evaluates every band pixel for wire-shape AFTER the authority boost
+    # and still kills real wire regardless. This engine has NO equivalent
+    # pass, so nothing here would stop a resurrected wire pixel from
+    # shipping — do not wire ck_authority_force_gm to any panel control, and
+    # do not change the gate above to plain "ck_authority" until either (a)
+    # this engine gains an equivalent shape/wire discriminator, or (b) Berto
+    # explicitly accepts the wire trade-off for this engine.
+    # Strict `is True` on purpose: settings is merged unfiltered JSON
+    # (ae_processor.load_settings), so a hand-edited string like "false" is
+    # still truthy in Python — only an actual JSON `true` may arm this.
+    _protect_soft = None
+    if settings.get("ck_authority_force_gm") is True and on_green_hsv is not None:
+        try:
+            print("CK_LOG: ck_authority ACTIVE via hidden ck_authority_force_gm "
+                  "(garbage_matte engine, wire-leak DANGER ZONE)", flush=True)
+            # Reuse dist_from_sam computed in the escape-valve block above (same
+            # `sam`) when it's available; that block's own try may still have
+            # failed even though on_green_hsv is not None here too, so fall
+            # back to computing our own rather than assume it exists.
+            if dist_from_sam is None:
+                _sam_inv_auth = (1 - sam).astype(np.uint8)
+                dist_from_sam = cv2.distanceTransform(_sam_inv_auth, cv2.DIST_L2, 5)
+            _protect_soft = _ck_authority_protect_mask(
+                ck, dist_from_sam, on_green_hsv, _scale,
+                feet_start=(None if _body_exits_bottom else feet_start),
+                edge_sigma=_gate_sigma,
+            )
+            garbage_matte = np.maximum(garbage_matte, _protect_soft)
+        except Exception as _auth_exc:
+            print(f"CK_LOG: ck_authority FAILED, continuing without protection: {_auth_exc}",
+                  flush=True)
+            _protect_soft = None
 
     final = np.clip(ck * garbage_matte, 0.0, 1.0).astype(np.float32)
 
@@ -1297,6 +1543,16 @@ def merge_ck_with_garbage_matte(
                 _fix_u8 = cv2.resize(_fix_u8, (w, h), interpolation=cv2.INTER_AREA)
             _hsv_kill = cv2.cvtColor(cv2.cvtColor(_fix_u8, cv2.COLOR_RGB2BGR), cv2.COLOR_BGR2HSV)
             shadow_kill = ((_hsv_kill[..., 2] < 52).astype(np.float32) * (1.0 - on_green_hsv) * (1.0 - sam.astype(np.float32)))
+            # CK AUTHORITY guard (Berto 2026-07-06): shadow_kill is unconditional —
+            # dark + off-green + outside-raw-SAM, no distance/confidence gate of its
+            # own (unlike unified_band's equivalent pass, which is naturally gated by
+            # (1-support) and so needs no separate guard). Without this, shadow_kill
+            # would zero the EXACT harness-bite pixels ck_authority just protected
+            # (dark, off-green, outside SAM's own bite in the silhouette there),
+            # silently undoing the fix a few lines above. No-op when _protect_soft
+            # is None (toggle off or the block above failed) — bit-identical then.
+            if _protect_soft is not None:
+                shadow_kill = shadow_kill * (1.0 - _protect_soft)
             final = np.clip(final * (1.0 - shadow_kill), 0.0, 1.0).astype(np.float32)
         except Exception:
             pass
@@ -1316,6 +1572,7 @@ def merge_ck_with_sam_active(
     proximity_px: Optional[int] = None,
     carve_points=None,
     return_garbage: bool = False,
+    settings: Optional[dict] = None,
 ) -> np.ndarray:
     # WHAT IT DOES: Dispatcher for the active merge mode. Routes based on
     #   MERGE_MODE flag: "garbage_matte" (new), "chroma_gated" (v2.3),
@@ -1325,6 +1582,12 @@ def merge_ck_with_sam_active(
     #   (alpha, garbage_matte_or_None). Only the garbage_matte mode produces a
     #   real gate; every other mode returns None for it. Default False keeps the
     #   single-array return so all existing callers (Resolve x6, previews) are safe.
+    # settings (Berto 2026-07-06): optional per-session dict, forwarded to the
+    #   garbage_matte engine only (settings.get("ck_authority_force_gm") —
+    #   see merge_ck_with_garbage_matte's docstring; plain "ck_authority" is
+    #   a no-op there by design, v1 scope is unified_band-only). None (every
+    #   caller that doesn't know about this key — Resolve x6, ComfyUI,
+    #   chroma_gated/path_b fallbacks) keeps the exact pre-authority behavior.
     def _ret(x):
         return (x, None) if return_garbage else x
     if sam_silhouette is None:
@@ -1337,6 +1600,7 @@ def merge_ck_with_sam_active(
                 proximity_px=proximity_px,
                 carve_points=carve_points,
                 return_garbage=return_garbage,
+                settings=settings,
             )
         except Exception:
             try:
@@ -2772,6 +3036,36 @@ def merge_ck_unified_band(
     _erode_px = max(1, int(round(UNIFIED_BAND_ERODE_PX_BASE * _scale)))
     _se_keep = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_erode_px * 2 + 1, _erode_px * 2 + 1))
     eroded_sam = cv2.erode(sam_for_dist, _se_keep) > 0
+
+    # CK AUTHORITY (Berto 2026-07-06) — settings.get("ck_authority"), OFF by
+    # default. See CK_AUTHORITY_* constants + _ck_authority_protect_mask
+    # (shared with merge_ck_with_garbage_matte, defined above
+    # solidify_sam_silhouette) for the full why. D(p) computed above is
+    # ALREADY the exterior distance from the (feet-corrected) SAM silhouette
+    # — zero inside SAM by construction — so this is the near_body measure
+    # the rule needs at no extra distance-transform cost.
+    #
+    # Placement is deliberate: AFTER support/eroded_sam, BEFORE band_alpha, so
+    # the shape-kill and dot-kill passes immediately below (which operate on
+    # band_alpha) run on TOP of this boosted support and keep final say over
+    # any protected pixel — an operator's negative dot or a real wire-shape
+    # verdict must still win. Do not reorder those passes relative to this
+    # block; only touch `support` here.
+    # Strict `is True` on purpose: settings is merged unfiltered JSON
+    # (ae_processor.load_settings), so a hand-edited string like "false" is
+    # still truthy in Python — only an actual JSON `true` may arm this.
+    if settings.get("ck_authority") is True and on_green_hsv is not None:
+        try:
+            print("CK_LOG: ck_authority ACTIVE (unified_band)", flush=True)
+            _protect_soft = _ck_authority_protect_mask(
+                ck, D, on_green_hsv, _scale,
+                feet_start=(None if _body_exits_bottom else feet_start),
+                edge_sigma=max(1.0, UNIFIED_BAND_OFF_GREEN_FEATHER_SIGMA_PX_BASE * _scale),
+            )
+            support = np.maximum(support, _protect_soft)
+        except Exception as _auth_exc:
+            print(f"CK_LOG: ck_authority FAILED, continuing without protection: {_auth_exc}",
+                  flush=True)
 
     band_alpha = np.clip(ck * support, 0.0, 1.0).astype(np.float32)
 
