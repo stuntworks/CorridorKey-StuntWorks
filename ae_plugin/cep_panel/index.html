@@ -1807,6 +1807,21 @@
                 <span class="w-row"><b>Why.</b> Targets the detached-rim crease defect without re-opening wire/strap bites. Requires SAM. Default OFF — not yet corpus-gated (P2) or Berto eye-test approved (P3).</span>
               </div>
             </div>
+
+            <div class="cell">
+              <div class="cell-top">
+                <span class="cell-title">CK Authority</span>
+                <div class="cell-control">
+                  <button class="pswitch" id="ckAuthority" type="button" aria-pressed="false" aria-label="CK Authority — SAM cannot cut where CK had green evidence">
+                    <span class="knob"></span>
+                  </button>
+                </div>
+              </div>
+              <div class="ww">
+                <span class="w-row"><b>What.</b> SAM may not cut a pixel where CK's own alpha is solid and green screen existed nearby. Heals SAM shadow-bites (harness back hole class).</span>
+                <span class="w-row"><b>Why.</b> CK is the matte; SAM is garbage only. Works with Edge V2 ONLY (its wire killer keeps rigging cleanup safe — measured 83% wire resurrection without it, so the old engine ignores this switch). Feet stay tight. Default OFF.</span>
+              </div>
+            </div>
           </div>
 
         </div>
@@ -2067,6 +2082,26 @@
     unifiedBandBtn.addEventListener('click', _ckFlipUnifiedBand);
     if (unifiedBandMain) unifiedBandMain.addEventListener('click', _ckFlipUnifiedBand);
     _ckSyncUnifiedBandMain();  // apply restored state on load
+  }
+
+  // CK AUTHORITY (2026-07-06) — cloned from the unified_band toggle pattern
+  // directly above. Global persisted state, DEFAULT OFF. Engine-side it only
+  // does anything on the unified_band path (merge module reads plain
+  // "ck_authority" in that engine ONLY; the garbage_matte engine deliberately
+  // ignores it — 83% measured wire resurrection there, see the DANGER ZONE
+  // comment in corridorkey_sam_merge.py). So no UI coupling to the Edge V2
+  // switch is needed: with Edge V2 off this key is a safe no-op by design.
+  const ckAuthorityBtn = document.getElementById('ckAuthority');
+  if (ckAuthorityBtn) {
+    if (localStorage.getItem('ck_global_ck_authority') === 'true') {
+      ckAuthorityBtn.setAttribute('aria-pressed', 'true');
+    }
+    ckAuthorityBtn.addEventListener('click', function () {
+      const aOn = ckAuthorityBtn.getAttribute('aria-pressed') === 'true';
+      ckAuthorityBtn.setAttribute('aria-pressed', aOn ? 'false' : 'true');
+      localStorage.setItem('ck_global_ck_authority', aOn ? 'false' : 'true');
+      ckLog('ck_authority toggle: ' + (aOn ? 'off' : 'on'));
+    });
   }
 
   // ---- Advanced = EXPAND TO COCKPIT (not an accordion) ----
@@ -3175,6 +3210,11 @@ function ckGetSettings() {
     const green_kill = greenKillEl ? (greenKillEl.getAttribute('aria-pressed') === 'true') : false;
     const samTemporalGuardEl = document.getElementById('samTemporalGuard');
     const sam2_temporal_guard_enabled = samTemporalGuardEl ? (samTemporalGuardEl.getAttribute('aria-pressed') === 'true') : false;
+    // CK AUTHORITY (2026-07-06): engine acts on it only when unified_band is
+    // also true (JSON true, strict is-True check python-side) — safe no-op
+    // on the default engine by design.
+    const ckAuthorityEl = document.getElementById('ckAuthority');
+    const ck_authority = ckAuthorityEl ? (ckAuthorityEl.getAttribute('aria-pressed') === 'true') : false;
     const settings = {
         screenType: screenType,
         despill: despill,
@@ -3191,7 +3231,8 @@ function ckGetSettings() {
         fusion_expand: (function(){ var e=document.getElementById('fusionExpand'); return e ? (parseInt(e.value,10)||6) : 6; })(),
         green_kill: green_kill,
         sam2_temporal_guard_enabled: sam2_temporal_guard_enabled,
-        unified_band: unified_band
+        unified_band: unified_band,
+        ck_authority: ck_authority
     };
     ckLog('fusion_v2: ' + (fusion_v2 ? 'on' : 'off') + ' at settings build');
     ckLog('unified_band: ' + (unified_band ? 'on' : 'off') + ' at settings build');
