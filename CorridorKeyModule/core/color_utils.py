@@ -398,12 +398,16 @@ def clean_matte_torch(alpha: torch.Tensor, area_threshold: int, dilation: int = 
 
 
 def create_checkerboard(
-    width: int, height: int, checker_size: int = 64, color1: float = 0.2, color2: float = 0.4
+    width: int, height: int, checker_size: int = 64, color1: float = 0.8, color2: float = 1.0
 ) -> np.ndarray:
     """
     Creates a linear grayscale checkerboard pattern.
     Returns: Numpy array [H, W, 3] float (0.0-1.0)
     """
+    # Default colors 0.8/1.0 (light gray / white) match After Effects'
+    # transparency grid (Berto 2026-07-10; was 0.2/0.4 dark gray). Callers
+    # that want a different look pass color1/color2 explicitly
+    # (backend.py / inference_engine.py already do).
     # Create coordinate grids
     x = np.arange(width)
     y = np.arange(height)
