@@ -217,6 +217,48 @@ _SAM_WARM_DISABLE = False  # RE-ENABLED 2026-06-22: warm cache was wrongly suspe
 OFF_GREEN_CHOKE_PX  = 0.0   # DISABLED: blanket off-green erode ate dark subject edges (pants hem broke up). Needs a smarter rim-only fix.
 OFF_GREEN_FEATHER_PX = 1.0  # gaussian feather applied to the choked region
 
+# ── Edge color decontamination (Berto 2026-07-11) ─────────────
+# CK never does true fg-color unmixing at a soft-alpha edge — apply_despill()
+# above only pulls green spill OUT of the foreground color, it never replaces
+# a pixel's color entirely. So a semi-transparent edge pixel (0 < alpha < 1)
+# whose plate color came from a DARK OFF-GREEN backing (unlit floor/table/car)
+# keeps that dark color verbatim; composited over ANY background it reads as a
+# visible dark rim at every subject/dark-object contact point. Proven at the
+# shoes (D:\CLAUDE_JUNK\ck_feet_ring\ — that fix hardens the ALPHA ramp in the
+# feet zone only, an accepted motion-blur trade acceptable there but not
+# elsewhere). This block is the general form: keep the alpha ramp untouched
+# everywhere, RECOLOR the RGB of the qualifying edge band toward the nearest
+# solid-foreground color instead. See the CK_EDGE_DECON block inside
+# apply_matte_postproc (below) for the implementation.
+#
+# Reference pixels at 1920-wide source, scaled by the matte's own resolution
+# at call time (same convention as OFF_GREEN_CHOKE_PX above / the *_PX_BASE
+# constants in corridorkey_sam_merge.py).
+CK_EDGE_DECON_REACH_PX_BASE = 6.0
+    # How far (in the exterior distance-from-solid-body field) a semi-transparent
+    # off-green pixel may sit and still qualify for recoloring. ~13px @4K. Chosen
+    # so it comfortably spans the shoe/floor ring width this was proven against
+    # (ck_feet_ring: 2-3px mean ring @1920-equivalent) with margin for other
+    # contact geometries (hand-on-table, body-against-car), while stopping well
+    # short of a detached/flying-hair wisp's typical multi-tens-of-px gap from
+    # the silhouette — that gap protection is the whole reason this is a REACH
+    # limit and not an unconditional off-green recolor.
+CK_EDGE_DECON_STRENGTH = 1.0
+    # Blend factor, original RGB -> pulled RGB. 1.0 = full replace (the ring
+    # should read AS the subject's own edge color, not a partial mix that still
+    # shows some backing-color bleed). Alpha is never touched by this block —
+    # color only.
+CK_EDGE_DECON_MIN_BODY_DIM_PX_BASE = 40.0
+    # Wire safety (task brief item 3): the color SOURCE must be a LARGE solid
+    # component (the body), not a small solid blob a wire remnant might touch.
+    # Expressed as an equivalent square side length at 1920-wide so the derived
+    # area floor stays resolution-relative like every other constant here:
+    # min_area = (CK_EDGE_DECON_MIN_BODY_DIM_PX_BASE * scale) ** 2. A real body
+    # part (hand, torso, leg) clears this trivially at any normal framing; a
+    # thin wire's own connected-component area would need to be absurdly long
+    # to reach it (wires are typically 2-4px wide after shape-kill/dot-kill
+    # have already run upstream in corridorkey_sam_merge.py).
+
 
 def _get_video_predictor(cfg: str, ckpt: str, device: str):
     _ensure_determinism()
@@ -787,6 +829,189 @@ def apply_matte_postproc(fg_rgb, alpha_raw, settings, sam_soft=None, source_rgb=
             except Exception as _e_og:
                 log.warning(f"off_green_choke skipped: {_e_og}")
     # ── end off-green edge choke ──────────────────────────────
+
+    # ── EDGE COLOR DECONTAMINATION (Berto 2026-07-11) ─────────────
+    # WHAT IT DOES: recolors semi-transparent off-green edge pixels (the dark-
+    #   ring problem — see CK_EDGE_DECON_* constants at module top for the full
+    #   forensic why) toward the nearest LARGE solid-foreground color. Alpha is
+    #   never touched here — color only. Runs on the FINAL alpha (after choke/
+    #   despeckle/off-green-choke above), so it sees exactly what the shipped
+    #   render/preview will use.
+    # DEPENDS ON: settings['unified_band'] (Edge V2 only — the only engine this
+    #   was verified against; gate keeps every other merge path byte-identical),
+    #   source_rgb (recomputes its own on-green classification locally — same
+    #   HSV bounds as the off-green edge choke block above — so this block can
+    #   be deleted or re-gated independently without touching that one).
+    # AFFECTS: fg_rgb only, strictly inside CK_EDGE_DECON_REACH_PX_BASE of the
+    #   largest connected alpha>=0.95 component. A detached/flying-hair wisp
+    #   with no nearby solid body, or a wire remnant with no LARGE solid
+    #   neighbor, is provably untouched (both the reach cap and the min-body-
+    #   size floor gate on that independently — see constants above).
+    # CK_EDGE_DECON_STRENGTH <= 0 is a full early-exit (not just a no-op blend)
+    # — lets a forensics/A-B harness toggle this block off in-process without
+    # touching the unified_band gate itself, and keeps a hand-edited "strength
+    # 0" settings-adjacent knob genuinely free instead of paying the distance-
+    # transform/connected-components cost for zero visual effect.
+    if bool(settings.get("unified_band", False)) and CK_EDGE_DECON_STRENGTH > 0.0:
+        try:
+            _src_dc = source_rgb if source_rgb is not None else None
+            if _src_dc is None:
+                # PARITY VISIBILITY (gate item 4): unified_band is on but there's no
+                # source plate to classify on/off-green with, so this block fails
+                # closed (no-ops) rather than guessing. That's the right call, but it
+                # is otherwise SILENT — cmd_postproc's PREVIEW path only has
+                # source_rgb when plate.png was cached, while cmd_batch's RENDER path
+                # always has the live decoded frame. Left quiet, PREVIEW would show
+                # less edge cleanup than RENDER with no trail, violating the project's
+                # preview=render law invisibly. Loud print instead.
+                print("CK_LOG: edge_decon SKIPPED — no source plate; preview may "
+                      "show less cleanup than render", flush=True)
+            if _src_dc is not None:
+                _h_dc, _w_dc = alpha.shape[:2]
+                _src_dc_arr = _np_r.asarray(_src_dc)
+                if _src_dc_arr.shape[:2] == (_h_dc, _w_dc):
+                    _scale_dc = max(_w_dc, 1) / 1920.0
+                    _reach_px_dc = max(1.0, CK_EDGE_DECON_REACH_PX_BASE * _scale_dc)
+                    _min_body_area_dc = (CK_EDGE_DECON_MIN_BODY_DIM_PX_BASE * _scale_dc) ** 2
+
+                    # PERF (measured 2026-07-11: ~230-270ms full-frame at native 4K,
+                    # dominated by on-green HSV conversion + connectedComponents +
+                    # distanceTransformWithLabels + np.where, each a full-frame pass —
+                    # see D:\CLAUDE_JUNK\ck_edge_decon\microbenchmark.py). BBOX-CROP
+                    # to the alpha-nonzero region before doing any of that: every
+                    # possible TARGET pixel requires alpha>0.05 by definition, and
+                    # every possible BODY (color-source) pixel requires alpha>=0.95
+                    # — both are subsets of {alpha>0.05}, which is itself a compact
+                    # region hugging the silhouette (unified_band's own W+feather
+                    # fields are bounded, so alpha decays to 0 within a few tens of
+                    # px of the body on every side). So cropping to this bbox (+a
+                    # small safety pad for the distance transform's discrete raster
+                    # passes at the crop edge) is EXACT, not an approximation — it
+                    # cannot exclude a body seed or a target pixel that the full-
+                    # frame computation would have found.
+                    _dc_ys, _dc_xs = _np_r.where(alpha > 0.05)
+                    if _dc_ys.size:
+                        _dc_pad = int(_np_r.ceil(_reach_px_dc)) + 4
+                        _dc_y0 = max(0, int(_dc_ys.min()) - _dc_pad)
+                        _dc_y1 = min(_h_dc, int(_dc_ys.max()) + _dc_pad + 1)
+                        _dc_x0 = max(0, int(_dc_xs.min()) - _dc_pad)
+                        _dc_x1 = min(_w_dc, int(_dc_xs.max()) + _dc_pad + 1)
+                        _alpha_c = alpha[_dc_y0:_dc_y1, _dc_x0:_dc_x1]
+                        _src_c = _src_dc_arr[_dc_y0:_dc_y1, _dc_x0:_dc_x1]
+
+                        # on-green classification — SAME HSV bounds as the off-green
+                        # edge choke block above (hue 35-85, sat/val >=50).
+                        if _src_c.dtype in (_np_r.float32, _np_r.float64):
+                            _u8_dc = (_np_r.clip(_src_c, 0.0, 1.0) * 255).astype(_np_r.uint8)
+                        else:
+                            _u8_dc = _np_r.clip(_src_c, 0, 255).astype(_np_r.uint8)
+                        if _u8_dc.ndim == 2:
+                            _u8_dc = _np_r.stack([_u8_dc, _u8_dc, _u8_dc], axis=-1)
+                        _bgr_dc = _cv2_r.cvtColor(_u8_dc, _cv2_r.COLOR_RGB2BGR)
+                        _hsv_dc = _cv2_r.cvtColor(_bgr_dc, _cv2_r.COLOR_BGR2HSV)
+                        _green_bin_dc = _cv2_r.inRange(
+                            _hsv_dc, _np_r.array([35, 50, 50], dtype=_np_r.uint8),
+                            _np_r.array([85, 255, 255], dtype=_np_r.uint8))
+                        _on_green_dc = _green_bin_dc.astype(_np_r.float32) / 255.0
+
+                        # Wire safety: color SOURCE = largest connected alpha>=0.95
+                        # component only, and it must clear the res-relative area
+                        # floor — a small solid blob (or none at all) means "skip
+                        # this frame", not "pull from whatever's biggest anyway".
+                        _solid_dc = (_alpha_c >= 0.95).astype(_np_r.uint8)
+                        _n_lbl_dc, _lbl_map_dc, _stats_dc, _ = _cv2_r.connectedComponentsWithStats(
+                            _solid_dc, connectivity=8)
+                        _body_mask_dc = None
+                        if _n_lbl_dc > 1:
+                            _areas_dc = _stats_dc[1:, _cv2_r.CC_STAT_AREA]
+                            _best_dc = int(_np_r.argmax(_areas_dc)) + 1
+                            if _areas_dc[_best_dc - 1] >= _min_body_area_dc:
+                                _body_mask_dc = (_lbl_map_dc == _best_dc).astype(_np_r.uint8)
+
+                        if _body_mask_dc is not None:
+                            _target_dc = (_alpha_c > 0.05) & (_alpha_c < 0.95) & (_on_green_dc < 0.5)
+                            if _np_r.any(_target_dc):
+                                # Nearest-label distance transform: labels[y,x] identifies
+                                # WHICH body pixel (not just how far) is nearest — the
+                                # standard trick for "propagate the nearest seed's value"
+                                # without an O(N*M) brute-force nearest-neighbor search.
+                                # The label<->coordinate mapping itself IS exact (label L's
+                                # seed is body_ys[L-1], body_xs[L-1] — verified against
+                                # np.where(body_mask>0)'s own raster order). The "nearest"
+                                # seed cv2 PICKS is only APPROXIMATE: DIST_L2/maskSize=5 is a
+                                # two-pass chamfer propagation, not a true Euclidean nearest-
+                                # neighbor, so at Voronoi boundaries between two body regions
+                                # it can pick a slightly-farther seed (gate reviewers measured
+                                # 3/200 and 6/2000 mismatches on adversarial scattered-seed
+                                # tests, e.g. claimed d=14.32 vs true d=14.14). No algorithm
+                                # change made for this: at our small REACH_PX cap the mispicked
+                                # seed is near-equidistant to the true nearest, so the pulled
+                                # color comes from an almost-equally-adjacent body pixel.
+                                # Concave geometry (armpit, crossed limbs) is where the winning
+                                # body part can flip, and even there both candidate parts are
+                                # legitimately adjacent — acceptable at this reach.
+                                _dist_dc, _nn_labels_dc = _cv2_r.distanceTransformWithLabels(
+                                    (1 - _body_mask_dc).astype(_np_r.uint8), _cv2_r.DIST_L2, 5,
+                                    labelType=_cv2_r.DIST_LABEL_PIXEL)
+                                _reach_mask_dc = _target_dc & (_dist_dc <= _reach_px_dc)
+                                if _np_r.any(_reach_mask_dc):
+                                    _fg_c = fg_rgb[_dc_y0:_dc_y1, _dc_x0:_dc_x1]
+                                    _body_ys_dc, _body_xs_dc = _np_r.where(_body_mask_dc > 0)
+                                    _idx_dc = _nn_labels_dc[_reach_mask_dc] - 1
+                                    # TELEMETRY (gate item 3): count indices the clip below would
+                                    # actually correct. distanceTransformWithLabels' labelType=
+                                    # DIST_LABEL_PIXEL should always hand back a valid 1-based
+                                    # label here, so this should read 0 every frame — if it ever
+                                    # doesn't, that's a silent wrong-color pull and this is the
+                                    # trail. Cheap: two comparisons on the small 1-D index array.
+                                    _clip_hits_dc = int(_np_r.count_nonzero(
+                                        (_idx_dc < 0) | (_idx_dc > len(_body_ys_dc) - 1)))
+                                    _idx_dc = _np_r.clip(_idx_dc, 0, len(_body_ys_dc) - 1)
+                                    _pulled_dc = _fg_c[_body_ys_dc[_idx_dc], _body_xs_dc[_idx_dc]]
+                                    _orig_dc = _fg_c[_reach_mask_dc]
+                                    _strength_dc = float(_np_r.clip(CK_EDGE_DECON_STRENGTH, 0.0, 1.0))
+                                    # PERF (gate item 1, 2026-07-11): mutate fg_rgb IN PLACE through
+                                    # the _fg_c crop view (assigned above at the `_fg_c = fg_rgb[...]`
+                                    # line) instead of `fg_rgb = fg_rgb.copy()` — that was a
+                                    # full-frame ~99MB float32 copy at 4K paid on every frame with
+                                    # any qualifying pixel, undercutting this block's own bbox-crop
+                                    # optimization. Safety: checked every apply_matte_postproc call
+                                    # site in this file — cmd_single (~1243), cmd_batch's
+                                    # unified_band branch (~1936) and default branch (~2013),
+                                    # cmd_batch_scrub (~2547), cmd_postproc's unified_band branch
+                                    # (~2812) and fusion_v2-else branch (~2860). None reuse their
+                                    # fg/fg_rgb argument after the call returns: each either
+                                    # reassigns the same local name to the return value before any
+                                    # further use, or (cmd_batch_scrub) discards the returned fg
+                                    # entirely and never touches the pre-call reference again. The
+                                    # NN engine (CorridorKeyModule/inference_engine.py
+                                    # CorridorKeyEngine.process_frame) hands back a freshly
+                                    # allocated tensor->numpy array each call, never a reused
+                                    # buffer, so there is no hidden caller-side aliasing either.
+                                    # apply_despill() above (default despill=0.5) already returns a
+                                    # fresh array in the common case; when despill is 0 it returns
+                                    # fg_rgb unchanged (same object as the caller's array) and the
+                                    # in-place mutation here still lands on that same
+                                    # already-verified-unreused array. FUTURE CALLERS: do not pass
+                                    # an fg/img array into apply_matte_postproc that you intend to
+                                    # read again after the call returns — this block (and
+                                    # apply_despill before it) may mutate or replace it.
+                                    # _orig_dc/_pulled_dc above are already independent copies
+                                    # (numpy fancy/boolean indexing always copies), so mutating
+                                    # _fg_c in place here does not affect the blend values already
+                                    # captured.
+                                    _fg_c[_reach_mask_dc] = (
+                                        _orig_dc * (1.0 - _strength_dc) + _pulled_dc * _strength_dc
+                                    ).astype(fg_rgb.dtype)
+                                    print(f"CK_LOG: edge_decon: recolored "
+                                          f"{int(_reach_mask_dc.sum())}px "
+                                          f"(reach={_reach_px_dc:.1f}px, "
+                                          f"body_area={int(_areas_dc[_best_dc - 1])}px, "
+                                          f"crop={_dc_x1-_dc_x0}x{_dc_y1-_dc_y0}, "
+                                          f"clip_hits={_clip_hits_dc})", flush=True)
+        except Exception as _dc_exc:
+            log.warning(f"edge_decon skipped: {_dc_exc}")
+    # ── end edge color decontamination ─────────────────────────
 
     if return_garbage:
         return fg_rgb, alpha, _green_garbage
