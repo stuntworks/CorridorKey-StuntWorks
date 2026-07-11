@@ -1399,7 +1399,11 @@ def merge_ck_with_garbage_matte(
         # edge rules, and THAT edge is the fat). Erode the hug 1px@1920 (≈2px at
         # 4K) on off-green pixels only; green-side keeps raw SAM so CK's soft
         # motion blur is never clipped. Feet zone only — body/hair untouched.
-        _feet_erode_r = max(1, int(round(1.0 * _scale)))
+        # 1.0 -> 1.5 base (Berto 2026-07-10: "remove 1 pixel from sam feet",
+        # light checker made the residual rim readable) — rounds 2px -> 3px
+        # at 4K, one more pixel off the off-green hug. Keep in sync with
+        # UNIFIED_BAND_FEET_ERODE_PX_BASE.
+        _feet_erode_r = max(1, int(round(1.5 * _scale)))
         _se_feet = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (_feet_erode_r * 2 + 1, _feet_erode_r * 2 + 1))
         _sam_feet_eroded = cv2.erode(sam.astype(np.float32), _se_feet)
@@ -1877,9 +1881,11 @@ UNIFIED_BAND_VAL_CEIL = 0.35
 UNIFIED_BAND_FEET_ZONE_START_PCT = 0.70   # matches merge_ck_with_garbage_matte's feet_start
 UNIFIED_BAND_SHADOW_KILL_VAL = 52.0 / 255.0  # matches the old shadow_kill value threshold
 UNIFIED_BAND_SHADOW_CUT_PCT = 0.92          # matches the old 92% "shadow below feet" cut
-UNIFIED_BAND_FEET_ERODE_PX_BASE = 1.0  # matches merge_ck_with_garbage_matte's feet-hug
+UNIFIED_BAND_FEET_ERODE_PX_BASE = 1.5  # matches merge_ck_with_garbage_matte's feet-hug
                                         # erosion radius — see the feet-erosion note
                                         # above D(p)'s computation in merge_ck_unified_band.
+                                        # 1.0 -> 1.5 with it (Berto 2026-07-10: one more
+                                        # px off the SAM feet; 2px -> 3px at 4K).
 UNIFIED_BAND_FEET_TIGHT_PX_BASE = 1.0  # feet-zone width TAPER TARGET — deliberately
                                         # NOT the general tight_px (5.5). The old
                                         # feet-ring-kill hugs a near-eroded silhouette
