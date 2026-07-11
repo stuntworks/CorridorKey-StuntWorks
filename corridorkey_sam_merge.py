@@ -1310,9 +1310,13 @@ def merge_ck_with_garbage_matte(
     # --- sam_tight: lateral-only dilation (no vertical), scaled ---
     # 5 -> 5.5 (Berto 2026-07-04): floor-50 classes shadowed butt-green as
     # off-green -> tight hug rolled the butt vs raw CK (CK MASTER A/B).
-    # +0.5@1920 = ~+1px at 4K on the off-green hug; bump to 6 if butt still
-    # shaved. Feet zone unaffected (hugs raw/eroded SAM separately below).
-    _tight_r = max(1, int(round(5.5 * _scale)))
+    # 5.5 -> 6.5 (Berto 2026-07-11): "SAM and CK mask is 1 or 2 pixels too
+    # tight, except the feet, at least on this shot" — +1@1920 = ~+2px @4K
+    # on the body hug. Feet zone unaffected (hugs raw/eroded SAM separately
+    # below). Corpus law applies: tuned on the A001 wide shot, gates + eye
+    # on other clips decide if it holds. Keep in sync with
+    # UNIFIED_BAND_TIGHT_PX_BASE.
+    _tight_r = max(1, int(round(6.5 * _scale)))
     se_tight = np.zeros((1, _tight_r * 2 + 1), dtype=np.uint8)
     se_tight[0, :] = 1
     sam_tight = cv2.dilate(sam, se_tight).astype(np.float32)
@@ -1410,7 +1414,10 @@ def merge_ck_with_garbage_matte(
             cv2.MORPH_ELLIPSE, (_feet_erode_r * 2 + 1, _feet_erode_r * 2 + 1))
         _sam_feet_eroded = cv2.erode(sam.astype(np.float32), _se_feet)
         _calf_start = bbox_y0 + int(bbox_h * 0.85)
-        _calf_erode_r = max(1, int(round(1.5 * _scale)))
+        # 1.5 -> 2.0 (Berto 2026-07-11): "feet might need one less" — one more
+        # pixel off the shoes (calf-and-below tier), ~4px @4K total. Same-shot
+        # tuning caveat as sam_tight above. Sync: UNIFIED_BAND_CALF_ERODE_PX_BASE.
+        _calf_erode_r = max(1, int(round(2.0 * _scale)))
         _se_calf = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (_calf_erode_r * 2 + 1, _calf_erode_r * 2 + 1))
         _sam_calf_eroded = cv2.erode(sam.astype(np.float32), _se_calf)
@@ -1837,10 +1844,14 @@ def apply_chroma_kill_to_matte(
 #          kill (support -> 0 handles this); band between -> alpha = CK * support.
 # ============================================================================
 
-UNIFIED_BAND_TIGHT_PX_BASE = 5.5   # matches merge_ck_with_garbage_matte's sam_tight
+UNIFIED_BAND_TIGHT_PX_BASE = 6.5   # matches merge_ck_with_garbage_matte's sam_tight
                                     # radius (feet/lateral hug) at 1920px wide — kept
                                     # identical so on-green baseline pixel counts don't
-                                    # drift for free. TRIED 3.0 during P1 verification
+                                    # drift for free. 5.5 -> 6.5 (Berto 2026-07-11):
+                                    # body outline 1-2px too tight except feet, "at
+                                    # least on this shot" — feet exempt via the feet
+                                    # taper. Corpus law: revisit if other clips object.
+                                    # TRIED 3.0 during P1 verification
                                     # to fight wire-bite resurrection (see the coverage
                                     # matrix / build report's honest-miss section) — it
                                     # measurably DEGRADED the named forensic crease fix
@@ -1894,7 +1905,10 @@ UNIFIED_BAND_FEET_ERODE_PX_BASE = 1.0  # matches merge_ck_with_garbage_matte's f
                                         # erosion radius — see the feet-erosion note
                                         # above D(p)'s computation in merge_ck_unified_band.
 UNIFIED_BAND_CALF_START_PCT = 0.85     # calf line — bottom 15% of the SAM bbox.
-UNIFIED_BAND_CALF_ERODE_PX_BASE = 1.5  # Berto 2026-07-10: MINUS one more pixel off
+UNIFIED_BAND_CALF_ERODE_PX_BASE = 2.0  # Berto 2026-07-10: MINUS one more pixel off
+                                        # (1.5 -> 2.0, Berto 2026-07-11: "feet might
+                                        # need one less" — shoes one more px tighter,
+                                        # same-shot tuning caveat as TIGHT_PX_BASE)
                                         # the SAM silhouette, calf and below ONLY
                                         # ("don't affect the rest") — 3px@4K there
                                         # vs the feet zone's 2px. Off-green side
