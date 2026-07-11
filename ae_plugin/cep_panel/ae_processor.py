@@ -2581,6 +2581,19 @@ def cmd_postproc(session_dir, output_path, settings, background="checker", v1_pa
         _g = cv2.imread(str(gate_path), cv2.IMREAD_UNCHANGED)
         if _g is not None:
             sam_soft = _g.astype(np.float32) / (65535.0 if _g.dtype == np.uint16 else 255.0)
+            # ZONE-FALLBACK PLACEHOLDER DETECTION (Berto 2026-07-11, round-4
+            # forensics): with 0 SAM points and a zone set, cmd_cache writes
+            # sam2_gate_raw.png as an ALL-ONES placeholder ("whole frame is
+            # body"). Feeding that into the merge as a real silhouette made
+            # the preview's CK/checker views pass dim-green junk as body —
+            # the speckle Berto caught that a render's true CK_ONLY never
+            # shows. A REAL SAM mask always has 0-valued background
+            # somewhere, so min() ~ 1.0 is a safe placeholder signature:
+            # treat it as no-SAM so the merge takes the clean CK-only bypass
+            # and the panel shows TRUE CK (rule-ck-previews-show-the-truth).
+            if float(sam_soft.min()) > 0.999:
+                sam_soft = None
+        if sam_soft is not None:
             _sam_erode_px = int(settings.get("sam_erode_px", 0))
             if _sam_erode_px > 0:
                 _ek = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_sam_erode_px * 2 + 1, _sam_erode_px * 2 + 1))
