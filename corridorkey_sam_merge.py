@@ -1,4 +1,4 @@
-# Last modified: 2026-07-06 | Change: CK AUTHORITY (settings.get("ck_authority"), default OFF) — shared _ck_authority_protect_mask helper, fixes SAM cutting CK where green evidence existed. v1 SCOPE (lead review): unified_band-only — merge_ck_with_garbage_matte gates on hidden "ck_authority_force_gm" instead (measured 83% wire-leak risk there, no shape discriminator). Perf: green-evidence dilate now pyrDown/dilate/pyrUp instead of full-res ellipse. Feet: protect_soft zeroed AFTER blur, not before. Full history: git log
+# Last modified: 2026-07-11 | Change: silhouette-continuation spare test added to _ub_shape_kill_wire_components' Signal A (UNIFIED_BAND_SHAPE_SPARE_* constants, _ub_silhouette_contour_points/_ub_local_silhouette_tangent/_ub_axis_angle_deg/_ub_shape_spare_silhouette_continuation) — spares short straight body-edge false-positive components (3rd confirmed class: back grooves/hip blotch + wavy pant edges) that CV/elongation alone cannot separate from wire, by testing tangent alignment with the local silhouette contour. THICKNESS_CV_MAX stays 0.25 (not restored to 0.35). Full history: git log
 """v1.0 two-mask SAM matte processing.
 
 CK matte and SAM matte are independent in v1.0. The plugin no longer
@@ -1973,6 +1973,92 @@ UNIFIED_BAND_SHAPE_RECOVER_MARGIN_PX_BASE = 3.0  # px @1920. After a fragment
     # Never grows past the band_mask itself (see kill_mask &= band_mask).
 
 # ----------------------------------------------------------------------------
+# SILHOUETTE-CONTINUATION SPARE TEST (P4, 2026-07-11) — 3rd confirmed
+# false-positive class from Signal A above: short STRAIGHT segments of the
+# performer's OWN silhouette edge, not wire. Confirmed twice more since the
+# CV_MAX 0.35->0.25 fix (which only partially covers this failure mode):
+# back grooves + below-butt blotch (2026-07-05, ck_p3_artifacts) and wavy
+# pant-leg edges (2026-07-10, D:\\CLAUDE_JUNK\\ck_wavy_pants\\ — right-knee
+# component cv_th=0.177, left-calf component cv_th=0.0, the latter
+# MATHEMATICALLY unexcludable by ANY CV_MAX ceiling since a body-edge segment
+# can measure zero thickness variance same as a real wire can).
+#
+# CV/elongation alone cannot separate these two populations (this is not a
+# new finding — UNIFIED_BAND_SHAPE_THICKNESS_CV_MAX's own comment already
+# documents it). What DOES separate them, measured directly on the wavy-pant
+# exemplar (D:\\CLAUDE_JUNK\\ck_shape_spare\\, step-by-step harness): a
+# false-positive component is a piece of the performer's OWN silhouette, so
+# its long axis runs TANGENT to (parallel with) the local silhouette contour
+# at the point where it attaches; a real wire crosses the band at an angle or
+# runs offset from the contour, so it does not. This is a SPARE test, not a
+# new kill signal — it only ever turns an already-would-be-killed Signal A
+# candidate back off; it cannot cause anything Signal A wouldn't otherwise
+# have killed to be killed, and it never touches Signal B (ridge) at all.
+#
+# TWO conditions, BOTH required (AND, not OR) before a Signal-A "is_wire"
+# candidate is spared:
+#   (a) hugs the main silhouette (median exterior-distance D of the
+#       component's own pixels <= SPARE_MAX_D_PX). NECESSARY but NOT
+#       sufficient — wire_vs_fp_distance_check.py (2026-07-05) already
+#       measured this does NOT separate wire from body-edge false positives
+#       by itself (the one confirmed wire sample and all three confirmed
+#       false-positive samples sit at nearly identical D, ~4-6px native).
+#       This gate exists so the tangent test below is never asked to judge a
+#       component that isn't even near the body in the first place.
+#   (b) its minAreaRect long axis is tangent-aligned (undirected angle <=
+#       SPARE_TANGENT_ANGLE_MAX_DEG) with the LOCAL silhouette contour
+#       direction at its own closest-approach point on the eroded-SAM
+#       boundary, via a small-neighborhood PCA (_ub_local_silhouette_tangent).
+#       THIS is the actual discriminator.
+# A component whose tangent reading is unavailable (degenerate/too-short
+# local contour patch — see _ub_local_silhouette_tangent) is NEVER spared —
+# absence of a reliable reading must fail closed (kill), not be treated as
+# "aligned," or a noisy silhouette patch could spare real wire by accident.
+#
+# SAFETY: this test can only REMOVE pixels from kill_seed_a (spare), the same
+# one-directional guarantee _ub_shape_kill_wire_components' own docstring
+# already states for the whole pass relative to band_alpha — it cannot grant
+# alpha the band didn't already have, and it never touches Signal B.
+UNIFIED_BAND_SHAPE_SPARE_MAX_D_PX_BASE = 3.0  # px @1920. Condition (a) — see
+    # above; chosen from the wavy-pant exemplar's own measured component D
+    # (median ~2.6-2.8px@1920 for both spared components) with headroom, and
+    # matches the wire-session distance-check's finding that both wire and
+    # body-edge false positives sit in this same near-body band, so this gate
+    # passes through everything Signal A would plausibly classify as
+    # near-silhouette without narrowing the population before the tangent
+    # test (the real, condition-(b)) gets to look at it.
+UNIFIED_BAND_SHAPE_SPARE_TANGENT_ANGLE_MAX_DEG = 22.5  # Condition (b)
+    # threshold — inside the 20-25 degree window the forensic task specified.
+    # A body-edge false positive's own local contour is not perfectly
+    # straight (real anatomy curves), so this must not be near-zero; a
+    # manufactured wire crossing the band has no reason to land inside a
+    # generous 22.5 degrees of the silhouette's own local tangent unless it
+    # is genuinely running along the body edge.
+    #
+    # ACCEPTED AS-IS for v1 (P4 gate review, 2026-07-11, both reviewers):
+    # the comparison is WHOLE-FRAGMENT minAreaRect axis (one direction for
+    # the entire Signal-A component) vs POINT-LOCAL contour tangent (PCA at
+    # just the component's own attach point) — different granularity. On a
+    # curved wire (one that bends along its own length) the whole-fragment
+    # axis is an average direction that may not match the silhouette's local
+    # tangent at the exact attach point even for a genuinely non-tangent
+    # wire, OR could coincidentally land within tolerance. This generous
+    # 22.5-degree threshold is deliberately wide enough to absorb ordinary
+    # granularity mismatch without over-firing on false positives (validated
+    # empirically, see D:\CLAUDE_JUNK\ck_shape_spare\ V1-V3), so no per-point
+    # (as opposed to per-fragment) axis refinement is being built for v1.
+UNIFIED_BAND_SHAPE_SPARE_TANGENT_WINDOW_PX_BASE = 15.0  # px @1920. ARC
+    # radius (contour-INDEX distance, not Euclidean image-space distance —
+    # see _ub_local_silhouette_tangent's own docstring for the P4 gate-review
+    # fix: Euclidean windowing mixes points from two different boundary
+    # branches near a self-close silhouette, e.g. the inner leg gap) around
+    # the nearest contour point over which the local tangent PCA is fit.
+    # Sized to comfortably span a typical false-positive component's own
+    # long_side (confirmed FP samples ranged ~15-22px@1920) so the PCA sees
+    # enough of the REAL local silhouette shape to be meaningful, not just a
+    # couple of quantized boundary pixels.
+
+# ----------------------------------------------------------------------------
 # SECOND SIGNAL: Hessian ridge/line strength on the SOURCE PLATE (P1b round 3,
 # 2026-07-06). The elongation+CV signal above is scored on tiny alpha-mask CC
 # fragments and, per direct diagnostic (D:\CLAUDE_JUNK\ck_p1b_wire\
@@ -2493,6 +2579,163 @@ def _ub_ridge_kill_seed(band_mask, D, scale, source_rgb, h, w):
         return None
 
 
+# Sentinel for the spare test's LAZY contour computation (P4 gate-review fix
+# 3, 2026-07-11): cv2.findContours costs ~4.5ms/frame even when zero Signal-A
+# candidates ever reach is_wire==True, and that cost was previously paid on
+# EVERY frame the band fragments at all, across hundreds of frames per batch.
+# A plain `None` cannot serve as the "not yet computed" flag because None is
+# ALSO the function's genuine "no eroded_sam foreground" result — this
+# distinct object identity lets the per-call loop tell "haven't tried yet"
+# apart from "tried, and there's honestly no contour" (which must stay
+# cached as such, not be recomputed on every subsequent is_wire candidate).
+_UB_CONTOUR_NOT_COMPUTED = object()
+
+
+def _ub_silhouette_contour_points(eroded_sam):
+    """WHAT IT DOES: returns the largest exterior contour of eroded_sam as an
+    (N,2) float32 array of (x,y) points — the reference boundary the
+    silhouette-continuation spare test measures local tangent direction
+    against. Returns None if eroded_sam has no foreground (nothing to trace).
+    DEPENDS ON: cv2.findContours (RETR_EXTERNAL — only the outer boundary
+    matters for a tangent reading; interior holes are irrelevant here).
+    AFFECTS: _ub_shape_spare_silhouette_continuation's condition (b) — a bug
+    here changes which Signal-A wire candidates get spared.
+    """
+    import cv2
+    if not eroded_sam.any():
+        return None
+    contours, _ = cv2.findContours(
+        eroded_sam.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        return None
+    largest = max(contours, key=cv2.contourArea)
+    pts = largest.reshape(-1, 2).astype(np.float32)
+    return pts if len(pts) >= 3 else None
+
+
+def _ub_local_silhouette_tangent(contour_pts, point_xy, window_px):
+    """WHAT IT DOES: local tangent (unit direction) of the silhouette contour
+    nearest point_xy, via PCA over contour points within window_px ARC
+    distance (contour-index proximity) of the single nearest contour point.
+    Returns None when the neighborhood has too few points for a reliable
+    reading (degenerate/short local patch) — the caller MUST treat None as
+    "cannot confirm," never as "aligned" (P4 safety rule, see
+    UNIFIED_BAND_SHAPE_SPARE_* constants).
+    DEPENDS ON: contour_pts from _ub_silhouette_contour_points (must be
+    CHAIN_APPROX_NONE, i.e. ~1px spacing between consecutive indices — this
+    function's index-count-as-arc-length conversion assumes that spacing).
+    AFFECTS: _ub_shape_spare_silhouette_continuation condition (b) only.
+
+    P4 GATE-REVIEW FIX (2026-07-11, both reviewers converged on this as the
+    blocker): the neighborhood is chosen by ARC distance — contour points
+    within +/-K indices of nearest_idx, K derived from window_px at the
+    contour's own ~1px-per-index spacing (CHAIN_APPROX_NONE), with modular
+    wraparound so it also handles the start/end seam trivially. This was
+    PREVIOUSLY Euclidean (image-space) distance, which is backwards: the
+    LOCAL geometry at a boundary point is defined by the contiguous arc that
+    passes through it, not by "whatever contour points happen to be nearby in
+    image space." Near a self-close silhouette (the inner-leg gap, a
+    self-occluding limb crossing close to another part of the body), TWO
+    physically separate boundary branches can sit within a few px of each
+    other in image space while being hundreds of contour-indices apart along
+    the boundary's own path. A Euclidean window pulls points from BOTH
+    branches into one PCA fit, which returns a confident but WRONG blended
+    tangent — exactly the failure mode that could false-spare a real wire
+    crossing through such a zone (the wire's own axis could accidentally land
+    within SPARE_TANGENT_ANGLE_MAX_DEG of the blended-nonsense direction even
+    though it matches NEITHER branch's true local tangent). Arc-indexing
+    cannot mix branches: by construction, only points reachable by walking
+    along the SAME boundary path from nearest_idx are ever included, so a
+    self-close second branch — however close in image space — is invisible
+    to this function unless it is ALSO within K indices along the path,
+    i.e. actually the same local arc. See
+    D:\\CLAUDE_JUNK\\ck_shape_spare\\test_arc_window_regression.py for the
+    synthetic self-close-silhouette regression test that pins this down.
+    """
+    if contour_pts is None:
+        return None
+    n = len(contour_pts)
+    # ACCEPTED AS-IS for v1 (P4 gate review, 2026-07-11): this is an O(N)
+    # nearest-point scan over the WHOLE contour per candidate, not a spatial
+    # index (k-d tree). Measured cost is only material on pathological
+    # SAM-failure frames with very large/noisy contours (25-83ms), which is
+    # inside the per-frame wall-time budget (see the P2 wall-time gate) and
+    # rare in the corpus. Not worth a k-d tree's added complexity for v1.
+    d2 = np.sum((contour_pts - point_xy) ** 2, axis=1)
+    nearest_idx = int(np.argmin(d2))
+    # K in INDEX units, not px — CHAIN_APPROX_NONE gives ~1px spacing between
+    # consecutive contour points, so K index-steps in either direction spans
+    # ~K px of arc length, matching window_px's own px meaning. Capped at
+    # n // 2 so a tiny/degenerate contour can't wrap around and double-count
+    # the same points from both directions.
+    k = max(1, min(int(round(window_px)), n // 2))
+    idx = np.arange(nearest_idx - k, nearest_idx + k + 1) % n
+    pts = contour_pts[idx]
+    if len(pts) < 3:
+        return None
+    mean = pts.mean(axis=0)
+    centered = pts - mean
+    # PCA via SVD: the first right-singular vector is the direction of
+    # maximum spread, i.e. the local tangent — a locally straight-or-curved
+    # contour segment's points spread mostly ALONG the boundary, not across
+    # it, so this direction is the boundary's own local orientation.
+    try:
+        _, _, vt = np.linalg.svd(centered, full_matrices=False)
+    except np.linalg.LinAlgError:
+        return None
+    tangent = vt[0]
+    norm = float(np.linalg.norm(tangent))
+    if norm < 1e-9:
+        return None
+    return tangent / norm
+
+
+def _ub_axis_angle_deg(vec_a, vec_b):
+    """WHAT IT DOES: undirected angle in degrees (0-90) between two
+    orientation vectors. ISOLATED — a minAreaRect long axis and a PCA
+    tangent both carry a 180-degree sign ambiguity (a line segment has no
+    intrinsic "forward"), so the raw angle is folded into [0, 90] before any
+    caller compares it to a threshold; without this fold, two genuinely
+    parallel-but-oppositely-signed vectors would score ~180 degrees apart
+    instead of 0.
+    """
+    na, nb = float(np.linalg.norm(vec_a)), float(np.linalg.norm(vec_b))
+    if na < 1e-9 or nb < 1e-9:
+        return 90.0
+    cos_a = float(np.dot(vec_a, vec_b)) / (na * nb)
+    cos_a = min(1.0, max(-1.0, cos_a))
+    deg = float(np.degrees(np.arccos(abs(cos_a))))
+    return deg
+
+
+def _ub_shape_spare_silhouette_continuation(dvals, attach_xy, axis_vec, contour_pts, scale):
+    """WHAT IT DOES: the silhouette-continuation spare test (P4, 2026-07-11).
+    Returns (spared: bool, median_d: float, tangent_deg: float or None) for
+    ONE Signal-A "is_wire" candidate component. See the
+    UNIFIED_BAND_SHAPE_SPARE_* constants above for the full forensic finding
+    and the two-condition (AND) rule this implements.
+    DEPENDS ON: dvals (the component's own D-array values), attach_xy (its
+    closest-to-silhouette pixel, in full-frame coords), axis_vec (its
+    minAreaRect long-axis direction), contour_pts
+    (_ub_silhouette_contour_points' output), scale (resolution factor, same
+    convention as every other UNIFIED_BAND_* constant).
+    AFFECTS: only whether the CALLER's is_wire candidate is spared — never
+    reaches outside this one component's own kill decision.
+    """
+    median_d = float(np.median(dvals))
+    max_d = UNIFIED_BAND_SHAPE_SPARE_MAX_D_PX_BASE * scale
+    if median_d > max_d:
+        return False, median_d, None  # condition (a) fails — not even near the body
+    window_px = UNIFIED_BAND_SHAPE_SPARE_TANGENT_WINDOW_PX_BASE * scale
+    tangent = _ub_local_silhouette_tangent(
+        contour_pts, np.asarray(attach_xy, dtype=np.float32), window_px)
+    if tangent is None:
+        return False, median_d, None  # fail closed — cannot confirm alignment
+    tangent_deg = _ub_axis_angle_deg(axis_vec, tangent)
+    spared = tangent_deg <= UNIFIED_BAND_SHAPE_SPARE_TANGENT_ANGLE_MAX_DEG
+    return spared, median_d, tangent_deg
+
+
 def _ub_shape_kill_wire_components(band_alpha, eroded_sam, D, scale, source_rgb=None,
                                     debug_dir=None, frame_idx=None):
     """SHAPE-DISCRIMINATION PASS (P1b, 2026-07-05/06) — kills wire-shaped
@@ -2512,12 +2755,21 @@ def _ub_shape_kill_wire_components(band_alpha, eroded_sam, D, scale, source_rgb=
       A. Elongation + thickness-CV on attach-margin-stripped CC fragments
          (round 1). Catches genuinely elongated, near-constant-caliber
          fragments once the continuous body-hugging band is fragmented at a
-         small attach margin so it can be scored piece by piece.
+         small attach margin so it can be scored piece by piece. AS OF P4
+         (2026-07-11), every "is_wire" candidate this signal finds is run
+         through the silhouette-continuation SPARE test
+         (_ub_shape_spare_silhouette_continuation) before it is actually
+         added to the kill seed — see the UNIFIED_BAND_SHAPE_SPARE_*
+         constants above for the 3rd-confirmed-false-positive-class finding
+         this closes (short straight segments of the performer's OWN edge,
+         not wire; CV/elongation alone cannot tell them apart).
       B. Hessian ridge/line strength on the source plate (round 3, see
          _ub_ridge_kill_seed) — reaches closer to the silhouette than (A)
          because it does not need the attach-margin strip, catching thin
          manufactured lines (A) is structurally blind to (tiny fragments,
-         noisy CV at that scale).
+         noisy CV at that scale). The spare test does NOT apply to Signal B
+         — Signal B's own near-silhouette exclusion already keeps it out of
+         the P4 false-positive zone (see UNIFIED_BAND_SHAPE_RIDGE_TINY_EXCLUDE_PX_BASE).
     Both seeds are grown back out by RECOVER_MARGIN (clamped to the band
     zone) so a kill isn't truncated at whatever stripping/exclusion each
     signal used for scoring — the wire doesn't stop being wire where it
@@ -2533,9 +2785,10 @@ def _ub_shape_kill_wire_components(band_alpha, eroded_sam, D, scale, source_rgb=
     D:\\CLAUDE_JUNK\\ck_p1b_wire\\explore_ridge_grid.py.
 
     Returns (band_alpha_out, kill_mask). debug_dir (Path or None): when given,
-    dumps a keep/kill component overlay + per-component feature table —
-    failures here must never break a real render (caller wraps in try/except
-    same as the existing unified_band_debug block).
+    dumps a keep/kill component overlay + per-component feature table (now
+    including each candidate's spare-test numbers, P4) — failures here must
+    never break a real render (caller wraps in try/except same as the
+    existing unified_band_debug block).
     """
     import cv2
     h, w = band_alpha.shape
@@ -2546,6 +2799,11 @@ def _ub_shape_kill_wire_components(band_alpha, eroded_sam, D, scale, source_rgb=
 
     kill_seed_a = np.zeros((h, w), dtype=bool)
     kill_seed_b = np.zeros((h, w), dtype=bool)
+    # Exact pixels of every component the spare test protects (P4 gate-review
+    # fix 2, 2026-07-11) — see the RECOVER_MARGIN subtraction below for why
+    # this has to be tracked separately from kill_seed_a rather than just
+    # trusting "is_wire stayed False so it was never added to kill_seed_a."
+    spare_mask = np.zeros((h, w), dtype=bool)
     _debug_rows = [] if debug_dir is not None else None
 
     # --- Signal A: elongation + thickness-CV on attach-stripped CC fragments.
@@ -2554,6 +2812,17 @@ def _ub_shape_kill_wire_components(band_alpha, eroded_sam, D, scale, source_rgb=
     stripped, n_lbl, labels, stats = _ub_fragment_band(band_mask, D, attach_margin)
     if stripped.any():
         min_len_px = UNIFIED_BAND_SHAPE_MIN_TANGENT_LEN_PX_BASE * scale
+        # Silhouette contour for the spare test's condition (b) — LAZY (P4
+        # gate-review fix 3, 2026-07-11): cv2.findContours costs ~4.5ms/frame,
+        # and the vast majority of frames/candidates never reach is_wire==True
+        # at all, so paying this cost unconditionally taxed every fragmented-
+        # band frame across a whole batch for nothing. Computed on the FIRST
+        # is_wire hit below instead, then cached in this local for the rest of
+        # the loop. _UB_CONTOUR_NOT_COMPUTED (not None) is the "haven't tried
+        # yet" sentinel — None is _ub_silhouette_contour_points' own genuine
+        # "no eroded_sam foreground" answer and must stay cached as such
+        # without re-invoking findContours on every subsequent candidate.
+        _spare_contour_pts = _UB_CONTOUR_NOT_COMPUTED
 
         for lbl in range(1, n_lbl):
             x0, y0, ww, hh, area = stats[lbl]
@@ -2564,7 +2833,8 @@ def _ub_shape_kill_wire_components(band_alpha, eroded_sam, D, scale, source_rgb=
             sub = (labels[y0:y0 + hh, x0:x0 + ww] == lbl)
             ys_sub, xs_sub = np.where(sub)
             pts = np.column_stack([xs_sub, ys_sub]).astype(np.float32)
-            (rw, rh) = cv2.minAreaRect(pts)[1]
+            rect = cv2.minAreaRect(pts)
+            (rw, rh) = rect[1]
             long_side, short_side = max(rw, rh), max(min(rw, rh), 1e-6)
             aspect = long_side / short_side
             # 1px zero-border pad before the distance transform — a component
@@ -2586,6 +2856,25 @@ def _ub_shape_kill_wire_components(band_alpha, eroded_sam, D, scale, source_rgb=
                 and aspect >= UNIFIED_BAND_SHAPE_ASPECT_MIN
                 and cv_th <= UNIFIED_BAND_SHAPE_THICKNESS_CV_MAX
             )
+            # --- SILHOUETTE-CONTINUATION SPARE TEST (P4, 2026-07-11) — only
+            # evaluated for candidates Signal A would otherwise kill; can only
+            # turn is_wire back to False, never the reverse. See the
+            # UNIFIED_BAND_SHAPE_SPARE_* constants for the full finding.
+            spared, spare_median_d, spare_tangent_deg = False, None, None
+            if is_wire:
+                if _spare_contour_pts is _UB_CONTOUR_NOT_COMPUTED:
+                    _spare_contour_pts = _ub_silhouette_contour_points(eroded_sam)
+                d_component = D[y0:y0 + hh, x0:x0 + ww][sub]
+                _attach_i = int(np.argmin(d_component))
+                attach_xy = (float(x0 + xs_sub[_attach_i]), float(y0 + ys_sub[_attach_i]))
+                box = cv2.boxPoints(rect)
+                edge0, edge1 = box[1] - box[0], box[2] - box[1]
+                axis_vec = edge0 if np.linalg.norm(edge0) >= np.linalg.norm(edge1) else edge1
+                spared, spare_median_d, spare_tangent_deg = _ub_shape_spare_silhouette_continuation(
+                    d_component, attach_xy, axis_vec, _spare_contour_pts, scale)
+                if spared:
+                    is_wire = False
+                    spare_mask[y0:y0 + hh, x0:x0 + ww] |= sub
             if is_wire:
                 kill_seed_a[y0:y0 + hh, x0:x0 + ww] |= sub
             if _debug_rows is not None:
@@ -2593,7 +2882,10 @@ def _ub_shape_kill_wire_components(band_alpha, eroded_sam, D, scale, source_rgb=
                     signal="A_elongation_cv", lbl=int(lbl), area=int(area),
                     aspect=round(float(aspect), 2), mean_thickness=round(mean_th, 2),
                     thickness_cv=round(cv_th, 3), long_side=round(float(long_side), 1),
-                    killed=bool(is_wire), bbox=[int(x0), int(y0), int(x0 + ww), int(y0 + hh)],
+                    killed=bool(is_wire), spared=bool(spared),
+                    spare_median_d=(round(spare_median_d, 2) if spare_median_d is not None else None),
+                    spare_tangent_deg=(round(spare_tangent_deg, 2) if spare_tangent_deg is not None else None),
+                    bbox=[int(x0), int(y0), int(x0 + ww), int(y0 + hh)],
                 ))
 
     # --- Signal B: Hessian ridge/line strength on the source plate, then a
@@ -2634,6 +2926,18 @@ def _ub_shape_kill_wire_components(band_alpha, eroded_sam, D, scale, source_rgb=
     # Recover-kernel building shared with the dot-kill pass via _ub_recover_kernel (F9).
     se_recover_a = _ub_recover_kernel(UNIFIED_BAND_SHAPE_RECOVER_MARGIN_PX_BASE, scale)
     kill_mask_a = cv2.dilate(kill_seed_a.astype(np.uint8), se_recover_a) > 0 if kill_seed_a.any() else empty_kill
+    # P4 gate-review fix 2 (2026-07-11): the dilate above is COMPONENT-BLIND —
+    # it grows every killed fragment's footprint by RECOVER_MARGIN regardless
+    # of what else sits nearby, so a killed wire fragment within ~RECOVER_
+    # MARGIN px of a component the spare test just protected would silently
+    # re-zero that spared component's own pixels, defeating the spare test
+    # without ever touching is_wire or kill_seed_a for that component. Strip
+    # the spared components' EXACT pixels back out after the dilation — the
+    # halo must still apply everywhere else (genuine background/wire pixels
+    # around a spared component are NOT protected, only the spared component
+    # itself), so this is a targeted subtraction, not a blanket exemption.
+    if spare_mask.any():
+        kill_mask_a = kill_mask_a & (~spare_mask)
 
     se_recover_b = _ub_recover_kernel(1, 1.0, plus_one=False)
     kill_mask_b = cv2.dilate(kill_seed_b.astype(np.uint8), se_recover_b) > 0 if kill_seed_b.any() else empty_kill
