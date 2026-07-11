@@ -1399,14 +1399,23 @@ def merge_ck_with_garbage_matte(
         # edge rules, and THAT edge is the fat). Erode the hug 1px@1920 (≈2px at
         # 4K) on off-green pixels only; green-side keeps raw SAM so CK's soft
         # motion blur is never clipped. Feet zone only — body/hair untouched.
-        # 1.0 -> 1.5 base (Berto 2026-07-10: "remove 1 pixel from sam feet",
-        # light checker made the residual rim readable) — rounds 2px -> 3px
-        # at 4K, one more pixel off the off-green hug. Keep in sync with
-        # UNIFIED_BAND_FEET_ERODE_PX_BASE.
-        _feet_erode_r = max(1, int(round(1.5 * _scale)))
+        # TWO-TIER (Berto 2026-07-10): "remove 1 pixel from sam feet... but
+        # only around and below the calf, don't affect the rest." The feet
+        # zone (bottom 30% of bbox) keeps the original 1px@1920 hug; from the
+        # calf line down (bottom 15% of bbox) one extra pixel comes off
+        # (1.5 base -> 3px@4K vs 2px). Light checker made the residual shoe
+        # rim readable. Keep in sync with the UNIFIED_BAND_CALF_* constants.
+        _feet_erode_r = max(1, int(round(1.0 * _scale)))
         _se_feet = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (_feet_erode_r * 2 + 1, _feet_erode_r * 2 + 1))
         _sam_feet_eroded = cv2.erode(sam.astype(np.float32), _se_feet)
+        _calf_start = bbox_y0 + int(bbox_h * 0.85)
+        _calf_erode_r = max(1, int(round(1.5 * _scale)))
+        _se_calf = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (_calf_erode_r * 2 + 1, _calf_erode_r * 2 + 1))
+        _sam_calf_eroded = cv2.erode(sam.astype(np.float32), _se_calf)
+        _calf_rows = np.arange(h, dtype=np.float32)[:, None] >= _calf_start
+        _sam_feet_eroded = np.where(_calf_rows, _sam_calf_eroded, _sam_feet_eroded)
         if on_green_hsv is not None:
             _sam_feet_hug = (sam.astype(np.float32) * on_green_hsv
                              + _sam_feet_eroded * (1.0 - on_green_hsv))
@@ -1881,11 +1890,17 @@ UNIFIED_BAND_VAL_CEIL = 0.35
 UNIFIED_BAND_FEET_ZONE_START_PCT = 0.70   # matches merge_ck_with_garbage_matte's feet_start
 UNIFIED_BAND_SHADOW_KILL_VAL = 52.0 / 255.0  # matches the old shadow_kill value threshold
 UNIFIED_BAND_SHADOW_CUT_PCT = 0.92          # matches the old 92% "shadow below feet" cut
-UNIFIED_BAND_FEET_ERODE_PX_BASE = 1.5  # matches merge_ck_with_garbage_matte's feet-hug
+UNIFIED_BAND_FEET_ERODE_PX_BASE = 1.0  # matches merge_ck_with_garbage_matte's feet-hug
                                         # erosion radius — see the feet-erosion note
                                         # above D(p)'s computation in merge_ck_unified_band.
-                                        # 1.0 -> 1.5 with it (Berto 2026-07-10: one more
-                                        # px off the SAM feet; 2px -> 3px at 4K).
+UNIFIED_BAND_CALF_START_PCT = 0.85     # calf line — bottom 15% of the SAM bbox.
+UNIFIED_BAND_CALF_ERODE_PX_BASE = 1.5  # Berto 2026-07-10: MINUS one more pixel off
+                                        # the SAM silhouette, calf and below ONLY
+                                        # ("don't affect the rest") — 3px@4K there
+                                        # vs the feet zone's 2px. Off-green side
+                                        # only, same as the feet hug. Keep in sync
+                                        # with merge_ck_with_garbage_matte's
+                                        # two-tier block.
 UNIFIED_BAND_FEET_TIGHT_PX_BASE = 1.0  # feet-zone width TAPER TARGET — deliberately
                                         # NOT the general tight_px (5.5). The old
                                         # feet-ring-kill hugs a near-eroded silhouette
@@ -2953,10 +2968,20 @@ def merge_ck_unified_band(
         _se_feet_ub = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (_feet_erode_r * 2 + 1, _feet_erode_r * 2 + 1))
         _sam_feet_eroded_ub = cv2.erode(sam, _se_feet_ub)
-        _feet_rows_pre = np.broadcast_to(
-            np.arange(h, dtype=np.float32)[:, None] >= feet_start, (h, w))
+        # TWO-TIER (Berto 2026-07-10): minus one MORE pixel calf-and-below only
+        # (bottom 15% of bbox); the rest of the feet zone keeps the 1px hug.
+        # Mirrors merge_ck_with_garbage_matte's two-tier block exactly.
+        _calf_start_ub = bbox_y0 + int(bbox_h * UNIFIED_BAND_CALF_START_PCT)
+        _calf_erode_r = max(1, int(round(UNIFIED_BAND_CALF_ERODE_PX_BASE * _scale)))
+        _se_calf_ub = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (_calf_erode_r * 2 + 1, _calf_erode_r * 2 + 1))
+        _sam_calf_eroded_ub = cv2.erode(sam, _se_calf_ub)
+        _rows_col_ub = np.arange(h, dtype=np.float32)[:, None]
+        _feet_rows_pre = np.broadcast_to(_rows_col_ub >= feet_start, (h, w))
+        _calf_rows_ub = np.broadcast_to(_rows_col_ub >= _calf_start_ub, (h, w))
+        _eroded_sel_ub = np.where(_calf_rows_ub, _sam_calf_eroded_ub, _sam_feet_eroded_ub)
         _off_green_feet_ub = _feet_rows_pre & (on_green_hsv < 0.5)
-        sam_for_dist = np.where(_off_green_feet_ub, _sam_feet_eroded_ub, sam).astype(np.uint8)
+        sam_for_dist = np.where(_off_green_feet_ub, _eroded_sel_ub, sam).astype(np.uint8)
 
     # --- D(p): exterior distance transform from the (feet-corrected) silhouette.
     D = cv2.distanceTransform((1 - sam_for_dist).astype(np.uint8), cv2.DIST_L2, 5).astype(np.float32)
