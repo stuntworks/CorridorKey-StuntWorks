@@ -1923,6 +1923,39 @@ UNIFIED_BAND_OFF_GREEN_FEATHER_SIGMA_PX_BASE = 2.5  # px @1920 (F8, 2026-07-05:
     # hoisted from a bare 2.5 literal). GaussianBlur sigma feathering the
     # off-green body-fill rescue before it's maxed into keep_alpha.
 
+# FEET-ZONE OFF-GREEN ALPHA-RING HARDENING (P4, 2026-07-11) — matte-forensics
+# attribution (D:\CLAUDE_JUNK\ck_feet_ring\): a 2-3px dark ring around shoes in
+# every off-green (floor) composite. ROOT CAUSE, confirmed on native 4K ROI
+# crops of ck_batch_a2cf5b549230 frame 13: CK's raw alpha keeps the dark unlit
+# floor as foreground (see CK_ALPHA sidecar — near-1.0 across the floor with no
+# SAM gate applied), so at the shoe/floor boundary `final`'s own soft ramp
+# (support's smoothstep transition, tuned for hair/body-edge quality) passes
+# through 2-3px of SEMI-TRANSPARENT pixels that still carry the dark FLOOR's
+# own color — any composite over any background reads a visible dark rim there,
+# regardless of what replaces green. This is an edge-COLOR problem, not an
+# edge-WIDTH problem: further SAM erosion (UNIFIED_BAND_FEET_ERODE_PX_BASE /
+# CALF_ERODE_PX_BASE above) only moves WHERE the ramp sits, it can't stop the
+# ramp's own semi-transparent pixels from carrying bad color — already proven
+# by the 2026-07-10 calf-shave commits netting zero change at the shoe/foot
+# silhouette itself (see ck_parity_feet/ in ck_p3_artifacts INDEX.md).
+# FIX: collapse the ramp toward near-binary in the feet zone, OFF-GREEN SIDE
+# ONLY (on_green_hsv < 0.5) — this is the SAME "feet stay tight, near-binary
+# hug" philosophy every other feet-zone constant above already encodes (the
+# old engine's feet-ring-kill was itself a near-binary hug, not a soft ramp).
+# A narrow smoothstep straddling 0.5 pushes real-coverage pixels toward 1 and
+# mostly-floor pixels toward 0, so at most a sub-pixel sliver of dark-floor-
+# colored translucency survives. This intentionally amputates a few px of
+# motion-blur softness at the shoe-over-floor boundary — an accepted trade,
+# not a regression, because that softness is exactly what was reading as a
+# visible dark ring. GREEN side is untouched (CK rules over green, hard law —
+# see module docstring) so soft edges / motion blur over actual green screen
+# keep their full soft ramp (verified: D:\CLAUDE_JUNK\ck_feet_ring\).
+UNIFIED_BAND_FEET_RING_HARD_LO = 0.35   # smoothstep low edge — tuned against
+    # ck_batch_a2cf5b549230 frame 13 (ring 2.3px mean -> <=1px target).
+UNIFIED_BAND_FEET_RING_HARD_HI = 0.65   # smoothstep high edge — symmetric
+    # around 0.5 so a genuinely ~50/50 mixed edge pixel still lands near 0.5,
+    # not snapped fully to 0 or 1 (avoids a new hard-edge aliasing artifact).
+
 # ----------------------------------------------------------------------------
 # SHAPE-DISCRIMINATION PASS constants (P1b, 2026-07-05/06). Forensic finding
 # (D:\CLAUDE_JUNK\ck_p1b_wire\explore_*.py, sessA
@@ -3483,6 +3516,34 @@ def merge_ck_unified_band(
             * (1.0 - support)
         )
         final = np.clip(final * (1.0 - shadow_kill), 0.0, 1.0).astype(np.float32)
+
+    # --- FEET-ZONE OFF-GREEN ALPHA-RING HARDENING (P4, 2026-07-11) — see the
+    # UNIFIED_BAND_FEET_RING_HARD_* constants above for the full forensic why.
+    # Gated identically to the feet taper above: same feet_start row test (crop-
+    # local, consistent with `final`/`on_green_hsv` at this point — the crop
+    # paste-back happens LATER, below), same _body_exits_bottom waist-crop
+    # framing guard (Berto's protection law), on_green_hsv required (no source
+    # plate => no color signal => nothing to harden against). Applied to
+    # `final` AFTER shadow_kill so it sees the same alpha the shipped render
+    # would, and BEFORE the debug dump so unified_band_debug reflects reality.
+    # Row-SLICED (not full-frame) on purpose — perf (P2 wall-time budget,
+    # measured 55ms full-frame vs ~25-30ms sliced to just rows >= feet_start,
+    # D:\CLAUDE_JUNK\ck_feet_ring\): feet_start is always the bottom ~30% of
+    # the bbox, so slicing before the smoothstep/where pass roughly halves
+    # this block's cost for free, no behavior change (rows above feet_start
+    # are provably untouched either way).
+    # 0 < feet_start (gate review 2026-07-11): a near-empty/failed SAM bbox can
+    # compute feet_start == 0 — without the lower bound this block would
+    # near-binary-collapse the ENTIRE frame's off-green alpha, not just the
+    # feet. Same degenerate case _ck_authority_protect_mask already guards;
+    # treat feet_start <= 0 as no-feet-info and skip.
+    if (not _body_exits_bottom and on_green_hsv is not None
+            and 0 < feet_start < h):
+        _fz_final = final[feet_start:, :]
+        _fz_on_green = on_green_hsv[feet_start:, :]
+        _fz_hardened = _ub_smoothstep(
+            UNIFIED_BAND_FEET_RING_HARD_LO, UNIFIED_BAND_FEET_RING_HARD_HI, _fz_final)
+        _fz_final[:] = np.where(_fz_on_green < 0.5, _fz_hardened, _fz_final)
 
     if _dbg_dir is not None:
         try:
