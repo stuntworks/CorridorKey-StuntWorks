@@ -1417,7 +1417,9 @@ def merge_ck_with_garbage_matte(
         # 1.5 -> 2.0 (Berto 2026-07-11): "feet might need one less" — one more
         # pixel off the shoes (calf-and-below tier), ~4px @4K total. Same-shot
         # tuning caveat as sam_tight above. Sync: UNIFIED_BAND_CALF_ERODE_PX_BASE.
-        _calf_erode_r = max(1, int(round(2.0 * _scale)))
+        # 2.0 -> 3.0 (Berto 2026-07-12, post-edge-decon render): "shrunk by one
+        # pixel around the feet I think and then we'll be good" — ~6px @4K.
+        _calf_erode_r = max(1, int(round(3.0 * _scale)))
         _se_calf = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (_calf_erode_r * 2 + 1, _calf_erode_r * 2 + 1))
         _sam_calf_eroded = cv2.erode(sam.astype(np.float32), _se_calf)
@@ -1905,9 +1907,11 @@ UNIFIED_BAND_FEET_ERODE_PX_BASE = 1.0  # matches merge_ck_with_garbage_matte's f
                                         # erosion radius — see the feet-erosion note
                                         # above D(p)'s computation in merge_ck_unified_band.
 UNIFIED_BAND_CALF_START_PCT = 0.85     # calf line — bottom 15% of the SAM bbox.
-UNIFIED_BAND_CALF_ERODE_PX_BASE = 2.0  # Berto 2026-07-10: MINUS one more pixel off
+UNIFIED_BAND_CALF_ERODE_PX_BASE = 3.0  # Berto 2026-07-10: MINUS one more pixel off
                                         # (1.5 -> 2.0, Berto 2026-07-11: "feet might
-                                        # need one less" — shoes one more px tighter,
+                                        # need one less"; 2.0 -> 3.0, Berto 2026-07-12
+                                        # post-edge-decon render: "shrunk by one pixel
+                                        # around the feet" — ~6px @4K,
                                         # same-shot tuning caveat as TIGHT_PX_BASE)
                                         # the SAM silhouette, calf and below ONLY
                                         # ("don't affect the rest") — 3px@4K there
