@@ -768,6 +768,12 @@
       0 3px 8px rgba(0,0,0,0.4) inset,
       0 -2px 5px rgba(255,255,255,0.3) inset;
   }
+  /* Screen-color tint (Berto 2026-07-12): same gradient/glow, just hue-shifted --
+     no new button style. GREEN/BLUE caption (.key-screenlabel) carries the actual
+     meaning; this is reinforcement only, so the shift stays subtle (partial
+     rotation, not a full recolor to saturated green/blue). */
+  .key-btn[data-screen="green"] { filter: hue-rotate(-18deg) saturate(1.05); }
+  .key-btn[data-screen="blue"]  { filter: hue-rotate(20deg); }
   .key-btn .kb-word {
     font-size: 27px;
     font-weight: 700;
@@ -779,13 +785,30 @@
     font-size: 8px; letter-spacing: 0.2em; margin-top: 2px;
     color: #0a3a37; text-transform: uppercase;
   }
-  /* ring label engraved around the cradle base */
+  /* ring label engraved around the cradle base.
+     bottom was 7px, which put the label's top edge ~1-2px INSIDE the button's
+     bottom edge (button bottom sits 14px above the cradle's bottom edge; a 7px
+     offset + ~8-9px of 7px-font text height overlapped it) -- that's why
+     "WORKING" read half-hidden behind the KEY button (Berto, 2026-07-12).
+     Moved down so the longest state word (WORKING/PREVIEW, 7 chars) clears the
+     button by a comfortable ~3-4px, not a literal 1px. */
   .key-ringlabel {
-    position: absolute; bottom: 7px; left: 0; right: 0;
+    position: absolute; bottom: 2px; left: 0; right: 0;
     text-align: center; font-size: 7px; letter-spacing: 0.3em;
     color: var(--cyan); text-shadow: 0 0 6px rgba(40,220,228,0.5);
     text-transform: uppercase; z-index: 3;
   }
+  /* screen-color caption (Berto 2026-07-12): mirrors .key-ringlabel's exact type
+     treatment but anchored to the TOP of the cradle so it can never collide with
+     the Ready/Working/etc state word below. Color set per data-screen attribute,
+     synced from the Advanced panel's Green/Blue screen-color pick (see JS). */
+  .key-screenlabel {
+    position: absolute; top: 2px; left: 0; right: 0;
+    text-align: center; font-size: 7px; letter-spacing: 0.3em;
+    text-transform: uppercase; z-index: 3;
+  }
+  .key-screenlabel[data-screen="green"] { color: #39ff8b; text-shadow: 0 0 6px rgba(0,230,118,0.5); }
+  .key-screenlabel[data-screen="blue"]  { color: #4d93ff; text-shadow: 0 0 6px rgba(47,123,255,0.5); }
 
   /* range selector = physical 2-position rocker stack */
   .range-col { flex: 1; min-width: 0; }
@@ -927,7 +950,16 @@
     padding: 12px 15px;
     color: var(--ink-dim);
     background: linear-gradient(180deg, #393e44 0%, #2a2e33 100%);
-    box-shadow: 0 1px 0 rgba(255,255,255,0.08) inset, 0 1px 2px rgba(0,0,0,0.4);
+    /* Quiet button affordance (Berto 2026-07-12): "does not look like a button" --
+       added a faint inset ring at rest using the same cyan accent + inset-ring
+       technique as .enlarge-btn:hover, so it reads as pressable even before
+       hovering. Brightens on hover, same pattern as .enlarge-btn/.ck-qpane. */
+    box-shadow: 0 1px 0 rgba(255,255,255,0.08) inset, 0 1px 2px rgba(0,0,0,0.4),
+      0 0 0 1px rgba(40,220,228,0.16) inset;
+  }
+  .adv-toggle:hover {
+    box-shadow: 0 1px 0 rgba(255,255,255,0.08) inset, 0 1px 2px rgba(0,0,0,0.4),
+      0 0 0 1px rgba(40,220,228,0.45) inset;
   }
   .adv-toggle .at-label { font-size: 10.5px; }
   .adv-toggle .at-chev {
@@ -1515,10 +1547,13 @@
       <div class="transport">
         <!-- the one and only primary action -->
         <div class="key-cradle">
-          <button class="key-btn" id="keyBtn" type="button" aria-label="KEY. Preview the keyed result on this frame.">
+          <button class="key-btn" id="keyBtn" type="button" data-screen="green" aria-label="KEY. Preview the keyed result on this frame.">
             <span class="kb-word">KEY</span>
             <span class="kb-sub">Preview</span>
           </button>
+          <!-- screen-color caption + KEY-button tint, synced from the Advanced
+               panel's Green/Blue pick (Berto 2026-07-12). See keyScreenLabel wiring. -->
+          <span class="key-screenlabel" id="keyScreenLabel" data-screen="green">Green</span>
           <span class="key-ringlabel">Ready</span>
         </div>
 
@@ -1911,6 +1946,30 @@
   exclusive('.seg-btn', 'data-fmt');
   exclusive('.seg-btn', 'data-mode');
   exclusive('.seg-btn', 'data-screen');
+
+  // Screen-color tint on the KEY button (Berto 2026-07-12): mirrors the Advanced
+  // panel's Green/Blue screen-color pick (the same control read at payload-build
+  // time, see ckSamPayload/doKey's screenType lookup) so the coordinator can
+  // confirm the keyer's target color at a glance. Listens on the same buttons
+  // exclusive() already wires; no new state/storage -- just mirrors current DOM
+  // selection, both on load and on every click.
+  (function () {
+    var _keyBtn = document.getElementById('keyBtn');
+    var _screenLbl = document.getElementById('keyScreenLabel');
+    function syncKeyScreenTint() {
+      var btn = document.querySelector('.seg-btn[data-screen][aria-pressed="true"]');
+      var val = (btn && btn.dataset.screen === 'blue') ? 'blue' : 'green';
+      if (_keyBtn) _keyBtn.dataset.screen = val;
+      if (_screenLbl) {
+        _screenLbl.dataset.screen = val;
+        _screenLbl.textContent = (val === 'blue') ? 'Blue' : 'Green';
+      }
+    }
+    document.querySelectorAll('.seg-btn[data-screen]').forEach(function (b) {
+      b.addEventListener('click', syncKeyScreenTint);
+    });
+    syncKeyScreenTint();
+  })();
   exclusive('.seg-btn', 'data-sam');
   exclusive('.seg-btn', 'data-scope');   // Advanced-only scope override
 
