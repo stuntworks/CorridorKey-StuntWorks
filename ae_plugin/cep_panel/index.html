@@ -1824,6 +1824,29 @@
             </div>
           </div>
 
+          <!-- SAM MATTE TIGHTEN (Berto 2026-07-12): panel-adjustable calf-and-below
+               SAM-matte erosion tier — both merge engines' two-tier feet block
+               (sam_matte_tighten_px). 0 = skip the extra calf erosion (rows below
+               the calf line fall back to the feet-tier hug). 3 = engine default
+               (matches the absent-key behavior every non-panel caller keeps). -->
+          <div class="matte-fader" id="faderSamMatteTighten" style="margin-top:12px">
+            <div class="fader-head">
+              <span class="cell-title">SAM MATTE TIGHTEN</span>
+              <span class="fader-value" id="samMatteTightenVal">3</span>
+            </div>
+            <div class="fader-row">
+              <div class="fader-track">
+                <div class="fader-slot"></div>
+                <div class="fader-fill" id="samMatteTightenFill" style="width:50%"></div>
+                <div class="fader-ticks" id="samMatteTightenTicks"></div>
+                <input type="range" class="fader" id="samMatteTighten" min="0" max="6" step="0.5" value="3"
+                       aria-label="SAM matte tighten, calf-and-below erosion, 0 to 6 px" />
+                <div class="fader-cap-lines" id="samMatteTightenCap" style="left:50%"></div>
+              </div>
+              <div class="fader-scale"><span>0</span><span>1.5</span><span>3</span><span>4.5</span><span>6</span></div>
+            </div>
+          </div>
+
         </div>
       </div>
     </div>
@@ -2104,6 +2127,22 @@
     });
   }
 
+  // SAM MATTE TIGHTEN (Berto 2026-07-12) — global persisted state, same
+  // ck_global_* convention as CK Authority above. Restore BEFORE wireFader()
+  // runs below so the fill/value/cap sync picks up the restored slider value
+  // on first paint. Default (no localStorage entry) = the 3 baked into the
+  // input's HTML value attribute, which matches the engines' own absent-key
+  // default — belt-and-suspenders, not required for byte-identity (the
+  // backend's _resolve_sam_matte_tighten_px default covers that on its own).
+  const samMatteTightenEl = document.getElementById('samMatteTighten');
+  if (samMatteTightenEl) {
+    const _smtSaved = localStorage.getItem('ck_global_sam_matte_tighten');
+    const _smtParsed = _smtSaved !== null ? parseFloat(_smtSaved) : NaN;
+    if (!isNaN(_smtParsed) && _smtParsed >= 0 && _smtParsed <= 6) {
+      samMatteTightenEl.value = _smtParsed;
+    }
+  }
+
   // ---- Advanced = EXPAND TO COCKPIT (not an accordion) ----
   const unit = document.querySelector('.unit');
   const adv = document.getElementById('adv');
@@ -2151,10 +2190,16 @@
   wireFader('despill');
   wireFader('zoneEdge');
   wireFader('fusionExpand');
+  wireFader('samMatteTighten');
   (function () {
-    ['despill', 'zoneEdge', 'fusionExpand'].forEach(function (id) {
+    ['despill', 'zoneEdge', 'fusionExpand', 'samMatteTighten'].forEach(function (id) {
       const el = document.getElementById(id);
-      if (el) el.addEventListener('change', function () { if (typeof ckScheduleRepreview === 'function') ckScheduleRepreview(); });
+      if (el) el.addEventListener('change', function () {
+        // SAM MATTE TIGHTEN (Berto 2026-07-12): persist alongside the repreview
+        // trigger the other faders already share — same ck_global_* convention.
+        if (id === 'samMatteTighten') localStorage.setItem('ck_global_sam_matte_tighten', el.value);
+        if (typeof ckScheduleRepreview === 'function') ckScheduleRepreview();
+      });
     });
   })();
 
@@ -3215,6 +3260,11 @@ function ckGetSettings() {
     // on the default engine by design.
     const ckAuthorityEl = document.getElementById('ckAuthority');
     const ck_authority = ckAuthorityEl ? (ckAuthorityEl.getAttribute('aria-pressed') === 'true') : false;
+    // SAM MATTE TIGHTEN (Berto 2026-07-12): calf-and-below SAM erosion override,
+    // read by both merge engines via _resolve_sam_matte_tighten_px. Number, not
+    // string — corridorkey_sam_merge's validator rejects non-numeric values.
+    const samMatteTightenEl = document.getElementById('samMatteTighten');
+    const sam_matte_tighten_px = samMatteTightenEl ? parseFloat(samMatteTightenEl.value) : 3;
     const settings = {
         screenType: screenType,
         despill: despill,
@@ -3232,7 +3282,8 @@ function ckGetSettings() {
         green_kill: green_kill,
         sam2_temporal_guard_enabled: sam2_temporal_guard_enabled,
         unified_band: unified_band,
-        ck_authority: ck_authority
+        ck_authority: ck_authority,
+        sam_matte_tighten_px: sam_matte_tighten_px
     };
     ckLog('fusion_v2: ' + (fusion_v2 ? 'on' : 'off') + ' at settings build');
     ckLog('unified_band: ' + (unified_band ? 'on' : 'off') + ' at settings build');
@@ -4448,7 +4499,7 @@ function ckOpenURL(url) {
     // Move faders to pod body as full-style slider row (ABOVE the button row)
     var podBody = document.getElementById('workPodBody');
     if (podBody) {
-        ['faderDespill', 'faderZoneEdge', 'faderFusionExpand'].forEach(function (id) {
+        ['faderDespill', 'faderZoneEdge', 'faderFusionExpand', 'faderSamMatteTighten'].forEach(function (id) {
             var f = document.getElementById(id);
             if (!f) return;
             var _savedDisplay = f.style.display;  // preserve fusion hide state across cssText wipe

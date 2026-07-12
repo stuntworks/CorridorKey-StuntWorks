@@ -1419,10 +1419,23 @@ def merge_ck_with_garbage_matte(
         # tuning caveat as sam_tight above. Sync: UNIFIED_BAND_CALF_ERODE_PX_BASE.
         # 2.0 -> 3.0 (Berto 2026-07-12, post-edge-decon render): "shrunk by one
         # pixel around the feet I think and then we'll be good" — ~6px @4K.
-        _calf_erode_r = max(1, int(round(3.0 * _scale)))
-        _se_calf = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE, (_calf_erode_r * 2 + 1, _calf_erode_r * 2 + 1))
-        _sam_calf_eroded = cv2.erode(sam.astype(np.float32), _se_calf)
+        # SAM MATTE TIGHTEN (Berto 2026-07-12, panel slider): the 3.0 base above
+        # is now the ABSENT-KEY default, resolved via _resolve_sam_matte_tighten_px
+        # (validated/clamped settings['sam_matte_tighten_px']) so DaVinci/ComfyUI
+        # callers that never pass the key stay byte-identical. 0.0 means SKIP the
+        # calf-tier EXTRA erosion cleanly: calf-and-below rows fall back to the
+        # feet-tier erosion computed just above (_sam_feet_eroded), not a
+        # max(1,...)-floored near-zero erosion of their own.
+        _sam_matte_tighten_px = _resolve_sam_matte_tighten_px(settings)
+        if _sam_matte_tighten_px != UNIFIED_BAND_CALF_ERODE_PX_BASE:
+            print(f"CK_LOG: sam_matte_tighten_px={_sam_matte_tighten_px}", flush=True)
+        if _sam_matte_tighten_px <= 0.0:
+            _sam_calf_eroded = _sam_feet_eroded
+        else:
+            _calf_erode_r = max(1, int(round(_sam_matte_tighten_px * _scale)))
+            _se_calf = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (_calf_erode_r * 2 + 1, _calf_erode_r * 2 + 1))
+            _sam_calf_eroded = cv2.erode(sam.astype(np.float32), _se_calf)
         _calf_rows = np.arange(h, dtype=np.float32)[:, None] >= _calf_start
         _sam_feet_eroded = np.where(_calf_rows, _sam_calf_eroded, _sam_feet_eroded)
         if on_green_hsv is not None:
@@ -1918,7 +1931,48 @@ UNIFIED_BAND_CALF_ERODE_PX_BASE = 3.0  # Berto 2026-07-10: MINUS one more pixel 
                                         # vs the feet zone's 2px. Off-green side
                                         # only, same as the feet hug. Keep in sync
                                         # with merge_ck_with_garbage_matte's
-                                        # two-tier block.
+                                        # two-tier block. This constant remains the
+                                        # DOCUMENTED DEFAULT SOURCE for the
+                                        # "SAM MATTE TIGHTEN" panel slider below
+                                        # (_resolve_sam_matte_tighten_px) — do not
+                                        # delete it even though most callers now
+                                        # reach it indirectly through that helper.
+SAM_MATTE_TIGHTEN_PX_MAX = 6.0  # panel slider ceiling — see _resolve_sam_matte_tighten_px
+
+
+def _resolve_sam_matte_tighten_px(settings):
+    """SAM MATTE TIGHTEN (Berto 2026-07-12, panel feature): validate+clamp the
+    optional per-session settings['sam_matte_tighten_px'] override for the
+    calf-and-below SAM-matte erosion tier — the two-tier feet block shared by
+    merge_ck_with_garbage_matte (gm engine) and merge_ck_unified_band (unified_band
+    engine), which previously hardcoded this radius (3.0 / UNIFIED_BAND_CALF_ERODE_PX_BASE).
+
+    Absent key, or any non-numeric/garbage value (string, null, bool, NaN/inf) ->
+    UNIFIED_BAND_CALF_ERODE_PX_BASE (3.0, today's hardcoded behavior). DaVinci
+    (x6 installs) and ComfyUI callers never pass this key, so their output stays
+    BYTE-IDENTICAL to pre-feature code. bool is excluded explicitly: in Python
+    `isinstance(True, int)` is True, so True/False would otherwise silently pass
+    through as 1.0/0.0 — settings is unfiltered JSON (ae_processor.load_settings
+    does `settings.update(json.load(f))`), so a hand-edited `true`/`false` value
+    for this numeric key is a realistic garbage input, not a hypothetical.
+
+    Clamped to [0.0, SAM_MATTE_TIGHTEN_PX_MAX]. 0.0 is a valid, MEANINGFUL value
+    (see callers): it means "skip the calf-tier EXTRA erosion" — rows below the
+    calf line fall back to the feet-tier erosion instead — NOT "erode by zero
+    pixels". The max(1, round(...)) floor both engines use on this radius would
+    otherwise silently re-erode at 0, so callers must branch on <= 0.0 explicitly
+    rather than feed 0.0 through the same erode-radius math as any other value.
+    """
+    _default = UNIFIED_BAND_CALF_ERODE_PX_BASE
+    if not isinstance(settings, dict) or "sam_matte_tighten_px" not in settings:
+        return _default
+    _v = settings.get("sam_matte_tighten_px")
+    if isinstance(_v, bool) or not isinstance(_v, (int, float)):
+        return _default
+    _v = float(_v)
+    if not np.isfinite(_v):
+        return _default
+    return float(min(SAM_MATTE_TIGHTEN_PX_MAX, max(0.0, _v)))
 UNIFIED_BAND_FEET_TIGHT_PX_BASE = 1.0  # feet-zone width TAPER TARGET — deliberately
                                         # NOT the general tight_px (5.5). The old
                                         # feet-ring-kill hugs a near-eroded silhouette
@@ -3327,10 +3381,24 @@ def merge_ck_unified_band(
         # (bottom 15% of bbox); the rest of the feet zone keeps the 1px hug.
         # Mirrors merge_ck_with_garbage_matte's two-tier block exactly.
         _calf_start_ub = bbox_y0 + int(bbox_h * UNIFIED_BAND_CALF_START_PCT)
-        _calf_erode_r = max(1, int(round(UNIFIED_BAND_CALF_ERODE_PX_BASE * _scale)))
-        _se_calf_ub = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE, (_calf_erode_r * 2 + 1, _calf_erode_r * 2 + 1))
-        _sam_calf_eroded_ub = cv2.erode(sam, _se_calf_ub)
+        # SAM MATTE TIGHTEN (Berto 2026-07-12, panel slider): mirrors the gm
+        # engine's block above exactly — UNIFIED_BAND_CALF_ERODE_PX_BASE stays the
+        # absent-key/invalid-value default (resolved via
+        # _resolve_sam_matte_tighten_px), so DaVinci/ComfyUI callers that never
+        # pass settings['sam_matte_tighten_px'] stay byte-identical. 0.0 means
+        # SKIP the calf-tier EXTRA erosion cleanly: calf-and-below rows fall back
+        # to the feet-tier erosion computed just above (_sam_feet_eroded_ub), not
+        # a max(1,...)-floored near-zero erosion of their own.
+        _ub_tighten_px = _resolve_sam_matte_tighten_px(settings)
+        if _ub_tighten_px != UNIFIED_BAND_CALF_ERODE_PX_BASE:
+            print(f"CK_LOG: sam_matte_tighten_px={_ub_tighten_px}", flush=True)
+        if _ub_tighten_px <= 0.0:
+            _sam_calf_eroded_ub = _sam_feet_eroded_ub
+        else:
+            _calf_erode_r = max(1, int(round(_ub_tighten_px * _scale)))
+            _se_calf_ub = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (_calf_erode_r * 2 + 1, _calf_erode_r * 2 + 1))
+            _sam_calf_eroded_ub = cv2.erode(sam, _se_calf_ub)
         _rows_col_ub = np.arange(h, dtype=np.float32)[:, None]
         _feet_rows_pre = np.broadcast_to(_rows_col_ub >= feet_start, (h, w))
         _calf_rows_ub = np.broadcast_to(_rows_col_ub >= _calf_start_ub, (h, w))
