@@ -681,38 +681,37 @@ function ae_createSAMPrecomp(mergedFirstFramePath, ckMatteFirstFramePath, samMat
         var ckComp = app.project.items.addComp("CK Comp " + srcName, comp.width, comp.height, comp.pixelAspect, ckCompDuration, comp.frameRate);
 
         // Build the compositing stack. Final top→bottom:
-        //   guide text (no render) | GARBAGE MASK (OFF) | CK + SAM AI OUTPUT (OFF) | CK MASTER (edit me) (ON)
+        //   guide text (no render) | GARBAGE MASK (OFF) | CK + SAM AI OUTPUT (ON) | CK MASTER (edit me) (OFF, raw)
         // Add in reverse: each layers.add() inserts at index 1 (top), so first-added ends at bottom.
-        // DEFAULT FLIPPED 2026-07-10 (Berto): "always be on CK MASTER with the matte; CK+SAM
-        // stays there but not selected." The 2026-06-27 rollback of this same flip predates
-        // the 2026-07-03 change that wires GARBAGE MASK as track matte onto CK MASTER too —
-        // back then CK MASTER was raw/unmatted (junk showed, hair argument confused it); now
-        // CK MASTER + matte cuts junk AND keeps full CK hair, and Berto A/B-prefers its edge.
-        // GUARD: on old AE (no setTrackMatte) CK MASTER can't receive the matte — the wiring
-        // block below flips defaults back to CK + SAM there so the visible default is never
-        // an unmatted raw key.
-        // CK MASTER — raw CK clip, junk cut by GARBAGE MASK track matte, user draws masks here
+        // DEFAULT RE-FLIPPED 2026-07-12 (Berto, after the butt/shape-kill fixes made the auto
+        // result trustworthy): "keep CK and SAM selected as the main one, keep CK there but
+        // let it be not selected, and don't let it have the garbage matte." So CK + SAM AI
+        // OUTPUT is the visible default again; CK MASTER stays in the stack OFF and RAW (no
+        // track matte) — the untouched full-hair CK key for hand-mask rescue work. This
+        // supersedes BOTH the 2026-07-10 CK-MASTER-default flip AND the 2026-07-03
+        // matte-on-CK-MASTER wiring (history of those in git — see a23409a).
+        // CK MASTER — raw CK clip, NO matte (Berto 2026-07-12), user draws masks here
         var ckoLayer = null;
         if (ckOnlySeq) {
             try {
                 ckoLayer = ckComp.layers.add(ckOnlySeq);        // added 1st → bottom
                 ckoLayer.name = "CK MASTER (edit me)";
-                ckoLayer.comment = "Raw CK key (full hair), junk cut by GARBAGE MASK track matte. Same treatment as AUTO.";
+                ckoLayer.comment = "Raw CK key (full hair), untouched — no SAM, no matte. Enable + draw masks here when the AUTO layer cuts something you need.";
                 ckoLayer.startTime = 0;
-                ckoLayer.enabled = true;   // visible default since 2026-07-10 (see stack note above)
+                ckoLayer.enabled = false;   // raw backup since 2026-07-12 (see stack note above)
                 try {
                     var ckoChoke = ckoLayer.property("ADBE Effect Parade").addProperty("ADBE Simple Choker");
                     ckoChoke.property("Choke Matte").setValue(0);
                 } catch (eChoke) {}
             } catch (ecko2) {}
         }
-        // CK + SAM AI OUTPUT — merged CK with SAM garbage matte; OFF alternate since
-        // 2026-07-10 (CK MASTER + matte is the visible default — see stack note above).
+        // CK + SAM AI OUTPUT — merged CK with SAM garbage matte; the visible default
+        // again since 2026-07-12 (see stack note above).
         var mergedLayer = ckComp.layers.add(mergedSeq);        // added 2nd → above CK MASTER
         mergedLayer.name = "CK + SAM AI OUTPUT";
         mergedLayer.comment = "Auto result: CK key + SAM garbage cut. Add/raise Simple Choker to adjust edge.";
         mergedLayer.startTime = 0;
-        mergedLayer.enabled = (ckoLayer === null);   // OFF when CK MASTER is the default; ON if CK MASTER missing
+        mergedLayer.enabled = true;   // visible default (Berto 2026-07-12 re-flip)
         try {
             var mergedChoke = mergedLayer.property("ADBE Effect Parade").addProperty("ADBE Simple Choker");
             mergedChoke.property("Choke Matte").setValue(0);   // neutral; tune per shot
@@ -731,41 +730,26 @@ function ae_createSAMPrecomp(mergedFirstFramePath, ckMatteFirstFramePath, samMat
         // Per-layer instructions live in each layer's .comment (Comment column), set above.
         // No on-screen guide layer (Berto 2026-06-21: notes belong ON the layer, not a text layer).
 
-        // Wire GARBAGE MASK as LUMA-INVERTED track matte on BOTH CK + SAM AI OUTPUT
-        // and CK MASTER (Berto 2026-07-03: both get the same treatment).
+        // Wire GARBAGE MASK as LUMA-INVERTED track matte on CK + SAM AI OUTPUT ONLY.
+        // CK MASTER stays RAW — no matte (Berto 2026-07-12: "don't let it have the
+        // garbage matte"; supersedes the 2026-07-03 both-layers wiring).
         if (tightSamLayer) {
             var _lumaInv = TrackMatteType.LUMA_INVERTED;
             try {
                 if (typeof mergedLayer.setTrackMatte === "function") {
                     mergedLayer.setTrackMatte(tightSamLayer, _lumaInv);
-                    if (ckoLayer) ckoLayer.setTrackMatte(tightSamLayer, _lumaInv);
                 } else {
-                    // Pre-2023 AE: adjacency matting — one matte layer can only drive the
-                    // layer directly below, so CK MASTER stays unmatted here. The 07-10
-                    // CK-MASTER-default flip therefore does NOT apply on old AE: an
-                    // unmatted raw key must never be the visible default (junk shows).
+                    // Pre-2023 AE: adjacency matting — GARBAGE MASK sits directly above
+                    // CK + SAM, so the merged default still gets its matte here.
                     mergedLayer.trackMatteType = _lumaInv;
-                    mergedLayer.enabled = true;
-                    if (ckoLayer) ckoLayer.enabled = false;
-                    _warnings.push("Old AE: setTrackMatte missing — GARBAGE MASK wired by adjacency (CK + SAM only; CK MASTER unmatted, kept OFF).");
                 }
             } catch (etm) {
                 _warnings.push("setTrackMatte failed: " + String(etm));
                 try { $.writeln("CK setTrackMatte error: " + etm); } catch (_w) {}
-                // Matte wiring failed entirely — same rule as the old-AE branch:
-                // never leave an unmatted CK MASTER as the visible default.
-                try {
-                    mergedLayer.enabled = true;
-                    if (ckoLayer) ckoLayer.enabled = false;
-                } catch (_ef) {}
             }
-        } else if (ckoLayer) {
-            // No GARBAGE MASK sequence at all — CK MASTER would be raw/unmatted, so it
-            // may not be the visible default (same rule as the wiring-failure paths).
-            mergedLayer.enabled = true;
-            ckoLayer.enabled = false;
-            _warnings.push("No GARBAGE MASK sequence — CK + SAM kept as visible default (CK MASTER would be unmatted).");
         }
+        // CK + SAM is the visible default in every branch above; CK MASTER is always
+        // OFF and unmatted, so no fallback re-flip logic is needed (2026-07-12).
 
         // Drop precomp in main comp above source, hide source
         var precompLayer = comp.layers.add(ckComp);
