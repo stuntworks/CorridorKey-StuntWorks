@@ -681,15 +681,18 @@ function ae_createSAMPrecomp(mergedFirstFramePath, ckMatteFirstFramePath, samMat
         var ckComp = app.project.items.addComp("CK Comp " + srcName, comp.width, comp.height, comp.pixelAspect, ckCompDuration, comp.frameRate);
 
         // Build the compositing stack. Final top→bottom:
-        //   guide text (no render) | GARBAGE MASK (OFF) | CK + SAM AI OUTPUT (ON) | CK MASTER (edit me) (OFF, raw)
+        //   guide text (no render) | GARBAGE MASK (OFF, unwired) | CK + SAM AI OUTPUT (ON, no track matte) | CK MASTER (edit me) (OFF, raw)
         // Add in reverse: each layers.add() inserts at index 1 (top), so first-added ends at bottom.
-        // DEFAULT RE-FLIPPED 2026-07-12 (Berto, after the butt/shape-kill fixes made the auto
-        // result trustworthy): "keep CK and SAM selected as the main one, keep CK there but
-        // let it be not selected, and don't let it have the garbage matte." So CK + SAM AI
-        // OUTPUT is the visible default again; CK MASTER stays in the stack OFF and RAW (no
-        // track matte) — the untouched full-hair CK key for hand-mask rescue work. This
-        // supersedes BOTH the 2026-07-10 CK-MASTER-default flip AND the 2026-07-03
-        // matte-on-CK-MASTER wiring (history of those in git — see a23409a).
+        // DEFAULT 2026-07-12 (Berto, after the butt/shape-kill fixes cleaned the auto result):
+        // "keep CK and SAM selected as the main one, keep CK there but not selected... take off
+        // the mask, we don't need it anymore, but leave the mask on for CorridorKey [= keep the
+        // GARBAGE MASK layer present, off, available]." So CK + SAM AI OUTPUT is the visible
+        // default with NO GARBAGE MASK track matte wired (the SAM garbage cut is already baked
+        // into the merged sequence upstream in corridorkey_sam_merge.py — the AE track matte was
+        // a redundant second cut, no longer needed now the merge is clean). GARBAGE MASK layer
+        // still ships in the stack, OFF and unwired, so any shot that regresses can re-enable it.
+        // CK MASTER stays OFF and RAW (no matte) — untouched full-hair CK key for hand-mask work.
+        // Supersedes the 2026-07-10 CK-MASTER-default flip and the 2026-07-03 matte wiring (git a23409a).
         // CK MASTER — raw CK clip, NO matte (Berto 2026-07-12), user draws masks here
         var ckoLayer = null;
         if (ckOnlySeq) {
@@ -716,13 +719,16 @@ function ae_createSAMPrecomp(mergedFirstFramePath, ckMatteFirstFramePath, samMat
             var mergedChoke = mergedLayer.property("ADBE Effect Parade").addProperty("ADBE Simple Choker");
             mergedChoke.property("Choke Matte").setValue(0);   // neutral; tune per shot
         } catch (eMergedChoke) {}
-        // GARBAGE MASK — SAM matte source; LUMA-INVERTED track matte for CK + SAM AI OUTPUT only
+        // GARBAGE MASK — SAM junk-mask source. Ships OFF and UNWIRED (Berto 2026-07-12:
+        // "take off the mask... but leave the mask on for CorridorKey"). The merged CK + SAM
+        // default already has this cut baked in upstream, so it needs no track matte here;
+        // this layer stays available for a shot that regresses.
         var tightSamLayer = null;
         if (tightSamSeq) {
             try {
                 tightSamLayer = ckComp.layers.add(tightSamSeq); // added 3rd → above CK + SAM AI OUTPUT
                 tightSamLayer.name = "GARBAGE MASK";
-                tightSamLayer.comment = "SAM junk mask (track matte for AUTO + CK MASTER). Enable + trim to bad frames to cut off-green junk.";
+                tightSamLayer.comment = "SAM junk mask, OFF by default. If a shot shows off-green junk: enable this, set it as CK + SAM AI OUTPUT's track matte (LUMA INVERTED), trim to the bad frames.";
                 tightSamLayer.startTime = 0;
                 tightSamLayer.enabled = false;
             } catch (eTsl) {}
@@ -730,26 +736,9 @@ function ae_createSAMPrecomp(mergedFirstFramePath, ckMatteFirstFramePath, samMat
         // Per-layer instructions live in each layer's .comment (Comment column), set above.
         // No on-screen guide layer (Berto 2026-06-21: notes belong ON the layer, not a text layer).
 
-        // Wire GARBAGE MASK as LUMA-INVERTED track matte on CK + SAM AI OUTPUT ONLY.
-        // CK MASTER stays RAW — no matte (Berto 2026-07-12: "don't let it have the
-        // garbage matte"; supersedes the 2026-07-03 both-layers wiring).
-        if (tightSamLayer) {
-            var _lumaInv = TrackMatteType.LUMA_INVERTED;
-            try {
-                if (typeof mergedLayer.setTrackMatte === "function") {
-                    mergedLayer.setTrackMatte(tightSamLayer, _lumaInv);
-                } else {
-                    // Pre-2023 AE: adjacency matting — GARBAGE MASK sits directly above
-                    // CK + SAM, so the merged default still gets its matte here.
-                    mergedLayer.trackMatteType = _lumaInv;
-                }
-            } catch (etm) {
-                _warnings.push("setTrackMatte failed: " + String(etm));
-                try { $.writeln("CK setTrackMatte error: " + etm); } catch (_w) {}
-            }
-        }
-        // CK + SAM is the visible default in every branch above; CK MASTER is always
-        // OFF and unmatted, so no fallback re-flip logic is needed (2026-07-12).
+        // NO track matte wired by default (Berto 2026-07-12): the merged CK + SAM sequence is
+        // already clean, so nothing needs the GARBAGE MASK cut on top. CK + SAM is the visible
+        // default; CK MASTER is OFF and raw. Both stay untouched here.
 
         // Drop precomp in main comp above source, hide source
         var precompLayer = comp.layers.add(ckComp);
