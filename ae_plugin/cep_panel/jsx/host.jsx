@@ -570,6 +570,19 @@ function ck_addLayerMask(layerName, maskModeStr) {
 //   lockHandleJson        — layer lock handle JSON from ae_lockLayer
 //   advanced              — "true" = show matte layers; "false" = hide them
 //   ckOnlyFirstFramePath  — path to CK_ONLY/CK_ONLY_00000.png (full-hair CK clip)
+// WHAT IT DOES: Adds a single duration/span layer marker (start=0, spans the given
+//   duration) carrying `text` as the marker comment, so the instruction reads directly
+//   on the layer's timeline bar without the hidden Comment column enabled.
+// WHY (Berto 2026-07-14): comments only show if that column is manually turned on;
+//   markers render on the bar / on hover / on double-click by default.
+// AFFECTS: mutates `layer`'s Marker property stream. Never throws — caller wraps each
+//   call in its own try/catch so one failed marker never aborts the comp build.
+function _addLayerMarker(layer, text, duration) {
+    var mv = new MarkerValue(String(text));
+    mv.duration = Number(duration) || 0;
+    layer.property("Marker").setValueAtTime(0, mv);
+}
+
 function ae_createSAMPrecomp(mergedFirstFramePath, ckMatteFirstFramePath, samMatteFirstFramePath,
                               fps, compStartTime, sourceFsName, lockHandleJson, advanced, ckOnlyFirstFramePath,
                               tightSamFirstFramePath) {
@@ -681,7 +694,7 @@ function ae_createSAMPrecomp(mergedFirstFramePath, ckMatteFirstFramePath, samMat
         var ckComp = app.project.items.addComp("CK Comp " + srcName, comp.width, comp.height, comp.pixelAspect, ckCompDuration, comp.frameRate);
 
         // Build the compositing stack. Final top→bottom:
-        //   guide text (no render) | GARBAGE MASK (OFF, unwired) | CK + SAM AI OUTPUT (ON, no track matte) | CK MASTER (edit me) (OFF, raw)
+        //   guide text (no render) | GARBAGE MASK (OFF, unwired) | CK + SAM AI OUTPUT (ON, no track matte) | CK MASTER (OFF, raw)
         // Add in reverse: each layers.add() inserts at index 1 (top), so first-added ends at bottom.
         // DEFAULT 2026-07-12 (Berto, after the butt/shape-kill fixes cleaned the auto result):
         // "keep CK and SAM selected as the main one, keep CK there but not selected... take off
@@ -698,7 +711,7 @@ function ae_createSAMPrecomp(mergedFirstFramePath, ckMatteFirstFramePath, samMat
         if (ckOnlySeq) {
             try {
                 ckoLayer = ckComp.layers.add(ckOnlySeq);        // added 1st → bottom
-                ckoLayer.name = "CK MASTER (edit me)";
+                ckoLayer.name = "CK MASTER";
                 ckoLayer.comment = "Raw CK key, full hair — for hand-mask rescue. Same junk fix works here: turn on GARBAGE MASK, set it as this layer's Track Matte, LUMA INVERTED.";
                 ckoLayer.startTime = 0;
                 ckoLayer.enabled = false;   // raw backup since 2026-07-12 (see stack note above)
@@ -706,6 +719,9 @@ function ae_createSAMPrecomp(mergedFirstFramePath, ckMatteFirstFramePath, samMat
                     var ckoChoke = ckoLayer.property("ADBE Effect Parade").addProperty("ADBE Simple Choker");
                     ckoChoke.property("Choke Matte").setValue(0);
                 } catch (eChoke) {}
+                try {
+                    _addLayerMarker(ckoLayer, "Raw CK, full hair — hand-mask rescue. Junk fix works here too: GARBAGE MASK as Track Matte, LUMA INVERTED.", ckCompDuration);
+                } catch (eMarkCko) { _warnings.push("CK MASTER marker: " + String(eMarkCko)); }
             } catch (ecko2) {}
         }
         // CK + SAM AI OUTPUT — merged CK with SAM garbage matte; the visible default
@@ -719,6 +735,9 @@ function ae_createSAMPrecomp(mergedFirstFramePath, ckMatteFirstFramePath, samMat
             var mergedChoke = mergedLayer.property("ADBE Effect Parade").addProperty("ADBE Simple Choker");
             mergedChoke.property("Choke Matte").setValue(0);   // neutral; tune per shot
         } catch (eMergedChoke) {}
+        try {
+            _addLayerMarker(mergedLayer, "YOUR FINISHED KEY — most shots you're done. Junk on a shot? Turn on GARBAGE MASK, set it as this layer's Track Matte, LUMA INVERTED.", ckCompDuration);
+        } catch (eMarkMerged) { _warnings.push("CK + SAM AI OUTPUT marker: " + String(eMarkMerged)); }
         // GARBAGE MASK — SAM junk-mask source. Ships OFF and UNWIRED (Berto 2026-07-12:
         // "take off the mask... but leave the mask on for CorridorKey"). The merged CK + SAM
         // default already has this cut baked in upstream, so it needs no track matte here;
@@ -731,6 +750,9 @@ function ae_createSAMPrecomp(mergedFirstFramePath, ckMatteFirstFramePath, samMat
                 tightSamLayer.comment = "Junk cleaner, OFF by default. Need it? Turn me on, then set me as the Track Matte (LUMA INVERTED) on CK + SAM or CK MASTER. Trim to just the bad frames.";
                 tightSamLayer.startTime = 0;
                 tightSamLayer.enabled = false;
+                try {
+                    _addLayerMarker(tightSamLayer, "Junk cleaner, OFF by default. Turn me on, set me as the Track Matte (LUMA INVERTED) on CK + SAM or CK MASTER.", ckCompDuration);
+                } catch (eMarkTsl) { _warnings.push("GARBAGE MASK marker: " + String(eMarkTsl)); }
             } catch (eTsl) {}
         }
         // Per-layer instructions live in each layer's .comment (Comment column), set above.
