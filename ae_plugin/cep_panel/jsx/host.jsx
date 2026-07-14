@@ -699,7 +699,7 @@ function ae_createSAMPrecomp(mergedFirstFramePath, ckMatteFirstFramePath, samMat
             try {
                 ckoLayer = ckComp.layers.add(ckOnlySeq);        // added 1st → bottom
                 ckoLayer.name = "CK MASTER (edit me)";
-                ckoLayer.comment = "Raw CK key (full hair), untouched — no SAM, no matte. Enable + draw masks here when the AUTO layer cuts something you need.";
+                ckoLayer.comment = "Raw CK key, full hair — for hand-mask rescue. Same junk fix works here: turn on GARBAGE MASK, set it as this layer's Track Matte, LUMA INVERTED.";
                 ckoLayer.startTime = 0;
                 ckoLayer.enabled = false;   // raw backup since 2026-07-12 (see stack note above)
                 try {
@@ -712,7 +712,7 @@ function ae_createSAMPrecomp(mergedFirstFramePath, ckMatteFirstFramePath, samMat
         // again since 2026-07-12 (see stack note above).
         var mergedLayer = ckComp.layers.add(mergedSeq);        // added 2nd → above CK MASTER
         mergedLayer.name = "CK + SAM AI OUTPUT";
-        mergedLayer.comment = "Auto result: CK key + SAM garbage cut. Add/raise Simple Choker to adjust edge.";
+        mergedLayer.comment = "This is your finished key — most shots, you're done. Leftover junk on a shot? Turn on GARBAGE MASK, set it as this layer's Track Matte, LUMA INVERTED.";
         mergedLayer.startTime = 0;
         mergedLayer.enabled = true;   // visible default (Berto 2026-07-12 re-flip)
         try {
@@ -728,7 +728,7 @@ function ae_createSAMPrecomp(mergedFirstFramePath, ckMatteFirstFramePath, samMat
             try {
                 tightSamLayer = ckComp.layers.add(tightSamSeq); // added 3rd → above CK + SAM AI OUTPUT
                 tightSamLayer.name = "GARBAGE MASK";
-                tightSamLayer.comment = "SAM junk mask, OFF by default. If a shot shows off-green junk: enable this, set it as CK + SAM AI OUTPUT's track matte (LUMA INVERTED), trim to the bad frames.";
+                tightSamLayer.comment = "Junk cleaner, OFF by default. Need it? Turn me on, then set me as the Track Matte (LUMA INVERTED) on CK + SAM or CK MASTER. Trim to just the bad frames.";
                 tightSamLayer.startTime = 0;
                 tightSamLayer.enabled = false;
             } catch (eTsl) {}
