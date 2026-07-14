@@ -681,38 +681,18 @@ function ae_createSAMPrecomp(mergedFirstFramePath, ckMatteFirstFramePath, samMat
         var ckComp = app.project.items.addComp("CK Comp " + srcName, comp.width, comp.height, comp.pixelAspect, ckCompDuration, comp.frameRate);
 
         // Build the compositing stack. Final top→bottom:
-        //   GARBAGE MASK (OFF, matte source) | CK + SAM (GARBAGE MASK ON) (OFF, pre-wired LUMA-INVERTED
-        //   matte from GARBAGE MASK) | CK + SAM AI OUTPUT (ON, clean, no matte) | CK MASTER (edit me) (OFF, raw)
+        //   guide text (no render) | GARBAGE MASK (OFF, unwired) | CK + SAM AI OUTPUT (ON, no track matte) | CK MASTER (edit me) (OFF, raw)
         // Add in reverse: each layers.add() inserts at index 1 (top), so first-added ends at bottom.
         // DEFAULT 2026-07-12 (Berto, after the butt/shape-kill fixes cleaned the auto result):
         // "keep CK and SAM selected as the main one, keep CK there but not selected... take off
         // the mask, we don't need it anymore, but leave the mask on for CorridorKey [= keep the
         // GARBAGE MASK layer present, off, available]." So CK + SAM AI OUTPUT is the visible
-        // default with NO GARBAGE MASK track matte cutting it (the SAM garbage cut is already baked
+        // default with NO GARBAGE MASK track matte wired (the SAM garbage cut is already baked
         // into the merged sequence upstream in corridorkey_sam_merge.py — the AE track matte was
-        // a redundant second cut, no longer needed now the merge is clean).
-        // ONE-CLICK GARBAGE MASK (Berto 2026-07-12, same-day follow-up): "all you gotta do is pick
-        // the mask and it works automatically" — wants the LUMA-INVERTED track-matte relationship
-        // already set up so re-enabling it isn't a manual assign-and-invert dance.
-        // RESEARCHED (AE 23.0+ scripting: docsforadobe.dev AVLayer reference + Adobe community
-        // "New Scripting API for Selectable Track Matte Layers" changelog thread): a track matte
-        // assigned via AVLayer.setTrackMatte() activates immediately and is fully independent of
-        // the MATTE layer's own enabled/video switch — there is no scriptable "assigned but
-        // disabled" state (no trackMatteEnabled-type property exists). Confirmed by this file's
-        // own history: GARBAGE MASK sat enabled=false from a23409a through a3ae036 while its matte
-        // was still actively cutting CK MASTER. So the matte CANNOT be pre-wired onto the live
-        // default layer (mergedLayer) without cutting it immediately — that would break the clean
-        // default Berto just fought to get (a3ae036). FIX: pre-wire the matte onto a SEPARATE
-        // duplicate fill layer ("CK + SAM (GARBAGE MASK ON)") instead, and leave that duplicate's
-        // own layer switch OFF. A disabled layer renders nothing, matte or not, so the default
-        // stays exactly as clean as a3ae036 left it. To activate on a regressed shot: disable
-        // "CK + SAM AI OUTPUT", enable "CK + SAM (GARBAGE MASK ON)" — two flips, zero track-matte
-        // dropdown navigation. GARBAGE MASK's own on/off switch is cosmetic now (see finding
-        // above) — its comment below says so explicitly so Berto doesn't chase the wrong switch.
-        // (New comp instances only pick this up after a full AE restart — host.jsx is cached.)
+        // a redundant second cut, no longer needed now the merge is clean). GARBAGE MASK layer
+        // still ships in the stack, OFF and unwired, so any shot that regresses can re-enable it.
         // CK MASTER stays OFF and RAW (no matte) — untouched full-hair CK key for hand-mask work.
-        // Supersedes the 2026-07-10 CK-MASTER-default flip, the 2026-07-03 matte wiring, and the
-        // 2026-07-12 unwiring (git a23409a, a3ae036) — same clean default, matte now pre-wired but inert.
+        // Supersedes the 2026-07-10 CK-MASTER-default flip and the 2026-07-03 matte wiring (git a23409a).
         // CK MASTER — raw CK clip, NO matte (Berto 2026-07-12), user draws masks here
         var ckoLayer = null;
         if (ckOnlySeq) {
@@ -732,67 +712,33 @@ function ae_createSAMPrecomp(mergedFirstFramePath, ckMatteFirstFramePath, samMat
         // again since 2026-07-12 (see stack note above).
         var mergedLayer = ckComp.layers.add(mergedSeq);        // added 2nd → above CK MASTER
         mergedLayer.name = "CK + SAM AI OUTPUT";
-        mergedLayer.comment = "Auto result: CK key + SAM garbage cut. Add/raise Simple Choker to adjust edge. If junk shows: disable this, enable 'CK + SAM (GARBAGE MASK ON)' above — matte's already wired, just flip the two switches.";
+        mergedLayer.comment = "Auto result: CK key + SAM garbage cut. Add/raise Simple Choker to adjust edge.";
         mergedLayer.startTime = 0;
         mergedLayer.enabled = true;   // visible default (Berto 2026-07-12 re-flip)
         try {
             var mergedChoke = mergedLayer.property("ADBE Effect Parade").addProperty("ADBE Simple Choker");
             mergedChoke.property("Choke Matte").setValue(0);   // neutral; tune per shot
         } catch (eMergedChoke) {}
-        // CK + SAM (GARBAGE MASK ON) — duplicate of CK + SAM AI OUTPUT with the GARBAGE MASK
-        // LUMA-INVERTED track matte pre-wired (see stack note above). OFF by default so it
-        // renders nothing and the default stays clean; the actual setTrackMatte() call happens
-        // below once GARBAGE MASK exists (needs the layer reference).
-        var dupMattedLayer = null;
-        if (tightSamSeq) {
-            try {
-                dupMattedLayer = ckComp.layers.add(mergedSeq);   // added 3rd → above CK + SAM AI OUTPUT
-                dupMattedLayer.name = "CK + SAM (GARBAGE MASK ON)";
-                dupMattedLayer.comment = "Pre-wired: GARBAGE MASK is already its LUMA INVERTED track matte. OFF by default. To use on a shot that regresses: disable 'CK + SAM AI OUTPUT' below, enable THIS layer — no manual track-matte assignment needed. Trim GARBAGE MASK to the bad frames if needed.";
-                dupMattedLayer.startTime = 0;
-                dupMattedLayer.enabled = false;   // OFF by default — CK + SAM AI OUTPUT stays the clean default
-                try {
-                    var dupChoke = dupMattedLayer.property("ADBE Effect Parade").addProperty("ADBE Simple Choker");
-                    dupChoke.property("Choke Matte").setValue(0);   // neutral; tune per shot, same as CK + SAM AI OUTPUT
-                } catch (eDupChoke) {}
-            } catch (eDup) {}
-        }
-        // GARBAGE MASK — SAM junk-mask source for CK + SAM (GARBAGE MASK ON) above. Ships OFF;
-        // its own on/off switch does NOT control the matte (track mattes run independent of the
-        // source layer's visibility — see stack note above), so it stays off purely for tidiness.
+        // GARBAGE MASK — SAM junk-mask source. Ships OFF and UNWIRED (Berto 2026-07-12:
+        // "take off the mask... but leave the mask on for CorridorKey"). The merged CK + SAM
+        // default already has this cut baked in upstream, so it needs no track matte here;
+        // this layer stays available for a shot that regresses.
         var tightSamLayer = null;
         if (tightSamSeq) {
             try {
-                tightSamLayer = ckComp.layers.add(tightSamSeq); // added 4th → top
+                tightSamLayer = ckComp.layers.add(tightSamSeq); // added 3rd → above CK + SAM AI OUTPUT
                 tightSamLayer.name = "GARBAGE MASK";
-                tightSamLayer.comment = "SAM junk mask — pre-wired as the LUMA INVERTED track matte for 'CK + SAM (GARBAGE MASK ON)'. This layer's own switch doesn't matter, leave it off. To use it: disable 'CK + SAM AI OUTPUT', enable 'CK + SAM (GARBAGE MASK ON)'. Trim to the bad frames if needed.";
+                tightSamLayer.comment = "SAM junk mask, OFF by default. If a shot shows off-green junk: enable this, set it as CK + SAM AI OUTPUT's track matte (LUMA INVERTED), trim to the bad frames.";
                 tightSamLayer.startTime = 0;
                 tightSamLayer.enabled = false;
             } catch (eTsl) {}
         }
-        // Wire GARBAGE MASK as LUMA-INVERTED track matte on the DUPLICATE layer ONLY — never on
-        // the live mergedLayer default (see stack note above for why). Both layers involved to
-        // this assignment stay OFF, so it is inert until Berto flips the two switches described
-        // in their .comments.
-        if (tightSamLayer && dupMattedLayer) {
-            var _lumaInv = TrackMatteType.LUMA_INVERTED;
-            try {
-                if (typeof dupMattedLayer.setTrackMatte === "function") {
-                    dupMattedLayer.setTrackMatte(tightSamLayer, _lumaInv);
-                } else {
-                    // Pre-2023 AE: adjacency matting — dupMattedLayer sits directly below
-                    // GARBAGE MASK in the stack, so the legacy trackMatteType assignment lands
-                    // on the right layer without needing setTrackMatte.
-                    dupMattedLayer.trackMatteType = _lumaInv;
-                    _warnings.push("Old AE: setTrackMatte missing — GARBAGE MASK pre-wired by adjacency onto 'CK + SAM (GARBAGE MASK ON)'.");
-                }
-            } catch (etm) {
-                _warnings.push("Pre-wiring GARBAGE MASK track matte failed: " + String(etm));
-                try { $.writeln("CK setTrackMatte error (pre-wire): " + etm); } catch (_w) {}
-            }
-        }
         // Per-layer instructions live in each layer's .comment (Comment column), set above.
         // No on-screen guide layer (Berto 2026-06-21: notes belong ON the layer, not a text layer).
+
+        // NO track matte wired by default (Berto 2026-07-12): the merged CK + SAM sequence is
+        // already clean, so nothing needs the GARBAGE MASK cut on top. CK + SAM is the visible
+        // default; CK MASTER is OFF and raw. Both stay untouched here.
 
         // Drop precomp in main comp above source, hide source
         var precompLayer = comp.layers.add(ckComp);
@@ -804,7 +750,6 @@ function ae_createSAMPrecomp(mergedFirstFramePath, ckMatteFirstFramePath, samMat
         comp.time = comp.time;
         return JSON.stringify({ ok: true, compName: ckComp.name, advanced: isAdvanced,
             ckMatte: !!ckMatteSeq, samMatte: !!samMatteSeq, tightSamMatte: !!tightSamSeq, ckFull: !!ckoLayer, via: via,
-            garbageMattePrewired: !!(tightSamLayer && dupMattedLayer),
             warnings: _warnings.length ? _warnings : undefined });
     } catch (e) { return JSON.stringify({ ok: false, error: String(e) }); }
 }
