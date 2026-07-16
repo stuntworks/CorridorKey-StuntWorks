@@ -516,6 +516,41 @@ def _braw_locate_exe():
     return next((str(p) for p in _BRAW_EXE_CANDIDATES if p.exists()), None)
 
 
+def _braw_job_object_for(proc):
+    """Wrap a BRAW decode subprocess in a Windows Job Object with
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE so an EXTERNAL kill of THIS python process
+    (broker kill, task-manager kill, Berto cancelling mid-render) cascades to kill
+    the braw-decode.exe grandchild too. Without this, killing the parent orphans the
+    decoder (it keeps running, holding the source file open) and leaks the temp PNG
+    dir, since our own cleanup code never gets to run. The per-frame watchdog +
+    `finally: _braw_kill(proc)` already cover the common failure modes (a stalled
+    decode, a normal error exit) — this only matters for the EXTERNAL-kill case, and
+    is intentionally best-effort: if pywin32 isn't installed or the Windows API
+    calls fail for any reason, this logs a warning and returns None, and the decode
+    proceeds with the pre-existing (smaller, heartbeat-mitigated) orphan risk rather
+    than blocking the render over an optional safety net.
+    Returns the job handle — CALLER MUST KEEP IT REFERENCED for as long as the kill
+    protection should apply (kill-on-close fires when the job's LAST handle closes,
+    i.e. when this returned object is garbage-collected or the process exits).
+    DEPENDS ON: pywin32 (win32job/win32api/win32con) — optional, degrades gracefully.
+    """
+    try:
+        import win32job
+        import win32api
+        import win32con
+        h_job = win32job.CreateJobObject(None, "")
+        info = win32job.QueryInformationJobObject(h_job, win32job.JobObjectExtendedLimitInformation)
+        info['BasicLimitInformation']['LimitFlags'] = win32job.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        win32job.SetInformationJobObject(h_job, win32job.JobObjectExtendedLimitInformation, info)
+        h_process = win32api.OpenProcess(win32con.PROCESS_ALL_ACCESS, False, proc.pid)
+        win32job.AssignProcessToJobObject(h_job, h_process)
+        return h_job
+    except Exception as e:
+        log.warning(f"BRAW range decode: Job Object setup failed (non-fatal — decode continues "
+                    f"without external-kill cascade protection): {e}")
+        return None
+
+
 def _braw_build_env():
     """Wire BRAW_SDK_PATH + PATH so braw-decode.exe's DLL loader finds
     BlackmagicRawAPI.dll's own dependencies (matches resolve_plugin's env wiring —
@@ -530,6 +565,332 @@ def _braw_build_env():
     return env
 
 
+# ── BRAW range decode for full-clip RENDER (F-braw-render, 2026-07-16) ─────
+# WHAT IT DOES: the block above (_cmd_extract_braw) decodes ONE frame for the
+#   source preview. cmd_batch (full-clip RENDER) needs a whole RANGE of frames, and
+#   cv2 still can't read .braw — so this pre-decodes the exact range cmd_batch needs
+#   to a temp PNG sequence via ONE braw-decode.exe stream, then _BrawFrameCapture
+#   (below) lets cmd_batch's existing cv2.VideoCapture-shaped code read them without
+#   any changes to the per-frame keying/SAM/post-proc pipeline itself.
+# SOURCE OF TRUTH: streaming shape mirrors resolve_plugin/CorridorKey_Pro.py's
+#   _try_braw_decode_exe (one Popen, `-c bgra -s 1 -i start -o end`, no
+#   --color-science flag so the SDK's Rec.709 default applies — proven 2026-07-16).
+_BRAW_MAX_DIM = 16384
+_BRAW_MAX_FRAME_BYTES = 800 * 1024 * 1024  # 800MB
+# DANGER ZONE FRAGILE: resolution sanity caps shared by EVERY BRAW decode path
+# (single-frame extract below AND the range decode below) — a corrupt/malicious clip
+# header could otherwise report an absurd WxH and drive an unbounded allocation.
+# Hoisted to module level (previously duplicated as locals inside _cmd_extract_braw)
+# so both paths enforce identical limits — do not re-duplicate these as locals.
+
+_BRAW_MAX_RANGE_FRAMES = 100_000
+# DANGER ZONE FRAGILE: sane upper bound on a single range-decode call (cmd_batch's
+# .braw path). Not a real-world render-length limit (100k frames @ 24fps = ~69 min) —
+# it exists so a bug upstream in start_frame/end_frame arithmetic (e.g. a negative or
+# huge computed range) fails loud with a CK_ERROR instead of _braw_decode_range_to_pngs
+# silently trying to decode/write an unbounded number of frames and filling the disk.
+
+_BRAW_FRAME_EPS = 1e-6
+# DANGER ZONE FRAGILE: epsilon used by _braw_time_to_frame's ceil() so a frame-exact
+# time (e.g. 8.875s @ 24fps = frame 213.0 exactly) lands on 213, not 214 from float
+# imprecision (8.875*24 can evaluate to 213.00000000000003).
+
+
+def _braw_parse_info_stdout(stdout_text):
+    """Parse braw-decode.exe's `-n` info-query stdout for 'Resolution: WxH' and
+    'Framerate: N' lines. Returns (w, h, fps) — w/h are None if unparseable, fps is
+    None if that line is missing/malformed (callers already fall back to a safe
+    default fps). This is the ONE place this byte-format parsing lives: both
+    _cmd_extract_braw (single-frame preview) and _braw_probe (range render, below)
+    call it instead of each carrying their own copy that could silently drift apart.
+    ISOLATED: pure string parsing, no I/O.
+    """
+    w = h = None
+    fps = None
+    for line in stdout_text.splitlines():
+        if "Resolution:" in line:
+            parts = line.split(":", 1)[1].strip().split("x")
+            w, h = int(parts[0].strip()), int(parts[1].strip())
+        elif "Framerate:" in line:
+            try:
+                fps = float(line.split(":", 1)[1].strip())
+            except ValueError:
+                pass
+    return w, h, fps
+
+
+def _braw_time_to_frame(time_sec, fps):
+    """Seconds -> frame index using the 'first frame AT OR AFTER the requested time'
+    convention — the SAME convention _cmd_extract_braw's single-frame preview uses.
+    Preview must equal render (hard project rule): a .braw RENDER's start_seconds has
+    to land on the identical frame a PREVIEW/extract at that same start_seconds
+    shows, so this helper is shared rather than reimplemented with different rounding
+    (e.g. round()) in cmd_batch.
+    DEPENDS ON: _BRAW_FRAME_EPS.
+    """
+    import math
+    safe_fps = fps if fps and fps > 0 else 24.0
+    return math.ceil(float(time_sec) * safe_fps - _BRAW_FRAME_EPS)
+
+
+def _braw_probe(source_video):
+    """Locate braw-decode.exe, wire its DLL env, and run its `-n` info query for a
+    .braw source. Returns (exe, env, w, h, fps, err): on failure exe/env/w/h/fps are
+    all None and `err` is a short CK_ERROR-ready message; on success err is None.
+    DEPENDS ON: _braw_locate_exe, _braw_build_env, _braw_parse_info_stdout,
+      _BRAW_MAX_DIM, _BRAW_MAX_FRAME_BYTES.
+    AFFECTS: only cmd_batch's .braw range-render path. The proven single-frame path
+      (_cmd_extract_braw) runs its own independent probe/subprocess call and is not
+      touched by this function.
+    """
+    import subprocess
+    exe = _braw_locate_exe()
+    if exe is None:
+        return None, None, None, None, None, ("BRAW decode helper not found (braw-decode.exe). "
+                                                "BRAW support needs the CorridorKey BRAW decoder installed.")
+    if not Path(_BRAW_DLL_DIR + "/BlackmagicRawAPI.dll").exists():
+        return None, None, None, None, None, ("BRAW decode needs the Blackmagic RAW SDK installed "
+                                                "(BlackmagicRawAPI.dll not found).")
+    env = _braw_build_env()
+    fp = str(source_video)
+    try:
+        r = subprocess.run([exe, "-n", "-s", "1", fp], capture_output=True, text=True, timeout=30,
+                            stdin=subprocess.DEVNULL, env=env,
+                            creationflags=subprocess.CREATE_NO_WINDOW)
+        if r.returncode != 0 or not r.stdout:
+            return None, None, None, None, None, f"BRAW decode info query failed (rc={r.returncode})"
+        w, h, fps = _braw_parse_info_stdout(r.stdout)
+        if w is None or h is None:
+            return None, None, None, None, None, "BRAW decode returned unreadable clip info"
+    except Exception as e:
+        return None, None, None, None, None, f"BRAW decode info query failed — {e}"
+
+    if not (1 <= w <= _BRAW_MAX_DIM and 1 <= h <= _BRAW_MAX_DIM):
+        return None, None, None, None, None, f"BRAW decode reported an implausible resolution {w}x{h}"
+    if w * h * 4 > _BRAW_MAX_FRAME_BYTES:
+        return None, None, None, None, None, f"BRAW decode frame size too large ({w}x{h})"
+    return exe, env, w, h, fps, None
+
+
+def _braw_decode_range_to_pngs(exe, env, source_video, first_abs_frame, last_abs_frame, w, h, temp_dir,
+                                progress_total=None):
+    """Stream-decode braw-decode.exe frames [first_abs_frame, last_abs_frame) from a
+    .braw source to <temp_dir>/<abs_frame:06d>.png (8-bit BGR — matches what
+    cv2.VideoCapture.read() would hand cmd_batch's pipeline for a normal source).
+    ONE braw-decode.exe process for the WHOLE range (mirrors resolve_plugin's
+    _try_braw_decode_exe / _export_braw_range_to_frames streaming shape) — never one
+    process per frame. Does NOT pass --color-science: braw-decode.exe already
+    defaults to Rec.709 (proven 2026-07-16), so the range call inherits it exactly
+    like the single-frame path does.
+    Returns None on full success, or a short CK_ERROR-ready message string if the
+    decode failed, the stream ended early, a PNG write failed, or a post-decode
+    sanity check found unexpected trailing bytes (possible frame-size desync — see
+    the DANGER ZONE comment below). Any frames written before a failure stay on
+    disk — the caller's finally block removes the whole temp_dir regardless, so a
+    partial write never survives as stale output.
+    NEVER raises. NEVER hangs — a PER-FRAME watchdog (same _BRAW_DECODE_TIMEOUT_S the
+    single-frame path uses) kills a stalled decoder instead of blocking forever; the
+    process is always reaped in `finally`.
+    HEARTBEAT: emits `PROGRESS k/progress_total` (same format cmd_batch's own keying
+    loop already emits, so the panel's existing regex needs no changes) once per
+    decoded frame. This exists for the broker (ck_broker.py's
+    _run_via_sam_subprocess resets its 600s stall watchdog on every stdout LINE — a
+    long single-shot decode that only logged "start"/"complete" could go silent past
+    that cap and get killed as "stalled" even though it was healthy) and, as a
+    side effect, keeps the panel's progress bar moving during pre-decode instead of
+    sitting frozen. progress_total defaults to this call's own frame count when the
+    caller doesn't pass the render's real total (denominator is capped so pre-decode
+    of the 1-frame SAM preroll never reports e.g. "6/5").
+    DEPENDS ON: _braw_read_exact, _braw_kill, _BRAW_DECODE_TIMEOUT_S, _BRAW_MAX_RANGE_FRAMES.
+    """
+    import subprocess
+    import threading
+    import cv2
+    import numpy as np
+
+    bytes_per_frame = w * h * 4  # BGRA U8 — DANGER ZONE FRAGILE, see _cmd_extract_braw's module note.
+    n_frames = int(last_abs_frame) - int(first_abs_frame)
+    if n_frames <= 0:
+        return "BRAW decode range is empty"
+    if n_frames > _BRAW_MAX_RANGE_FRAMES:
+        return f"BRAW decode range too large ({n_frames} frames, cap {_BRAW_MAX_RANGE_FRAMES}) — refusing"
+
+    _progress_total = int(progress_total) if progress_total else n_frames
+
+    proc = None
+    watchdog = None
+    decoded = 0
+    _stalled = threading.Event()
+
+    def _mark_stalled_and_kill():
+        _stalled.set()
+        _braw_kill(proc)
+
+    _braw_job_handle = None  # kept referenced for this function's lifetime — see _braw_job_object_for
+    try:
+        proc = subprocess.Popen(
+            [exe, "-c", "bgra", "-s", "1", "-i", str(first_abs_frame), "-o", str(last_abs_frame), str(source_video)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=env,
+            creationflags=subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP,
+        )
+        # Residual-risk mitigation (2026-07-16 review, item 5): the heartbeat above
+        # covers the common external-kill trigger (broker stall-kill from silence);
+        # this Job Object covers the remaining case — the python process itself
+        # being killed externally mid-decode — so the grandchild exe can't be left
+        # running as an orphan holding the source file open.
+        _braw_job_handle = _braw_job_object_for(proc)
+        for offset in range(n_frames):
+            abs_idx = first_abs_frame + offset
+            # Fresh watchdog PER FRAME (not one for the whole range) — total decode
+            # time for a long render is unbounded and legitimate; what must never
+            # happen is ONE frame stalling forever.
+            watchdog = threading.Timer(_BRAW_DECODE_TIMEOUT_S, _mark_stalled_and_kill)
+            watchdog.daemon = True
+            watchdog.start()
+            raw = _braw_read_exact(proc.stdout, bytes_per_frame)
+            watchdog.cancel()
+            if raw is None:
+                if _stalled.is_set():
+                    log.error(f"BRAW range decode: watchdog killed a stalled decode at frame {abs_idx}")
+                    return f"BRAW decode stalled past {_BRAW_DECODE_TIMEOUT_S}s and was killed (decoded {decoded}/{n_frames})"
+                log.error(f"BRAW range decode: stream ended before frame {abs_idx} (decoded {decoded}/{n_frames})")
+                return f"BRAW decode stream ended early (decoded {decoded}/{n_frames} frames)"
+            arr = np.frombuffer(raw, dtype=np.uint8).reshape(h, w, 4)
+            bgr = cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
+            # Check imwrite's return value — a failed write (disk full, bad path,
+            # permissions) previously counted as a "decoded" frame and only surfaced
+            # later as a confusing per-frame None deep in cmd_batch's keying loop.
+            if not cv2.imwrite(str(Path(temp_dir) / f"{abs_idx:06d}.png"), bgr):
+                log.error(f"BRAW range decode: failed to write PNG for frame {abs_idx}")
+                return f"BRAW decode failed to write frame {abs_idx} to disk (decoded {decoded}/{n_frames})"
+            decoded += 1
+            # HEARTBEAT — see docstring. Cheap: one stdout line per frame.
+            print(f"PROGRESS {min(decoded, _progress_total)}/{_progress_total}", flush=True)
+        if decoded != n_frames:
+            # Defensive/explicit — structurally unreachable (every early-exit path
+            # above already returns before this point), kept so a future change to
+            # the loop above can't silently start shipping partial ranges.
+            return f"BRAW decode wrote fewer PNGs than expected ({decoded}/{n_frames})"
+
+        # DANGER ZONE FRAGILE — desync check: _braw_read_exact reads EXACTLY
+        # bytes_per_frame per frame with no separator in the stream, so if our
+        # w*h*4 assumption were ever wrong for this clip, every frame from the
+        # mismatch onward would be byte-shifted into the wrong PNG with no error.
+        # Cheap self-consistency check: after consuming exactly n_frames *
+        # bytes_per_frame bytes for the range we told braw-decode.exe to decode
+        # (-i first -o last), nothing should be left on the pipe. A short 5s
+        # watchdog (well under the per-frame 30s cap) bounds this so a merely-slow
+        # process exit can't stall the whole render on an advisory check.
+        _trailing_stalled = threading.Event()
+
+        def _mark_trailing_stalled():
+            _trailing_stalled.set()
+            _braw_kill(proc)
+
+        _trailing_watchdog = threading.Timer(5.0, _mark_trailing_stalled)
+        _trailing_watchdog.daemon = True
+        _trailing_watchdog.start()
+        _extra = _braw_read_exact(proc.stdout, 1)
+        _trailing_watchdog.cancel()
+        if _extra is not None and not _trailing_stalled.is_set():
+            log.error(f"BRAW range decode: unexpected trailing data after {decoded} frames — "
+                      f"possible frame-size desync")
+            return (f"BRAW decode produced unexpected extra data after {decoded} frames — "
+                    f"aborting to avoid shipping byte-shifted frames")
+
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+        try:
+            stderr_out = proc.stderr.read().decode("utf-8", errors="replace").strip()
+        except Exception:
+            stderr_out = ""
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            pass
+        if proc.returncode not in (0, None):
+            log.warning(f"BRAW range decode: exit {proc.returncode} — {stderr_out}")
+        log.info(f"BRAW range decode: {decoded}/{n_frames} frames written to {temp_dir}")
+        return None
+    except Exception as e:
+        log.error(f"BRAW range decode: failed at frame {first_abs_frame + decoded}: {e}")
+        return f"BRAW range decode failed — {e}"
+    finally:
+        if watchdog is not None:
+            watchdog.cancel()
+        if proc is not None:
+            _braw_kill(proc)
+
+
+class _BrawFrameCapture:
+    """Minimal cv2.VideoCapture-compatible shim over a directory of pre-decoded BRAW
+    frame PNGs (written by _braw_decode_range_to_pngs). Implements ONLY the subset of
+    the cv2.VideoCapture surface cmd_batch actually calls — isOpened/get/set/read/
+    release — so a .braw source flows through cmd_batch's EXISTING per-frame pipeline
+    completely unmodified: every cv2.VideoCapture(source_video, ...) call site inside
+    cmd_batch swaps to an instance of this shim when the source is .braw (see the
+    is_braw branches in cmd_batch), so the main keying loop AND the SAM export loop
+    both see real decoded frames instead of cv2's "Could not read frame" failure.
+    DEPENDS ON: PNGs already on disk at <frame_dir>/<abs_frame:06d>.png, covering at
+      least [first_abs_frame, last_abs_frame) — see _braw_decode_range_to_pngs.
+    AFFECTS: a future cmd_batch call site that reads a cv2.VideoCapture property this
+      shim does not implement gets 0.0/False instead of the real value for a .braw
+      source — by design (fails safe/visibly rather than a silent AttributeError deep
+      in a long render), but a NEW property need must be added here explicitly.
+    """
+
+    def __init__(self, frame_dir, first_abs_frame, last_abs_frame, width, height, fps):
+        self._dir = Path(frame_dir)
+        self._first = int(first_abs_frame)
+        self._last = int(last_abs_frame)  # exclusive
+        self._w = int(width)
+        self._h = int(height)
+        self._fps = float(fps) if fps else 24.0
+        self._pos = int(first_abs_frame)  # absolute frame index the NEXT .read() returns
+
+    def isOpened(self):
+        return True
+
+    def get(self, prop_id):
+        import cv2
+        if prop_id == cv2.CAP_PROP_FPS:
+            return self._fps
+        if prop_id == cv2.CAP_PROP_FRAME_WIDTH:
+            return float(self._w)
+        if prop_id == cv2.CAP_PROP_FRAME_HEIGHT:
+            return float(self._h)
+        if prop_id == cv2.CAP_PROP_POS_FRAMES:
+            return float(self._pos)
+        if prop_id == cv2.CAP_PROP_POS_MSEC:
+            return float(self._pos) * 1000.0 / self._fps
+        return 0.0
+
+    def set(self, prop_id, value):
+        import cv2
+        if prop_id == cv2.CAP_PROP_POS_FRAMES:
+            self._pos = int(value)
+            return True
+        return False
+
+    def read(self):
+        import cv2
+        idx = self._pos
+        if idx < self._first or idx >= self._last:
+            return False, None
+        png_path = self._dir / f"{idx:06d}.png"
+        frame = cv2.imread(str(png_path), cv2.IMREAD_COLOR)
+        if frame is None:
+            return False, None
+        self._pos += 1
+        return True, frame
+
+    def release(self):
+        pass  # no per-instance resource — the shared temp dir is cleaned by cmd_batch's finally
+
+
 def _cmd_extract_braw(src, output_png, frame_idx=None, time_sec=None):
     """Decode a single frame from a .braw file via braw-decode.exe. Returns True/False —
     NEVER raises; any missing-dependency or decode failure prints a single CK_ERROR: line
@@ -540,7 +901,6 @@ def _cmd_extract_braw(src, output_png, frame_idx=None, time_sec=None):
     become an orphan."""
     import subprocess
     import threading
-    import math
     import cv2
     import numpy as np
 
@@ -576,17 +936,7 @@ def _cmd_extract_braw(src, output_png, frame_idx=None, time_sec=None):
             print(f"CK_ERROR: BRAW decode info query failed (rc={r.returncode})", flush=True)
             log.error(f"BRAW decode exe: info failed (rc={r.returncode}) stderr={r.stderr!r}")
             return False
-        w = h = None
-        fps = None
-        for line in r.stdout.splitlines():
-            if "Resolution:" in line:
-                parts = line.split(":", 1)[1].strip().split("x")
-                w, h = int(parts[0].strip()), int(parts[1].strip())
-            elif "Framerate:" in line:
-                try:
-                    fps = float(line.split(":", 1)[1].strip())
-                except ValueError:
-                    pass
+        w, h, fps = _braw_parse_info_stdout(r.stdout)
         if w is None or h is None:
             print("CK_ERROR: BRAW decode returned unreadable clip info", flush=True)
             log.error(f"BRAW decode exe: cannot parse resolution — stdout={r.stdout!r}")
@@ -604,19 +954,14 @@ def _cmd_extract_braw(src, output_png, frame_idx=None, time_sec=None):
         if frame_idx is not None:
             target_frame = int(frame_idx)
         elif time_sec is not None:
-            safe_fps = fps if fps and fps > 0 else 24.0
             # Match the "first frame AT OR AFTER the requested time" convention used
             # by the PyAV path (_extract_frame_pyav above: `while f.pts < target_pts:
             # skip`) and the cv2 path (CAP_PROP_POS_MSEC seek + decode-forward), so a
             # BRAW source and a ProRes/HEVC source resolve the SAME requested
-            # timecode to the SAME frame (previously this used round(), which picks
-            # the NEAREST frame — a different frame than the other two paths at
-            # non-frame-exact times, a preview/scrub inconsistency). ceil() with a
-            # small epsilon keeps frame-exact boundaries (8.875s @ 24fps = frame
-            # 213.0 exactly) landing on 213, not rolling to 214 from float
-            # imprecision (8.875*24 can evaluate to 213.00000000000003).
-            _BRAW_FRAME_EPS = 1e-6
-            target_frame = math.ceil(float(time_sec) * safe_fps - _BRAW_FRAME_EPS)
+            # timecode to the SAME frame. Shared with cmd_batch's range-render path
+            # (_braw_time_to_frame, above) so a RENDER's start_seconds lands on the
+            # identical frame this PREVIEW path shows for the same time.
+            target_frame = _braw_time_to_frame(time_sec, fps)
         else:
             print("CK_ERROR: BRAW decode requires --frame or --time", flush=True)
             log.error("BRAW decode: neither frame_idx nor time_sec provided")
@@ -630,9 +975,9 @@ def _cmd_extract_braw(src, output_png, frame_idx=None, time_sec=None):
 
     # Resolution sanity cap (security): -n text parsing has no inherent bound, so a
     # corrupt/malicious clip header could report an absurd WxH and drive an
-    # unbounded allocation below. Reject fast with a CK_ERROR instead.
-    _BRAW_MAX_DIM = 16384
-    _BRAW_MAX_FRAME_BYTES = 800 * 1024 * 1024  # 800MB
+    # unbounded allocation below. Reject fast with a CK_ERROR instead. Caps are
+    # module-level (_BRAW_MAX_DIM/_BRAW_MAX_FRAME_BYTES, above) — shared with
+    # cmd_batch's range-render path so both enforce identical limits.
     if not (1 <= w <= _BRAW_MAX_DIM and 1 <= h <= _BRAW_MAX_DIM):
         print(f"CK_ERROR: BRAW decode reported an implausible resolution {w}x{h}", flush=True)
         log.error(f"BRAW decode exe: implausible resolution {w}x{h} — refusing to allocate")
@@ -1755,32 +2100,121 @@ def cmd_batch(source_video, output_folder, settings,
         _cf = Path.home() / _cf_name
         _merge_crash_mtimes[_cf] = _cf.stat().st_mtime if _cf.exists() else None
 
-    # Resolve time range to frame indices using SOURCE's native fps. This eliminates
-    # the drift that happens when JSX converts seconds->frames using the sequence fps
-    # rather than the clip's actual fps.
-    cap_probe = cv2.VideoCapture(str(source_video))
-    if not cap_probe.isOpened():
-        log.error(f"Cannot open: {source_video}")
-        return 0
-    source_fps = cap_probe.get(cv2.CAP_PROP_FPS)
-    cap_probe.release()
-    if not source_fps or source_fps <= 0:
-        log.warning(f"Source fps unknown, defaulting to {fps or 24}")
-        source_fps = float(fps or 24)
+    # ── BRAW range render (F-braw-render, 2026-07-16) ───────────────────────
+    # WHAT IT DOES: cv2.VideoCapture cannot decode .braw (see the module note above
+    #   _cmd_extract_braw). For a .braw source this pre-decodes the EXACT absolute
+    #   frame range cmd_batch needs — the main keying loop's [start_frame, end_frame)
+    #   plus SAM's optional 1-frame preroll before start_frame — to a temp PNG
+    #   sequence via ONE braw-decode.exe stream (_braw_decode_range_to_pngs), then
+    #   swaps in _BrawFrameCapture (a tiny cv2.VideoCapture-compatible shim reading
+    #   those PNGs) at every `cv2.VideoCapture(source_video, ...)` call site below.
+    #   Every other line of cmd_batch's per-frame pipeline (NN key, SAM, post-proc,
+    #   sidecars, PROGRESS) runs completely unchanged for either source type.
+    # DEPENDS ON: _braw_probe, _braw_time_to_frame, _braw_decode_range_to_pngs,
+    #   _BrawFrameCapture (all above, near _cmd_extract_braw).
+    # AFFECTS: .braw sources only — the else branch (non-braw) below is byte-identical
+    #   to the pre-braw code, so ProRes/HEVC/mp4 RENDER is unaffected (isolated branch).
+    src_path = Path(source_video)
+    is_braw = src_path.suffix.lower() == ".braw"
+    _braw_temp_dir = None
+    braw_w = braw_h = None
+    _braw_decode_first = _braw_decode_last = None
 
-    if start_seconds is not None and end_seconds is not None:
-        start_frame = int(round(float(start_seconds) * source_fps))
-        end_frame   = int(round(float(end_seconds)   * source_fps))
-        log.info(f"Time range {start_seconds:.4f}..{end_seconds:.4f}s @ source fps {source_fps:.3f} -> frames {start_frame}..{end_frame}")
+    if is_braw:
+        braw_exe, braw_env, braw_w, braw_h, braw_fps, _probe_err = _braw_probe(source_video)
+        if _probe_err:
+            print(f"CK_ERROR: {_probe_err}", flush=True)
+            log.error(f"BRAW batch: probe failed — {_probe_err}")
+            return 0
+        source_fps = braw_fps if braw_fps and braw_fps > 0 else float(fps or 24.0)
+
+        if start_seconds is not None and end_seconds is not None:
+            start_frame = _braw_time_to_frame(start_seconds, source_fps)
+            end_frame = _braw_time_to_frame(end_seconds, source_fps)
+            log.info(f"BRAW time range {start_seconds:.4f}..{end_seconds:.4f}s @ fps {source_fps:.3f} -> frames {start_frame}..{end_frame}")
+        else:
+            start_frame = int(start_frame); end_frame = int(end_frame)
+            log.info(f"BRAW frame range {start_frame}..{end_frame} (fps {source_fps:.3f})")
+
+        if end_frame <= start_frame:
+            print("CK_ERROR: BRAW render range is empty (end_frame <= start_frame)", flush=True)
+            log.error(f"BRAW batch: empty range {start_frame}..{end_frame}")
+            return 0
+
+        # SAM's video predictor pre-rolls ONE frame before start_frame (when
+        # start_frame > 0) to warm its temporal memory — see _actual_preroll further
+        # below. Decode that extra frame too, UNCONDITIONALLY, so the range covers
+        # both the main keying loop's need and SAM's, regardless of whether SAM turns
+        # out active (that isn't known yet at this point in the function). Formula
+        # matches _actual_preroll = min(1, start_frame) exactly.
+        _braw_decode_first = start_frame - 1 if start_frame > 0 else 0
+        _braw_decode_last = end_frame
+        _braw_n_frames = _braw_decode_last - _braw_decode_first
+
+        # Pre-decode disk preflight (FIX FIRST, 2026-07-16 review): the temp PNG
+        # staging dir is created INSIDE out_dir (dir=str(out_dir), below) specifically
+        # so it shares a volume with the render's real output — one disk_usage() call
+        # on out_dir now covers both. Checked BEFORE decoding starts (not after,
+        # like the pre-existing output-only preflight further below) because for a
+        # .braw source the staging PNGs are themselves ~w*h*5 bytes/frame and would
+        # otherwise fill the drive silently before the later check ever runs.
+        import shutil as _braw_shutil_preflight
+        _braw_need_bytes = int(_braw_n_frames * braw_w * braw_h * 5 * 1.3)
+        _braw_free_bytes = _braw_shutil_preflight.disk_usage(str(out_dir)).free
+        if _braw_free_bytes < _braw_need_bytes:
+            print(f"CK_ERROR: not enough disk for BRAW pre-decode — need ~"
+                  f"{_braw_need_bytes / 1e9:.1f} GB free on {Path(out_dir).drive or out_dir}, "
+                  f"have {_braw_free_bytes / 1e9:.1f} GB. Free space or shorten the range.",
+                  flush=True)
+            log.error(f"BRAW pre-decode preflight failed: need {_braw_need_bytes}, free {_braw_free_bytes}")
+            return 0
+
+        import tempfile as _braw_tempfile
+        # dir=str(out_dir): keeps the staging PNGs on the SAME volume as the render
+        # output (see preflight comment above) — was bare mkdtemp() -> %TEMP%, often
+        # drive C, a different volume than out_dir with no space check at all.
+        _braw_temp_dir = Path(_braw_tempfile.mkdtemp(prefix="ck_braw_render_", dir=str(out_dir)))
+        log.info(f"BRAW batch: decoding frames {_braw_decode_first}..{_braw_decode_last} -> {_braw_temp_dir}")
+        _decode_err = _braw_decode_range_to_pngs(
+            braw_exe, braw_env, source_video, _braw_decode_first, _braw_decode_last,
+            braw_w, braw_h, _braw_temp_dir, progress_total=max(1, end_frame - start_frame))
+        if _decode_err:
+            print(f"CK_ERROR: {_decode_err}", flush=True)
+            log.error(f"BRAW batch: range decode failed — {_decode_err}")
+            import shutil as _braw_shutil_early
+            _braw_shutil_early.rmtree(_braw_temp_dir, ignore_errors=True)
+            return 0
+        log.info("BRAW batch: decode complete")
     else:
-        start_frame = int(start_frame); end_frame = int(end_frame)
-        log.info(f"Frame range {start_frame}..{end_frame} (source fps {source_fps:.3f})")
+        # Resolve time range to frame indices using SOURCE's native fps. This eliminates
+        # the drift that happens when JSX converts seconds->frames using the sequence fps
+        # rather than the clip's actual fps.
+        cap_probe = cv2.VideoCapture(str(source_video))
+        if not cap_probe.isOpened():
+            log.error(f"Cannot open: {source_video}")
+            return 0
+        source_fps = cap_probe.get(cv2.CAP_PROP_FPS)
+        cap_probe.release()
+        if not source_fps or source_fps <= 0:
+            log.warning(f"Source fps unknown, defaulting to {fps or 24}")
+            source_fps = float(fps or 24)
+
+        if start_seconds is not None and end_seconds is not None:
+            start_frame = int(round(float(start_seconds) * source_fps))
+            end_frame   = int(round(float(end_seconds)   * source_fps))
+            log.info(f"Time range {start_seconds:.4f}..{end_seconds:.4f}s @ source fps {source_fps:.3f} -> frames {start_frame}..{end_frame}")
+        else:
+            start_frame = int(start_frame); end_frame = int(end_frame)
+            log.info(f"Frame range {start_frame}..{end_frame} (source fps {source_fps:.3f})")
 
     log.info(f"Batch: {source_video}  frames {start_frame}..{end_frame}")
-    cap = cv2.VideoCapture(str(source_video), cv2.CAP_FFMPEG)   # FIX C: FFMPEG backend -> POS_FRAMES reliable
-    if not cap.isOpened():
-        log.error(f"Cannot open: {source_video}")
-        return 0
+    if is_braw:
+        cap = _BrawFrameCapture(_braw_temp_dir, _braw_decode_first, _braw_decode_last, braw_w, braw_h, source_fps)
+    else:
+        cap = cv2.VideoCapture(str(source_video), cv2.CAP_FFMPEG)   # FIX C: FFMPEG backend -> POS_FRAMES reliable
+        if not cap.isOpened():
+            log.error(f"Cannot open: {source_video}")
+            return 0
 
     from corridorkey_processor import CorridorKeyProcessor, ProcessingSettings
     from CorridorKeyModule.core import color_utils as _cu
@@ -1885,10 +2319,19 @@ def cmd_batch(source_video, output_folder, settings,
             _patch_sam2_png()
             _src_h = _src_w = _pad_box = None
             try:
-                _exp_cap = cv2.VideoCapture(str(source_video), cv2.CAP_FFMPEG)
+                if is_braw:
+                    # Same pre-decoded PNG range cap already uses — SAM's preroll frame is
+                    # already inside [_braw_decode_first, _braw_decode_last), see above.
+                    _exp_cap = _BrawFrameCapture(_braw_temp_dir, _braw_decode_first, _braw_decode_last, braw_w, braw_h, source_fps)
+                else:
+                    _exp_cap = cv2.VideoCapture(str(source_video), cv2.CAP_FFMPEG)
                 # FIX C: POS_FRAMES + throwaway prime read (MSEC returns a dirty first read on long-GOP).
+                # Not needed for the BRAW shim — each read is an independent PNG load, no
+                # decoder state to warm/desync, so seek straight to the real start.
                 _sf = _sf_export
-                if _sf > 0:
+                if is_braw:
+                    _exp_cap.set(cv2.CAP_PROP_POS_FRAMES, _sf)
+                elif _sf > 0:
                     _exp_cap.set(cv2.CAP_PROP_POS_FRAMES, _sf - 1)
                     _exp_cap.read()        # throwaway: warms decoder -> next read = _sf_export
                 # _sf_export == 0: never seek — freshly opened cap reads frame 0 cleanly.
@@ -2190,6 +2633,14 @@ def cmd_batch(source_video, output_folder, settings,
                 _trim_processor(processor)   # release CUDA weights — preflight bail is outside the try/finally
             except Exception:
                 pass
+            # BLOCKER fix (2026-07-16 review): this block is deliberately OUTSIDE the
+            # main try/finally below, so its `return False` never reached that
+            # finally's rmtree — for a .braw source the temp PNG dir is already fully
+            # populated by this point (decode happens before `cap` even exists) and
+            # would leak on every render that fails THIS specific preflight check.
+            if is_braw and _braw_temp_dir is not None:
+                import shutil as _braw_shutil_preflight2
+                _braw_shutil_preflight2.rmtree(_braw_temp_dir, ignore_errors=True)
             print(f"CK_ERROR: not enough disk for this render — need ~"
                   f"{_need / 1e9:.1f} GB free on {Path(out_dir).drive or out_dir}, "
                   f"have {_free / 1e9:.1f} GB. Free space or shorten the range.",
@@ -2206,7 +2657,12 @@ def cmd_batch(source_video, output_folder, settings,
         # decoder is warm and the first REAL read below returns a clean start_frame.
         # start_frame==0: no -1 to seek to, so prime-read frame 0 then rewind to 0.
         _sf = int(start_frame)
-        if _sf > 0:
+        if is_braw:
+            # BRAW shim: no decoder-priming quirks (each read is an independent PNG
+            # load, no persistent decoder state to warm or desync) — seek straight to
+            # start_frame, no -1/throwaway/reopen dance needed.
+            cap.set(cv2.CAP_PROP_POS_FRAMES, _sf)
+        elif _sf > 0:
             cap.set(cv2.CAP_PROP_POS_FRAMES, _sf - 1)
             cap.read()                 # throwaway: consumes (_sf-1) -> next read = start_frame
         else:
@@ -2425,6 +2881,12 @@ def cmd_batch(source_video, output_folder, settings,
                     sam_torch.cuda.empty_cache()
             except Exception:
                 pass
+        # BRAW pre-decoded temp PNG sequence cleanup — runs on EVERY exit path
+        # (success, per-frame failure, or the CK_ERROR abort below), never leaves a
+        # stale ck_braw_render_* dir behind.
+        if is_braw and _braw_temp_dir is not None:
+            import shutil as _braw_shutil_cleanup
+            _braw_shutil_cleanup.rmtree(_braw_temp_dir, ignore_errors=True)
 
     # 4th field = SAM2 temporal guard held-count (Fix 3). Panel parses batch_result.txt
     # POSITIONALLY (index.html ~3903 doCommit, ~4050 doSAMCommit read br[0]/br[1]/br[2]
