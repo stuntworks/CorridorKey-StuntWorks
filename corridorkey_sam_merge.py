@@ -1221,6 +1221,170 @@ def _ck_authority_protect_mask(ck, dist_from_sam, on_green_hsv, scale,
     return protect_soft
 
 
+# ============================================================================
+# FEET-VS-CROP TAPER SIGNAL (Berto 2026-07-16) — fixes the SAM MATTE TIGHTEN
+# slider doing nothing on shots where real feet sit close to the bottom of
+# the frame (e.g. a wide full-body stunt-rigging shot on a 6144x3456 BRAW
+# plate). Root cause: the framing guard below (`_body_exits_bottom`, both
+# engines) used to be a single test — "is the SAM bbox within 3% of the
+# frame's bottom edge?" — that guard exists to protect WAIST/KNEE-CROP shots
+# (legs cut off by the frame edge, no floor/feet visible; tightening the feet
+# zone there mangles the cut into a ragged line). But it fires identically
+# for a full-body shot whose feet just happen to sit within that same 3%
+# margin by camera framing, not by cropping — and the whole feet-zone block
+# (including every code path SAM MATTE TIGHTEN drives) is skipped whenever it
+# fires, so the slider silently does nothing on those shots.
+# This function tells the two cases apart with a SHAPE test, not a position
+# test: a real foot/shoe silhouette narrows to a point where it meets the
+# floor (any solid object's silhouette naturally tapers to ~0 width at its
+# true bottom edge, regardless of viewing angle — confirmed on a real cached
+# full-body mask: width fell from 235px to 47px over the last 50 rows). A
+# frame-edge crop does NOT taper — the frame boundary truncates the shape
+# mid-limb, so the width at the cutoff is the SAME as a few rows above it
+# (confirmed on synthetic waist/knee/ankle crops of that same mask: ratio
+# 0.97-1.99 at every crop height tested, vs 0.27-0.28 for the real feet —
+# see D:\CLAUDE_JUNK\ck_sam_tighten_slider\taper_signal_explore3.py). Uses
+# row PIXEL-COUNT (not left-to-right span) so two separate feet/shoes with a
+# gap between them still read as narrow, not falsely "wide."
+FEET_TAPER_RATIO_MAX = 0.5  # tip-width / reference-width must fall below this
+                              # to count as a real taper-to-feet. Measured
+                              # real-feet ratio ~0.27-0.28; measured crop
+                              # ratio (mid-thigh through just-above-the-foot)
+                              # 0.97-1.99 — 0.5 sits with a wide safety margin
+                              # on both sides of the observed data.
+FEET_TAPER_OFFSET_PX_BASE = 12.0  # px @1920 — floor for how far above the
+                                    # silhouette's bottom row the reference
+                                    # band sits, so a short/cropped bbox still
+                                    # gets a non-noisy reference width.
+FEET_TAPER_OFFSET_PCT = 0.03      # reference offset also scales with body
+                                    # size (% of bbox_h) so a close-up and a
+                                    # wide shot of the same pose measure the
+                                    # same relative taper.
+
+
+def _silhouette_tapers_to_feet(sam_bin, bbox_y0, bbox_y1, scale):
+    # WHAT IT DOES: True if the SAM silhouette's own bottom rows narrow to a
+    #   point (real feet/shoes ending on the floor); False if the bottom rows
+    #   stay flat/wide (the frame edge cut the shape off mid-limb). See the
+    #   FEET-VS-CROP TAPER SIGNAL banner above for the full rationale and the
+    #   measured ratios that set FEET_TAPER_RATIO_MAX.
+    # DEPENDS ON: FEET_TAPER_RATIO_MAX, FEET_TAPER_OFFSET_PX_BASE,
+    #   FEET_TAPER_OFFSET_PCT. Caller supplies the binary/thresholded SAM
+    #   mask and its own bbox (bbox_y0/bbox_y1, either full-frame or
+    #   crop-local — this is a ratio of two LOCAL widths, so it commutes with
+    #   translation and works either way) plus the resolution scale
+    #   (_scale = frame_w / 1920.0) both merge engines already compute.
+    # AFFECTS: only the `_body_exits_bottom` framing guard in both merge
+    #   engines — a wrong verdict here either wrongly re-enables the feet
+    #   zone on a real waist-crop (ragged/squared bottom edge) or wrongly
+    #   leaves SAM MATTE TIGHTEN dead on a real feet-near-frame-bottom shot.
+    bbox_h = max(bbox_y1 - bbox_y0, 1)
+    offset_px = max(int(round(FEET_TAPER_OFFSET_PX_BASE * scale)),
+                     int(round(bbox_h * FEET_TAPER_OFFSET_PCT)))
+    # PERF (gate review 2026-07-16): only the bottom band this function
+    # actually reads is summed — a full-frame sam_bin.sum(axis=1) was 21M+
+    # elements at 6K in the gm engine (sam isn't bbox-cropped there), for a
+    # result that only ever looks at ~offset_px+2 rows near bbox_y1.
+    band_lo = max(bbox_y0, bbox_y1 - offset_px - 2)
+    widths = sam_bin[band_lo:bbox_y1 + 1].sum(axis=1).astype(np.float32)
+    tip_lo = max(bbox_y0, bbox_y1 - 2) - band_lo
+    tip_width = float(np.median(widths[tip_lo:bbox_y1 + 1 - band_lo]))
+    ref_row = max(bbox_y0, bbox_y1 - offset_px)
+    ref_lo = max(bbox_y0, ref_row - 2) - band_lo
+    ref_hi = min(bbox_y1, ref_row + 2) + 1 - band_lo
+    ref_width = float(np.median(widths[ref_lo:ref_hi]))
+    if ref_width <= 0.0:
+        return False  # degenerate/near-empty mask — no reference signal, never claim a taper blind
+    return (tip_width / ref_width) < FEET_TAPER_RATIO_MAX
+
+
+# FEET-VS-CROP GAP SIGNAL (Berto 2026-07-16, real-data follow-up; margin
+# reworked 2026-07-16 gate review) — the taper signal above assumes the
+# silhouette narrows to a point at its true bottom edge, which breaks on a
+# STRICT SIDE-PROFILE shot: a shoe's sole viewed edge-on projects its LENGTH
+# (heel-to-toe) into the row-width measurement, so the width can stay wide
+# (or even grow) right up to the last real row instead of tapering. Real SAM
+# output from Berto's actual BRAW clip (3 sessions,
+# D:\CK_SCRATCH\ck_session_{32eddecd89f28eaaf453b63a,
+# 4b73f9b3db713a0a5a40b481,d8aeb040d57f71a7c4ed7b9e}\sam2_gate_raw.png, all
+# the same strict-profile walk) confirms this — the taper signal alone
+# doesn't fire there. But the SAME real masks reveal a simpler, profile-
+# INDEPENDENT tell: the silhouette's bottom row sits 13-19px above the
+# frame's actual last row (never reaches it) — because real feet are a real
+# object boundary, floating above nothing once the foot itself ends. A
+# genuine frame-edge crop has no such gap: the frame boundary IS the cutoff,
+# so the silhouette fills every row up to (and including) the last one,
+# by construction, regardless of viewing angle.
+#
+# MARGIN IS A FRACTION OF FRAME HEIGHT, NOT SCALED PIXELS (gate finding,
+# 2026-07-16): the panel's scrub PREVIEW runs the merge at a 1280px-long-edge
+# cap (ae_processor.py ~2977), so a px@1920-scaled margin can shrink to ~1px
+# at preview res — small enough to (a) flip the feet/crop verdict between
+# preview and full-res render on a borderline shot (preview must show the
+# truth) and (b) sit inside ordinary SAM boundary softness, so a real
+# waist-crop with a slightly soft edge could show a stray 1-2px gap and get
+# wrongly read as feet. A frame-height FRACTION scales the margin down with
+# the frame the same way the real gap itself scales down, so the ratio
+# between "real gap" and "noise floor" stays roughly constant across
+# resolutions — verified directly: Berto's real gap resamples to ~3-4px at
+# the clip's own 1280x720 scrub size (measured, not assumed proportional —
+# see D:\CLAUDE_JUNK\ck_sam_tighten_slider\verify_gap_pct_signal.py), still
+# comfortably above the fractional margin at that size.
+#
+# This is checked as an ADDITIONAL "is this feet" test alongside the taper
+# signal (either one firing means "feet, run the zone"). That OR does widen
+# the false-positive surface in the dangerous direction (a signal misfiring
+# "feet" on a real crop wrongly re-enables feet-zone erosion on a cropped
+# bottom) — accepted because the taper signal's own measured margin is huge
+# (real feet ratio 0.27-0.28 vs every crop severity tested 0.97-1.99, see the
+# banner above _silhouette_tapers_to_feet) and it is kept specifically for
+# framings the gap signal might miss (feet planted flush at the very edge,
+# gap≈0) — a case Berto's own clip doesn't exercise (real gap is a
+# comfortable 13-19px there) but a tighter framing could.
+#
+# KNOWN FLICKER TRADEOFF (gate review 2026-07-16): this is a stateless
+# per-frame test with no cross-frame hysteresis — a walking shot's true
+# lowest-planted-foot gap is what should drive it, but if BOTH feet are ever
+# briefly airborne (a jump, a big stride) the gap for that frame alone could
+# shrink toward the margin and flip the verdict for that frame only. Not
+# fixed here on purpose: adding cross-frame state to a stateless per-frame
+# merge function is a bigger, riskier change than this bug warrants, and the
+# fraction-of-height margin (tuned well below the smallest real single-frame
+# gap seen) already makes this rare. Documented so a future reader
+# investigating a rare feet-zone flicker on an airborne-foot frame knows this
+# is a known, considered tradeoff, not a new bug.
+GAP_BELOW_FEET_PCT = 0.003  # fraction of frame height. Real Berto BRAW gap:
+                              # 13-19px @h=3456 = 0.38%-0.55%. SAM boundary
+                              # softness noise: ~1-2px, worst case ~0.06% at
+                              # full res, ~0.28% at a 720-tall scrub preview.
+                              # 0.3% sits above the noise ceiling and well
+                              # below real feet at every resolution tested.
+GAP_BELOW_FEET_PX_FLOOR = 2  # absolute floor so an absurdly small render
+                              # target can't collapse the margin to 0 — the
+                              # fraction dominates at any normal frame size.
+
+
+def _has_gap_below_silhouette(bbox_y1, frame_h):
+    # WHAT IT DOES: True if the silhouette's bottom row stops short of the
+    #   frame's actual last row by more than a small, RESOLUTION-INVARIANT
+    #   margin (a fraction of frame height, not a scaled pixel count) — i.e.
+    #   the object ends on its own, it wasn't truncated by the image
+    #   boundary. See the FEET-VS-CROP GAP SIGNAL banner above.
+    # DEPENDS ON: GAP_BELOW_FEET_PCT, GAP_BELOW_FEET_PX_FLOOR. Caller
+    #   supplies the silhouette's own bbox_y1 in ABSOLUTE (full-frame) row
+    #   coordinates — unlike the taper signal, this test is NOT
+    #   translation-invariant (it cares exactly where the frame's real edge
+    #   is), so unified_band must pass bbox_y1 + crop_offset_y here, not the
+    #   crop-local row.
+    # AFFECTS: only the `_body_exits_bottom` framing guard in both merge
+    #   engines, alongside _silhouette_tapers_to_feet. Deliberately the SAME
+    #   verdict at any render resolution (preview or full render) for the
+    #   same real gap, by construction — no scale parameter, on purpose.
+    margin_px = max(GAP_BELOW_FEET_PX_FLOOR, int(round(GAP_BELOW_FEET_PCT * frame_h)))
+    return bbox_y1 < (frame_h - margin_px)
+# ============================================================================
+
+
 def merge_ck_with_garbage_matte(
     ck_alpha: np.ndarray,
     sam_silhouette: Optional[np.ndarray],
@@ -1294,7 +1458,28 @@ def merge_ck_with_garbage_matte(
     # below are WRONG — they were designed for full-body shots with feet on the
     # floor. On a waist crop they land on the lower torso and mangle the bottom
     # edge (ragged/broken bottom in BOTH viewer and render). Detect and skip them.
-    _body_exits_bottom = bbox_y1 >= int(h * 0.97)
+    # UPDATED 2026-07-16 (Berto-approved, gate-reviewed same day, see the
+    # FEET-VS-CROP TAPER SIGNAL / GAP SIGNAL banners above
+    # solidify_sam_silhouette's caller block for the full rationale, the
+    # margin math, and the honest false-positive-risk accounting): "near the
+    # bottom edge" alone used to be sufficient to call this a crop — but a
+    # full-body shot whose real feet just sit close to the bottom edge
+    # (camera framing, not a crop) tripped the same guard and silently killed
+    # SAM MATTE TIGHTEN. Only trust the position test when NEITHER shape test
+    # says "feet": GAP (primary, resolution-invariant, profile-independent)
+    # OR TAPER (secondary, covers feet planted flush at the edge where the
+    # gap is ~0). A normal full-body shot with feet clear of the bottom
+    # (_near_bottom False) never reaches either test and is byte-identical to
+    # before this fix.
+    _near_bottom = bbox_y1 >= int(h * 0.97)
+    if _near_bottom:
+        _is_feet = (
+            _has_gap_below_silhouette(bbox_y1, h)
+            or _silhouette_tapers_to_feet(sam, bbox_y0, bbox_y1, float(w) / 1920.0)
+        )
+        _body_exits_bottom = not _is_feet
+    else:
+        _body_exits_bottom = False
 
     # Resolution-aware kernel scaling — constants calibrated at 1920px wide.
     _scale = float(w) / 1920.0
@@ -3098,9 +3283,17 @@ def _ub_dump_shape_debug(debug_dir, band_mask, stripped, kill_mask, debug_rows, 
 #                                            RESCUE, not a bypass)
 #   shadow_kill                           -> COVERED verbatim: same val<52/255 threshold,
 #                                            same off-green/outside-SAM gating
-#   framing guards (_body_exits_bottom)   -> COVERED verbatim: identical bbox_y1>=97%*h
-#                                            test, disables the feet taper AND the 92%
-#                                            shadow cut exactly like the old function
+#   framing guards (_body_exits_bottom)   -> COVERED, then EXTENDED 2026-07-16:
+#                                            same bbox_y1>=97%*h entry gate as before,
+#                                            but now ALSO requires neither the GAP nor
+#                                            TAPER feet-vs-crop signal to fire (see
+#                                            _has_gap_below_silhouette /
+#                                            _silhouette_tapers_to_feet above
+#                                            solidify_sam_silhouette's caller block)
+#                                            before treating a near-bottom silhouette as
+#                                            a crop — disables the feet taper AND the
+#                                            92% shadow cut exactly like the old
+#                                            function ONLY when still classified a crop
 #   no-down kernels (sam_wide top-zeroed) -> COVERED, re-derived: masked term forcing
 #                                            W to ZERO (not tight — F10 correction,
 #                                            2026-07-05) for any exterior pixel directly
@@ -3265,17 +3458,40 @@ def merge_ck_unified_band(
     bbox_h = max(bbox_y1 - bbox_y0, 1)
     feet_start = bbox_y0 + int(bbox_h * UNIFIED_BAND_FEET_ZONE_START_PCT)
 
-    # Framing guard — KEPT VERBATIM from merge_ck_with_garbage_matte (Berto's
-    # waist-crop protection law). Disables the feet taper and the 92% shadow cut
-    # below exactly like it disables the feet-ring hug in the old function.
-    # bbox_y1 is CROP-LOCAL when cropping is on — the "does the body run off
-    # the bottom of the FRAME" test must compare against the TRUE frame height
-    # and the body's ABSOLUTE row, not the crop's (task brief: "pass absolute
-    # frame h, don't recompute from crop"). feet_start/the taper/no-down zone
-    # below stay crop-local on purpose — those are pure offsets of bbox_y0/h,
-    # which commute with translation, so computing them locally already gives
-    # the same rows a full-frame run would (shifted by the same crop origin).
-    _body_exits_bottom = (bbox_y1 + _ub_crop_oy) >= int(_full_h * 0.97)
+    # Framing guard — mirrors merge_ck_with_garbage_matte's guard exactly
+    # (Berto's waist-crop protection law). Disables the feet taper and the 92%
+    # shadow cut below exactly like it disables the feet-ring hug in the old
+    # function. bbox_y1 is CROP-LOCAL when cropping is on — the "does the body
+    # run off the bottom of the FRAME" test must compare against the TRUE
+    # frame height and the body's ABSOLUTE row, not the crop's (task brief:
+    # "pass absolute frame h, don't recompute from crop"). feet_start/the
+    # taper/no-down zone below stay crop-local on purpose — those are pure
+    # offsets of bbox_y0/h, which commute with translation, so computing them
+    # locally already gives the same rows a full-frame run would (shifted by
+    # the same crop origin).
+    # UPDATED 2026-07-16 (Berto-approved) — same fix as the gm engine's guard,
+    # see the FEET-VS-CROP TAPER SIGNAL / GAP SIGNAL banners above
+    # solidify_sam_silhouette's caller block (full rationale, margin math,
+    # honest false-positive-risk accounting, gate-reviewed 2026-07-16): "near
+    # the bottom edge" alone can't tell a real waist-crop apart from real feet
+    # that just sit close to the frame's bottom edge by camera framing.
+    # Primary test is the GAP signal, resolution-invariant by construction
+    # (fraction of frame height, no scale param) — NOT translation-invariant
+    # though (it cares exactly where the frame's real edge is), so it needs
+    # the ABSOLUTE row, bbox_y1 + _ub_crop_oy, and the true frame height
+    # _full_h, same as _near_bottom just above. The TAPER signal
+    # (translation-invariant, runs on the crop-local `sam`/bbox like the
+    # taper/no-down zone below already does) is OR-ed in as a second,
+    # independent path for feet planted flush at the edge (gap≈0).
+    _near_bottom = (bbox_y1 + _ub_crop_oy) >= int(_full_h * 0.97)
+    if _near_bottom:
+        _is_feet = (
+            _has_gap_below_silhouette(bbox_y1 + _ub_crop_oy, _full_h)
+            or _silhouette_tapers_to_feet(sam, bbox_y0, bbox_y1, float(_full_w) / 1920.0)
+        )
+        _body_exits_bottom = not _is_feet
+    else:
+        _body_exits_bottom = False
 
     # _scale MUST reflect the TRUE FRAME resolution, not the crop's own (smaller)
     # width — every UNIFIED_BAND_*_PX_BASE constant is calibrated "at 1920px
