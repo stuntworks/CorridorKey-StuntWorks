@@ -590,10 +590,8 @@ _BRAW_MAX_RANGE_FRAMES = 100_000
 # huge computed range) fails loud with a CK_ERROR instead of _braw_decode_range_to_pngs
 # silently trying to decode/write an unbounded number of frames and filling the disk.
 
-_BRAW_FRAME_EPS = 1e-6
-# DANGER ZONE FRAGILE: epsilon used by _braw_time_to_frame's ceil() so a frame-exact
-# time (e.g. 8.875s @ 24fps = frame 213.0 exactly) lands on 213, not 214 from float
-# imprecision (8.875*24 can evaluate to 213.00000000000003).
+# (removed 2026-07-16: _BRAW_FRAME_EPS — _braw_time_to_frame now uses round(),
+# which needs no epsilon; see its docstring.)
 
 
 def _braw_parse_info_stdout(stdout_text):
@@ -620,17 +618,30 @@ def _braw_parse_info_stdout(stdout_text):
 
 
 def _braw_time_to_frame(time_sec, fps):
-    """Seconds -> frame index using the 'first frame AT OR AFTER the requested time'
-    convention — the SAME convention _cmd_extract_braw's single-frame preview uses.
-    Preview must equal render (hard project rule): a .braw RENDER's start_seconds has
-    to land on the identical frame a PREVIEW/extract at that same start_seconds
-    shows, so this helper is shared rather than reimplemented with different rounding
-    (e.g. round()) in cmd_batch.
-    DEPENDS ON: _BRAW_FRAME_EPS.
+    """Seconds -> frame index in braw-decode.exe's numbering, shared by the
+    single-frame preview/extract AND cmd_batch's render range. Preview must equal
+    render (hard project rule): a .braw RENDER's start_seconds has to land on the
+    identical frame a PREVIEW/extract at that same start_seconds shows, so this
+    helper is shared rather than reimplemented with different rounding in cmd_batch.
+
+    Two deliberate choices (2026-07-16, Berto's 6K BRAW timing session):
+    - round(), NOT ceil(t*fps - eps): the old at-or-after ceil was fragile — a host
+      time rounded to ~6 decimals (e.g. 8.916667 for frame 214 = 8.91666...) lands
+      just above the frame boundary and ceil bumped it a full frame forward (proven
+      live: --time 8.916667 decoded frame 215). round() absorbs up to half a frame
+      of representation error in either direction; hosts always send frame-aligned
+      times, so nothing legitimate sits near the .5 midpoint.
+    - the trailing -1: braw-decode.exe's frame index runs ONE AHEAD of the frame
+      Premiere/AE (BRAW Studio importer) displays at the same time — proven on
+      Berto's A001_02091949_C020.braw: a render whose math said "start at frame
+      214" produced first-frame content one frame FORWARD of the host's display,
+      and the host's first frame matched braw-decode's 213. Subtracting here keeps
+      extract and batch in lockstep and lands both on what the user actually sees.
+    DEPENDS ON: braw-decode.exe indexing (BMD SDK); revisit if the decoder or the
+      host BRAW importer changes.
     """
-    import math
     safe_fps = fps if fps and fps > 0 else 24.0
-    return math.ceil(float(time_sec) * safe_fps - _BRAW_FRAME_EPS)
+    return max(0, int(round(float(time_sec) * safe_fps)) - 1)
 
 
 def _braw_probe(source_video):
@@ -952,15 +963,15 @@ def _cmd_extract_braw(src, output_png, frame_idx=None, time_sec=None):
     # future non-CLI caller that passes a raw string.
     try:
         if frame_idx is not None:
-            target_frame = int(frame_idx)
+            # frame_idx arrives in HOST (Premiere/AE display) numbering — same -1
+            # shift into braw-decode.exe numbering as _braw_time_to_frame applies,
+            # so --frame N and --time N/fps decode the identical frame.
+            target_frame = max(0, int(frame_idx) - 1)
         elif time_sec is not None:
-            # Match the "first frame AT OR AFTER the requested time" convention used
-            # by the PyAV path (_extract_frame_pyav above: `while f.pts < target_pts:
-            # skip`) and the cv2 path (CAP_PROP_POS_MSEC seek + decode-forward), so a
-            # BRAW source and a ProRes/HEVC source resolve the SAME requested
-            # timecode to the SAME frame. Shared with cmd_batch's range-render path
-            # (_braw_time_to_frame, above) so a RENDER's start_seconds lands on the
-            # identical frame this PREVIEW path shows for the same time.
+            # Shared with cmd_batch's range-render path (_braw_time_to_frame, above)
+            # so a RENDER's start_seconds lands on the identical frame this PREVIEW
+            # path shows for the same time. See that helper's docstring for the
+            # round() choice and the braw-decode-runs-one-ahead -1 shift.
             target_frame = _braw_time_to_frame(time_sec, fps)
         else:
             print("CK_ERROR: BRAW decode requires --frame or --time", flush=True)
