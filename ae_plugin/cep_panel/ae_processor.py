@@ -447,15 +447,280 @@ _HEVC_EXTS = {".hevc", ".heic"}
 _HEVC_CODECS = {"hevc", "h265", "x265"}
 
 
+# ── BRAW single-frame extraction (F-braw, 2026-07-16) ──────────
+# WHAT IT DOES: cv2.VideoCapture cannot decode Blackmagic RAW (.braw) — it fails with
+#   "Could not read frame", which the panel surfaces as an opaque "Python exited code 1"
+#   and a blank source preview. This decodes ONE frame via the Blackmagic RAW SDK's
+#   braw-decode.exe instead.
+# SOURCE OF TRUTH: this is a faithful port of the proven exe-location / env-wiring /
+#   byte-parsing logic in resolve_plugin/CorridorKey_Pro.py:_try_braw_decode_exe. It is
+#   NOT imported from there because that module does `import fusionscript` and calls
+#   `fu.GetResolve()` at module load time — it only runs inside Resolve's embedded
+#   Python and crashes immediately in this standalone CLI process. Do not "improve" the
+#   byte-parsing here — braw-decode.exe streams raw BGRA pixels with NO frame separator,
+#   any drift desyncs the read.
+# SCOPE: single-frame decode only (this fixes source-preview load); no batch/range yet.
+# braw-decode.exe rebuilt 2026-07-16 against the current Blackmagic RAW SDK 5.1 (Resolve 21
+# ABI); the braw-decode-win/bin copy is the FIXED build (its adjacent MinGW runtime DLLs
+# ship beside it) — prefer it. The old ProgramData/Utility copy is the stale April build
+# that faults on the current DLL; kept last only as a fallback if the dev build is absent.
+_BRAW_EXE_CANDIDATES = [
+    Path("D:/New AI Projects/braw-decode-win/bin/braw-decode.exe"),
+    Path("C:/ProgramData/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility/braw-decode.exe"),
+]
+# Point the DLL loader at the SDK's OWN Win/Libraries — the version-matched BlackmagicRawAPI.dll
+# PLUS its decoder deps (DecoderCUDA/OpenCL, InstructionSetServicesAVX*). Resolve's install dir
+# has a mismatched DLL that faulted with 0xC0000005; the SDK Libraries set is what the rebuilt
+# exe was proven against (real decode 2026-07-16).
+_BRAW_DLL_DIR = r"C:\Program Files (x86)\Blackmagic Design\Blackmagic RAW\Blackmagic RAW SDK\Win\Libraries"
+
+
+def _braw_read_exact(stream, n):
+    """Read exactly n bytes from a binary stream (subprocess stdout pipe). Returns bytes,
+    or None if the stream ends before n bytes are available. Mirrors resolve_plugin's
+    _read_exact — required because braw-decode.exe has no frame separator in its stream."""
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = stream.read(n - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return bytes(buf)
+
+
+# Wall-clock cap on the decode subprocess's full lifetime (Popen -> frame read -> exit).
+# If braw-decode.exe stalls mid-stream (bad clip, driver hang, etc.) a watchdog Timer
+# kills it at this deadline — killing the process closes its stdout pipe, which
+# unblocks _braw_read_exact's blocking read with a clean EOF (-> raw=None -> the
+# existing "no frame data" CK_ERROR path), never an indefinite hang. Same 30s figure
+# already used on the -n info-query subprocess.run call above.
+_BRAW_DECODE_TIMEOUT_S = 30
+
+
+def _braw_kill(proc):
+    """Best-effort kill + reap. Safe to call more than once (watchdog thread AND a
+    finally both call this) and safe to call on an already-exited process — never
+    raises, so the caller's cleanup path can't itself become the thing that hangs
+    or crashes. This is what makes the decoder never an orphan."""
+    try:
+        proc.kill()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        pass
+
+
+def _braw_locate_exe():
+    return next((str(p) for p in _BRAW_EXE_CANDIDATES if p.exists()), None)
+
+
+def _braw_build_env():
+    """Wire BRAW_SDK_PATH + PATH so braw-decode.exe's DLL loader finds
+    BlackmagicRawAPI.dll's own dependencies (matches resolve_plugin's env wiring —
+    without this the DLL faults with 0xC0000005 during init)."""
+    import os as _os
+    env = _os.environ.copy()
+    if Path(_BRAW_DLL_DIR + "/BlackmagicRawAPI.dll").exists():
+        if not env.get("BRAW_SDK_PATH"):
+            env["BRAW_SDK_PATH"] = _BRAW_DLL_DIR
+        if _BRAW_DLL_DIR.lower() not in env.get("PATH", "").lower():
+            env["PATH"] = _BRAW_DLL_DIR + ";" + env.get("PATH", "")
+    return env
+
+
+def _cmd_extract_braw(src, output_png, frame_idx=None, time_sec=None):
+    """Decode a single frame from a .braw file via braw-decode.exe. Returns True/False —
+    NEVER raises; any missing-dependency or decode failure prints a single CK_ERROR: line
+    to stdout (which the panel already surfaces) and returns False cleanly, so a machine
+    without Resolve/the BRAW SDK gets a clear message instead of a crash traceback. Also
+    NEVER hangs: a wall-clock watchdog (_BRAW_DECODE_TIMEOUT_S) kills a stalled decoder
+    subprocess instead of blocking forever, and the process is always reaped so it can't
+    become an orphan."""
+    import subprocess
+    import threading
+    import math
+    import cv2
+    import numpy as np
+
+    exe = _braw_locate_exe()
+    if exe is None:
+        print("CK_ERROR: BRAW decode helper not found (braw-decode.exe). "
+              "BRAW support needs the CorridorKey BRAW decoder installed.", flush=True)
+        log.error("BRAW decode: braw-decode.exe not found in known locations")
+        return False
+
+    if not Path(_BRAW_DLL_DIR + "/BlackmagicRawAPI.dll").exists():
+        print("CK_ERROR: BRAW decode needs the Blackmagic RAW SDK installed "
+              "(BlackmagicRawAPI.dll not found).", flush=True)
+        log.error(f"BRAW decode: BlackmagicRawAPI.dll not found at {_BRAW_DLL_DIR}")
+        return False
+
+    env = _braw_build_env()
+    fp = str(src)
+    log.info(f"BRAW decode exe: using {exe!r} clip={fp!r}")
+
+    # Info-only pass (-n): parses "Resolution: WxH" and "Framerate: N" from stdout.
+    # Framerate is needed here (unlike resolve_plugin's caller, which already has the
+    # project fps from the timeline) to convert a --time seconds request into a frame
+    # index for braw-decode.exe, which only understands frame indices (-i/-o).
+    try:
+        # -s 1 explicitly on the info query too (previously only the decode call passed
+        # it) — keeps the reported resolution locked to the same scale as the decode,
+        # so they can never diverge and desync bytes_per_frame from the real stream.
+        r = subprocess.run([exe, "-n", "-s", "1", fp], capture_output=True, text=True, timeout=30,
+                            stdin=subprocess.DEVNULL, env=env,
+                            creationflags=subprocess.CREATE_NO_WINDOW)
+        if r.returncode != 0 or not r.stdout:
+            print(f"CK_ERROR: BRAW decode info query failed (rc={r.returncode})", flush=True)
+            log.error(f"BRAW decode exe: info failed (rc={r.returncode}) stderr={r.stderr!r}")
+            return False
+        w = h = None
+        fps = None
+        for line in r.stdout.splitlines():
+            if "Resolution:" in line:
+                parts = line.split(":", 1)[1].strip().split("x")
+                w, h = int(parts[0].strip()), int(parts[1].strip())
+            elif "Framerate:" in line:
+                try:
+                    fps = float(line.split(":", 1)[1].strip())
+                except ValueError:
+                    pass
+        if w is None or h is None:
+            print("CK_ERROR: BRAW decode returned unreadable clip info", flush=True)
+            log.error(f"BRAW decode exe: cannot parse resolution — stdout={r.stdout!r}")
+            return False
+    except Exception as e:
+        print(f"CK_ERROR: BRAW decode info query failed — {e}", flush=True)
+        log.error(f"BRAW decode exe: info query failed: {e}")
+        return False
+
+    # Frame-index dispatch wrapped in try/except (defensive): argparse already coerces
+    # --frame/--time to int/float for the CLI, so int()/float() below can't normally
+    # raise — but this keeps the function's "never raises" contract true even for a
+    # future non-CLI caller that passes a raw string.
+    try:
+        if frame_idx is not None:
+            target_frame = int(frame_idx)
+        elif time_sec is not None:
+            safe_fps = fps if fps and fps > 0 else 24.0
+            # Match the "first frame AT OR AFTER the requested time" convention used
+            # by the PyAV path (_extract_frame_pyav above: `while f.pts < target_pts:
+            # skip`) and the cv2 path (CAP_PROP_POS_MSEC seek + decode-forward), so a
+            # BRAW source and a ProRes/HEVC source resolve the SAME requested
+            # timecode to the SAME frame (previously this used round(), which picks
+            # the NEAREST frame — a different frame than the other two paths at
+            # non-frame-exact times, a preview/scrub inconsistency). ceil() with a
+            # small epsilon keeps frame-exact boundaries (8.875s @ 24fps = frame
+            # 213.0 exactly) landing on 213, not rolling to 214 from float
+            # imprecision (8.875*24 can evaluate to 213.00000000000003).
+            _BRAW_FRAME_EPS = 1e-6
+            target_frame = math.ceil(float(time_sec) * safe_fps - _BRAW_FRAME_EPS)
+        else:
+            print("CK_ERROR: BRAW decode requires --frame or --time", flush=True)
+            log.error("BRAW decode: neither frame_idx nor time_sec provided")
+            return False
+    except Exception as e:
+        print(f"CK_ERROR: BRAW decode got an invalid --frame/--time value — {e}", flush=True)
+        log.error(f"BRAW decode: frame/time dispatch failed: {e}")
+        return False
+
+    log.info(f"BRAW decode: {w}x{h} fps={fps} -> frame {target_frame}")
+
+    # Resolution sanity cap (security): -n text parsing has no inherent bound, so a
+    # corrupt/malicious clip header could report an absurd WxH and drive an
+    # unbounded allocation below. Reject fast with a CK_ERROR instead.
+    _BRAW_MAX_DIM = 16384
+    _BRAW_MAX_FRAME_BYTES = 800 * 1024 * 1024  # 800MB
+    if not (1 <= w <= _BRAW_MAX_DIM and 1 <= h <= _BRAW_MAX_DIM):
+        print(f"CK_ERROR: BRAW decode reported an implausible resolution {w}x{h}", flush=True)
+        log.error(f"BRAW decode exe: implausible resolution {w}x{h} — refusing to allocate")
+        return False
+    if w * h * 4 > _BRAW_MAX_FRAME_BYTES:
+        print(f"CK_ERROR: BRAW decode frame size too large ({w}x{h})", flush=True)
+        log.error(f"BRAW decode exe: frame size {w}x{h} exceeds {_BRAW_MAX_FRAME_BYTES}-byte cap")
+        return False
+
+    bytes_per_frame = w * h * 4  # BGRA U8 — DANGER ZONE FRAGILE, see module note above.
+    proc = None
+    watchdog = None
+    try:
+        # CREATE_NEW_PROCESS_GROUP: gives the decoder its own group so a kill (ours,
+        # here, or the panel's outer broker) doesn't rely on console-signal delivery
+        # to a shared group — proc.kill() (TerminateProcess) still cleanly ends it.
+        proc = subprocess.Popen(
+            [exe, "-c", "bgra", "-s", "1", "-i", str(target_frame), "-o", str(target_frame + 1), fp],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=env,
+            creationflags=subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP,
+        )
+        # Watchdog: see _BRAW_DECODE_TIMEOUT_S docstring above _braw_kill. Started
+        # AFTER Popen succeeds so a failed launch can't spawn a stray timer.
+        watchdog = threading.Timer(_BRAW_DECODE_TIMEOUT_S, _braw_kill, args=(proc,))
+        watchdog.daemon = True
+        watchdog.start()
+        raw = _braw_read_exact(proc.stdout, bytes_per_frame)
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+        try:
+            stderr_out = proc.stderr.read().decode("utf-8", errors="replace").strip()
+        except Exception:
+            stderr_out = ""
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            pass  # finally below reaps unconditionally regardless of how we got here
+        if raw is None:
+            timed_out = watchdog is not None and not watchdog.is_alive()
+            if timed_out:
+                print(f"CK_ERROR: BRAW decode stalled past {_BRAW_DECODE_TIMEOUT_S}s and was killed", flush=True)
+                log.error(f"BRAW decode exe: watchdog killed a stalled decode at frame {target_frame}")
+            else:
+                print("CK_ERROR: BRAW decode produced no frame data", flush=True)
+                log.error(f"BRAW decode exe: stream ended before frame {target_frame} — {stderr_out}")
+            return False
+        if proc.returncode not in (0, None):
+            log.warning(f"BRAW decode exe: exit {proc.returncode} — {stderr_out}")
+        arr = np.frombuffer(raw, dtype=np.uint8).reshape(h, w, 4)
+        bgr = cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
+    except Exception as e:
+        print(f"CK_ERROR: BRAW decode failed — {e}", flush=True)
+        log.error(f"BRAW decode exe: failed: {e}")
+        if proc is not None:
+            _braw_kill(proc)
+        return False
+    finally:
+        # Reap unconditionally on every exit path (success, error, or timeout) — the
+        # decoder must never survive this function as an orphan. Safe/no-op if the
+        # process already exited cleanly.
+        if watchdog is not None:
+            watchdog.cancel()
+        if proc is not None:
+            _braw_kill(proc)
+
+    out = Path(output_png)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(out), bgr)
+    log.info(f"Extracted (BRAW) frame {target_frame} -> {out}")
+    return True
+
+
 def cmd_extract(source_video, output_png, frame_idx=None, time_sec=None):
     """Pull one frame from a video. HEVC sources use PyAV with explicit BT.709 colorspace
     to avoid the BT.601 default that causes wrong colors on H.265 footage (PyAV Issue #873).
+    BRAW sources use the Blackmagic RAW SDK (braw-decode.exe) — cv2 cannot decode BRAW.
     All other codecs use cv2. Falls back to cv2 if PyAV is not installed."""
     import cv2
     src = Path(source_video)
     if not src.exists():
         log.error(f"Source video not found: {src}")
         return False
+
+    if src.suffix.lower() == ".braw":
+        return _cmd_extract_braw(src, output_png, frame_idx=frame_idx, time_sec=time_sec)
 
     # Resolve time_sec for both paths
     if time_sec is None:
