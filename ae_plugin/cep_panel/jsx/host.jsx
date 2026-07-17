@@ -840,12 +840,16 @@ function ppro_getFrameInfo() {
         var filePath = targetClip.projectItem.getMediaPath();
         if (!filePath) return JSON.stringify({ ok: false, error: "Cannot get source file path" });
 
-        // Source-media TIME in seconds. Subtract one sequence-frame's worth because
-        // Premiere's playerPos reports the NEXT frame boundary. Python seeks by
-        // CAP_PROP_POS_MSEC (accurate across long-GOP codecs + fps mismatches),
-        // not by frame number.
+        // Source-media TIME in seconds. NO -1 frame adjustment: getPlayerPosition()
+        // reports the START boundary of the frame under the CTI (verified 2026-07-17,
+        // Berto's tile compare on A001_02091949_C020.braw — the displayed frame
+        // matched the un-shifted decode). A -1 lived here until then on the belief
+        // that playerPos reports the NEXT boundary; it shifted every key-frame
+        // extract and SAM anchor one frame back, pushing the anchor OUTSIDE the
+        // render range so the dots re-anchored onto the wrong frame's image
+        // (chewed mattes on fast motion). Python seeks by CAP_PROP_POS_MSEC
+        // (accurate across long-GOP codecs + fps mismatches), not by frame number.
         var sourceTimeSec = playerPos.seconds - targetClip.start.seconds + targetClip.inPoint.seconds;
-        sourceTimeSec = sourceTimeSec - (1.0 / fps);
         if (sourceTimeSec < 0) sourceTimeSec = 0;
 
         // sourceFrame = the absolute source-media frame under the playhead. Used ONLY as

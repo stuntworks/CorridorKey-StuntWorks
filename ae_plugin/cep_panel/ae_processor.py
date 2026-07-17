@@ -2294,15 +2294,27 @@ def cmd_batch(source_video, output_folder, settings,
             cfg = "configs/sam2.1/sam2.1_hiera_s.yaml"
             device = "cuda" if sam_torch.cuda.is_available() else "cpu"
 
-            # Map absolute click frame → range-relative anchor. If the click was
-            # outside the batch range (or never recorded), anchor at frame 0 and
-            # forward-propagate only — same fallback cmd_batch_scrub uses.
-            if sam_anchor_abs is not None and start_frame <= int(sam_anchor_abs) < end_frame:
-                sam_anchor_rel = int(sam_anchor_abs) - int(start_frame)
-            else:
-                sam_anchor_rel = 0
+            # Map absolute click frame → range-relative anchor. The SAM export
+            # includes _actual_preroll frame(s) BEFORE start_frame, so an anchor on
+            # the preroll frame (start_frame-1) is a legitimate in-range anchor —
+            # honor it instead of squashing to range frame 0+preroll, which would
+            # apply the user's click coordinates to the WRONG frame's image (2026-
+            # 07-17: exactly that squash re-anchored Berto's frame-386 dots onto
+            # frame 387 and chewed the mattes). Truly-outside anchors (or none
+            # recorded) still fall back to the first exported frame with forward-
+            # only propagation — same fallback cmd_batch_scrub uses.
             _actual_preroll = min(1, int(start_frame))  # warm SAM2 with one prior frame; 0 when start_frame==0
-            sam_anchor_rel += _actual_preroll
+            if (sam_anchor_abs is not None
+                    and (start_frame - _actual_preroll) <= int(sam_anchor_abs) < end_frame):
+                sam_anchor_rel = int(sam_anchor_abs) - int(start_frame) + _actual_preroll
+            else:
+                sam_anchor_rel = _actual_preroll
+                if sam_anchor_abs is not None:
+                    log.warning(
+                        f"SAM2 video: anchor frame {sam_anchor_abs} outside decoded range "
+                        f"[{int(start_frame) - _actual_preroll}, {int(end_frame)}) — "
+                        f"re-anchoring dots at range start; click coordinates may not "
+                        f"match that frame's image")
 
             # Export the N range frames to a temp dir — SAM2 video predictor
             # reads frames from disk via init_state(video_path=...). Phase 0
