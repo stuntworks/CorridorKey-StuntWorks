@@ -1161,8 +1161,6 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
 
         // v1.0 placement — find highest-used video track so we never overwrite
         // previous-run output. CK keyed sequence lands on max(source, used)+1.
-        // +1 frame nudge matches the -1 in ppro_getFrameInfo for playhead-
-        // boundary compensation.
         var highestUsedSeq = ppro_highest_used_video_track(seq);
         var ckTrackVSeq = (highestUsedSeq >= 1) ? (highestUsedSeq + 1) : 2;
         var ckTrackIdxSeq = ckTrackVSeq - 1;
@@ -1178,13 +1176,15 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
 
         var placeSec = Number(startSeconds);
         if (isNaN(placeSec) || placeSec < 0) placeSec = 0;
-        // Nudge by one frame at the SOURCE'S rate (since that's what the imported
-        // sequence is now conformed to) to compensate for Premiere dropping the first
-        // frame of a numbered-stills import. The dummy output_00000.png takes that hit.
-        var rateForNudge = appliedRate || targetRate;
-        var nudge = 1.0 / Number(rateForNudge || 24);
+        // NO nudge — place exactly at startSeconds. A +1-frame nudge lived here
+        // until 2026-07-16 to compensate for "Premiere dropping the first frame of
+        // a numbered-stills import". That drop was a misdiagnosis of our own dirty
+        // frame 0 (pre-FIX-C CAP_PROP_POS_MSEC decode); output_00000.png is the
+        // REAL first frame (pixel-verified against the source), Premiere keeps it,
+        // and the nudge landed every render one frame late on the timeline —
+        // Berto's long-standing "one frame off". Do not re-add.
         try {
-            v2.overwriteClip(imported, placeSec + nudge);
+            v2.overwriteClip(imported, placeSec);
         } catch (e) {
             return JSON.stringify({ ok: true, placed: false, binName: imported.name,
                 note: "Imported into bin but overwriteClip failed: " + String(e) });
@@ -1210,7 +1210,7 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
             try {
                 var vSam = seq.videoTracks[samTrackIdxSeq];
                 if (vSam) {
-                    vSam.overwriteClip(samImported, placeSec + nudge);
+                    vSam.overwriteClip(samImported, placeSec);
                     samPlaced = true;
                 }
             } catch (_) {}

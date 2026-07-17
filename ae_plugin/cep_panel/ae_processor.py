@@ -631,17 +631,14 @@ def _braw_time_to_frame(time_sec, fps):
       live: --time 8.916667 decoded frame 215). round() absorbs up to half a frame
       of representation error in either direction; hosts always send frame-aligned
       times, so nothing legitimate sits near the .5 midpoint.
-    - the trailing -1: braw-decode.exe's frame index runs ONE AHEAD of the frame
-      Premiere/AE (BRAW Studio importer) displays at the same time — proven on
-      Berto's A001_02091949_C020.braw: a render whose math said "start at frame
-      214" produced first-frame content one frame FORWARD of the host's display,
-      and the host's first frame matched braw-decode's 213. Subtracting here keeps
-      extract and batch in lockstep and lands both on what the user actually sees.
-    DEPENDS ON: braw-decode.exe indexing (BMD SDK); revisit if the decoder or the
-      host BRAW importer changes.
+    (2026-07-16 evening: a -1 shift briefly lived here on the theory that
+    braw-decode.exe indexes one ahead of the host display. DISPROVEN the same
+    night — the visible one-frame offset was the PANEL's timeline PLACEMENT of
+    the rendered PNG sequence, not the decode; Berto's tile compare confirmed
+    host and decoder numbering agree. Do not re-add the shift.)
     """
     safe_fps = fps if fps and fps > 0 else 24.0
-    return max(0, int(round(float(time_sec) * safe_fps)) - 1)
+    return int(round(float(time_sec) * safe_fps))
 
 
 def _braw_probe(source_video):
@@ -963,10 +960,7 @@ def _cmd_extract_braw(src, output_png, frame_idx=None, time_sec=None):
     # future non-CLI caller that passes a raw string.
     try:
         if frame_idx is not None:
-            # frame_idx arrives in HOST (Premiere/AE display) numbering — same -1
-            # shift into braw-decode.exe numbering as _braw_time_to_frame applies,
-            # so --frame N and --time N/fps decode the identical frame.
-            target_frame = max(0, int(frame_idx) - 1)
+            target_frame = int(frame_idx)
         elif time_sec is not None:
             # Shared with cmd_batch's range-render path (_braw_time_to_frame, above)
             # so a RENDER's start_seconds lands on the identical frame this PREVIEW
