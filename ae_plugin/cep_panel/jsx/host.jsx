@@ -1317,9 +1317,35 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
                 } catch (_) {}
                 try { if (ckBin) samImported.moveBin(ckBin); } catch (_) {}
                 try {
+                    // SEQUENCE-WRAP (2026-07-18): scripted overwriteClip of a
+                    // NUMBERED-STILLS projectItem renders BLANK in the program
+                    // monitor even when every API read-back is healthy (placed,
+                    // right media, full duration, track output on) — while the
+                    // same overwriteClip of a SEQUENCE item displays fine (the
+                    // master nest itself proves it on the main timeline). So each
+                    // aux matte is wrapped in its own sequence via
+                    // createNewSequenceFromClips (the proven-visible path) and
+                    // THAT sequence is nested onto the aux track.
+                    var _samPlaceItem = samImported;
+                    try {
+                        var _seqsBeforeSam = app.project.sequences.numSequences;
+                        app.project.createNewSequenceFromClips("GARBAGE MASK", [samImported], ckBin || app.project.rootItem);
+                        if (app.project.sequences.numSequences > _seqsBeforeSam) {
+                            var _samSeq = app.project.sequences[app.project.sequences.numSequences - 1];
+                            var _srRoots = ckBin ? [ckBin, app.project.rootItem] : [app.project.rootItem];
+                            for (var srI = 0; srI < _srRoots.length; srI++) {
+                                var _srKids = _srRoots[srI].children;
+                                for (var srJ = 0; srJ < _srKids.numItems; srJ++) {
+                                    var _srK = _srKids[srJ];
+                                    if (_srK.name === "GARBAGE MASK" && _srK.type !== 2) { _samPlaceItem = _srK; break; }
+                                }
+                                if (_samPlaceItem !== samImported) break;
+                            }
+                        }
+                    } catch (_) {}
                     var vSamN = (_samTargetIdx >= 0) ? nestSeq.videoTracks[_samTargetIdx] : null;
                     if (vSamN) {
-                        vSamN.overwriteClip(samImported, 0);
+                        vSamN.overwriteClip(_samPlaceItem, 0);
                         samPlaced = true;
                         // AE-parity: auxiliary layers ship OFF inside the nest.
                         try {
@@ -1343,9 +1369,27 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
                 } catch (_) {}
                 try { if (ckBin) ckOnlyImported.moveBin(ckBin); } catch (_) {}
                 try {
+                    // SEQUENCE-WRAP — same stills-item display bug workaround as
+                    // the GARBAGE MASK block above.
+                    var _ckoPlaceItem = ckOnlyImported;
+                    try {
+                        var _seqsBeforeCko = app.project.sequences.numSequences;
+                        app.project.createNewSequenceFromClips("CK MASTER", [ckOnlyImported], ckBin || app.project.rootItem);
+                        if (app.project.sequences.numSequences > _seqsBeforeCko) {
+                            var _ckRoots = ckBin ? [ckBin, app.project.rootItem] : [app.project.rootItem];
+                            for (var crI = 0; crI < _ckRoots.length; crI++) {
+                                var _crKids = _ckRoots[crI].children;
+                                for (var crJ = 0; crJ < _crKids.numItems; crJ++) {
+                                    var _crK = _crKids[crJ];
+                                    if (_crK.name === "CK MASTER" && _crK.type !== 2) { _ckoPlaceItem = _crK; break; }
+                                }
+                                if (_ckoPlaceItem !== ckOnlyImported) break;
+                            }
+                        }
+                    } catch (_) {}
                     var vCkoN = (_ckoTargetIdx >= 0) ? nestSeq.videoTracks[_ckoTargetIdx] : null;
                     if (vCkoN) {
-                        vCkoN.overwriteClip(ckOnlyImported, 0);
+                        vCkoN.overwriteClip(_ckoPlaceItem, 0);
                         ckOnlyPlaced = true;
                         // AE-parity: CK MASTER ships OFF inside the nest.
                         try {
