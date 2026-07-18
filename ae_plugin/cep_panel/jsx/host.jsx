@@ -886,40 +886,53 @@ function ppro_getInOutInfo() {
         var fps = parseFloat(seq.getSettings().videoFrameRate);
         if (isNaN(fps) || fps <= 0) fps = 24;
 
-        // Preferred: sequence in/out markers.
-        // Fallback: the clip the playhead sits on (or the first clip on V1) — we use
-        // its own in/out trim to decide what source-media frame range to key. This
-        // lets the user click PROCESS IN/OUT RANGE without first setting timeline
-        // markers, which was the behavior before the rewrite and the one Berto
-        // expects.
-        var track = seq.videoTracks[0];
-        if (track.clips.numItems < 1) return JSON.stringify({ ok: false, error: "No clips on Track 1" });
-
-        var inPoint = seq.getInPointAsTime();
-        var outPoint = seq.getOutPointAsTime();
-        var haveSeqRange = inPoint && outPoint && inPoint.seconds < outPoint.seconds;
-
+        // THE CLIP IS THE RANGE (Berto's law, 2026-07-18): "It's the clip. It's
+        // always been the clip. That's how it works with all the other apps."
+        // Sequence in/out marks are NEVER consulted — stale/invisible marks
+        // (getInPointAsTime persists per sequence even when the ruler highlight
+        // is unnoticeable) silently shrank a render to ONE frame. Range comes
+        // from the clip itself: the SELECTED video clip when there is one, else
+        // the clip under the playhead scanning every video track bottom-up,
+        // else the first clip found. The clip's own trim = the render range.
         var sourceClip = null;
-        if (haveSeqRange) {
-            // Find a clip overlapping the marker range (prefer the one at inPoint).
-            for (var i = 0; i < track.clips.numItems; i++) {
-                var c = track.clips[i];
-                if (inPoint.seconds >= c.start.seconds && inPoint.seconds < c.end.seconds) {
-                    sourceClip = c; break;
+        var rangeVia = "";
+        // 1) Selection (newer Premieres; guarded — older versions lack getSelection).
+        try {
+            if (typeof seq.getSelection === "function") {
+                var _sel = seq.getSelection();
+                for (var si = 0; _sel && si < _sel.length; si++) {
+                    var sc = _sel[si];
+                    if (sc && sc.mediaType === "Video" && sc.projectItem) { sourceClip = sc; rangeVia = "selection"; break; }
+                    // Some versions expose mediaType differently — accept any
+                    // trackItem with a projectItem that has a media path.
+                    if (!sourceClip && sc && sc.projectItem) {
+                        try { if (sc.projectItem.getMediaPath()) { sourceClip = sc; rangeVia = "selection"; break; } } catch (_) {}
+                    }
                 }
             }
-            if (!sourceClip) sourceClip = track.clips[0];
-        } else {
-            // No markers — use the clip under the playhead, or the first clip.
+        } catch (_) {}
+        // 2) Playhead — scan EVERY video track bottom-up (the source is not
+        //    always on V1: color mattes / earlier renders may occupy low tracks).
+        if (!sourceClip) {
             var playheadSec = seq.getPlayerPosition().seconds;
-            for (var j = 0; j < track.clips.numItems; j++) {
-                var cc = track.clips[j];
-                if (playheadSec >= cc.start.seconds && playheadSec < cc.end.seconds) {
-                    sourceClip = cc; break;
+            for (var tj = 0; tj < seq.videoTracks.numTracks && !sourceClip; tj++) {
+                var trk2 = seq.videoTracks[tj];
+                for (var j = 0; j < trk2.clips.numItems; j++) {
+                    var cc = trk2.clips[j];
+                    if (playheadSec >= cc.start.seconds && playheadSec < cc.end.seconds) {
+                        try { if (cc.projectItem && cc.projectItem.getMediaPath()) { sourceClip = cc; rangeVia = "playhead V" + (tj + 1); break; } } catch (_) {}
+                    }
                 }
             }
-            if (!sourceClip) sourceClip = track.clips[0];
         }
+        // 3) First clip on the lowest non-empty track.
+        if (!sourceClip) {
+            for (var tk = 0; tk < seq.videoTracks.numTracks && !sourceClip; tk++) {
+                if (seq.videoTracks[tk].clips.numItems > 0) { sourceClip = seq.videoTracks[tk].clips[0]; rangeVia = "first clip V" + (tk + 1); }
+            }
+        }
+        if (!sourceClip) return JSON.stringify({ ok: false, error: "No clips on any video track" });
+        var haveSeqRange = false; // marks are dead — kept for the payload shape below
 
         var filePath = sourceClip.projectItem.getMediaPath();
         if (!filePath) return JSON.stringify({ ok: false, error: "Cannot get source file path" });
@@ -960,7 +973,8 @@ function ppro_getInOutInfo() {
             fps: fps,
             sourceFrameRate: sourceFrameRate,
             inPointSeconds: timelineInSec,
-            usedSeqMarkers: haveSeqRange
+            usedSeqMarkers: haveSeqRange,
+            rangeVia: rangeVia
         });
     } catch (e) { return JSON.stringify({ ok: false, error: String(e) }); }
 }

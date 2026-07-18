@@ -4375,6 +4375,18 @@ function doSAMCommit(advanced) {
     try { setBusy(true); } catch (_) {}
     jsxCall(infoFn, [], (info) => {
         if (!info || !info.ok) { if (keyBtn) delete keyBtn.dataset.busy; CK_BATCH_IN_PROGRESS = false; try { setBusy(false); } catch (_) {} ckStatus(info && info.error ? info.error : 'Select the clip on the timeline first'); return; }
+        // RANGE DIAG (2026-07-18): THIS is the flow SAM-dotted renders take (doCommit's
+        // twin diag never fired for them). Log what range the host reported + where it
+        // came from; scream when it is <= 1 frame.
+        try {
+            ckLog('render range diag: ' + JSON.stringify({
+                start: info.startSeconds, end: info.endSeconds,
+                frames: Math.round((Number(info.endSeconds) - Number(info.startSeconds)) * (Number(info.fps) || 24)),
+                rangeVia: info.rangeVia, source: info.sourceFile
+            }));
+            var _rngFrames2 = Math.round((Number(info.endSeconds) - Number(info.startSeconds)) * (Number(info.fps) || 24));
+            if (_rngFrames2 <= 1) ckLog('render range diag: RANGE IS ' + _rngFrames2 + ' FRAME(S) — check the source clip trim on the timeline', true);
+        } catch (_) {}
         const ckLockJson = (info.lock ? JSON.stringify(info.lock) : '');
         if (typeof window.ckVwBatch === 'function') window.ckVwBatch(true, 'Rendering');
         if (vwProc) vwProc.classList.add('show');
