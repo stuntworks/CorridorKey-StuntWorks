@@ -737,7 +737,15 @@ def _braw_decode_range_to_pngs(exe, env, source_video, first_abs_frame, last_abs
     _braw_job_handle = None  # kept referenced for this function's lifetime — see _braw_job_object_for
     try:
         proc = subprocess.Popen(
-            [exe, "-c", "bgra", "-s", "1", "-i", str(first_abs_frame), "-o", str(last_abs_frame), str(source_video)],
+            # -k native (2026-07-18): decode with CAMERA-NATIVE color science, not
+            # the exe's Rec709 default. Rec709 crushes shadows to black (34% vs 14%
+            # dark pixels on the C039 strap/crotch crop) — the NN keyer and SAM then
+            # fail exactly in those zones (black blobs, chewed straps), while DaVinci
+            # feeds the same engine its own flat decode and keys clean. Native also
+            # matches what the host's BRAW importer displays, so rendered fg color
+            # matches the timeline (fixes the vivid-vs-flat discoloration). Keep in
+            # lockstep with the single-frame extract below — preview must equal render.
+            [exe, "-c", "bgra", "-s", "1", "-k", "native", "-i", str(first_abs_frame), "-o", str(last_abs_frame), str(source_video)],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             env=env,
             creationflags=subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP,
@@ -1000,7 +1008,9 @@ def _cmd_extract_braw(src, output_png, frame_idx=None, time_sec=None):
         # here, or the panel's outer broker) doesn't rely on console-signal delivery
         # to a shared group — proc.kill() (TerminateProcess) still cleanly ends it.
         proc = subprocess.Popen(
-            [exe, "-c", "bgra", "-s", "1", "-i", str(target_frame), "-o", str(target_frame + 1), fp],
+            # -k native — MUST match _braw_decode_range_to_pngs' color science
+            # exactly (preview == render); see the comment there for the full why.
+            [exe, "-c", "bgra", "-s", "1", "-k", "native", "-i", str(target_frame), "-o", str(target_frame + 1), fp],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             env=env,
             creationflags=subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP,
