@@ -681,15 +681,17 @@ def _braw_probe(source_video):
 
 
 def _braw_decode_range_to_pngs(exe, env, source_video, first_abs_frame, last_abs_frame, w, h, temp_dir,
-                                progress_total=None):
+                                progress_total=None, color_science="rec709"):
     """Stream-decode braw-decode.exe frames [first_abs_frame, last_abs_frame) from a
     .braw source to <temp_dir>/<abs_frame:06d>.png (8-bit BGR — matches what
     cv2.VideoCapture.read() would hand cmd_batch's pipeline for a normal source).
     ONE braw-decode.exe process for the WHOLE range (mirrors resolve_plugin's
     _try_braw_decode_exe / _export_braw_range_to_frames streaming shape) — never one
-    process per frame. Does NOT pass --color-science: braw-decode.exe already
-    defaults to Rec.709 (proven 2026-07-16), so the range call inherits it exactly
-    like the single-frame path does.
+    process per frame. color_science selects braw-decode.exe's -k flag
+    ("rec709"|"native"); default "rec709" matches braw-decode.exe's own default
+    (proven 2026-07-16), so existing callers stay byte-identical. TWO-STREAM BRAW
+    COLOR (2026-07-18): cmd_batch calls this TWICE per render — once "rec709" for
+    keying/mattes/QC (unchanged), once "native" for the shipped output color.
     Returns None on full success, or a short CK_ERROR-ready message string if the
     decode failed, the stream ended early, a PNG write failed, or a post-decode
     sanity check found unexpected trailing bytes (possible frame-size desync — see
@@ -737,7 +739,7 @@ def _braw_decode_range_to_pngs(exe, env, source_video, first_abs_frame, last_abs
     _braw_job_handle = None  # kept referenced for this function's lifetime — see _braw_job_object_for
     try:
         proc = subprocess.Popen(
-            [exe, "-c", "bgra", "-s", "1", "-i", str(first_abs_frame), "-o", str(last_abs_frame), str(source_video)],
+            [exe, "-c", "bgra", "-s", "1", "-k", str(color_science), "-i", str(first_abs_frame), "-o", str(last_abs_frame), str(source_video)],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             env=env,
             creationflags=subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP,
@@ -2122,6 +2124,7 @@ def cmd_batch(source_video, output_folder, settings,
     src_path = Path(source_video)
     is_braw = src_path.suffix.lower() == ".braw"
     _braw_temp_dir = None
+    _braw_temp_dir_native = None
     braw_w = braw_h = None
     _braw_decode_first = _braw_decode_last = None
 
@@ -2164,7 +2167,10 @@ def cmd_batch(source_video, output_folder, settings,
         # .braw source the staging PNGs are themselves ~w*h*5 bytes/frame and would
         # otherwise fill the drive silently before the later check ever runs.
         import shutil as _braw_shutil_preflight
-        _braw_need_bytes = int(_braw_n_frames * braw_w * braw_h * 5 * 1.3)
+        # TWO-STREAM BRAW COLOR (2026-07-18): rec709 + native PNG sets stage
+        # simultaneously (both survive until the per-frame loop finishes reading
+        # them), so the preflight need is doubled here, BEFORE the first decode.
+        _braw_need_bytes = int(_braw_n_frames * braw_w * braw_h * 5 * 1.3) * 2
         _braw_free_bytes = _braw_shutil_preflight.disk_usage(str(out_dir)).free
         if _braw_free_bytes < _braw_need_bytes:
             print(f"CK_ERROR: not enough disk for BRAW pre-decode — need ~"
@@ -2190,6 +2196,28 @@ def cmd_batch(source_video, output_folder, settings,
             _braw_shutil_early.rmtree(_braw_temp_dir, ignore_errors=True)
             return 0
         log.info("BRAW batch: decode complete")
+
+        # TWO-STREAM BRAW COLOR (2026-07-18): the decode above is Rec709 — the
+        # engine keys on it, alpha/mattes/SAM/QC all derive from it, unchanged.
+        # This SECOND decode of the same frame range is camera-native color — the
+        # shipped output color comes from this stream instead, so the render
+        # matches what the host's BRAW importer displays (no baked Rec709) and the
+        # client's own grade/LUT applies on top exactly like it does to the source.
+        _braw_temp_dir_native = Path(str(_braw_temp_dir) + "_native")
+        _braw_temp_dir_native.mkdir(parents=True, exist_ok=True)
+        log.info(f"BRAW batch: decoding native-color frames {_braw_decode_first}..{_braw_decode_last} -> {_braw_temp_dir_native}")
+        _decode_err_native = _braw_decode_range_to_pngs(
+            braw_exe, braw_env, source_video, _braw_decode_first, _braw_decode_last,
+            braw_w, braw_h, _braw_temp_dir_native, progress_total=max(1, end_frame - start_frame),
+            color_science="native")
+        if _decode_err_native:
+            print(f"CK_ERROR: BRAW native color decode failed — {_decode_err_native}", flush=True)
+            log.error(f"BRAW batch: native color range decode failed — {_decode_err_native}")
+            import shutil as _braw_shutil_early_native
+            _braw_shutil_early_native.rmtree(_braw_temp_dir, ignore_errors=True)
+            _braw_shutil_early_native.rmtree(_braw_temp_dir_native, ignore_errors=True)
+            return 0
+        log.info("BRAW batch: native color decode complete")
     else:
         # Resolve time range to frame indices using SOURCE's native fps. This eliminates
         # the drift that happens when JSX converts seconds->frames using the sequence fps
@@ -2812,6 +2840,18 @@ def cmd_batch(source_video, output_folder, settings,
                             fg, alpha_raw, settings, sam_soft=_sam_frame, source_rgb=img_rgb,
                             screen_type=settings["screenType"], return_garbage=True,
                             frame_idx=seq_num)
+                # TWO-STREAM BRAW COLOR (2026-07-18): alpha above was keyed on the
+                # Rec709 decode (saturated -> keyable); the SHIPPED color is the
+                # camera-native decode of the same frame, so the render matches the
+                # host's BRAW display and the client's own grade/LUT applies to our
+                # output exactly like it applies to the source clip (no double-709).
+                # Alpha/mattes/QC untouched. Non-braw sources: no-op.
+                if is_braw and _braw_temp_dir_native is not None:
+                    _native_png = Path(_braw_temp_dir_native) / f"{frame_idx:06d}.png"
+                    _native_bgr = cv2.imread(str(_native_png), cv2.IMREAD_COLOR)
+                    if _native_bgr is None:
+                        raise RuntimeError(f"CK_ERROR: native-color frame {frame_idx} missing from two-stream decode")
+                    fg = cv2.cvtColor(_native_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
                 fg_uint16 = (np.clip(fg, 0, 1) * 65535).astype(np.uint16)
                 alpha_uint16 = (np.clip(alpha, 0, 1) * 65535).astype(np.uint16)
                 fg_bgr = cv2.cvtColor(fg_uint16, cv2.COLOR_RGB2BGR)
@@ -2904,6 +2944,9 @@ def cmd_batch(source_video, output_folder, settings,
         if is_braw and _braw_temp_dir is not None:
             import shutil as _braw_shutil_cleanup
             _braw_shutil_cleanup.rmtree(_braw_temp_dir, ignore_errors=True)
+        if is_braw and _braw_temp_dir_native is not None:
+            import shutil as _braw_shutil_cleanup_native
+            _braw_shutil_cleanup_native.rmtree(_braw_temp_dir_native, ignore_errors=True)
 
     # 4th field = SAM2 temporal guard held-count (Fix 3). Panel parses batch_result.txt
     # POSITIONALLY (index.html ~3903 doCommit, ~4050 doSAMCommit read br[0]/br[1]/br[2]
