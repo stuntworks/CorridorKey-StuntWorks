@@ -1193,25 +1193,11 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
         if (!ckBin) { try { ckBin = root.createBin("CorridorKey"); } catch (_) {} }
         if (ckBin) { try { imported.moveBin(ckBin); } catch (_) {} }
 
-        // v1.0 placement — find highest-used video track so we never overwrite
-        // previous-run output. CK keyed sequence lands on max(source, used)+1.
-        var highestUsedSeq = ppro_highest_used_video_track(seq);
-        var ckTrackVSeq = (highestUsedSeq >= 1) ? (highestUsedSeq + 1) : 2;
-        var ckTrackIdxSeq = ckTrackVSeq - 1;
-        // SAM sidecar (when present) lives on the track immediately above CK.
-        var samTrackVSeq = samImported ? (ckTrackVSeq + 1) : 0;
-        var samTrackIdxSeq = samImported ? (samTrackVSeq - 1) : -1;
-        // CK MASTER (CK_ONLY) lives on the track immediately above SAM (or above
-        // CK if no SAM matte is present).
-        var ckOnlyTrackVSeq = ckOnlyImported ? ((samImported ? samTrackVSeq : ckTrackVSeq) + 1) : 0;
-        var ckOnlyTrackIdxSeq = ckOnlyImported ? (ckOnlyTrackVSeq - 1) : -1;
-        var topNeededIdx = ckOnlyImported ? ckOnlyTrackIdxSeq : (samImported ? samTrackIdxSeq : ckTrackIdxSeq);
-        while (seq.videoTracks.numTracks <= topNeededIdx) {
-            try { seq.videoTracks.addTracks(1); } catch (_) { break; }
-        }
-        var v2 = seq.videoTracks[ckTrackIdxSeq];
-        if (!v2) return JSON.stringify({ ok: true, placed: false, note: "Imported but V" + ckTrackVSeq + " unavailable" });
-
+        // Nested-sequence placement — AE-precomp parity. Build one nested sequence
+        // containing CK + SAM + CK MASTER stacked (aux disabled), then place that
+        // single nest on the user's main timeline. Falls back to the old flat
+        // placement below if nesting isn't available in this Premiere build.
+        var mainSeq = seq;
         var placeSec = Number(startSeconds);
         if (isNaN(placeSec) || placeSec < 0) placeSec = 0;
         // NO nudge — place exactly at startSeconds. A +1-frame nudge lived here
@@ -1221,89 +1207,274 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
         // REAL first frame (pixel-verified against the source), Premiere keeps it,
         // and the nudge landed every render one frame late on the timeline —
         // Berto's long-standing "one frame off". Do not re-add.
+
+        var nestSeq = null;
+        var nestErr = "";
+        var _nestName = "CK " + (imported.name || "Render");
         try {
-            v2.overwriteClip(imported, placeSec);
-        } catch (e) {
-            return JSON.stringify({ ok: true, placed: false, binName: imported.name,
-                note: "Imported into bin but overwriteClip failed: " + String(e) });
-        }
+            if (typeof app.project.createNewSequenceFromClips === "function") {
+                var seqCountBefore = app.project.sequences.numSequences;
+                var newSeqObj = app.project.createNewSequenceFromClips(_nestName, [imported], ckBin || app.project.rootItem);
+                // Some versions return the Sequence, some return undefined — resolve by diff.
+                if (newSeqObj && newSeqObj.sequenceID) { nestSeq = newSeqObj; }
+                else if (app.project.sequences.numSequences > seqCountBefore) {
+                    nestSeq = app.project.sequences[app.project.sequences.numSequences - 1];
+                }
+            } else {
+                nestErr = "createNewSequenceFromClips unavailable";
+            }
+        } catch (eNest) { nestErr = String(eNest); }
 
-        // SAM matte sidecar — conform rate, move into bin, place above CK.
-        // Failures here don't roll back CK placement; the user keeps the keyed
-        // sequence either way.
         var samPlaced = false;
-        if (samImported) {
+        var ckOnlyPlaced = false;
+        var trackV = 0;
+        var samTrackV = 0;
+        var mode = "flat";
+        var nestProjectItem = null;
+
+        if (nestSeq) {
+            // createNewSequenceFromClips already placed `imported` on V1 at 0 — do
+            // not place it again. Ensure V2 (SAM) + V3 (CK MASTER) exist.
             try {
-                if (typeof samImported.setOverrideFrameRate === "function") {
-                    samImported.setOverrideFrameRate(targetRate);
-                } else {
-                    var fiSam = samImported.getFootageInterpretation();
-                    if (fiSam) {
-                        fiSam.frameRate = targetRate;
-                        samImported.setFootageInterpretation(fiSam);
+                while (nestSeq.videoTracks.numTracks < 3) { nestSeq.videoTracks.addTracks(1); }
+            } catch (_) {}
+
+            if (samImported) {
+                try {
+                    if (typeof samImported.setOverrideFrameRate === "function") {
+                        samImported.setOverrideFrameRate(targetRate);
+                    } else {
+                        var fiSamN = samImported.getFootageInterpretation();
+                        if (fiSamN) { fiSamN.frameRate = targetRate; samImported.setFootageInterpretation(fiSamN); }
+                    }
+                } catch (_) {}
+                try { if (ckBin) samImported.moveBin(ckBin); } catch (_) {}
+                try {
+                    var vSamN = nestSeq.videoTracks[1];
+                    if (vSamN) {
+                        vSamN.overwriteClip(samImported, 0);
+                        samPlaced = true;
+                        // AE-parity: auxiliary layers ship OFF inside the nest.
+                        try {
+                            for (var qiSamN = 0; qiSamN < vSamN.clips.numItems; qiSamN++) {
+                                var qcSamN = vSamN.clips[qiSamN];
+                                if (Math.abs(qcSamN.start.seconds) < 0.5 / Number(fps || 24)) { qcSamN.disabled = true; break; }
+                            }
+                        } catch (_) {}
+                    }
+                } catch (_) {}
+            }
+
+            if (ckOnlyImported) {
+                try {
+                    if (typeof ckOnlyImported.setOverrideFrameRate === "function") {
+                        ckOnlyImported.setOverrideFrameRate(targetRate);
+                    } else {
+                        var fiCkoN = ckOnlyImported.getFootageInterpretation();
+                        if (fiCkoN) { fiCkoN.frameRate = targetRate; ckOnlyImported.setFootageInterpretation(fiCkoN); }
+                    }
+                } catch (_) {}
+                try { if (ckBin) ckOnlyImported.moveBin(ckBin); } catch (_) {}
+                try {
+                    var vCkoN = nestSeq.videoTracks[2];
+                    if (vCkoN) {
+                        vCkoN.overwriteClip(ckOnlyImported, 0);
+                        ckOnlyPlaced = true;
+                        // AE-parity: CK MASTER ships OFF inside the nest.
+                        try {
+                            for (var qiCkoN = 0; qiCkoN < vCkoN.clips.numItems; qiCkoN++) {
+                                var qcCkoN = vCkoN.clips[qiCkoN];
+                                if (Math.abs(qcCkoN.start.seconds) < 0.5 / Number(fps || 24)) { qcCkoN.disabled = true; break; }
+                            }
+                        } catch (_) {}
+                    }
+                } catch (_) {}
+            }
+
+            // Locate the nest's own project item so it can be placed on the main
+            // timeline, same as any other clip.
+            try {
+                var _searchRoots = ckBin ? [app.project.rootItem, ckBin] : [app.project.rootItem];
+                for (var rIdx = 0; rIdx < _searchRoots.length && !nestProjectItem; rIdx++) {
+                    var _kids = _searchRoots[rIdx].children;
+                    for (var nIdx = 0; nIdx < _kids.numItems; nIdx++) {
+                        var _kid = _kids[nIdx];
+                        if (_kid.name === _nestName && _kid.type !== 2) { nestProjectItem = _kid; break; }
                     }
                 }
-            } catch (_) {}
-            try { if (ckBin) samImported.moveBin(ckBin); } catch (_) {}
-            try {
-                var vSam = seq.videoTracks[samTrackIdxSeq];
-                if (vSam) {
-                    vSam.overwriteClip(samImported, placeSec);
-                    samPlaced = true;
-                    // AE-parity: auxiliary layers ship OFF (GARBAGE MASK / CK MASTER are rescue
-                    // material, not part of the default composite). trackItem.disabled exists on
-                    // Premiere 14+; older versions just leave the clip visible (harmless).
-                    try {
-                        var vTrkSam = seq.videoTracks[samTrackIdxSeq];
-                        for (var qiSam = 0; qiSam < vTrkSam.clips.numItems; qiSam++) {
-                            var qcSam = vTrkSam.clips[qiSam];
-                            if (Math.abs(qcSam.start.seconds - placeSec) < 0.5 / Number(fps || 24)) { qcSam.disabled = true; break; }
-                        }
-                    } catch (_) {}
+            } catch (eFind) { if (!nestErr) nestErr = String(eFind); }
+            if (!nestProjectItem && !nestErr) { nestErr = "nest projectItem not found"; }
+
+            if (nestProjectItem) {
+                // Same highest-used-track + addTracks pattern as the old flat path,
+                // run against the USER'S main sequence, not the nest.
+                try {
+                    var highestUsedMain = ppro_highest_used_video_track(mainSeq);
+                    var nestTrackV = (highestUsedMain >= 1) ? (highestUsedMain + 1) : 2;
+                    var nestTrackIdx = nestTrackV - 1;
+                    while (mainSeq.videoTracks.numTracks <= nestTrackIdx) {
+                        try { mainSeq.videoTracks.addTracks(1); } catch (_) { break; }
+                    }
+                    var vNest = mainSeq.videoTracks[nestTrackIdx];
+                    if (!vNest) throw new Error("V" + nestTrackV + " unavailable on main sequence");
+                    vNest.overwriteClip(nestProjectItem, placeSec);
+                    trackV = nestTrackV;
+                    mode = "nested";
+                } catch (eMainPlace) {
+                    if (!nestErr) nestErr = String(eMainPlace);
                 }
-            } catch (_) {}
+            }
         }
 
-        // CK MASTER (CK_ONLY) — conform rate, move into bin, place above the SAM
-        // matte (or above CK if no SAM matte). Failures here don't roll back
-        // CK/SAM placement; the user keeps those either way.
-        var ckOnlyPlaced = false;
-        if (ckOnlyImported) {
+        // Restore the user's own sequence as active — createNewSequenceFromClips
+        // may have switched focus to the nest.
+        try {
+            if (mainSeq && typeof app.project.openSequence === "function" && mainSeq.sequenceID) {
+                app.project.openSequence(mainSeq.sequenceID);
+            }
+        } catch (_) {}
+
+        // FALLBACK — old flat placement (pre-nesting behavior). Used when
+        // createNewSequenceFromClips is unavailable, the nest's project item
+        // couldn't be located, or placing the nest on the main timeline failed.
+        if (mode !== "nested") {
+            samPlaced = false;
+            ckOnlyPlaced = false;
+
+            // v1.0 placement — find highest-used video track so we never overwrite
+            // previous-run output. CK keyed sequence lands on max(source, used)+1.
+            var highestUsedSeq = ppro_highest_used_video_track(mainSeq);
+            var ckTrackVSeq = (highestUsedSeq >= 1) ? (highestUsedSeq + 1) : 2;
+            var ckTrackIdxSeq = ckTrackVSeq - 1;
+            // SAM sidecar (when present) lives on the track immediately above CK.
+            var samTrackVSeq = samImported ? (ckTrackVSeq + 1) : 0;
+            var samTrackIdxSeq = samImported ? (samTrackVSeq - 1) : -1;
+            // CK MASTER (CK_ONLY) lives on the track immediately above SAM (or above
+            // CK if no SAM matte is present).
+            var ckOnlyTrackVSeq = ckOnlyImported ? ((samImported ? samTrackVSeq : ckTrackVSeq) + 1) : 0;
+            var ckOnlyTrackIdxSeq = ckOnlyImported ? (ckOnlyTrackVSeq - 1) : -1;
+            var topNeededIdx = ckOnlyImported ? ckOnlyTrackIdxSeq : (samImported ? samTrackIdxSeq : ckTrackIdxSeq);
+            while (mainSeq.videoTracks.numTracks <= topNeededIdx) {
+                try { mainSeq.videoTracks.addTracks(1); } catch (_) { break; }
+            }
+            var v2 = mainSeq.videoTracks[ckTrackIdxSeq];
+            if (!v2) {
+                return JSON.stringify({ ok: true, placed: false, note: "Imported but V" + ckTrackVSeq + " unavailable",
+                    diag: { mainName: imported.name,
+                        mainPath: (function () { try { return imported.getMediaPath(); } catch (_) { return ""; } })(),
+                        mode: "flat", nestErr: nestErr, nestFallback: nestErr } });
+            }
+
             try {
-                if (typeof ckOnlyImported.setOverrideFrameRate === "function") {
-                    ckOnlyImported.setOverrideFrameRate(targetRate);
-                } else {
-                    var fiCko = ckOnlyImported.getFootageInterpretation();
-                    if (fiCko) {
-                        fiCko.frameRate = targetRate;
-                        ckOnlyImported.setFootageInterpretation(fiCko);
-                    }
-                }
-            } catch (_) {}
-            try { if (ckBin) ckOnlyImported.moveBin(ckBin); } catch (_) {}
-            try {
-                var vCko = seq.videoTracks[ckOnlyTrackIdxSeq];
-                if (vCko) {
-                    vCko.overwriteClip(ckOnlyImported, placeSec);
-                    ckOnlyPlaced = true;
-                    // AE-parity: CK MASTER ships OFF (rescue material, not part of the
-                    // default composite).
-                    try {
-                        var vTrkCko = seq.videoTracks[ckOnlyTrackIdxSeq];
-                        for (var qiCko = 0; qiCko < vTrkCko.clips.numItems; qiCko++) {
-                            var qcCko = vTrkCko.clips[qiCko];
-                            if (Math.abs(qcCko.start.seconds - placeSec) < 0.5 / Number(fps || 24)) { qcCko.disabled = true; break; }
+                v2.overwriteClip(imported, placeSec);
+            } catch (e) {
+                return JSON.stringify({ ok: true, placed: false, binName: imported.name,
+                    note: "Imported into bin but overwriteClip failed: " + String(e),
+                    diag: { mainName: imported.name,
+                        mainPath: (function () { try { return imported.getMediaPath(); } catch (_) { return ""; } })(),
+                        mode: "flat", nestErr: nestErr, nestFallback: nestErr } });
+            }
+
+            // SAM matte sidecar — conform rate, move into bin, place above CK.
+            // Failures here don't roll back CK placement; the user keeps the keyed
+            // sequence either way.
+            if (samImported) {
+                try {
+                    if (typeof samImported.setOverrideFrameRate === "function") {
+                        samImported.setOverrideFrameRate(targetRate);
+                    } else {
+                        var fiSam = samImported.getFootageInterpretation();
+                        if (fiSam) {
+                            fiSam.frameRate = targetRate;
+                            samImported.setFootageInterpretation(fiSam);
                         }
-                    } catch (_) {}
-                }
-            } catch (_) {}
+                    }
+                } catch (_) {}
+                try { if (ckBin) samImported.moveBin(ckBin); } catch (_) {}
+                try {
+                    var vSam = mainSeq.videoTracks[samTrackIdxSeq];
+                    if (vSam) {
+                        vSam.overwriteClip(samImported, placeSec);
+                        samPlaced = true;
+                        // AE-parity: auxiliary layers ship OFF (GARBAGE MASK / CK MASTER are rescue
+                        // material, not part of the default composite). trackItem.disabled exists on
+                        // Premiere 14+; older versions just leave the clip visible (harmless).
+                        try {
+                            var vTrkSam = mainSeq.videoTracks[samTrackIdxSeq];
+                            for (var qiSam = 0; qiSam < vTrkSam.clips.numItems; qiSam++) {
+                                var qcSam = vTrkSam.clips[qiSam];
+                                if (Math.abs(qcSam.start.seconds - placeSec) < 0.5 / Number(fps || 24)) { qcSam.disabled = true; break; }
+                            }
+                        } catch (_) {}
+                    }
+                } catch (_) {}
+            }
+
+            // CK MASTER (CK_ONLY) — conform rate, move into bin, place above the SAM
+            // matte (or above CK if no SAM matte). Failures here don't roll back
+            // CK/SAM placement; the user keeps those either way.
+            if (ckOnlyImported) {
+                try {
+                    if (typeof ckOnlyImported.setOverrideFrameRate === "function") {
+                        ckOnlyImported.setOverrideFrameRate(targetRate);
+                    } else {
+                        var fiCko = ckOnlyImported.getFootageInterpretation();
+                        if (fiCko) {
+                            fiCko.frameRate = targetRate;
+                            ckOnlyImported.setFootageInterpretation(fiCko);
+                        }
+                    }
+                } catch (_) {}
+                try { if (ckBin) ckOnlyImported.moveBin(ckBin); } catch (_) {}
+                try {
+                    var vCko = mainSeq.videoTracks[ckOnlyTrackIdxSeq];
+                    if (vCko) {
+                        vCko.overwriteClip(ckOnlyImported, placeSec);
+                        ckOnlyPlaced = true;
+                        // AE-parity: CK MASTER ships OFF (rescue material, not part of the
+                        // default composite).
+                        try {
+                            var vTrkCko = mainSeq.videoTracks[ckOnlyTrackIdxSeq];
+                            for (var qiCko = 0; qiCko < vTrkCko.clips.numItems; qiCko++) {
+                                var qcCko = vTrkCko.clips[qiCko];
+                                if (Math.abs(qcCko.start.seconds - placeSec) < 0.5 / Number(fps || 24)) { qcCko.disabled = true; break; }
+                            }
+                        } catch (_) {}
+                    }
+                } catch (_) {}
+            }
+
+            trackV = ckTrackVSeq;
+            samTrackV = samImported ? samTrackVSeq : 0;
+        } else {
+            samTrackV = samImported ? 2 : 0;
+        }
+
+        // Read-back diagnostics — so the next "aux clip shows nothing" failure is
+        // diagnosable without re-running the whole export. getMediaPath is guarded;
+        // sequences/some footage types don't implement it.
+        var diag = {
+            mainName: imported.name,
+            mainPath: (function () { try { return imported.getMediaPath(); } catch (_) { return ""; } })(),
+            mode: mode,
+            nestErr: nestErr
+        };
+        if (mode !== "nested") { diag.nestFallback = nestErr; }
+        if (samImported) {
+            diag.samName = samImported.name;
+            diag.samPath = (function () { try { return samImported.getMediaPath(); } catch (_) { return ""; } })();
+        }
+        if (ckOnlyImported) {
+            diag.ckoName = ckOnlyImported.name;
+            diag.ckoPath = (function () { try { return ckOnlyImported.getMediaPath(); } catch (_) { return ""; } })();
         }
 
         return JSON.stringify({
             ok: true, placed: true, binName: imported.name, appliedRate: appliedRate,
-            trackV: ckTrackVSeq, samPlaced: samPlaced,
-            samTrackV: samImported ? samTrackVSeq : 0,
-            ckOnlyPlaced: ckOnlyPlaced
+            trackV: trackV, samPlaced: samPlaced,
+            samTrackV: samTrackV,
+            ckOnlyPlaced: ckOnlyPlaced,
+            diag: diag
         });
     } catch (e) { return JSON.stringify({ ok: false, error: String(e) }); }
 }

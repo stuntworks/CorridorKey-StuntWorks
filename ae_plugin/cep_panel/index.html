@@ -4454,7 +4454,13 @@ function doSAMCommit(advanced) {
                 ], (imp) => {
                     if (!imp || !imp.ok) return finish('Import failed: ' + (imp && imp.error ? imp.error : 'unknown'), true);
                     if (imp.via) ckLog('samCommit: import target resolved via ' + imp.via);
-                    finish('Done. Keyed clip on your timeline' + (samMattePath ? ' (+ SAM matte)' : '') + '.' +
+                    // Import read-back diagnostics (2026-07-18): names/paths/mode of what
+                    // actually landed — an invisible clip on the timeline is diagnosable
+                    // from this line instead of guesswork.
+                    try { if (imp.diag) ckLog('ppro import diag: ' + JSON.stringify(imp.diag)); } catch (_) {}
+                    if (imp.nestFallback) ckLog('ppro import: NESTED placement failed, used flat fallback — ' + imp.nestFallback, true);
+                    finish('Done. ' + (imp.diag && imp.diag.mode === 'nested' ? 'Nested CK clip on your timeline (aux layers inside, off by default).'
+                           : 'Keyed clip on your timeline' + (samMattePath ? ' (+ SAM matte)' : '') + '.') +
                            (_samGuardHeld > 0 ? ' ' + _samGuardHeld + ' frame(s) auto-held by SAM guard — check log.' : ''));
                 });
             } else {
