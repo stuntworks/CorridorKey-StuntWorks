@@ -1235,9 +1235,31 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
         if (nestSeq) {
             // createNewSequenceFromClips already placed `imported` on V1 at 0 — do
             // not place it again. Ensure V2 (SAM) + V3 (CK MASTER) exist.
+            // GOTCHA (2026-07-18, root cause of the missing GARBAGE MASK/CK MASTER):
+            // TrackCollection.addTracks() does NOT exist in Premiere's plain
+            // scripting DOM — it's a QE-DOM method. The call threw into a swallowing
+            // catch, the fresh nest kept its single video track, videoTracks[1]/[2]
+            // came back undefined, and both aux placements were silently skipped.
+            // Use the QE sequence (the nest IS the active sequence right after
+            // createNewSequenceFromClips) to add real tracks, and record failure in
+            // nestErr instead of swallowing it.
+            try { app.enableQE(); } catch (_) {}
             try {
-                while (nestSeq.videoTracks.numTracks < 3) { nestSeq.videoTracks.addTracks(1); }
-            } catch (_) {}
+                var _trackGuard = 0;
+                while (nestSeq.videoTracks.numTracks < 3 && _trackGuard < 6) {
+                    _trackGuard++;
+                    var _beforeTracks = nestSeq.videoTracks.numTracks;
+                    try { nestSeq.videoTracks.addTracks(1); } catch (_) {}
+                    if (nestSeq.videoTracks.numTracks === _beforeTracks) {
+                        try { qe.project.getActiveSequence().addTracks(1); } catch (_) {}
+                    }
+                    if (nestSeq.videoTracks.numTracks === _beforeTracks) {
+                        nestErr = nestErr || ("could not add video tracks to nest (stuck at " +
+                                              nestSeq.videoTracks.numTracks + ")");
+                        break;
+                    }
+                }
+            } catch (eTrk) { nestErr = nestErr || String(eTrk); }
 
             if (samImported) {
                 try {
@@ -1457,7 +1479,12 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
             mainName: imported.name,
             mainPath: (function () { try { return imported.getMediaPath(); } catch (_) { return ""; } })(),
             mode: mode,
-            nestErr: nestErr
+            nestErr: nestErr,
+            // Placement truth — the import can succeed while a placement silently
+            // fails (2026-07-18: nest had 1 video track, aux clips skipped).
+            samPlaced: samPlaced,
+            ckOnlyPlaced: ckOnlyPlaced,
+            nestTracks: (function () { try { return nestSeq ? nestSeq.videoTracks.numTracks : -1; } catch (_) { return -1; } })()
         };
         if (mode !== "nested") { diag.nestFallback = nestErr; }
         if (samImported) {
