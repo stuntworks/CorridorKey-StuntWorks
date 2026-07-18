@@ -1279,6 +1279,33 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
                 }
             } catch (eTrk) { nestErr = nestErr || String(eTrk); }
 
+            // INDEX RE-RESOLUTION + TRACK OUTPUT (2026-07-18, gpt-5.6-terra review):
+            // QE's addTracks is undocumented and can PREPEND tracks — shifting every
+            // index, so "V1 holds the main clip" is no longer trustworthy after the
+            // loop above, and QE-born tracks can arrive with Track Output dark
+            // (clips healthy + enabled, yet the track never renders = 'blank').
+            // Re-find the main clip's track by CLIP IDENTITY, target the other
+            // tracks for the aux clips, and force every video track's output ON.
+            var _mainTrackIdx = 0;
+            try {
+                for (var mtI = 0; mtI < nestSeq.videoTracks.numTracks; mtI++) {
+                    var mtT = nestSeq.videoTracks[mtI];
+                    if (mtT.clips.numItems > 0) { _mainTrackIdx = mtI; break; }
+                }
+            } catch (_) {}
+            var _auxIdxs = [];
+            for (var axI = 0; axI < nestSeq.videoTracks.numTracks && _auxIdxs.length < 2; axI++) {
+                if (axI !== _mainTrackIdx) _auxIdxs.push(axI);
+            }
+            var _samTargetIdx = (_auxIdxs.length > 0) ? _auxIdxs[0] : -1;
+            var _ckoTargetIdx = (_auxIdxs.length > 1) ? _auxIdxs[1] : -1;
+            try {
+                for (var toI = 0; toI < nestSeq.videoTracks.numTracks; toI++) {
+                    var toT = nestSeq.videoTracks[toI];
+                    try { if (typeof toT.setMute === "function") toT.setMute(0); } catch (_) {}
+                }
+            } catch (_) {}
+
             if (samImported) {
                 try {
                     if (typeof samImported.setOverrideFrameRate === "function") {
@@ -1290,7 +1317,7 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
                 } catch (_) {}
                 try { if (ckBin) samImported.moveBin(ckBin); } catch (_) {}
                 try {
-                    var vSamN = nestSeq.videoTracks[1];
+                    var vSamN = (_samTargetIdx >= 0) ? nestSeq.videoTracks[_samTargetIdx] : null;
                     if (vSamN) {
                         vSamN.overwriteClip(samImported, 0);
                         samPlaced = true;
@@ -1316,7 +1343,7 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
                 } catch (_) {}
                 try { if (ckBin) ckOnlyImported.moveBin(ckBin); } catch (_) {}
                 try {
-                    var vCkoN = nestSeq.videoTracks[2];
+                    var vCkoN = (_ckoTargetIdx >= 0) ? nestSeq.videoTracks[_ckoTargetIdx] : null;
                     if (vCkoN) {
                         vCkoN.overwriteClip(ckOnlyImported, 0);
                         ckOnlyPlaced = true;
@@ -1535,7 +1562,7 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
         var placedInfo = [];
         try {
             if (nestSeq) {
-                for (var pv = 1; pv < nestSeq.videoTracks.numTracks && pv < 3; pv++) {
+                for (var pv = 0; pv < nestSeq.videoTracks.numTracks; pv++) {
                     var pTrk = nestSeq.videoTracks[pv];
                     for (var pc = 0; pc < pTrk.clips.numItems; pc++) {
                         var pClip = pTrk.clips[pc];
@@ -1563,6 +1590,9 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
             samPlaced: samPlaced,
             ckOnlyPlaced: ckOnlyPlaced,
             nestTracks: (function () { try { return nestSeq ? nestSeq.videoTracks.numTracks : -1; } catch (_) { return -1; } })(),
+            mainTrackIdx: (typeof _mainTrackIdx !== "undefined") ? _mainTrackIdx : -1,
+            samTargetIdx: (typeof _samTargetIdx !== "undefined") ? _samTargetIdx : -1,
+            ckoTargetIdx: (typeof _ckoTargetIdx !== "undefined") ? _ckoTargetIdx : -1,
             placed: placedInfo
         };
         if (mode !== "nested") { diag.nestFallback = nestErr; }
