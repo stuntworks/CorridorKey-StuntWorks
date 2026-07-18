@@ -1060,7 +1060,7 @@ function ppro_importFrame(outputPath, playheadSeconds, fps) {
 // DEPENDS-ON: firstFramePath exists; its folder contains a clean output_NNNNN.png pattern
 //   with no other PNG series (mattes live in a subfolder).
 // AFFECTS: Project panel (bin + imported item), timeline V2 (overwriteClip).
-function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate, samFirstFramePath, ckOnlyFirstFramePath) {
+function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate, samFirstFramePath, ckOnlyFirstFramePath, durationSeconds) {
     try {
         var seq = app.project.activeSequence;
         if (!seq) return JSON.stringify({ ok: false, error: "No active sequence" });
@@ -1328,19 +1328,53 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
             if (!nestProjectItem && !nestErr) { nestErr = "nest projectItem not found"; }
 
             if (nestProjectItem) {
-                // Same highest-used-track + addTracks pattern as the old flat path,
-                // run against the USER'S main sequence, not the nest.
                 try {
                     var highestUsedMain = ppro_highest_used_video_track(mainSeq);
                     var nestTrackV = (highestUsedMain >= 1) ? (highestUsedMain + 1) : 2;
                     var nestTrackIdx = nestTrackV - 1;
-                    while (mainSeq.videoTracks.numTracks <= nestTrackIdx) {
-                        try { mainSeq.videoTracks.addTracks(1); } catch (_) { break; }
+                    // NEVER-OVERWRITE GUARD (2026-07-18): overwriteClip TRUNCATES
+                    // whatever occupies the target range — a wrong track pick here
+                    // can chop the user's SOURCE clip to a stub (prime suspect for
+                    // Berto's frozen one-frame render: the next render measured a
+                    // 1-frame braw remnant). Only place on a track that is EMPTY
+                    // across the nest's whole duration; climb until one is found.
+                    // Plain-DOM addTracks() does not exist (QE-only), so search
+                    // EXISTING tracks first and use QE growth as a last resort —
+                    // and REFUSE loudly rather than eat a clip.
+                    var _durGuard = (typeof durationSeconds !== "undefined" && Number(durationSeconds) > 0)
+                        ? Number(durationSeconds) : (1.0 / Number(fps || 24));
+                    var _placeEnd = placeSec + _durGuard;
+                    var _trackFreeInRange = function (trk) {
+                        try {
+                            for (var fi2 = 0; fi2 < trk.clips.numItems; fi2++) {
+                                var fc = trk.clips[fi2];
+                                if (fc.start.seconds < _placeEnd && fc.end.seconds > placeSec) return false;
+                            }
+                            return true;
+                        } catch (_) { return false; }
+                    };
+                    var _chosenIdx = -1;
+                    for (var ti2 = nestTrackIdx; ti2 < mainSeq.videoTracks.numTracks; ti2++) {
+                        if (_trackFreeInRange(mainSeq.videoTracks[ti2])) { _chosenIdx = ti2; break; }
                     }
-                    var vNest = mainSeq.videoTracks[nestTrackIdx];
-                    if (!vNest) throw new Error("V" + nestTrackV + " unavailable on main sequence");
+                    if (_chosenIdx < 0) {
+                        // Grow the MAIN sequence via QE (needs to be the active sequence).
+                        try {
+                            if (typeof app.project.openSequence === "function" && mainSeq.sequenceID) {
+                                app.project.openSequence(mainSeq.sequenceID);
+                            }
+                            app.enableQE();
+                            qe.project.getActiveSequence().addTracks(1);
+                            var _newIdx = mainSeq.videoTracks.numTracks - 1;
+                            if (_trackFreeInRange(mainSeq.videoTracks[_newIdx])) _chosenIdx = _newIdx;
+                        } catch (_) {}
+                    }
+                    if (_chosenIdx < 0) {
+                        throw new Error("no empty video track for the nested clip — refusing to overwrite existing clips");
+                    }
+                    var vNest = mainSeq.videoTracks[_chosenIdx];
                     vNest.overwriteClip(nestProjectItem, placeSec);
-                    trackV = nestTrackV;
+                    trackV = _chosenIdx + 1;
                     mode = "nested";
                 } catch (eMainPlace) {
                     if (!nestErr) nestErr = String(eMainPlace);

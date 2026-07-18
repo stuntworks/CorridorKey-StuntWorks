@@ -4188,6 +4188,18 @@ function doCommit() {
     try { setBusy(true); } catch (_) {}
     jsxCall(infoFn, [], (info) => {
         if (!info || !info.ok) { if (keyBtn) delete keyBtn.dataset.busy; CK_BATCH_IN_PROGRESS = false; try { setBusy(false); } catch (_) {} ckStatus(info && info.error ? info.error : 'Select the clip on the timeline first'); return; }
+        // RANGE DIAG (2026-07-18, after the frozen-one-frame render): log exactly what
+        // range the host reported and where it came from (sequence in/out marks vs the
+        // clip's own trim), so a wrong-range render is attributable from the log.
+        try {
+            ckLog('render range diag: ' + JSON.stringify({
+                start: info.startSeconds, end: info.endSeconds,
+                frames: Math.round((Number(info.endSeconds) - Number(info.startSeconds)) * (Number(info.fps) || 24)),
+                usedSeqMarkers: info.usedSeqMarkers, source: info.sourceFile
+            }));
+            var _rngFrames = Math.round((Number(info.endSeconds) - Number(info.startSeconds)) * (Number(info.fps) || 24));
+            if (_rngFrames <= 1) ckLog('render range diag: RANGE IS ' + _rngFrames + ' FRAME(S) — check sequence in/out marks and the source clip trim on the timeline', true);
+        } catch (_) {}
         // LAYER LOCK: snapshot the durable comp+layer handle NOW (render start) and carry
         // it through the whole render so the import target never depends on the live
         // selection at render end (AE path only). '' when absent -> JSX falls back.
@@ -4450,7 +4462,8 @@ function doSAMCommit(advanced) {
             ckStatus('Building precomp...');
             if (HOST_APP === 'ppro') {
                 jsxCall('ppro_importSequence', [
-                    firstFrame, info.inPointSeconds, info.fps, info.sourceFrameRate || info.fps, samMattePath, ckOnlyPath
+                    firstFrame, info.inPointSeconds, info.fps, info.sourceFrameRate || info.fps, samMattePath, ckOnlyPath,
+                    (Number(info.endSeconds) - Number(info.startSeconds)) || 0
                 ], (imp) => {
                     if (!imp || !imp.ok) return finish('Import failed: ' + (imp && imp.error ? imp.error : 'unknown'), true);
                     if (imp.via) ckLog('samCommit: import target resolved via ' + imp.via);
