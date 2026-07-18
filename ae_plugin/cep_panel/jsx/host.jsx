@@ -1239,24 +1239,69 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
         // parity; if it lays them SEQUENTIALLY on V1, that is detected and the aux
         // mattes are placed VISIBLY on the user's main timeline instead (see
         // _auxOnMain below) — working beats pretty.
-        var _nestClips = [imported];
-        if (samImported) _nestClips.push(samImported);
-        if (ckOnlyImported) _nestClips.push(ckOnlyImported);
+        // PRESET-BORN NEST (2026-07-18, per gpt-5.6-terra research): the ONLY
+        // CEP-reliable way to a 3-layer stacked nest. QE tracks never render
+        // (confirmed unsupported), and createNewSequenceFromClips is DOCUMENTED
+        // to lay multiple clips sequentially — it can never stack. A shipped
+        // .sqpreset with three NATIVE video tracks + app.project.newSequence()
+        // gives factory tracks that render. Preset must be authored in Premiere
+        // once (Save Preset in the New Sequence dialog) and dropped at one of the
+        // candidate paths below.
+        var _presetSeq = null;
+        var _presetTried = "";
         try {
-            if (typeof app.project.createNewSequenceFromClips === "function") {
-                var seqCountBefore = app.project.sequences.numSequences;
-                var newSeqObj = app.project.createNewSequenceFromClips(_nestName, _nestClips, ckBin || app.project.rootItem);
-                // Some versions return the Sequence, some return undefined — resolve by diff.
-                if (newSeqObj && newSeqObj.sequenceID) { nestSeq = newSeqObj; }
-                else if (app.project.sequences.numSequences > seqCountBefore) {
-                    nestSeq = app.project.sequences[app.project.sequences.numSequences - 1];
-                }
-            } else {
-                nestErr = "createNewSequenceFromClips unavailable";
+            var _panelDir = File($.fileName).parent.parent.fsName; // jsx/ -> cep_panel/
+            var _presetCandidates = [
+                _panelDir + "/presets/CK_3TRACK.sqpreset",
+                _panelDir + "/CK_3TRACK.sqpreset"
+            ];
+            var _presetPath = null;
+            for (var ppI = 0; ppI < _presetCandidates.length; ppI++) {
+                if (File(_presetCandidates[ppI]).exists) { _presetPath = _presetCandidates[ppI]; break; }
             }
-        } catch (eNest) { nestErr = String(eNest); }
+            _presetTried = _presetPath || ("missing: " + _presetCandidates[0]);
+            if (_presetPath && typeof app.project.newSequence === "function") {
+                var _seqIdsBefore = {};
+                for (var sbI = 0; sbI < app.project.sequences.numSequences; sbI++) {
+                    _seqIdsBefore[String(app.project.sequences[sbI].sequenceID)] = true;
+                }
+                var _nsResult = app.project.newSequence(_nestName, File(_presetPath).fsName);
+                if (_nsResult && _nsResult.videoTracks) { _presetSeq = _nsResult; }
+                else {
+                    for (var saI = 0; saI < app.project.sequences.numSequences; saI++) {
+                        var _saSeq = app.project.sequences[saI];
+                        if (!_seqIdsBefore[String(_saSeq.sequenceID)]) { _presetSeq = _saSeq; break; }
+                    }
+                }
+                if (_presetSeq && _presetSeq.videoTracks.numTracks < 3) {
+                    nestErr = "preset created only " + _presetSeq.videoTracks.numTracks + " video tracks";
+                    _presetSeq = null;
+                }
+            }
+        } catch (ePre) { nestErr = nestErr || ("preset: " + String(ePre)); }
+
+        if (_presetSeq) {
+            nestSeq = _presetSeq;
+            _nestGeomSource = "preset";
+        } else {
+            // Fallback: single-clip factory nest (V1 renders); aux will route to
+            // the main timeline (aux-on-main) since extra tracks can't be trusted.
+            try {
+                if (typeof app.project.createNewSequenceFromClips === "function") {
+                    var seqCountBefore = app.project.sequences.numSequences;
+                    var newSeqObj = app.project.createNewSequenceFromClips(_nestName, [imported], ckBin || app.project.rootItem);
+                    if (newSeqObj && newSeqObj.sequenceID) { nestSeq = newSeqObj; }
+                    else if (app.project.sequences.numSequences > seqCountBefore) {
+                        nestSeq = app.project.sequences[app.project.sequences.numSequences - 1];
+                    }
+                } else {
+                    nestErr = "createNewSequenceFromClips unavailable";
+                }
+            } catch (eNest) { nestErr = String(eNest); }
+        }
         var _auxOnMain = false;   // set when nest geometry is sequential — aux goes to the main timeline
         var _nestGeom = "";       // read-back: 'stacked' | 'sequential' | 'single' | ''
+        var _nestGeomSource = ""; // 'preset' when the shipped .sqpreset built the nest
 
         var samPlaced = false;
         var ckOnlyPlaced = false;
@@ -1265,7 +1310,43 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
         var mode = "flat";
         var nestProjectItem = null;
 
-        if (nestSeq) {
+        if (nestSeq && _nestGeomSource === "preset") {
+            // PRESET NEST: three factory tracks guaranteed. Place the stack
+            // directly — V1 output (on), V2 garbage (off), V3 ck_only (off).
+            try {
+                nestSeq.videoTracks[0].overwriteClip(imported, 0);
+                if (samImported) { nestSeq.videoTracks[1].overwriteClip(samImported, 0); samPlaced = true; }
+                if (ckOnlyImported) { nestSeq.videoTracks[2].overwriteClip(ckOnlyImported, 0); ckOnlyPlaced = true; }
+                for (var prT = 0; prT < 3 && prT < nestSeq.videoTracks.numTracks; prT++) {
+                    var _prTrk = nestSeq.videoTracks[prT];
+                    try { if (typeof _prTrk.setMute === "function") _prTrk.setMute(0); } catch (_) {}
+                    try {
+                        if (_prTrk.clips.numItems > 0) {
+                            var _prClip = _prTrk.clips[0];
+                            // Rename the TIMELINE instances (not the source items).
+                            try { _prClip.name = (prT === 0) ? "CK + SAM AI OUTPUT" : (prT === 1 ? "GARBAGE MASK" : "CK MASTER"); } catch (_) {}
+                            try { _prClip.disabled = (prT !== 0); } catch (_) {}
+                        }
+                    } catch (_) {}
+                }
+                _nestGeom = "preset-stacked";
+            } catch (ePrePlace) { nestErr = nestErr || String(ePrePlace); }
+            // Conform aux frame rates + bin placement (same as the other path).
+            if (samImported) {
+                try {
+                    if (typeof samImported.setOverrideFrameRate === "function") { samImported.setOverrideFrameRate(targetRate); }
+                    else { var fiSamP = samImported.getFootageInterpretation(); if (fiSamP) { fiSamP.frameRate = targetRate; samImported.setFootageInterpretation(fiSamP); } }
+                } catch (_) {}
+                try { if (ckBin) samImported.moveBin(ckBin); } catch (_) {}
+            }
+            if (ckOnlyImported) {
+                try {
+                    if (typeof ckOnlyImported.setOverrideFrameRate === "function") { ckOnlyImported.setOverrideFrameRate(targetRate); }
+                    else { var fiCkoP = ckOnlyImported.getFootageInterpretation(); if (fiCkoP) { fiCkoP.frameRate = targetRate; ckOnlyImported.setFootageInterpretation(fiCkoP); } }
+                } catch (_) {}
+                try { if (ckBin) ckOnlyImported.moveBin(ckBin); } catch (_) {}
+            }
+        } else if (nestSeq) {
             // GEOMETRY READ-BACK (2026-07-18): the factory nest was created from
             // ALL the clips (see MULTI-CLIP FACTORY NEST above). Determine what
             // this Premiere actually built. NO QE anywhere — QE-born tracks are
@@ -1603,6 +1684,8 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
             ckOnlyPlaced: ckOnlyPlaced,
             nestTracks: (function () { try { return nestSeq ? nestSeq.videoTracks.numTracks : -1; } catch (_) { return -1; } })(),
             nestGeom: (typeof _nestGeom !== "undefined") ? _nestGeom : "",
+            nestSource: (typeof _nestGeomSource !== "undefined") ? _nestGeomSource : "",
+            presetTried: (typeof _presetTried !== "undefined") ? _presetTried : "",
             auxOnMain: (typeof _auxOnMain !== "undefined") ? _auxOnMain : false,
             mainTrackIdx: (typeof _mainTrackIdx !== "undefined") ? _mainTrackIdx : -1,
             samTargetIdx: (typeof _samTargetIdx !== "undefined") ? _samTargetIdx : -1,
