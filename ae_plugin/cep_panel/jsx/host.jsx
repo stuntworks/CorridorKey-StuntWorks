@@ -1060,7 +1060,7 @@ function ppro_importFrame(outputPath, playheadSeconds, fps) {
 // DEPENDS-ON: firstFramePath exists; its folder contains a clean output_NNNNN.png pattern
 //   with no other PNG series (mattes live in a subfolder).
 // AFFECTS: Project panel (bin + imported item), timeline V2 (overwriteClip).
-function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate, samFirstFramePath) {
+function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate, samFirstFramePath, ckOnlyFirstFramePath) {
     try {
         var seq = app.project.activeSequence;
         if (!seq) return JSON.stringify({ ok: false, error: "No active sequence" });
@@ -1122,6 +1122,31 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
             }
         }
 
+        // CK_ONLY sidecar (CK MASTER layer) — same snapshot-diff import pattern.
+        var ckOnlyImported = null;
+        if (ckOnlyFirstFramePath) {
+            try {
+                var ckoFile = new File(String(ckOnlyFirstFramePath));
+                if (ckoFile.exists) {
+                    var beforeIdsCko = {};
+                    for (var iCko = 0; iCko < root.children.numItems; iCko++) {
+                        var chCko = root.children[iCko];
+                        beforeIdsCko[chCko.nodeId || String(iCko) + "-" + chCko.name] = true;
+                    }
+                    var okCko = app.project.importFiles([String(ckOnlyFirstFramePath)], true, root, true);
+                    if (okCko) {
+                        for (var jCko = 0; jCko < root.children.numItems; jCko++) {
+                            var cCko = root.children[jCko];
+                            var idCko = cCko.nodeId || String(jCko) + "-" + cCko.name;
+                            if (!beforeIdsCko[idCko]) { ckOnlyImported = cCko; break; }
+                        }
+                    }
+                }
+            } catch (eCkoImport) {
+                // Non-fatal — CK + garbage still go through.
+            }
+        }
+
         // Force the imported PNG sequence's footage frame rate to match V1's. Without
         // this, Premiere applies its default (usually the project fps) and V2 drifts
         // relative to V1 whenever the source's native fps differs. Try both APIs —
@@ -1153,6 +1178,11 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
             } catch (_) {}
         }
 
+        // Layer names — Premiere parity with the AE precomp stack.
+        try { imported.name = "CK + SAM AI OUTPUT"; } catch (_) {}
+        try { if (samImported) samImported.name = "GARBAGE MASK"; } catch (_) {}
+        try { if (ckOnlyImported) ckOnlyImported.name = "CK MASTER"; } catch (_) {}
+
         // Move the new item into the CorridorKey bin (create if missing). If the move
         // fails we leave it at the root — still visible to the user.
         var ckBin = null;
@@ -1171,7 +1201,11 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
         // SAM sidecar (when present) lives on the track immediately above CK.
         var samTrackVSeq = samImported ? (ckTrackVSeq + 1) : 0;
         var samTrackIdxSeq = samImported ? (samTrackVSeq - 1) : -1;
-        var topNeededIdx = samImported ? samTrackIdxSeq : ckTrackIdxSeq;
+        // CK MASTER (CK_ONLY) lives on the track immediately above SAM (or above
+        // CK if no SAM matte is present).
+        var ckOnlyTrackVSeq = ckOnlyImported ? ((samImported ? samTrackVSeq : ckTrackVSeq) + 1) : 0;
+        var ckOnlyTrackIdxSeq = ckOnlyImported ? (ckOnlyTrackVSeq - 1) : -1;
+        var topNeededIdx = ckOnlyImported ? ckOnlyTrackIdxSeq : (samImported ? samTrackIdxSeq : ckTrackIdxSeq);
         while (seq.videoTracks.numTracks <= topNeededIdx) {
             try { seq.videoTracks.addTracks(1); } catch (_) { break; }
         }
@@ -1216,6 +1250,51 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
                 if (vSam) {
                     vSam.overwriteClip(samImported, placeSec);
                     samPlaced = true;
+                    // AE-parity: auxiliary layers ship OFF (GARBAGE MASK / CK MASTER are rescue
+                    // material, not part of the default composite). trackItem.disabled exists on
+                    // Premiere 14+; older versions just leave the clip visible (harmless).
+                    try {
+                        var vTrkSam = seq.videoTracks[samTrackIdxSeq];
+                        for (var qiSam = 0; qiSam < vTrkSam.clips.numItems; qiSam++) {
+                            var qcSam = vTrkSam.clips[qiSam];
+                            if (Math.abs(qcSam.start.seconds - placeSec) < 0.5 / Number(fps || 24)) { qcSam.disabled = true; break; }
+                        }
+                    } catch (_) {}
+                }
+            } catch (_) {}
+        }
+
+        // CK MASTER (CK_ONLY) — conform rate, move into bin, place above the SAM
+        // matte (or above CK if no SAM matte). Failures here don't roll back
+        // CK/SAM placement; the user keeps those either way.
+        var ckOnlyPlaced = false;
+        if (ckOnlyImported) {
+            try {
+                if (typeof ckOnlyImported.setOverrideFrameRate === "function") {
+                    ckOnlyImported.setOverrideFrameRate(targetRate);
+                } else {
+                    var fiCko = ckOnlyImported.getFootageInterpretation();
+                    if (fiCko) {
+                        fiCko.frameRate = targetRate;
+                        ckOnlyImported.setFootageInterpretation(fiCko);
+                    }
+                }
+            } catch (_) {}
+            try { if (ckBin) ckOnlyImported.moveBin(ckBin); } catch (_) {}
+            try {
+                var vCko = seq.videoTracks[ckOnlyTrackIdxSeq];
+                if (vCko) {
+                    vCko.overwriteClip(ckOnlyImported, placeSec);
+                    ckOnlyPlaced = true;
+                    // AE-parity: CK MASTER ships OFF (rescue material, not part of the
+                    // default composite).
+                    try {
+                        var vTrkCko = seq.videoTracks[ckOnlyTrackIdxSeq];
+                        for (var qiCko = 0; qiCko < vTrkCko.clips.numItems; qiCko++) {
+                            var qcCko = vTrkCko.clips[qiCko];
+                            if (Math.abs(qcCko.start.seconds - placeSec) < 0.5 / Number(fps || 24)) { qcCko.disabled = true; break; }
+                        }
+                    } catch (_) {}
                 }
             } catch (_) {}
         }
@@ -1223,7 +1302,8 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
         return JSON.stringify({
             ok: true, placed: true, binName: imported.name, appliedRate: appliedRate,
             trackV: ckTrackVSeq, samPlaced: samPlaced,
-            samTrackV: samImported ? samTrackVSeq : 0
+            samTrackV: samImported ? samTrackVSeq : 0,
+            ckOnlyPlaced: ckOnlyPlaced
         });
     } catch (e) { return JSON.stringify({ ok: false, error: String(e) }); }
 }

@@ -4450,7 +4450,7 @@ function doSAMCommit(advanced) {
             ckStatus('Building precomp...');
             if (HOST_APP === 'ppro') {
                 jsxCall('ppro_importSequence', [
-                    firstFrame, info.inPointSeconds, info.fps, info.sourceFrameRate || info.fps, samMattePath
+                    firstFrame, info.inPointSeconds, info.fps, info.sourceFrameRate || info.fps, samMattePath, ckOnlyPath
                 ], (imp) => {
                     if (!imp || !imp.ok) return finish('Import failed: ' + (imp && imp.error ? imp.error : 'unknown'), true);
                     if (imp.via) ckLog('samCommit: import target resolved via ' + imp.via);
