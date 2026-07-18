@@ -1229,10 +1229,23 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
         var nestSeq = null;
         var nestErr = "";
         var _nestName = "CK " + (imported.name || "Render");
+        // MULTI-CLIP FACTORY NEST (2026-07-18): tracks added to a sequence via QE
+        // addTracks are DEAD — anything placed on them (stills items AND wrapped
+        // sequences) renders blank in the program monitor while V1, born of
+        // createNewSequenceFromClips, always displays. So the ONLY reliable way to
+        // get 3 working tracks is to have the factory build them: pass all three
+        // clips to createNewSequenceFromClips. Geometry is read back afterwards —
+        // if this Premiere stacks them (separate tracks at t=0) we have exact AE
+        // parity; if it lays them SEQUENTIALLY on V1, that is detected and the aux
+        // mattes are placed VISIBLY on the user's main timeline instead (see
+        // _auxOnMain below) — working beats pretty.
+        var _nestClips = [imported];
+        if (samImported) _nestClips.push(samImported);
+        if (ckOnlyImported) _nestClips.push(ckOnlyImported);
         try {
             if (typeof app.project.createNewSequenceFromClips === "function") {
                 var seqCountBefore = app.project.sequences.numSequences;
-                var newSeqObj = app.project.createNewSequenceFromClips(_nestName, [imported], ckBin || app.project.rootItem);
+                var newSeqObj = app.project.createNewSequenceFromClips(_nestName, _nestClips, ckBin || app.project.rootItem);
                 // Some versions return the Sequence, some return undefined — resolve by diff.
                 if (newSeqObj && newSeqObj.sequenceID) { nestSeq = newSeqObj; }
                 else if (app.project.sequences.numSequences > seqCountBefore) {
@@ -1242,6 +1255,8 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
                 nestErr = "createNewSequenceFromClips unavailable";
             }
         } catch (eNest) { nestErr = String(eNest); }
+        var _auxOnMain = false;   // set when nest geometry is sequential — aux goes to the main timeline
+        var _nestGeom = "";       // read-back: 'stacked' | 'sequential' | 'single' | ''
 
         var samPlaced = false;
         var ckOnlyPlaced = false;
@@ -1251,155 +1266,84 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
         var nestProjectItem = null;
 
         if (nestSeq) {
-            // createNewSequenceFromClips already placed `imported` on V1 at 0 — do
-            // not place it again. Ensure V2 (SAM) + V3 (CK MASTER) exist.
-            // GOTCHA (2026-07-18, root cause of the missing GARBAGE MASK/CK MASTER):
-            // TrackCollection.addTracks() does NOT exist in Premiere's plain
-            // scripting DOM — it's a QE-DOM method. The call threw into a swallowing
-            // catch, the fresh nest kept its single video track, videoTracks[1]/[2]
-            // came back undefined, and both aux placements were silently skipped.
-            // Use the QE sequence (the nest IS the active sequence right after
-            // createNewSequenceFromClips) to add real tracks, and record failure in
-            // nestErr instead of swallowing it.
-            try { app.enableQE(); } catch (_) {}
+            // GEOMETRY READ-BACK (2026-07-18): the factory nest was created from
+            // ALL the clips (see MULTI-CLIP FACTORY NEST above). Determine what
+            // this Premiere actually built. NO QE anywhere — QE-born tracks are
+            // dead (render blank regardless of content).
+            var _tracksWithClips = 0;
+            var _v1ClipCount = 0;
+            var _allStartZero = true;
             try {
-                var _trackGuard = 0;
-                while (nestSeq.videoTracks.numTracks < 3 && _trackGuard < 6) {
-                    _trackGuard++;
-                    var _beforeTracks = nestSeq.videoTracks.numTracks;
-                    try { nestSeq.videoTracks.addTracks(1); } catch (_) {}
-                    if (nestSeq.videoTracks.numTracks === _beforeTracks) {
-                        try { qe.project.getActiveSequence().addTracks(1); } catch (_) {}
+                for (var giI = 0; giI < nestSeq.videoTracks.numTracks; giI++) {
+                    var giT = nestSeq.videoTracks[giI];
+                    if (giT.clips.numItems > 0) {
+                        _tracksWithClips++;
+                        if (giI === 0) _v1ClipCount = giT.clips.numItems;
+                        for (var giJ = 0; giJ < giT.clips.numItems; giJ++) {
+                            if (giT.clips[giJ].start.seconds > 0.02) _allStartZero = false;
+                        }
                     }
-                    if (nestSeq.videoTracks.numTracks === _beforeTracks) {
-                        nestErr = nestErr || ("could not add video tracks to nest (stuck at " +
-                                              nestSeq.videoTracks.numTracks + ")");
-                        break;
-                    }
-                }
-            } catch (eTrk) { nestErr = nestErr || String(eTrk); }
-
-            // INDEX RE-RESOLUTION + TRACK OUTPUT (2026-07-18, gpt-5.6-terra review):
-            // QE's addTracks is undocumented and can PREPEND tracks — shifting every
-            // index, so "V1 holds the main clip" is no longer trustworthy after the
-            // loop above, and QE-born tracks can arrive with Track Output dark
-            // (clips healthy + enabled, yet the track never renders = 'blank').
-            // Re-find the main clip's track by CLIP IDENTITY, target the other
-            // tracks for the aux clips, and force every video track's output ON.
-            var _mainTrackIdx = 0;
-            try {
-                for (var mtI = 0; mtI < nestSeq.videoTracks.numTracks; mtI++) {
-                    var mtT = nestSeq.videoTracks[mtI];
-                    if (mtT.clips.numItems > 0) { _mainTrackIdx = mtI; break; }
+                    try { if (typeof giT.setMute === "function") giT.setMute(0); } catch (_) {}
                 }
             } catch (_) {}
-            var _auxIdxs = [];
-            for (var axI = 0; axI < nestSeq.videoTracks.numTracks && _auxIdxs.length < 2; axI++) {
-                if (axI !== _mainTrackIdx) _auxIdxs.push(axI);
+            if (_tracksWithClips >= _nestClips.length && _allStartZero) {
+                _nestGeom = "stacked";       // exact AE parity — factory stacked them
+            } else if (_v1ClipCount > 1) {
+                _nestGeom = "sequential";    // clips laid end-to-end on V1
+            } else {
+                _nestGeom = "single";
             }
-            var _samTargetIdx = (_auxIdxs.length > 0) ? _auxIdxs[0] : -1;
-            var _ckoTargetIdx = (_auxIdxs.length > 1) ? _auxIdxs[1] : -1;
-            try {
-                for (var toI = 0; toI < nestSeq.videoTracks.numTracks; toI++) {
-                    var toT = nestSeq.videoTracks[toI];
-                    try { if (typeof toT.setMute === "function") toT.setMute(0); } catch (_) {}
-                }
-            } catch (_) {}
 
+            if (_nestGeom === "stacked") {
+                // Disable the aux clips inside the nest (AE parity: GARBAGE MASK /
+                // CK MASTER ship OFF) — find them by projectItem identity.
+                try {
+                    for (var dsI = 0; dsI < nestSeq.videoTracks.numTracks; dsI++) {
+                        var dsT = nestSeq.videoTracks[dsI];
+                        for (var dsJ = 0; dsJ < dsT.clips.numItems; dsJ++) {
+                            var dsC = dsT.clips[dsJ];
+                            var dsMedia = (function () { try { return dsC.projectItem.getMediaPath(); } catch (_) { return ""; } })();
+                            if (dsMedia && dsMedia.indexOf("output_") === -1) {
+                                try { dsC.disabled = true; } catch (_) {}
+                            }
+                        }
+                    }
+                } catch (_) {}
+                samPlaced = !!samImported;
+                ckOnlyPlaced = !!ckOnlyImported;
+            } else if (_nestGeom === "sequential") {
+                // Sequential nest is unusable as the AE-parity stack: trim it back
+                // to the MAIN clip only by removing the aux clips from V1 (their
+                // start > 0), then route the aux mattes to the main timeline.
+                try {
+                    var sqT = nestSeq.videoTracks[0];
+                    for (var sqJ = sqT.clips.numItems - 1; sqJ >= 0; sqJ--) {
+                        var sqC = sqT.clips[sqJ];
+                        if (sqC.start.seconds > 0.02) {
+                            try { sqC.remove(false, false); } catch (_) { try { sqC.disabled = true; } catch (_) {} }
+                        }
+                    }
+                } catch (_) {}
+                _auxOnMain = !!(samImported || ckOnlyImported);
+            } else {
+                // Only the main clip landed — aux to the main timeline.
+                _auxOnMain = !!(samImported || ckOnlyImported);
+            }
+
+            // Frame-rate conform for the aux items regardless of destination.
             if (samImported) {
                 try {
-                    if (typeof samImported.setOverrideFrameRate === "function") {
-                        samImported.setOverrideFrameRate(targetRate);
-                    } else {
-                        var fiSamN = samImported.getFootageInterpretation();
-                        if (fiSamN) { fiSamN.frameRate = targetRate; samImported.setFootageInterpretation(fiSamN); }
-                    }
+                    if (typeof samImported.setOverrideFrameRate === "function") { samImported.setOverrideFrameRate(targetRate); }
+                    else { var fiSamN = samImported.getFootageInterpretation(); if (fiSamN) { fiSamN.frameRate = targetRate; samImported.setFootageInterpretation(fiSamN); } }
                 } catch (_) {}
                 try { if (ckBin) samImported.moveBin(ckBin); } catch (_) {}
-                try {
-                    // SEQUENCE-WRAP (2026-07-18): scripted overwriteClip of a
-                    // NUMBERED-STILLS projectItem renders BLANK in the program
-                    // monitor even when every API read-back is healthy (placed,
-                    // right media, full duration, track output on) — while the
-                    // same overwriteClip of a SEQUENCE item displays fine (the
-                    // master nest itself proves it on the main timeline). So each
-                    // aux matte is wrapped in its own sequence via
-                    // createNewSequenceFromClips (the proven-visible path) and
-                    // THAT sequence is nested onto the aux track.
-                    var _samPlaceItem = samImported;
-                    try {
-                        var _seqsBeforeSam = app.project.sequences.numSequences;
-                        app.project.createNewSequenceFromClips("GARBAGE MASK", [samImported], ckBin || app.project.rootItem);
-                        if (app.project.sequences.numSequences > _seqsBeforeSam) {
-                            var _samSeq = app.project.sequences[app.project.sequences.numSequences - 1];
-                            var _srRoots = ckBin ? [ckBin, app.project.rootItem] : [app.project.rootItem];
-                            for (var srI = 0; srI < _srRoots.length; srI++) {
-                                var _srKids = _srRoots[srI].children;
-                                for (var srJ = 0; srJ < _srKids.numItems; srJ++) {
-                                    var _srK = _srKids[srJ];
-                                    if (_srK.name === "GARBAGE MASK" && _srK.type !== 2) { _samPlaceItem = _srK; break; }
-                                }
-                                if (_samPlaceItem !== samImported) break;
-                            }
-                        }
-                    } catch (_) {}
-                    var vSamN = (_samTargetIdx >= 0) ? nestSeq.videoTracks[_samTargetIdx] : null;
-                    if (vSamN) {
-                        vSamN.overwriteClip(_samPlaceItem, 0);
-                        samPlaced = true;
-                        // AE-parity: auxiliary layers ship OFF inside the nest.
-                        try {
-                            for (var qiSamN = 0; qiSamN < vSamN.clips.numItems; qiSamN++) {
-                                var qcSamN = vSamN.clips[qiSamN];
-                                if (Math.abs(qcSamN.start.seconds) < 0.5 / Number(fps || 24)) { qcSamN.disabled = true; break; }
-                            }
-                        } catch (_) {}
-                    }
-                } catch (_) {}
             }
-
             if (ckOnlyImported) {
                 try {
-                    if (typeof ckOnlyImported.setOverrideFrameRate === "function") {
-                        ckOnlyImported.setOverrideFrameRate(targetRate);
-                    } else {
-                        var fiCkoN = ckOnlyImported.getFootageInterpretation();
-                        if (fiCkoN) { fiCkoN.frameRate = targetRate; ckOnlyImported.setFootageInterpretation(fiCkoN); }
-                    }
+                    if (typeof ckOnlyImported.setOverrideFrameRate === "function") { ckOnlyImported.setOverrideFrameRate(targetRate); }
+                    else { var fiCkoN = ckOnlyImported.getFootageInterpretation(); if (fiCkoN) { fiCkoN.frameRate = targetRate; ckOnlyImported.setFootageInterpretation(fiCkoN); } }
                 } catch (_) {}
                 try { if (ckBin) ckOnlyImported.moveBin(ckBin); } catch (_) {}
-                try {
-                    // SEQUENCE-WRAP — same stills-item display bug workaround as
-                    // the GARBAGE MASK block above.
-                    var _ckoPlaceItem = ckOnlyImported;
-                    try {
-                        var _seqsBeforeCko = app.project.sequences.numSequences;
-                        app.project.createNewSequenceFromClips("CK MASTER", [ckOnlyImported], ckBin || app.project.rootItem);
-                        if (app.project.sequences.numSequences > _seqsBeforeCko) {
-                            var _ckRoots = ckBin ? [ckBin, app.project.rootItem] : [app.project.rootItem];
-                            for (var crI = 0; crI < _ckRoots.length; crI++) {
-                                var _crKids = _ckRoots[crI].children;
-                                for (var crJ = 0; crJ < _crKids.numItems; crJ++) {
-                                    var _crK = _crKids[crJ];
-                                    if (_crK.name === "CK MASTER" && _crK.type !== 2) { _ckoPlaceItem = _crK; break; }
-                                }
-                                if (_ckoPlaceItem !== ckOnlyImported) break;
-                            }
-                        }
-                    } catch (_) {}
-                    var vCkoN = (_ckoTargetIdx >= 0) ? nestSeq.videoTracks[_ckoTargetIdx] : null;
-                    if (vCkoN) {
-                        vCkoN.overwriteClip(_ckoPlaceItem, 0);
-                        ckOnlyPlaced = true;
-                        // AE-parity: CK MASTER ships OFF inside the nest.
-                        try {
-                            for (var qiCkoN = 0; qiCkoN < vCkoN.clips.numItems; qiCkoN++) {
-                                var qcCkoN = vCkoN.clips[qiCkoN];
-                                if (Math.abs(qcCkoN.start.seconds) < 0.5 / Number(fps || 24)) { qcCkoN.disabled = true; break; }
-                            }
-                        } catch (_) {}
-                    }
-                } catch (_) {}
             }
 
             // Locate the nest's own project item so it can be placed on the main
@@ -1447,24 +1391,48 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
                         if (_trackFreeInRange(mainSeq.videoTracks[ti2])) { _chosenIdx = ti2; break; }
                     }
                     if (_chosenIdx < 0) {
-                        // Grow the MAIN sequence via QE (needs to be the active sequence).
-                        try {
-                            if (typeof app.project.openSequence === "function" && mainSeq.sequenceID) {
-                                app.project.openSequence(mainSeq.sequenceID);
-                            }
-                            app.enableQE();
-                            qe.project.getActiveSequence().addTracks(1);
-                            var _newIdx = mainSeq.videoTracks.numTracks - 1;
-                            if (_trackFreeInRange(mainSeq.videoTracks[_newIdx])) _chosenIdx = _newIdx;
-                        } catch (_) {}
-                    }
-                    if (_chosenIdx < 0) {
-                        throw new Error("no empty video track for the nested clip — refusing to overwrite existing clips");
+                        // NO QE growth here — QE-added tracks are DEAD (clips on
+                        // them render blank; proven 2026-07-18). Better to ask the
+                        // user for one manual track than to place invisibly.
+                        throw new Error("no empty video track for the CK clip — add a video track above your footage and render again");
                     }
                     var vNest = mainSeq.videoTracks[_chosenIdx];
                     vNest.overwriteClip(nestProjectItem, placeSec);
                     trackV = _chosenIdx + 1;
                     mode = "nested";
+
+                    // AUX ON MAIN TIMELINE (2026-07-18): when the factory nest
+                    // could not stack all three clips, the mattes land HERE — on
+                    // the user's own timeline, the placement environment that
+                    // provably displays. Same never-overwrite guard: only empty
+                    // tracks, climbing from just above the nest. Ship disabled.
+                    if (_auxOnMain) {
+                        var _auxList = [];
+                        if (samImported) _auxList.push(samImported);
+                        if (ckOnlyImported) _auxList.push(ckOnlyImported);
+                        var _fromIdx = _chosenIdx + 1;
+                        for (var alI = 0; alI < _auxList.length; alI++) {
+                            var _placedAux = false;
+                            for (var atI = _fromIdx; atI < mainSeq.videoTracks.numTracks && !_placedAux; atI++) {
+                                if (_trackFreeInRange(mainSeq.videoTracks[atI])) {
+                                    try {
+                                        mainSeq.videoTracks[atI].overwriteClip(_auxList[alI], placeSec);
+                                        var _atT = mainSeq.videoTracks[atI];
+                                        for (var adJ = 0; adJ < _atT.clips.numItems; adJ++) {
+                                            var _adC = _atT.clips[adJ];
+                                            if (Math.abs(_adC.start.seconds - placeSec) < 0.5 / Number(fps || 24)) {
+                                                try { _adC.disabled = true; } catch (_) {}
+                                                break;
+                                            }
+                                        }
+                                        _placedAux = true;
+                                        _fromIdx = atI + 1;
+                                        if (_auxList[alI] === samImported) samPlaced = true; else ckOnlyPlaced = true;
+                                    } catch (_) {}
+                                }
+                            }
+                        }
+                    }
                 } catch (eMainPlace) {
                     if (!nestErr) nestErr = String(eMainPlace);
                 }
@@ -1634,6 +1602,8 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
             samPlaced: samPlaced,
             ckOnlyPlaced: ckOnlyPlaced,
             nestTracks: (function () { try { return nestSeq ? nestSeq.videoTracks.numTracks : -1; } catch (_) { return -1; } })(),
+            nestGeom: (typeof _nestGeom !== "undefined") ? _nestGeom : "",
+            auxOnMain: (typeof _auxOnMain !== "undefined") ? _auxOnMain : false,
             mainTrackIdx: (typeof _mainTrackIdx !== "undefined") ? _mainTrackIdx : -1,
             samTargetIdx: (typeof _samTargetIdx !== "undefined") ? _samTargetIdx : -1,
             ckoTargetIdx: (typeof _ckoTargetIdx !== "undefined") ? _ckoTargetIdx : -1,
