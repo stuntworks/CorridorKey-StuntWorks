@@ -1536,7 +1536,14 @@ def merge_ck_with_garbage_matte(
                 # classes dark green as green: wide protection + chroma escape apply.
                 # Verified 2026-07-02 on 4K session: body-zone loss 32k->28k px,
                 # zero far-junk regression. Hue stays 35-85 (green only).
-                _lower, _upper = np.array([35, 50, 50]), np.array([85, 255, 255])  # A/B 2026-07-03: floor 50 under test vs 20 (hair-bite suspect)
+                # A/B 2026-07-03: floor 50 under test vs 20 (hair-bite suspect).
+                # A/B 2026-07-17 (Berto's C039 harness clip): floor 20 DOES clear
+                # the interior dark-green slivers (8 -> 1) but swallows the legit
+                # bright-green thigh gap — matte bloats, the exact hair-bite
+                # failure the 07-03 test feared. Floor stays 50; the slivers are
+                # fixed downstream by the enclosed-sliver fill on the keep-gate
+                # (see _fill_enclosed_keep_gate_slivers).
+                _lower, _upper = np.array([35, 50, 50]), np.array([85, 255, 255])
             _green_bin = cv2.inRange(hsv_map, _lower, _upper)
             on_green_hsv = _green_bin.astype(np.float32) / 255.0
             _rc = max(3, int(round(9 * _scale)) | 1)
@@ -2104,6 +2111,7 @@ UNIFIED_BAND_SHADOW_CUT_PCT = 0.92          # matches the old 92% "shadow below 
 UNIFIED_BAND_FEET_ERODE_PX_BASE = 1.0  # matches merge_ck_with_garbage_matte's feet-hug
                                         # erosion radius — see the feet-erosion note
                                         # above D(p)'s computation in merge_ck_unified_band.
+UNIFIED_BAND_SLIVER_MAX_AREA_PX_BASE = 24.0  # px @1920, squared at runtime; enclosed dark slivers larger than (this*scale)^2 are NOT filled
 UNIFIED_BAND_CALF_START_PCT = 0.85     # calf line — bottom 15% of the SAM bbox.
 UNIFIED_BAND_CALF_ERODE_PX_BASE = 3.0  # Berto 2026-07-10: MINUS one more pixel off
                                         # (1.5 -> 2.0, Berto 2026-07-11: "feet might
@@ -3864,14 +3872,59 @@ def merge_ck_unified_band(
         except Exception:
             pass  # debug dump only — never let a diagnostics failure break a real render
 
+    # --- ENCLOSED-SLIVER FILL (2026-07-17, Berto's C039 harness clip): thin
+    # junk slivers fully ENCLOSED by the keep zone, whose source pixels are
+    # DARK (on_green_hsv ~ 0 there — the V-floor-50 screen classifier rejects
+    # shadowed green bounce between thighs/straps), are misclassified body
+    # fabric: fill them as keep-zone members (final = keep_alpha, gate = 1).
+    # Bright-green enclosed gaps (real see-through — on_green_hsv ~ 1) and
+    # anything touching the frame border (thigh gap connects to background
+    # below the crotch) are left alone. Size cap is resolution-scaled so a
+    # big legit gap can never qualify.
+    _sliver_fill_mask = None
+    try:
+        # Detect on the gate WITH the shape-pass kill applied — the shape pass
+        # (orphan-ribbon killer) is itself a producer of these enclosed body
+        # holes (C039: the crotch strap bits are orphaned band components, so
+        # they only become junk AFTER the kill). The fill overrides shape-kill
+        # misfires; the OPERATOR dot-kill keeps final say (excluded below).
+        _gate_now = np.where(eroded_sam, 1.0, support)
+        _gate_now = np.where(_shape_kill_mask, 0.0, _gate_now)
+        _junk_bin = (_gate_now < 0.5).astype(np.uint8)
+        _n_sl, _lab_sl, _stats_sl, _ = cv2.connectedComponentsWithStats(_junk_bin, 8)
+        _max_sliver_area = (UNIFIED_BAND_SLIVER_MAX_AREA_PX_BASE * _scale) ** 2
+        _h_sl, _w_sl = _junk_bin.shape
+        for _j_sl in range(1, _n_sl):
+            _x_sl, _y_sl, _ww_sl, _hh_sl, _area_sl = _stats_sl[_j_sl]
+            if _x_sl == 0 or _y_sl == 0 or _x_sl + _ww_sl >= _w_sl or _y_sl + _hh_sl >= _h_sl:
+                continue  # touches border — connected to real background
+            if _area_sl > _max_sliver_area:
+                continue  # too big to be a sliver — could be a legit gap
+            _reg_sl = _lab_sl == _j_sl
+            if on_green_hsv is not None and float(on_green_hsv[_reg_sl].mean()) >= 0.5:
+                continue  # bright screen color — a real see-through hole
+            if _sliver_fill_mask is None:
+                _sliver_fill_mask = np.zeros_like(_junk_bin, dtype=bool)
+            _sliver_fill_mask[_reg_sl] = True
+        if _sliver_fill_mask is not None:
+            # Operator dot-kill keeps final say — never fill what a user's
+            # negative dot explicitly removed.
+            _sliver_fill_mask &= ~_dot_kill_mask.astype(bool)
+            final = np.where(_sliver_fill_mask, keep_alpha, final).astype(np.float32)
+            final = np.clip(final, 0.0, 1.0)
+    except Exception:
+        _sliver_fill_mask = None  # advisory pass — never kill the render
+
     if return_garbage:
         band_gate = np.where(eroded_sam, 1.0, support).astype(np.float32)
-        # Reflect the shape-pass kill in the returned gate too, so any downstream
+        # Reflect the shape-pass kill in the returned gate, so any downstream
         # consumer of band_gate (debug tooling, future gates) stays consistent
-        # with what `final` actually contains.
+        # with what `final` actually contains. Ordering: shape-kill first, the
+        # enclosed-sliver fill OVERRIDES shape-kill misfires (see the fill
+        # block above), and the operator dot-kill lands last with final say.
         band_gate = np.where(_shape_kill_mask, 0.0, band_gate)
-        # Reflect the operator dot-kill too — same reasoning, keep band_gate
-        # consistent with what `final` actually contains.
+        if _sliver_fill_mask is not None:
+            band_gate = np.where(_sliver_fill_mask, 1.0, band_gate)
         band_gate = np.where(_dot_kill_mask, 0.0, band_gate)
         band_gate = np.clip(band_gate, 0.0, 1.0).astype(np.float32)
     else:
