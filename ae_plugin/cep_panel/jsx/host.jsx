@@ -1192,10 +1192,14 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
             } catch (_) {}
         }
 
-        // Layer names — Premiere parity with the AE precomp stack.
+        // Layer name — main clip only, BEFORE nest creation (the nest is named
+        // "CK " + imported.name). AUX renames moved to AFTER placement
+        // (2026-07-18): renaming a numbered-stills projectItem before
+        // overwriteClip is the one thing that changed between "mattes showed on
+        // the timeline" and Berto's "GARBAGE MASK / CK MASTER are blank" —
+        // suspected of breaking the media link for stills sequences. Placement
+        // now happens on the un-renamed items; names are applied afterwards.
         try { imported.name = "CK + SAM AI OUTPUT"; } catch (_) {}
-        try { if (samImported) samImported.name = "GARBAGE MASK"; } catch (_) {}
-        try { if (ckOnlyImported) ckOnlyImported.name = "CK MASTER"; } catch (_) {}
 
         // Move the new item into the CorridorKey bin (create if missing). If the move
         // fails we leave it at the root — still visible to the user.
@@ -1520,6 +1524,32 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
             samTrackV = samImported ? 2 : 0;
         }
 
+        // AUX renames — applied only now, AFTER every placement (see the note at
+        // the main-clip rename above).
+        try { if (samImported) samImported.name = "GARBAGE MASK"; } catch (_) {}
+        try { if (ckOnlyImported) ckOnlyImported.name = "CK MASTER"; } catch (_) {}
+
+        // Placed-clip read-back: what is ACTUALLY sitting on the nest's V2/V3 —
+        // duration + media path of the placed trackItems, not just the imported
+        // projectItems. A blank layer with a healthy import shows up here.
+        var placedInfo = [];
+        try {
+            if (nestSeq) {
+                for (var pv = 1; pv < nestSeq.videoTracks.numTracks && pv < 3; pv++) {
+                    var pTrk = nestSeq.videoTracks[pv];
+                    for (var pc = 0; pc < pTrk.clips.numItems; pc++) {
+                        var pClip = pTrk.clips[pc];
+                        placedInfo.push({
+                            track: "V" + (pv + 1),
+                            name: (function () { try { return pClip.name; } catch (_) { return "?"; } })(),
+                            durSec: (function () { try { return Math.round((pClip.end.seconds - pClip.start.seconds) * 1000) / 1000; } catch (_) { return -1; } })(),
+                            media: (function () { try { return pClip.projectItem.getMediaPath(); } catch (_) { return ""; } })()
+                        });
+                    }
+                }
+            }
+        } catch (_) {}
+
         // Read-back diagnostics — so the next "aux clip shows nothing" failure is
         // diagnosable without re-running the whole export. getMediaPath is guarded;
         // sequences/some footage types don't implement it.
@@ -1532,7 +1562,8 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
             // fails (2026-07-18: nest had 1 video track, aux clips skipped).
             samPlaced: samPlaced,
             ckOnlyPlaced: ckOnlyPlaced,
-            nestTracks: (function () { try { return nestSeq ? nestSeq.videoTracks.numTracks : -1; } catch (_) { return -1; } })()
+            nestTracks: (function () { try { return nestSeq ? nestSeq.videoTracks.numTracks : -1; } catch (_) { return -1; } })(),
+            placed: placedInfo
         };
         if (mode !== "nested") { diag.nestFallback = nestErr; }
         if (samImported) {
