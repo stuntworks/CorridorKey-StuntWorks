@@ -1,7 +1,7 @@
 /**
  * CorridorKey — Host Script (ExtendScript)
- * Last modified: 2026-05-29 | Change: ppro_getFrameInfo returns sourceFrame for the SAM2
- *   anchor (was seconds-only, so mid-range Premiere clicks lost backward propagation).
+ * Last modified: 2026-07-18 | Change: conform three-track Premiere preset nests to each
+ *   rendered PNG sequence's dimensions and frame rate.
  *
  * WHAT IT DOES: Reads timeline state from After Effects / Premiere Pro and returns it
  *   to the CEP panel as a JSON string. Imports the PNG(s) Python produced back onto the
@@ -1072,12 +1072,33 @@ function ppro_importFrame(outputPath, playheadSeconds, fps) {
 //   import to root, locate the new item by diffing root.children before/after, then move
 //   it into the CorridorKey bin and overwrite onto V2.
 // DEPENDS-ON: firstFramePath exists; its folder contains a clean output_NNNNN.png pattern
-//   with no other PNG series (mattes live in a subfolder).
-// AFFECTS: Project panel (bin + imported item), timeline V2 (overwriteClip).
-function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate, samFirstFramePath, ckOnlyFirstFramePath, durationSeconds) {
+//   with no other PNG series (mattes live in a subfolder). sourceWidth/sourceHeight come
+//   from the first rendered PNG; the active sequence is the guarded fallback.
+// AFFECTS: Project panel (bin + imported item), timeline, and nested-sequence geometry.
+function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate, samFirstFramePath, ckOnlyFirstFramePath, durationSeconds, sourceWidth, sourceHeight) {
     try {
         var seq = app.project.activeSequence;
         if (!seq) return JSON.stringify({ ok: false, error: "No active sequence" });
+
+        // DANGER ZONE HIGH: A wrong nest size rescales every rendered layer and breaks
+        // pixel alignment. Use the PNG header dimensions; fall back only when absent.
+        var targetWidth = Number(sourceWidth);
+        var targetHeight = Number(sourceHeight);
+        if (!targetWidth || isNaN(targetWidth) || targetWidth <= 0) {
+            try { targetWidth = Number(seq.frameSizeHorizontal); } catch (_) { targetWidth = 0; }
+        }
+        if (!targetHeight || isNaN(targetHeight) || targetHeight <= 0) {
+            try { targetHeight = Number(seq.frameSizeVertical); } catch (_) { targetHeight = 0; }
+        }
+        if (!targetWidth || !targetHeight) {
+            try {
+                var activeSequenceSettings = seq.getSettings();
+                targetWidth = targetWidth || Number(activeSequenceSettings.videoFrameWidth);
+                targetHeight = targetHeight || Number(activeSequenceSettings.videoFrameHeight);
+            } catch (_) {}
+        }
+        targetWidth = Math.round(targetWidth);
+        targetHeight = Math.round(targetHeight);
 
         var root = app.project.rootItem;
 
@@ -1249,6 +1270,7 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
         // candidate paths below.
         var _presetSeq = null;
         var _presetTried = "";
+        var _nestGeomSource = ""; // 'preset' when the shipped .sqpreset built the nest
         try {
             var _panelDir = File($.fileName).parent.parent.fsName; // jsx/ -> cep_panel/
             var _presetCandidates = [
@@ -1277,6 +1299,52 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
                     nestErr = "preset created only " + _presetSeq.videoTracks.numTracks + " video tracks";
                     _presetSeq = null;
                 }
+                if (_presetSeq) {
+                    // DANGER ZONE HIGH: The seed preset contributes native tracks only.
+                    // Its placeholder geometry must never leak into a client's render.
+                    var presetSettings = _presetSeq.getSettings();
+                    presetSettings.videoFrameWidth = targetWidth;
+                    presetSettings.videoFrameHeight = targetHeight;
+                    if (presetSettings.videoFrameRate &&
+                        typeof presetSettings.videoFrameRate.seconds !== "undefined") {
+                        presetSettings.videoFrameRate.seconds = 1.0 / targetRate;
+                    } else {
+                        var seedRate = Number(presetSettings.videoFrameRate);
+                        if (!seedRate || Math.abs(seedRate - targetRate) > 0.01) {
+                            nestErr = "preset frame-rate setting unavailable for " + targetRate + " fps";
+                            _presetSeq = null;
+                        }
+                    }
+
+                    if (_presetSeq) {
+                        var settingsResult = _presetSeq.setSettings(presetSettings);
+                        if (settingsResult === false) {
+                            nestErr = "preset setSettings returned false";
+                            _presetSeq = null;
+                        }
+                    }
+
+                    if (_presetSeq) {
+                        var verifiedPresetSettings = _presetSeq.getSettings();
+                        var verifiedRate = 0;
+                        if (verifiedPresetSettings.videoFrameRate &&
+                            Number(verifiedPresetSettings.videoFrameRate.seconds) > 0) {
+                            verifiedRate = 1.0 / Number(verifiedPresetSettings.videoFrameRate.seconds);
+                        } else {
+                            verifiedRate = Number(verifiedPresetSettings.videoFrameRate);
+                        }
+                        if (Number(verifiedPresetSettings.videoFrameWidth) !== targetWidth ||
+                            Number(verifiedPresetSettings.videoFrameHeight) !== targetHeight ||
+                            !verifiedRate || Math.abs(verifiedRate - targetRate) > 0.01) {
+                            nestErr = "preset geometry verification failed: " +
+                                String(verifiedPresetSettings.videoFrameWidth) + "x" +
+                                String(verifiedPresetSettings.videoFrameHeight) + " @ " +
+                                String(verifiedRate) + "; expected " + targetWidth + "x" +
+                                targetHeight + " @ " + targetRate;
+                            _presetSeq = null;
+                        }
+                    }
+                }
             }
         } catch (ePre) { nestErr = nestErr || ("preset: " + String(ePre)); }
 
@@ -1301,7 +1369,6 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
         }
         var _auxOnMain = false;   // set when nest geometry is sequential — aux goes to the main timeline
         var _nestGeom = "";       // read-back: 'stacked' | 'sequential' | 'single' | ''
-        var _nestGeomSource = ""; // 'preset' when the shipped .sqpreset built the nest
 
         var samPlaced = false;
         var ckOnlyPlaced = false;
@@ -1367,7 +1434,8 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
                     try { if (typeof giT.setMute === "function") giT.setMute(0); } catch (_) {}
                 }
             } catch (_) {}
-            if (_tracksWithClips >= _nestClips.length && _allStartZero) {
+            var expectedNestClipCount = 1 + (samImported ? 1 : 0) + (ckOnlyImported ? 1 : 0);
+            if (_tracksWithClips >= expectedNestClipCount && _allStartZero) {
                 _nestGeom = "stacked";       // exact AE parity — factory stacked them
             } else if (_v1ClipCount > 1) {
                 _nestGeom = "sequential";    // clips laid end-to-end on V1

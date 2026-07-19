@@ -1,3 +1,4 @@
+<!-- Last modified: 2026-07-18 | Change: pass rendered PNG geometry into Premiere preset nests | Full history: git log -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3115,6 +3116,33 @@ let CK_ANCHOR_FRAME = null;   // source frame the SAM dots were placed on (ancho
 let CK_BATCH_IN_PROGRESS = false;   // true while a KEY CLIP render runs — blocks live re-preview + double-commit
 let CK_LAST_SOURCE = null;   // tracks source file path; zone clears when a different clip is keyed
 
+// WHAT IT DOES: Reads the exact width and height stored in a rendered PNG header.
+// DEPENDS ON:   Node fs/Buffer and a valid PNG path; CK_SRC_W/H are guarded fallbacks.
+// AFFECTS:      Premiere nested-sequence geometry for every imported render.
+function ckReadPngDimensions(pngPath) {
+    let fileHandle = null;
+    try {
+        const header = Buffer.alloc ? Buffer.alloc(24) : new Buffer(24);
+        fileHandle = fs.openSync(pngPath, 'r');
+        const bytesRead = fs.readSync(fileHandle, header, 0, 24, 0);
+        if (bytesRead === 24 &&
+            header[0] === 0x89 && header[1] === 0x50 &&
+            header[2] === 0x4E && header[3] === 0x47) {
+            return {
+                width: header.readUInt32BE(16),
+                height: header.readUInt32BE(20)
+            };
+        }
+    } catch (dimensionError) {
+        ckLog('PNG dimension read failed: ' + dimensionError.message, true);
+    } finally {
+        if (fileHandle !== null) {
+            try { fs.closeSync(fileHandle); } catch (_) {}
+        }
+    }
+    return { width: Number(CK_SRC_W) || 0, height: Number(CK_SRC_H) || 0 };
+}
+
 function findCorridorkeyRoot() {
     const candidates = [];
     if (process.env.CORRIDORKEY_ROOT) candidates.push(process.env.CORRIDORKEY_ROOT);
@@ -4281,8 +4309,10 @@ function doCommit() {
             const samJunkSidecar = fs.existsSync(samJunkFirst) ? samJunkFirst
                 : (() => { try { const _ff = fs.readdirSync(_samJunkDir).filter(n => n.startsWith('SAM_JUNK_') && n.endsWith('.png')).sort(); return _ff.length ? path.join(_samJunkDir, _ff[0]) : null; } catch(_) { return null; } })();
             const importFn = HOST_APP === 'ppro' ? 'ppro_importSequence' : 'ae_importSequence';
+            const renderDimensions = ckReadPngDimensions(firstFrame);
             const importArgs = HOST_APP === 'ppro'
-                ? [firstFrame, info.inPointSeconds, info.fps, info.sourceFrameRate || info.fps, null]
+                ? [firstFrame, info.inPointSeconds, info.fps, info.sourceFrameRate || info.fps,
+                   null, null, 0, renderDimensions.width, renderDimensions.height]
                 : [firstFrame, info.fps, info.compStartTime, true, ckLockJson, ckMatteSidecar, info.sourceFile, samJunkSidecar];   // merged clip + CK matte + SAM junk mask
             ckStatus('Placing on timeline...');
             jsxCall(importFn, importArgs, (imp) => {
@@ -4473,9 +4503,11 @@ function doSAMCommit(advanced) {
                 : (() => { try { const _ff = fs.readdirSync(_ckOnlyDir).filter(n => n.startsWith('CK_ONLY_') && n.endsWith('.png')).sort(); return _ff.length ? path.join(_ckOnlyDir, _ff[0]) : null; } catch(_) { return null; } })();
             ckStatus('Building precomp...');
             if (HOST_APP === 'ppro') {
+                const renderDimensions = ckReadPngDimensions(firstFrame);
                 jsxCall('ppro_importSequence', [
                     firstFrame, info.inPointSeconds, info.fps, info.sourceFrameRate || info.fps, samMattePath, ckOnlyPath,
-                    (Number(info.endSeconds) - Number(info.startSeconds)) || 0
+                    (Number(info.endSeconds) - Number(info.startSeconds)) || 0,
+                    renderDimensions.width, renderDimensions.height
                 ], (imp) => {
                     if (!imp || !imp.ok) return finish('Import failed: ' + (imp && imp.error ? imp.error : 'unknown'), true);
                     if (imp.via) ckLog('samCommit: import target resolved via ' + imp.via);
