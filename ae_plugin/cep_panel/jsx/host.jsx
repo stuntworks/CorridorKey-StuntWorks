@@ -1,7 +1,6 @@
 /**
  * CorridorKey — Host Script (ExtendScript)
- * Last modified: 2026-07-18 | Change: conform three-track Premiere preset nests to each
- *   rendered PNG sequence's dimensions and frame rate.
+ * Last modified: 2026-07-19 | Change: use the bundled preset path supplied by the CEP panel.
  *
  * WHAT IT DOES: Reads timeline state from After Effects / Premiere Pro and returns it
  *   to the CEP panel as a JSON string. Imports the PNG(s) Python produced back onto the
@@ -1073,9 +1072,10 @@ function ppro_importFrame(outputPath, playheadSeconds, fps) {
 //   it into the CorridorKey bin and overwrite onto V2.
 // DEPENDS-ON: firstFramePath exists; its folder contains a clean output_NNNNN.png pattern
 //   with no other PNG series (mattes live in a subfolder). sourceWidth/sourceHeight come
-//   from the first rendered PNG; the active sequence is the guarded fallback.
+//   from the first rendered PNG. presetPath comes from the CEP panel directory;
+//   the active sequence is the guarded geometry fallback.
 // AFFECTS: Project panel (bin + imported item), timeline, and nested-sequence geometry.
-function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate, samFirstFramePath, ckOnlyFirstFramePath, durationSeconds, sourceWidth, sourceHeight) {
+function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate, samFirstFramePath, ckOnlyFirstFramePath, durationSeconds, sourceWidth, sourceHeight, presetPath) {
     try {
         var seq = app.project.activeSequence;
         if (!seq) return JSON.stringify({ ok: false, error: "No active sequence" });
@@ -1272,11 +1272,14 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
         var _presetTried = "";
         var _nestGeomSource = ""; // 'preset' when the shipped .sqpreset built the nest
         try {
+            // DANGER ZONE HIGH: $.fileName can resolve against Premiere.exe when CEP
+            // loads this script through ScriptPath. The panel-supplied path is the
+            // only reliable installed location and must be tried first.
+            var _presetCandidates = [];
+            if (presetPath) _presetCandidates.push(String(presetPath));
             var _panelDir = File($.fileName).parent.parent.fsName; // jsx/ -> cep_panel/
-            var _presetCandidates = [
-                _panelDir + "/presets/CK_3TRACK.sqpreset",
-                _panelDir + "/CK_3TRACK.sqpreset"
-            ];
+            _presetCandidates.push(_panelDir + "/presets/CK_3TRACK.sqpreset");
+            _presetCandidates.push(_panelDir + "/CK_3TRACK.sqpreset");
             var _presetPath = null;
             for (var ppI = 0; ppI < _presetCandidates.length; ppI++) {
                 if (File(_presetCandidates[ppI]).exists) { _presetPath = _presetCandidates[ppI]; break; }
@@ -1386,13 +1389,16 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
                 if (ckOnlyImported) { nestSeq.videoTracks[2].overwriteClip(ckOnlyImported, 0); ckOnlyPlaced = true; }
                 for (var prT = 0; prT < 3 && prT < nestSeq.videoTracks.numTracks; prT++) {
                     var _prTrk = nestSeq.videoTracks[prT];
-                    try { if (typeof _prTrk.setMute === "function") _prTrk.setMute(0); } catch (_) {}
+                    // AE-parity default state: clips stay ENABLED; V2/V3 hide via
+                    // track output (the timeline eyeball), so toggling the eyeball
+                    // reveals them — same gesture as the AE precomp layer eyeball.
+                    try { if (typeof _prTrk.setMute === "function") _prTrk.setMute(prT === 0 ? 0 : 1); } catch (_) {}
                     try {
                         if (_prTrk.clips.numItems > 0) {
                             var _prClip = _prTrk.clips[0];
                             // Rename the TIMELINE instances (not the source items).
                             try { _prClip.name = (prT === 0) ? "CK + SAM AI OUTPUT" : (prT === 1 ? "GARBAGE MASK" : "CK MASTER"); } catch (_) {}
-                            try { _prClip.disabled = (prT !== 0); } catch (_) {}
+                            try { _prClip.disabled = false; } catch (_) {}
                         }
                     } catch (_) {}
                 }
@@ -1412,6 +1418,55 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
                     else { var fiCkoP = ckOnlyImported.getFootageInterpretation(); if (fiCkoP) { fiCkoP.frameRate = targetRate; ckOnlyImported.setFootageInterpretation(fiCkoP); } }
                 } catch (_) {}
                 try { if (ckBin) ckOnlyImported.moveBin(ckBin); } catch (_) {}
+            }
+
+            // Place the preset-born sequence itself on the user's timeline.
+            // The old code performed this step only in the non-preset branch,
+            // leaving mode="flat" and spilling all three sources onto main tracks.
+            try {
+                var _presetNestProjectItem = null;
+                try { _presetNestProjectItem = nestSeq.projectItem; } catch (_) {}
+                if (!_presetNestProjectItem) {
+                    var _presetSearchRoots = ckBin ? [app.project.rootItem, ckBin] : [app.project.rootItem];
+                    for (var _psr = 0; _psr < _presetSearchRoots.length && !_presetNestProjectItem; _psr++) {
+                        var _presetKids = _presetSearchRoots[_psr].children;
+                        for (var _pki = 0; _pki < _presetKids.numItems; _pki++) {
+                            var _presetKid = _presetKids[_pki];
+                            if (_presetKid.name === _nestName && _presetKid.type !== 2) {
+                                _presetNestProjectItem = _presetKid;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (!_presetNestProjectItem) throw new Error("preset nest projectItem not found");
+
+                var _presetDuration = (Number(durationSeconds) > 0)
+                    ? Number(durationSeconds) : (1.0 / Number(fps || 24));
+                var _presetPlaceEnd = placeSec + _presetDuration;
+                var _presetMainTrackIndex = -1;
+                for (var _pmt = 1; _pmt < mainSeq.videoTracks.numTracks; _pmt++) {
+                    var _presetTrackIsFree = true;
+                    var _presetMainTrack = mainSeq.videoTracks[_pmt];
+                    for (var _pmc = 0; _pmc < _presetMainTrack.clips.numItems; _pmc++) {
+                        var _presetExistingClip = _presetMainTrack.clips[_pmc];
+                        if (_presetExistingClip.start.seconds < _presetPlaceEnd &&
+                            _presetExistingClip.end.seconds > placeSec) {
+                            _presetTrackIsFree = false;
+                            break;
+                        }
+                    }
+                    if (_presetTrackIsFree) { _presetMainTrackIndex = _pmt; break; }
+                }
+                if (_presetMainTrackIndex < 0) {
+                    throw new Error("no empty video track for the CK nested clip");
+                }
+                mainSeq.videoTracks[_presetMainTrackIndex].overwriteClip(_presetNestProjectItem, placeSec);
+                nestProjectItem = _presetNestProjectItem;
+                trackV = _presetMainTrackIndex + 1;
+                mode = "nested";
+            } catch (ePresetMainPlace) {
+                nestErr = nestErr || String(ePresetMainPlace);
             }
         } else if (nestSeq) {
             // GEOMETRY READ-BACK (2026-07-18): the factory nest was created from
@@ -1599,6 +1654,10 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
         // FALLBACK — old flat placement (pre-nesting behavior). Used when
         // createNewSequenceFromClips is unavailable, the nest's project item
         // couldn't be located, or placing the nest on the main timeline failed.
+        if (mode !== "nested" && (samImported || ckOnlyImported)) {
+            return JSON.stringify({ ok: false,
+                error: "Could not place the three-layer CK nested sequence: " + (nestErr || "unknown placement error") });
+        }
         if (mode !== "nested") {
             samPlaced = false;
             ckOnlyPlaced = false;

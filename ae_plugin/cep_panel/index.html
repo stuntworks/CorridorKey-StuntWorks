@@ -1,4 +1,4 @@
-<!-- Last modified: 2026-07-18 | Change: pass rendered PNG geometry into Premiere preset nests | Full history: git log -->
+<!-- Last modified: 2026-07-19 | Change: pass the bundled three-track preset path into Premiere | Full history: git log -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4310,9 +4310,10 @@ function doCommit() {
                 : (() => { try { const _ff = fs.readdirSync(_samJunkDir).filter(n => n.startsWith('SAM_JUNK_') && n.endsWith('.png')).sort(); return _ff.length ? path.join(_samJunkDir, _ff[0]) : null; } catch(_) { return null; } })();
             const importFn = HOST_APP === 'ppro' ? 'ppro_importSequence' : 'ae_importSequence';
             const renderDimensions = ckReadPngDimensions(firstFrame);
+            const renderPresetPath = path.join(PANEL_DIR, 'presets', 'CK_3TRACK.sqpreset');
             const importArgs = HOST_APP === 'ppro'
                 ? [firstFrame, info.inPointSeconds, info.fps, info.sourceFrameRate || info.fps,
-                   null, null, 0, renderDimensions.width, renderDimensions.height]
+                   null, null, 0, renderDimensions.width, renderDimensions.height, renderPresetPath]
                 : [firstFrame, info.fps, info.compStartTime, true, ckLockJson, ckMatteSidecar, info.sourceFile, samJunkSidecar];   // merged clip + CK matte + SAM junk mask
             ckStatus('Placing on timeline...');
             jsxCall(importFn, importArgs, (imp) => {
@@ -4504,10 +4505,11 @@ function doSAMCommit(advanced) {
             ckStatus('Building precomp...');
             if (HOST_APP === 'ppro') {
                 const renderDimensions = ckReadPngDimensions(firstFrame);
+                const renderPresetPath = path.join(PANEL_DIR, 'presets', 'CK_3TRACK.sqpreset');
                 jsxCall('ppro_importSequence', [
                     firstFrame, info.inPointSeconds, info.fps, info.sourceFrameRate || info.fps, samMattePath, ckOnlyPath,
                     (Number(info.endSeconds) - Number(info.startSeconds)) || 0,
-                    renderDimensions.width, renderDimensions.height
+                    renderDimensions.width, renderDimensions.height, renderPresetPath
                 ], (imp) => {
                     if (!imp || !imp.ok) return finish('Import failed: ' + (imp && imp.error ? imp.error : 'unknown'), true);
                     if (imp.via) ckLog('samCommit: import target resolved via ' + imp.via);
