@@ -417,7 +417,8 @@ function ae_importSequence(firstFramePath, fps, compStartTime, hideSource, lockH
         // clean layer instead of 4-5 loose layers. Double-click the precomp to paint.
         var srcName = (layer.source && layer.source.name) ? layer.source.name.replace(/\.[^.]+$/, '') : layer.name;
         var ckCompDuration = (comp.workAreaDuration > 0) ? comp.workAreaDuration : comp.duration;
-        var ckComp = app.project.items.addComp("CK " + srcName, comp.width, comp.height, comp.pixelAspect, ckCompDuration, comp.frameRate);
+        // "CK MASK <src>" — matches the Premiere nest name (cross-host consistency law, Berto 2026-07-19).
+        var ckComp = app.project.items.addComp("CK MASK " + srcName, comp.width, comp.height, comp.pixelAspect, ckCompDuration, comp.frameRate);
 
         // Add layers in reverse stack order — each layers.add() inserts at pos 1.
         // Final stack top→bottom: SAM JUNK MASK | CK MATTE | keyed clip.
@@ -1075,7 +1076,7 @@ function ppro_importFrame(outputPath, playheadSeconds, fps) {
 //   from the first rendered PNG. presetPath comes from the CEP panel directory;
 //   the active sequence is the guarded geometry fallback.
 // AFFECTS: Project panel (bin + imported item), timeline, and nested-sequence geometry.
-function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate, samFirstFramePath, ckOnlyFirstFramePath, durationSeconds, sourceWidth, sourceHeight, presetPath) {
+function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate, samFirstFramePath, ckOnlyFirstFramePath, durationSeconds, sourceWidth, sourceHeight, presetPath, srcVideoPath) {
     try {
         var seq = app.project.activeSequence;
         if (!seq) return JSON.stringify({ ok: false, error: "No active sequence" });
@@ -1249,7 +1250,18 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
 
         var nestSeq = null;
         var nestErr = "";
-        var _nestName = "CK " + (imported.name || "Render");
+        // Nest name from the SOURCE clip, matching AE's "CK <srcName>" comp name.
+        // (Old code used imported.name, but that clip is renamed "CK + SAM AI
+        // OUTPUT" before this line runs, which produced "CK CK + SAM AI OUTPUT".)
+        var _nestSrcBase = "";
+        try {
+            if (srcVideoPath) {
+                _nestSrcBase = String(srcVideoPath).replace(/\\/g, "/").split("/").pop();
+                var _nestDot = _nestSrcBase.lastIndexOf(".");
+                if (_nestDot > 0) _nestSrcBase = _nestSrcBase.substring(0, _nestDot);
+            }
+        } catch (_) {}
+        var _nestName = "CK MASK " + (_nestSrcBase || imported.name || "Render");
         // MULTI-CLIP FACTORY NEST (2026-07-18): tracks added to a sequence via QE
         // addTracks are DEAD — anything placed on them (stills items AND wrapped
         // sequences) renders blank in the program monitor while V1, born of
@@ -1382,11 +1394,14 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
 
         if (nestSeq && _nestGeomSource === "preset") {
             // PRESET NEST: three factory tracks guaranteed. Place the stack
-            // directly — V1 output (on), V2 garbage (off), V3 ck_only (off).
+            // directly — V1 output (on), V2 CK MASTER (off), V3 GARBAGE MASK (off,
+            // TOP). Berto 2026-07-19: the matte must sit ABOVE the clip it cuts —
+            // Premiere's Track Matte Key only offers HIGHER tracks in its Matte
+            // dropdown, so GARBAGE MASK rides top where CK MASTER (V2) can reach it.
             try {
                 nestSeq.videoTracks[0].overwriteClip(imported, 0);
-                if (samImported) { nestSeq.videoTracks[1].overwriteClip(samImported, 0); samPlaced = true; }
-                if (ckOnlyImported) { nestSeq.videoTracks[2].overwriteClip(ckOnlyImported, 0); ckOnlyPlaced = true; }
+                if (ckOnlyImported) { nestSeq.videoTracks[1].overwriteClip(ckOnlyImported, 0); ckOnlyPlaced = true; }
+                if (samImported) { nestSeq.videoTracks[2].overwriteClip(samImported, 0); samPlaced = true; }
                 for (var prT = 0; prT < 3 && prT < nestSeq.videoTracks.numTracks; prT++) {
                     var _prTrk = nestSeq.videoTracks[prT];
                     // AE-parity default state: clips stay ENABLED; V2/V3 hide via
@@ -1397,7 +1412,7 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
                         if (_prTrk.clips.numItems > 0) {
                             var _prClip = _prTrk.clips[0];
                             // Rename the TIMELINE instances (not the source items).
-                            try { _prClip.name = (prT === 0) ? "CK + SAM AI OUTPUT" : (prT === 1 ? "GARBAGE MASK" : "CK MASTER"); } catch (_) {}
+                            try { _prClip.name = (prT === 0) ? "CK + SAM AI OUTPUT" : (prT === 1 ? "CK MASTER" : "GARBAGE MASK"); } catch (_) {}
                             try { _prClip.disabled = false; } catch (_) {}
                         }
                     } catch (_) {}
@@ -1465,6 +1480,43 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
                 nestProjectItem = _presetNestProjectItem;
                 trackV = _presetMainTrackIndex + 1;
                 mode = "nested";
+                // ORIGINAL CLIP GUIDANCE (Berto 2026-07-19): do NOT disable the
+                // source clip — editors may have other clips on that track and an
+                // auto-disabled clip reads as breakage. Instead, label it and drop
+                // a timeline marker so a beginner knows what to do (the Premiere
+                // version of AE's on-layer instruction markers). Match by media
+                // path so we never touch unrelated clips.
+                try {
+                    if (srcVideoPath) {
+                        var _srcNorm = String(srcVideoPath).replace(/\\/g, "/").toLowerCase();
+                        for (var _soT = 0; _soT < mainSeq.videoTracks.numTracks; _soT++) {
+                            if (_soT === _presetMainTrackIndex) continue;
+                            var _soTrack = mainSeq.videoTracks[_soT];
+                            for (var _soC = 0; _soC < _soTrack.clips.numItems; _soC++) {
+                                var _soClip = _soTrack.clips[_soC];
+                                if (_soClip.start.seconds < _presetPlaceEnd &&
+                                    _soClip.end.seconds > placeSec) {
+                                    var _soMedia = "";
+                                    try { _soMedia = String(_soClip.projectItem.getMediaPath()).replace(/\\/g, "/").toLowerCase(); } catch (_) {}
+                                    if (_soMedia && _soMedia === _srcNorm) {
+                                        try {
+                                            if (String(_soClip.name).indexOf("ORIGINAL") === -1) {
+                                                _soClip.name = String(_soClip.name) + "  — ORIGINAL: switch me off if you only want the key";
+                                            }
+                                        } catch (_) {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Timeline marker at the nest start with the same instruction.
+                    try {
+                        var _ckMk = mainSeq.markers.createMarker(placeSec);
+                        _ckMk.name = "CK keyed clip landed";
+                        _ckMk.comments = "The keyed nest is on V" + (_presetMainTrackIndex + 1) +
+                            ". Your ORIGINAL clip below is untouched — switch it off (right-click > Enable) when you only want the keyed video.";
+                    } catch (_) {}
+                } catch (_) {}
             } catch (ePresetMainPlace) {
                 nestErr = nestErr || String(ePresetMainPlace);
             }
