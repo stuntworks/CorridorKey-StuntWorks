@@ -1,4 +1,4 @@
-# Last modified: 2026-07-18 | Change: Verify universal three-track Premiere preset behavior | Full history: git log
+# Last modified: 2026-07-19 | Change: Verify preset nests land as one main-timeline clip | Full history: git log
 """Static contract checks for the CEP three-track preset path."""
 
 from pathlib import Path
@@ -38,3 +38,31 @@ def test_premiere_preset_branch_state_is_initialized_once():
 
     assert initialization < preset_assignment
     assert "_nestClips" not in function_body
+
+
+# WHAT IT DOES: Verifies CEP passes its real bundled preset path into ExtendScript.
+# DEPENDS ON:   The panel-side PANEL_DIR value and ppro_importSequence argument order.
+# AFFECTS:      Fails if Premiere falls back to its executable folder for the preset.
+def test_premiere_receives_bundled_preset_path_from_panel():
+    host = HOST_PATH.read_text(encoding="utf-8")
+    panel = PANEL_PATH.read_text(encoding="utf-8")
+
+    assert "sourceWidth, sourceHeight, presetPath" in host
+    assert "const renderPresetPath = path.join(PANEL_DIR, 'presets', 'CK_3TRACK.sqpreset');" in panel
+    assert panel.count("renderDimensions.width, renderDimensions.height, renderPresetPath") == 2
+    assert "if (presetPath) _presetCandidates.push(String(presetPath));" in host
+    assert host.index("if (presetPath) _presetCandidates.push(String(presetPath));") < host.index("File($.fileName).parent.parent.fsName")
+
+
+# WHAT IT DOES: Verifies a preset-born sequence is placed as one nested timeline clip.
+# DEPENDS ON:   The preset branch and flat-fallback guard in ppro_importSequence.
+# AFFECTS:      Fails if auxiliary masks can escape onto the user's main timeline.
+def test_premiere_places_preset_nest_and_refuses_aux_flat_fallback():
+    host = HOST_PATH.read_text(encoding="utf-8")
+    function_body = host.split("function ppro_importSequence", 1)[1]
+    preset_branch = function_body.split('if (nestSeq && _nestGeomSource === "preset")', 1)[1]
+    preset_branch = preset_branch.split("} else if (nestSeq)", 1)[0]
+
+    assert "mainSeq.videoTracks[_presetMainTrackIndex].overwriteClip(_presetNestProjectItem, placeSec);" in preset_branch
+    assert 'mode = "nested";' in preset_branch
+    assert 'if (mode !== "nested" && (samImported || ckOnlyImported))' in function_body

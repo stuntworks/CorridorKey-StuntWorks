@@ -1,4 +1,4 @@
-# Last modified: 2026-07-11 | Change: silhouette-continuation spare test added to _ub_shape_kill_wire_components' Signal A (UNIFIED_BAND_SHAPE_SPARE_* constants, _ub_silhouette_contour_points/_ub_local_silhouette_tangent/_ub_axis_angle_deg/_ub_shape_spare_silhouette_continuation) — spares short straight body-edge false-positive components (3rd confirmed class: back grooves/hip blotch + wavy pant edges) that CV/elongation alone cannot separate from wire, by testing tangent alignment with the local silhouette contour. THICKNESS_CV_MAX stays 0.25 (not restored to 0.35). Full history: git log
+# Last modified: 2026-07-19 | Change: restore large enclosed dark holes when CK identifies solid subject | Full history: git log
 """v1.0 two-mask SAM matte processing.
 
 CK matte and SAM matte are independent in v1.0. The plugin no longer
@@ -2112,6 +2112,20 @@ UNIFIED_BAND_FEET_ERODE_PX_BASE = 1.0  # matches merge_ck_with_garbage_matte's f
                                         # erosion radius — see the feet-erosion note
                                         # above D(p)'s computation in merge_ck_unified_band.
 UNIFIED_BAND_SLIVER_MAX_AREA_PX_BASE = 24.0  # px @1920, squared at runtime; enclosed dark slivers larger than (this*scale)^2 are NOT filled
+
+
+# WHAT IT DOES: Accepts small enclosed slivers, plus larger enclosed regions when
+#   a majority of their raw CK pixels confidently identify solid foreground.
+# DEPENDS ON:   CK_AUTHORITY_SOLID_T and a one-dimensional CK alpha sample.
+# AFFECTS:      Controls which enclosed unified-band holes may be restored.
+def should_restore_enclosed_body_region(region_area, small_area_limit, ck_region_values):
+    if float(region_area) <= float(small_area_limit):
+        return True
+    ck_values = np.asarray(ck_region_values, dtype=np.float32)
+    if ck_values.size == 0:
+        return False
+    solid_fraction = float(np.mean(ck_values >= CK_AUTHORITY_SOLID_T))
+    return solid_fraction >= 0.5
 UNIFIED_BAND_CALF_START_PCT = 0.85     # calf line — bottom 15% of the SAM bbox.
 UNIFIED_BAND_CALF_ERODE_PX_BASE = 3.0  # Berto 2026-07-10: MINUS one more pixel off
                                         # (1.5 -> 2.0, Berto 2026-07-11: "feet might
@@ -3898,9 +3912,10 @@ def merge_ck_unified_band(
             _x_sl, _y_sl, _ww_sl, _hh_sl, _area_sl = _stats_sl[_j_sl]
             if _x_sl == 0 or _y_sl == 0 or _x_sl + _ww_sl >= _w_sl or _y_sl + _hh_sl >= _h_sl:
                 continue  # touches border — connected to real background
-            if _area_sl > _max_sliver_area:
-                continue  # too big to be a sliver — could be a legit gap
             _reg_sl = _lab_sl == _j_sl
+            if not should_restore_enclosed_body_region(
+                    _area_sl, _max_sliver_area, ck[_reg_sl]):
+                continue  # large region without majority-solid CK could be a legit gap
             if on_green_hsv is not None and float(on_green_hsv[_reg_sl].mean()) >= 0.5:
                 continue  # bright screen color — a real see-through hole
             if _sliver_fill_mask is None:
