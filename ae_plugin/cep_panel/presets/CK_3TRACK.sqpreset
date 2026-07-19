@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<PremiereData Version="3">
+	<SequencePreset ObjectRef="1"/>
+	<SequencePreset ObjectID="1" ClassID="5e73dd7e-4f86-4917-80eb-08ddb2f4a5f3" Version="10">
+		<ColorManagementPreset ObjectRef="2"/>
+		<VideoTimeDisplay>100</VideoTimeDisplay>
+		<AudioTimeDisplay>200</AudioTimeDisplay>
+		<VideoFieldType>0</VideoFieldType>
+		<WorkingColorSpace>{"baseColorProfile":{"colorProfileName":"BT.709 RGB Full"},"baseProfileType":1}</WorkingColorSpace>
+		<AutoToneMapEnabled>true</AutoToneMapEnabled>
+		<Names Version="1">
+			<NameItem Version="1" Index="0">
+				<First>en_US</First>
+				<Second>CK_3TRACK</Second>
+			</NameItem>
+		</Names>
+		<Descriptions Version="1">
+			<DescriptionItem Version="1" Index="0">
+				<First>en_US</First>
+				<Second>Corridorkey + sam</Second>
+			</DescriptionItem>
+		</Descriptions>
+		<EditingModeGUID.Mac>9678af98-a7b7-4bdb-b477-7ac9c8df4a4e</EditingModeGUID.Mac>
+		<EditingModeGUID.Win>9678af98-a7b7-4bdb-b477-7ac9c8df4a4e</EditingModeGUID.Win>
+		<PreviewPresetFileName.Mac>QuickTime</PreviewPresetFileName.Mac>
+		<PreviewPresetVideoCodec.Mac>1634755443</PreviewPresetVideoCodec.Mac>
+		<PreviewPresetFileName.Win>QuickTime</PreviewPresetFileName.Win>
+		<PreviewPresetVideoCodec.Win>1634755443</PreviewPresetVideoCodec.Win>
+		<VideoFrameRate>10584000000</VideoFrameRate>
+		<VideoFrameSize>0,0,1920,1080</VideoFrameSize>
+		<VideoPixelAspectRatio>1,1</VideoPixelAspectRatio>
+		<VideoUseMaxBitDepth>false</VideoUseMaxBitDepth>
+		<VideoUseMaxRenderQuality>false</VideoUseMaxRenderQuality>
+		<VideoAllowLinearCompositing>true</VideoAllowLinearCompositing>
+		<AudioFrameRate>5292000</AudioFrameRate>
+		<AudioChannelType>3</AudioChannelType>
+		<AdaptiveNumChannels>4</AdaptiveNumChannels>
+		<InitialNumberOfVideoTracks>3</InitialNumberOfVideoTracks>
+		<AudioTracks>[{"mAssign":1,"mAudioSends":[],"mChannelType":0,"mExpandedHeight":41,"mIsOpen":false,"mIsSubmix":false,"mKeyframeMode":true,"mLocked":false,"mMatrix":[],"mMute":false,"mName":"Output 1","mPan":-100,"mPannerAssignments":[[0,[0]]],"mSolo":false,"mSyncLock":true,"mTargeted":true,"mTrackID":2,"mVolume":1},{"mAssign":1,"mAudioSends":[],"mChannelType":0,"mExpandedHeight":41,"mIsOpen":false,"mIsSubmix":false,"mKeyframeMode":true,"mLocked":false,"mMatrix":[],"mMute":false,"mName":"Output 2","mPan":100,"mPannerAssignments":[[0,[0]]],"mSolo":false,"mSyncLock":true,"mTargeted":true,"mTrackID":3,"mVolume":1},{"mAssign":1,"mAudioSends":[],"mChannelType":0,"mExpandedHeight":41,"mIsOpen":false,"mIsSubmix":false,"mKeyframeMode":true,"mLocked":false,"mMatrix":[],"mMute":false,"mName":"Output 3","mPan":-100,"mPannerAssignments":[[0,[2]]],"mSolo":false,"mSyncLock":true,"mTargeted":true,"mTrackID":4,"mVolume":1},{"mAssign":1,"mAudioSends":[],"mChannelType":0,"mExpandedHeight":41,"mIsOpen":false,"mIsSubmix":false,"mKeyframeMode":true,"mLocked":false,"mMatrix":[],"mMute":false,"mName":"Output 4","mPan":100,"mPannerAssignments":[[0,[2]]],"mSolo":false,"mSyncLock":true,"mTargeted":true,"mTrackID":5,"mVolume":1}]</AudioTracks>
+		<VideoTracks>[]</VideoTracks>
+		<ImmersiveVideoVRConfiguration>{"ambisonicsHRIR":"","ambisonicsMonitoringType":0,"capturedHorizontalView":0,"capturedVerticalView":0,"fieldOfHorizontalView":108,"fieldOfVerticalView":108,"projectionType":0,"stereoscopicEye":0,"stereoscopicType":0,"version":3}</ImmersiveVideoVRConfiguration>
+		<PreviewVideoFrameSize>0,0,1920,1080</PreviewVideoFrameSize>
+		<SequenceWorkingColorSpace>{"workingSpaceConfigVersion":1,"workingSpaceID":"BT.709 RGB Full","workingSpaceIsLinearized":0}</SequenceWorkingColorSpace>
+	</SequencePreset>
+	<ColorManagementPreset ObjectID="2" ClassID="a02a917a-807e-46ef-aaa2-7a440773db94" Version="1">
+		<Gain>1.</Gain>
+		<GraphicsWhiteLuminance>203</GraphicsWhiteLuminance>
+		<ColorAwareEffectsEnabled>false</ColorAwareEffectsEnabled>
+		<OutputColorSpace>{"baseColorProfile":{"colorProfileData":"AQAAAGQAAAA=","colorProfileName":"BT.709,8-bit,Display-Referred"},"baseProfileType":1,"colorSpaceMetadata":{"peakLuminance":100}}</OutputColorSpace>
+		<WorkingColorSpace>{"baseColorProfile":{"colorProfileName":"BT.709 RGB Full"},"baseProfileType":1}</WorkingColorSpace>
+		<Peak>1.</Peak>
+		<Desaturation>0.5</Desaturation>
+		<Knee>0.</Knee>
+		<ToneMappingAlgorithm>0</ToneMappingAlgorithm>
+		<GamutCompressionAlgorithm>0</GamutCompressionAlgorithm>
+		<GraphicsWhiteLuminanceSameAsProject>false</GraphicsWhiteLuminanceSameAsProject>
+		<ColorAwareEffectsEnabledSameAsProject>false</ColorAwareEffectsEnabledSameAsProject>
+		<AutoToneMapEnabled>true</AutoToneMapEnabled>
+		<AutoInputGamutCompressionEnabled>true</AutoInputGamutCompressionEnabled>
+		<ColorManagementSystem>0</ColorManagementSystem>
+	</ColorManagementPreset>
+</PremiereData>
