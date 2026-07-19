@@ -1365,7 +1365,7 @@ def apply_matte_postproc(fg_rgb, alpha_raw, settings, sam_soft=None, source_rgb=
         alpha = _merge_simple(alpha, _sam_r)
         # fill_body_holes available but defaults OFF in simple mode (Resolve does not fill).
         if settings.get('fill_body_holes', False) and _sam_r is not None:
-            alpha = _fill_body_holes(alpha, _sam_r)
+            alpha = _fill_body_holes(alpha, _sam_r, src_rgb=src, screen_type=screen_type)
     else:
         # Legacy garbage-matte path (simple_combine=False or no SAM active).
         alpha, _green_garbage = sam_garbage_merge(alpha, sam_soft, src, settings, screen_type,
@@ -1379,8 +1379,11 @@ def apply_matte_postproc(fg_rgb, alpha_raw, settings, sam_soft=None, source_rgb=
         # fill_body_holes stays OFF: A/B 2026-07-03 (Berto verdict) — ON refills junk
         # inside the arm on motion-blur frames (patches REAL see-through gaps, not just
         # NN dropouts). Same reason as the silent 07-01 flip. Do not re-enable.
+        # 2026-07-19 DOT LAW update: dots now enable it (see sam_active in cmd_batch);
+        # the screen-color exception inside _fill_body_holes keeps real see-through
+        # gaps open, which retires the 07-03 objection at the pixel level.
         if settings.get('fill_body_holes', False) and _sam_r is not None:
-            alpha = _fill_body_holes(alpha, _sam_r)
+            alpha = _fill_body_holes(alpha, _sam_r, src_rgb=src, screen_type=screen_type)
         # adaptive_green_kill CALL DISABLED (06-12 restore): function remains defined
         # in corridorkey_sam_merge; call disabled per 06-12 parity (did not exist then).
         # if settings.get('green_kill', False):
@@ -1758,11 +1761,20 @@ def _zone_cut_from_sam(sam_bin, settings, w, h, scale, auto_offset=None):
     return np.clip(1.0 - zone_f + zone_f * tight_f, 0.0, 1.0)
 
 
-def _fill_body_holes(alpha, sam_soft):
+def _fill_body_holes(alpha, sam_soft, src_rgb=None, screen_type="green"):
     """Fill enclosed interior holes in CK matte that fall inside the solid SAM body.
     Enclosed holes = pixels binary_fill_holes closes on (alpha>0.5) that were not
     already opaque AND lie inside solidify_sam_silhouette. Only those pixels go to 1.0.
     Soft outer edge is untouched — hair survives.
+
+    SCREEN-COLOR EXCEPTION (Berto 2026-07-19, the AE "junk cleaner" rule made
+    automatic): when src_rgb is given, hole pixels whose source color matches the
+    screen (same HSV window as the merge classifiers: green hue 35-85 / blue
+    100-130, S>=50, V>=50) are NOT filled — real screen showing through a gap
+    (arm/hair wedge) stays transparent, exactly what the AE track-matte rescue
+    produced by hand. Fabric/hair dropouts (beige vest, whip blur) are not
+    screen-colored, so they still fill solid. src_rgb=None keeps the old
+    fill-everything behavior byte-identical.
     """
     try:
         import numpy as _np_fh
@@ -1779,6 +1791,18 @@ def _fill_body_holes(alpha, sam_soft):
         a_bin = a > 0.5
         enclosed_holes = _snd.binary_fill_holes(a_bin) & ~a_bin
         fix_mask = enclosed_holes & (solid > 0)
+        if fix_mask.any() and src_rgb is not None:
+            src_u8 = (src_rgb if src_rgb.dtype == _np_fh.uint8
+                      else (_np_fh.clip(src_rgb, 0, 1) * 255).astype(_np_fh.uint8))
+            if src_u8.shape[:2] != (h, w):
+                src_u8 = _cv2_fh.resize(src_u8, (w, h), interpolation=_cv2_fh.INTER_LINEAR)
+            hsv = _cv2_fh.cvtColor(src_u8, _cv2_fh.COLOR_RGB2HSV)
+            if str(screen_type).lower() == "blue":
+                _lo, _hi = (100, 50, 50), (130, 255, 255)
+            else:
+                _lo, _hi = (35, 50, 50), (85, 255, 255)
+            on_screen = _cv2_fh.inRange(hsv, _lo, _hi) > 0
+            fix_mask = fix_mask & ~on_screen
         if fix_mask.any():
             a = a.copy()
             a[fix_mask] = 1.0
@@ -2278,6 +2302,16 @@ def cmd_batch(source_video, output_folder, settings,
     sam_fill     = int(settings.get("fill_holes", 0))
 
     sam_active = (len(sam_pos) + len(sam_neg)) > 0
+    # DOT LAW (Berto 2026-07-19): operator dots are truth. When dots drive the
+    # render, enclosed CK holes inside the dot-defined SAM body are filled
+    # (_fill_body_holes) — the beige-vest / hair-whip dropout class the NN keyer
+    # zeroes despite SAM saying "body". Real see-through gaps stay under operator
+    # control: a negative dot carves them out of the SAM body, so the fill leaves
+    # them open (the 2026-07-03 arm-gap verdict is preserved by dots, not by a
+    # global OFF). An explicit fill_body_holes key in params still wins, so A/B
+    # runs and dotless renders stay byte-identical to before.
+    if sam_active and ('fill_body_holes' not in settings):
+        settings['fill_body_holes'] = True
     sam_video_masks = {}  # {seq_num: float32 mask 0..1}
     _tg_held_frames = []  # SAM2 temporal guard (Fix 3): frames held this render; stays [] when OFF
 
@@ -2773,7 +2807,8 @@ def cmd_batch(source_video, output_folder, settings,
                     # apply_matte_postproc; the non-default branches must run the same
                     # sequence here to stay byte-identical to the pre-unification render.
                     if settings.get('fill_body_holes', False) and _sam_frame is not None:
-                        alpha = _fill_body_holes(alpha, _sam_frame)
+                        alpha = _fill_body_holes(alpha, _sam_frame, src_rgb=img_rgb,
+                                                 screen_type=settings["screenType"])
                     # adaptive_green_kill CALL DISABLED (06-12 restore)
                     # if settings.get('green_kill', False):
                     #     from corridorkey_sam_merge import adaptive_green_kill
@@ -2826,7 +2861,8 @@ def cmd_batch(source_video, output_folder, settings,
                             alpha = np.clip(alpha * _zone_mask, 0.0, 1.0)
                         log.info(f'fusion_v2 batch frame {frame_idx}: hybrid solve done')
                         if settings.get('fill_body_holes', False) and _sam_frame is not None:
-                            alpha = _fill_body_holes(alpha, _sam_frame)
+                            alpha = _fill_body_holes(alpha, _sam_frame, src_rgb=img_rgb,
+                                                     screen_type=settings["screenType"])
                         # adaptive_green_kill CALL DISABLED (06-12 restore)
                         # if settings.get('green_kill', False):
                         #     from corridorkey_sam_merge import adaptive_green_kill
