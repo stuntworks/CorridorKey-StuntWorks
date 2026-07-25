@@ -3872,6 +3872,7 @@ function doKey(auto) {
                     // worse gate (helmet hair, face bites) that lies about the render.
                     samPayload.sourceVideo = info.sourceFile;
                     samPayload.sourceFrame = info.sourceFrame;
+                    samPayload.sourceTimeSeconds = info.sourceTimeSeconds;
                     ckLog('KEY: running SAM (' + samPayload.sam_positive.length + ' incl / ' + samPayload.sam_negative.length + ' excl)');
                     try { fs.writeFileSync(path.join(sess, 'live_params.json'), JSON.stringify(samPayload)); } catch (_) {}
                     const samParams = writeParamsFile(samPayload);

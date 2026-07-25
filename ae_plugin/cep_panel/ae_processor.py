@@ -3904,6 +3904,19 @@ def cmd_sam_apply(session_dir, settings):
             from corridorkey_sam_merge import patch_sam2_loader_for_png as _patch_pr
             _patch_pr()
             _pr_cap = cv2.VideoCapture(str(_sv_path), cv2.CAP_FFMPEG)
+            # Resolve the pre-roll seek index from the SOURCE's own fps when the panel
+            # sent sourceTimeSeconds — mirrors cmd_batch's time-range resolution above.
+            # The raw sourceFrame the panel computed can be derived from the SEQUENCE
+            # fps (Premiere) rather than this clip's native fps, which drifts CK's
+            # keyed frame away from the frame SAM actually segments.
+            _sf_time = settings.get("sourceTimeSeconds")
+            if _sf_time is not None:
+                try:
+                    _src_fps = _pr_cap.get(cv2.CAP_PROP_FPS)
+                    if _src_fps and _src_fps > 0:
+                        _sf_idx = round(float(_sf_time) * _src_fps)
+                except (TypeError, ValueError):
+                    pass
             _pr_preroll = _sf_idx - 1
             if _pr_preroll > 0:
                 _pr_cap.set(cv2.CAP_PROP_POS_FRAMES, _pr_preroll - 1)
