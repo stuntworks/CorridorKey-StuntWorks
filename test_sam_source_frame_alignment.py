@@ -27,6 +27,8 @@ is monkeypatched to raise a probe-only sentinel the instant init_state() would b
 called, after the pre-roll branch has already seeked+decoded+written the real
 frames to disk via genuine cv2 video decode.
 """
+import logging
+import re
 import shutil
 import subprocess
 import sys
@@ -265,3 +267,265 @@ def test_sam_preroll_falls_back_to_panel_frame_when_source_time_seconds_absent(
     )
     resolved_frame = _decode_index(target_png)
     assert resolved_frame == WRONG_SEQUENCE_FPS_FRAME
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Part 2 (2026-07-25): the SAME bug, THIRD location — ae_processor.cmd_batch's
+# render-range SAM anchor, reported live by Berto:
+#
+#   samCommit: SAM -> batch (9 incl, anchor 142)
+#   DOT FORENSICS anchor=142 dots=[(142,1354,44,+1) ... 8 more, all frame 142]
+#   Batch: K:\CK_REGRESSION_CORPUS\SBV_0727.MOV  frames 710..914
+#   SAM2 video: anchor at range frame 1 (absolute 142)
+#
+# cmd_batch's render range (710..914) is computed correctly from the SOURCE's own
+# fps (this was already fixed). The anchor (142) is still the sequence-fps label,
+# so it falls outside that range and cmd_batch's own safety-net range guard
+# (correctly) rejects it and re-anchors SAM at range-start instead of the dotted
+# frame -- SAM then propagates outward from the WRONG frame, and the render loses
+# the subject a few frames past the seed (Berto: arm drops where the wire crosses
+# it, ~10 frames in). AE's comp fps is close enough to source fps that its label
+# usually lands inside the range and passes the guard by luck, not by design --
+# which is why AE looked clean and Premiere didn't.
+#
+# Fix under test: ae_processor._sam_dot_source_frame + its two cmd_batch call
+# sites (the single sam_anchor_frame and every sam_frames[] multi-stamp entry).
+# ═══════════════════════════════════════════════════════════════════════════
+
+# A second, independent stamped point (the ADD FRAME multi-stamp trap) -- source
+# frame 703, inside the same [700, 719) render range as the primary anchor (710)
+# but far enough from it to prove each dot resolves on ITS OWN time, not the
+# anchor's. Its sequence-fps label is derived the same way SOURCE_TIME_SEC's is
+# above, so if the fix ever regresses to raw-label trust, this stamp's label
+# (~141, computed below) would land outside [700, 719) and the entry would be
+# silently DROPPED -- the multi-stamp desync this test exists to catch.
+SECOND_CORRECT_SOURCE_FPS_FRAME = 703
+SECOND_SOURCE_TIME_SEC = SECOND_CORRECT_SOURCE_FPS_FRAME / SOURCE_FPS
+SECOND_WRONG_SEQUENCE_FPS_FRAME = round(SECOND_SOURCE_TIME_SEC * SEQUENCE_FPS)
+
+BATCH_START_FRAME = 700   # > 0 so SAM's 1-frame pre-roll (source frame 699) is exercised
+BATCH_END_FRAME = 719     # < N_FRAMES(720); holds both stamped source frames (703, 710)
+BATCH_ACTUAL_PREROLL = 1  # mirrors cmd_batch's `min(1, start_frame)` for start_frame=700
+
+
+class _BatchProbeStop(BaseException):
+    """Raised from a monkeypatched fake SAM2 video predictor's propagate_in_video()
+    the instant cmd_batch's SAM block would start real inference -- BaseException
+    (not Exception) so it escapes cmd_batch's own `except Exception as _e` guard
+    around the whole SAM block (ae_processor.py, wraps the SAM-active branch) instead
+    of being silently swallowed into a 0-mask CK-only fallback, which would hide the
+    very thing under test: whether the anchor/multi-stamp resolution and the range
+    guard did what this test expects. Carries the fake predictor instance so the test
+    can inspect every add_new_points_or_box() call cmd_batch made before propagation
+    -- the anchor call AND every multi-stamp call -- with zero SAM2 model weights
+    loaded and zero GPU inference run."""
+    def __init__(self, predictor):
+        super().__init__("batch probe stop (test-only, not a real failure)")
+        self.predictor = predictor
+
+
+class _FakeBatchVideoPredictor:
+    """Stands in for the real SAM2VideoPredictor inside cmd_batch. init_state() and
+    add_new_points_or_box() are real no-ops that just record what cmd_batch called
+    them with (video_path, and every add_new_points_or_box call in order) -- this is
+    what lets the multi-stamp test observe the SECOND (non-anchor) stamp's resolved
+    frame_idx, which cmd_batch only computes AFTER init_state() returns. propagate_in_
+    video() raises _BatchProbeStop the instant it's called (before any inference),
+    which is the earliest point after BOTH the anchor and every sam_frames[] entry
+    have been resolved and registered.
+    """
+    def __init__(self):
+        self.video_path = None
+        self.calls = []  # each: dict(frame_idx, obj_id, clear_old_points)
+
+    def init_state(self, video_path, **kwargs):
+        self.video_path = video_path
+        return {"fake_state": True}
+
+    def add_new_points_or_box(self, inference_state, frame_idx, obj_id, points, labels,
+                               clear_old_points):
+        # Read the exported PNG's bytes NOW, not after propagate_in_video() raises --
+        # cmd_batch's `finally: rmtree(sam_tmp_dir)` deletes video_path the instant the
+        # exception unwinds past it, before test code outside cmd_batch could ever see it.
+        png_bytes = (Path(self.video_path) / f"{frame_idx:06d}.png").read_bytes()
+        self.calls.append({
+            "frame_idx": frame_idx, "obj_id": obj_id, "clear_old_points": clear_old_points,
+            "png_bytes": png_bytes,
+        })
+
+    def propagate_in_video(self, inference_state, reverse=False):
+        raise _BatchProbeStop(self)
+
+    def reset_state(self, inference_state):  # pragma: no cover - never reached
+        pass
+
+
+def _fake_get_processor(device="cuda"):
+    """Stands in for ae_processor._get_processor. cmd_batch builds a REAL
+    CorridorKeyProcessor (~5-8s NN weight load) unconditionally before it even looks
+    at SAM settings, but never calls anything on it before our SAM2 probe fires below
+    -- so a bare placeholder reaches the probe with zero GPU/NN weights touched."""
+    return object()
+
+
+def _run_cmd_batch_sam_probe(monkeypatch, caplog, source_video, out_dir, settings_extra):
+    """Runs the REAL ae_processor.cmd_batch far enough to resolve + register every SAM
+    dot (anchor and every sam_frames[] multi-stamp entry) against the REAL range-guard
+    code, then stops it via _BatchProbeStop the instant it would start real SAM2
+    propagation. Returns the fake predictor (video_path + recorded calls) so the
+    caller can inspect exactly what cmd_batch resolved, plus caplog for the anchor's
+    own log line and the range-guard fallback warning.
+    """
+    monkeypatch.setattr(ae_processor, "_get_processor", _fake_get_processor)
+    fake_predictor = _FakeBatchVideoPredictor()
+    monkeypatch.setattr(ae_processor, "_get_video_predictor",
+                         lambda cfg, ckpt, device: fake_predictor)
+
+    settings = {"screenType": "green", "sam_negative": []}
+    settings.update(settings_extra)
+
+    caplog.set_level(logging.INFO, logger="corridorkey")
+    try:
+        ae_processor.cmd_batch(str(source_video), str(out_dir), settings,
+                                start_frame=BATCH_START_FRAME, end_frame=BATCH_END_FRAME)
+    except _BatchProbeStop:
+        return fake_predictor
+
+    pytest.fail("cmd_batch never reached SAM2 propagate_in_video() (returned without "
+                "raising) -- test setup is broken, this is not evidence about the fix.")
+
+
+def _batch_anchor_log_values(caplog):
+    """Pulls (range-relative, absolute) straight out of cmd_batch's own
+    'SAM2 video: anchor at range frame N (absolute M)' log line -- the exact line
+    Berto's real bug report quoted -- so this test reads cmd_batch's decision the
+    same way the live log does."""
+    for rec in caplog.records:
+        m = re.search(r"SAM2 video: anchor at range frame (-?\d+) \(absolute (\S+)\)", rec.message)
+        if m:
+            return int(m.group(1)), m.group(2)
+    pytest.fail("no 'SAM2 video: anchor at range frame' log line found -- "
+                "test setup is broken, this is not evidence about the fix.")
+
+
+# WHAT IT DOES: Reproduces Berto's exact live-log regression against the REAL
+#   cmd_batch render-range path (cmd_sam_apply's PREVIEW path above was already
+#   fixed in bd6bd27 -- this is the separate, still-broken RENDER path). Proves the
+#   SAM anchor resolves to the true source frame (710) from sam_anchor_time_seconds
+#   -- not the sequence-fps label (142) -- lands inside the render range, and the
+#   range-guard fallback re-anchor does NOT fire.
+# DEPENDS ON: ae_processor.cmd_batch's "Map absolute click frame -> range-relative
+#   anchor" block and ae_processor._sam_dot_source_frame.
+# AFFECTS: Every KEY CLIP / RENDER commit in Premiere and AE that carries SAM dots.
+def test_cmd_batch_sam_anchor_resolves_true_source_frame_not_sequence_fps_frame(
+    synthetic_source_video, tmp_path, monkeypatch, caplog,
+):
+    out_dir = tmp_path / "batch_out"
+    predictor = _run_cmd_batch_sam_probe(
+        monkeypatch, caplog, synthetic_source_video, out_dir,
+        {
+            "sam_positive": [[32, 32]],
+            "sam_anchor_frame": WRONG_SEQUENCE_FPS_FRAME,       # 142 -- what Premiere sent
+            "sam_anchor_time_seconds": SOURCE_TIME_SEC,          # new: fps-independent truth
+        },
+    )
+    anchor_rel, anchor_abs = _batch_anchor_log_values(caplog)
+
+    assert anchor_abs == str(CORRECT_SOURCE_FPS_FRAME), (
+        f"cmd_batch resolved SAM anchor to absolute frame {anchor_abs}, expected "
+        f"{CORRECT_SOURCE_FPS_FRAME} (t={SOURCE_TIME_SEC}s at the source's own "
+        f"{SOURCE_FPS}fps). Got the sequence-fps label ({WRONG_SEQUENCE_FPS_FRAME}) "
+        f"instead -- this is the bug."
+    )
+
+    # Requirement 3: the range-guard fallback (re-anchor at range start + warning)
+    # must NOT have fired -- the guard stays a safety net, not the normal path, now
+    # that it's being asked a question with the right units.
+    fallback_msgs = [r.message for r in caplog.records if "outside decoded range" in r.message]
+    assert not fallback_msgs, (
+        f"range-guard fallback fired even though the true source frame "
+        f"({CORRECT_SOURCE_FPS_FRAME}) is inside [{BATCH_START_FRAME}, {BATCH_END_FRAME}): "
+        f"{fallback_msgs}"
+    )
+
+    expected_rel = CORRECT_SOURCE_FPS_FRAME - BATCH_START_FRAME + BATCH_ACTUAL_PREROLL
+    assert anchor_rel == expected_rel, (
+        f"range-relative anchor {anchor_rel} != expected {expected_rel} -- the "
+        f"fallback squashed the anchor to the range start instead of resolving it."
+    )
+    assert predictor.calls, "cmd_batch never called add_new_points_or_box for the anchor"
+    assert predictor.calls[0]["frame_idx"] == expected_rel
+    assert predictor.calls[0]["clear_old_points"] is True
+
+    # Pixel proof: the frame actually exported to SAM at the resolved anchor position
+    # really is source frame 710 (not some off-by-N neighbour).
+    resolved_frame = _decode_index(predictor.calls[0]["png_bytes"])
+    assert resolved_frame == CORRECT_SOURCE_FPS_FRAME, (
+        f"SAM's exported anchor frame encodes source index {resolved_frame}, "
+        f"expected {CORRECT_SOURCE_FPS_FRAME}."
+    )
+
+
+# WHAT IT DOES: THE MULTI-FRAME DOT-STAMP TRAP. A second, independently-stamped
+#   frame (ADD FRAME) must resolve on ITS OWN sourceTimeSeconds, not the anchor's --
+#   proves the fix is a single centralized conversion applied to every dot label,
+#   not a patch of the anchor value alone. Without per-entry timeSeconds, this
+#   stamp's raw sequence-fps label (~141) falls outside [700, 719) and cmd_batch
+#   silently drops the whole stamped frame (desync bug the task brief warns about).
+# DEPENDS ON: The same cmd_batch block's "Multi-frame SAM prompting" loop.
+# AFFECTS: The ADD FRAME feature (fast-motion clips needing more than one SAM seed).
+def test_cmd_batch_sam_multi_stamp_each_resolves_its_own_source_frame(
+    synthetic_source_video, tmp_path, monkeypatch, caplog,
+):
+    out_dir = tmp_path / "batch_out_multi"
+    predictor = _run_cmd_batch_sam_probe(
+        monkeypatch, caplog, synthetic_source_video, out_dir,
+        {
+            "sam_positive": [[32, 32]],
+            "sam_anchor_frame": WRONG_SEQUENCE_FPS_FRAME,
+            "sam_anchor_time_seconds": SOURCE_TIME_SEC,
+            "sam_frames": [
+                {"frame": WRONG_SEQUENCE_FPS_FRAME, "timeSeconds": SOURCE_TIME_SEC,
+                 "positive": [[32, 32]], "negative": []},
+                {"frame": SECOND_WRONG_SEQUENCE_FPS_FRAME, "timeSeconds": SECOND_SOURCE_TIME_SEC,
+                 "positive": [[20, 20]], "negative": []},
+            ],
+        },
+    )
+
+    fallback_msgs = [r.message for r in caplog.records if "outside decoded range" in r.message]
+    assert not fallback_msgs, f"anchor range-guard fallback fired unexpectedly: {fallback_msgs}"
+    dropped_msgs = [r.message for r in caplog.records
+                    if "SAM2 multi-frame: skipping entry" in r.message]
+    assert not dropped_msgs, (
+        f"the second stamp was dropped/skipped instead of being registered: {dropped_msgs}"
+    )
+
+    expected_anchor_rel = CORRECT_SOURCE_FPS_FRAME - BATCH_START_FRAME + BATCH_ACTUAL_PREROLL
+    expected_second_rel = (SECOND_CORRECT_SOURCE_FPS_FRAME - BATCH_START_FRAME
+                            + BATCH_ACTUAL_PREROLL)
+    assert expected_second_rel != expected_anchor_rel  # sanity: test actually exercises 2 frames
+
+    call_summary = [(c["frame_idx"], c["clear_old_points"]) for c in predictor.calls]
+    call_frame_idxs = [c["frame_idx"] for c in predictor.calls]
+    assert expected_anchor_rel in call_frame_idxs, (
+        f"anchor (source frame {CORRECT_SOURCE_FPS_FRAME}, rel {expected_anchor_rel}) "
+        f"was never registered: calls(frame_idx, clear_old_points)={call_summary}"
+    )
+    assert expected_second_rel in call_frame_idxs, (
+        f"second stamp (source frame {SECOND_CORRECT_SOURCE_FPS_FRAME}, rel "
+        f"{expected_second_rel}) was never registered -- it resolved from the wrong "
+        f"label and either landed outside the range or collided with another frame: "
+        f"calls(frame_idx, clear_old_points)={call_summary}"
+    )
+    second_call = next(c for c in predictor.calls if c["frame_idx"] == expected_second_rel)
+    assert second_call["clear_old_points"] is False, (
+        "second stamp must NOT clear the anchor's points (clear_old_points=False)"
+    )
+
+    # Pixel proof for BOTH stamped frames: each resolved slot in SAM's exported frame
+    # folder really does hold ITS OWN dotted source frame, not the anchor's or a
+    # neighbour's -- the coordinate-vs-frame relationship (requirement 4) is intact.
+    anchor_call = next(c for c in predictor.calls if c["frame_idx"] == expected_anchor_rel)
+    assert _decode_index(anchor_call["png_bytes"]) == CORRECT_SOURCE_FPS_FRAME
+    assert _decode_index(second_call["png_bytes"]) == SECOND_CORRECT_SOURCE_FPS_FRAME

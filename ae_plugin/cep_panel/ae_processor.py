@@ -2107,6 +2107,51 @@ def _apply_sam_temporal_guard(sam_video_masks, sorted_keys, settings):
     return flagged
 
 
+# ── SAM dot frame-label resolution (2026-07-25) ───────────────
+def _sam_dot_source_frame(raw_frame, time_seconds, source_fps):
+    """Resolve ONE SAM dot's TRUE source-media frame index.
+
+    Every SAM dot — the single anchor AND every ADD-FRAME multi-stamp — is
+    labelled client-side by the panel with round(sourceTimeSeconds *
+    HOST-TIMELINE-fps): Premiere's SEQUENCE fps (ppro_getFrameInfo,
+    host.jsx ~863) or AE's COMP fps (ae_getFrameInfo, host.jsx ~188) — NOT
+    the source clip's own fps. host.jsx documents this at the source:
+    "DANGER ZONE FRAGILE: do NOT use sourceFrame for keying math ... SAM
+    tolerates a frame of anchor slop because it propagates both
+    directions" — an assumption that only holds when sequence fps and
+    source fps are close. It breaks badly when they aren't: a 24fps
+    Premiere sequence holding a 119.88fps source clip sends anchor 142 for
+    a click that is really at source frame 710 (t=5.9226s), a ~570-frame
+    miss. cmd_batch's own range guard then (correctly) rejects 142 as
+    outside the [start_frame, end_frame) range it computed from the
+    SOURCE's own fps, and silently re-anchors SAM at the start of the
+    render instead of the dotted frame — SAM propagates outward from the
+    wrong frame and the render loses the subject a few frames in.
+
+    Same fault family as the already-fixed cmd_extract (time-based seek)
+    and cmd_sam_apply pre-roll (bd6bd27) paths: resolve from SOURCE TIME
+    using the SOURCE's own fps, exactly like those call sites, instead of
+    trusting the sequence/comp-fps frame label. `time_seconds` — the new
+    per-dot value the panel now sends alongside the legacy label
+    (sam_anchor_time_seconds on the anchor, timeSeconds per sam_frames
+    entry) — wins whenever present. Falls back to the raw `raw_frame`
+    label unchanged for any caller that hasn't been migrated to send a
+    time value, preserving exact legacy behaviour (e.g. cmd_sam_apply's
+    own fallback test) with zero regression risk.
+    """
+    if time_seconds is not None and source_fps:
+        try:
+            return int(round(float(time_seconds) * float(source_fps)))
+        except (TypeError, ValueError):
+            pass
+    if raw_frame is None:
+        return None
+    try:
+        return int(raw_frame)
+    except (TypeError, ValueError):
+        return None
+
+
 # ── Subcommand: batch ─────────────────────────────────────────
 def cmd_batch(source_video, output_folder, settings,
               start_frame=None, end_frame=None, fps=None,
@@ -2292,8 +2337,12 @@ def cmd_batch(source_video, output_folder, settings,
     # so render matches the side-by-side preview the user just signed off on.
     sam_pos = settings.get("sam_positive", []) or []
     sam_neg = settings.get("sam_negative", []) or []
-    sam_anchor_abs = settings.get("sam_anchor_frame")
-    sam_frames_raw = settings.get("sam_frames", None)  # list of {frame, positive, negative} for multi-frame prompting
+    # Resolve from the panel's sourceTimeSeconds + this clip's own fps (source_fps,
+    # computed above from CAP_PROP_FPS / braw probe), NOT the raw sequence/comp-fps
+    # frame label the panel also sends — see _sam_dot_source_frame docstring.
+    sam_anchor_abs = _sam_dot_source_frame(
+        settings.get("sam_anchor_frame"), settings.get("sam_anchor_time_seconds"), source_fps)
+    sam_frames_raw = settings.get("sam_frames", None)  # list of {frame, positive, negative[, timeSeconds]} for multi-frame prompting
     # Match DaVinci exactly: margin from sam2_margin (default 0 = no dilation).
     # NOT sam_sidecar_margin (=10) — that 10px dilation grabs dark background
     # off-green and prints a ~10px border around the subject. DaVinci uses 0.
@@ -2477,7 +2526,14 @@ def cmd_batch(source_video, output_folder, settings,
                         _extra_registered = 0
                         for _sf_entry in sam_frames_raw:
                             try:
-                                _sf_abs = int(_sf_entry["frame"])
+                                # Same time-based resolution as the anchor above — every
+                                # multi-stamp frame label comes from the identical wrong
+                                # sequence/comp-fps arithmetic, so it needs the identical fix.
+                                _sf_abs = _sam_dot_source_frame(
+                                    _sf_entry.get("frame"), _sf_entry.get("timeSeconds"), source_fps)
+                                if _sf_abs is None:
+                                    log.warning(f"SAM2 multi-frame: skipping entry with no frame/timeSeconds: {_sf_entry}")
+                                    continue
                                 if not (start_frame <= _sf_abs < end_frame):
                                     continue  # outside this render range
                                 _sf_rel = _sf_abs - int(start_frame) + _actual_preroll

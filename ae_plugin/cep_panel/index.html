@@ -2313,7 +2313,16 @@
       const px = [Math.round(p.x * CK_SRC_W), Math.round(p.y * CK_SRC_H)];
       if (p.label === 1) pos.push(px); else neg.push(px);
     });
-    samFrames[frameIdx] = { positive: pos, negative: neg };
+    // timeSeconds travels with the stamp so Python can re-derive this frame's TRUE
+    // source-media index from the source's own fps (2026-07-25 fix) instead of
+    // trusting frameIdx, which is sequence/comp-fps space and drifts when that
+    // differs from the source clip's fps. CK_ANCHOR_TIME_SECONDS is current here
+    // because stampDotsToFrame is only ever called with frameIdx === CK_ANCHOR_FRAME
+    // (the ADD FRAME button below), set together at the last PREVIEW/KEY.
+    samFrames[frameIdx] = {
+        positive: pos, negative: neg,
+        timeSeconds: (typeof CK_ANCHOR_TIME_SECONDS === 'number') ? CK_ANCHOR_TIME_SECONDS : null,
+    };
     samFrameCount = Object.keys(samFrames).length;
     clearPoints();  // wipes DOM dots + samPoints + resets mode
     ckStatus('Frame ' + frameIdx + ' stamped (' + samFrameCount + ' frame' + (samFrameCount === 1 ? '' : 's') + ' total). Dot the next frame, then ADD FRAME again.');
@@ -3113,6 +3122,13 @@ let HOST_APP = 'unknown';
 let CK_SESSION_DIR = null;
 let CK_SRC_W = 0, CK_SRC_H = 0;
 let CK_ANCHOR_FRAME = null;   // source frame the SAM dots were placed on (anchors batch propagation)
+// CK_ANCHOR_FRAME is round(sourceTimeSeconds * HOST-TIMELINE fps) -- Premiere's
+// SEQUENCE fps or AE's COMP fps, NOT the source clip's own fps (see host.jsx
+// ppro_getFrameInfo/ae_getFrameInfo). It drifts from the true source frame when
+// those fps values differ (2026-07-25 regression). CK_ANCHOR_TIME_SECONDS is the
+// fps-independent time value set alongside it, so Python can re-derive the true
+// source frame from the SOURCE's own fps instead of trusting this label.
+let CK_ANCHOR_TIME_SECONDS = null;
 let CK_BATCH_IN_PROGRESS = false;   // true while a KEY CLIP render runs — blocks live re-preview + double-commit
 let CK_LAST_SOURCE = null;   // tracks source file path; zone clears when a different clip is keyed
 
@@ -3427,6 +3443,13 @@ function ckSamPayload(anchorFrame) {
     let anchorPos = pts.filter(p => p.label === 1).map(scale);
     let anchorNeg = pts.filter(p => p.label === 0).map(scale);
     let resolvedAnchor = anchor;
+    // fps-independent partner to resolvedAnchor -- lets Python re-derive the TRUE
+    // source frame from the source's own fps instead of trusting resolvedAnchor,
+    // which is sequence/comp-fps space (2026-07-25 fix). Only valid when resolvedAnchor
+    // is still the live CK_ANCHOR_FRAME (the anchor param, when passed, always is —
+    // every call site passes it right after setting both together); the stamped-frame
+    // branch below overwrites it from that stamp's own recorded timeSeconds.
+    let resolvedAnchorTime = (typeof CK_ANCHOR_TIME_SECONDS === 'number') ? CK_ANCHOR_TIME_SECONDS : null;
     if (!anchorPos.length && !anchorNeg.length && hasStamped) {
         // No unstamped working dots — seed the legacy fields from the earliest stamped frame.
         const keys = Object.keys(samFrames).map(Number).sort((a, b) => a - b);
@@ -3434,14 +3457,16 @@ function ckSamPayload(anchorFrame) {
         anchorPos = (samFrames[firstKey].positive || []);
         anchorNeg = (samFrames[firstKey].negative || []);
         resolvedAnchor = firstKey;
+        resolvedAnchorTime = (typeof samFrames[firstKey].timeSeconds === 'number') ? samFrames[firstKey].timeSeconds : null;
     }
     const payload = {
         sam_positive: anchorPos,
         sam_negative: anchorNeg,
         sam_anchor_frame: resolvedAnchor,
     };
+    if (typeof resolvedAnchorTime === 'number') payload.sam_anchor_time_seconds = resolvedAnchorTime;
     if (!hasStamped) {
-        // No stamped frames — exact legacy payload, no sam_frames key added.
+        // No stamped frames — exact legacy payload (+ sam_anchor_time_seconds above), no sam_frames key added.
         return payload;
     }
     // Build sam_frames list: stamped frames + working dots as one more entry (if any).
@@ -3450,7 +3475,9 @@ function ckSamPayload(anchorFrame) {
         const fi = parseInt(k, 10);
         const sf = samFrames[fi];
         if ((sf.positive && sf.positive.length) || (sf.negative && sf.negative.length)) {
-            framesList.push({ frame: fi, positive: sf.positive || [], negative: sf.negative || [] });
+            const entry = { frame: fi, positive: sf.positive || [], negative: sf.negative || [] };
+            if (typeof sf.timeSeconds === 'number') entry.timeSeconds = sf.timeSeconds;
+            framesList.push(entry);
         }
     });
     // Add the current unstamped working dots as one more entry for the live anchor frame
@@ -3459,7 +3486,12 @@ function ckSamPayload(anchorFrame) {
         const livePos = pts.filter(p => p.label === 1).map(scale);
         const liveNeg = pts.filter(p => p.label === 0).map(scale);
         if (livePos.length || liveNeg.length) {
-            framesList.push({ frame: anchor, positive: livePos, negative: liveNeg });
+            const liveEntry = { frame: anchor, positive: livePos, negative: liveNeg };
+            // Same correspondence as resolvedAnchorTime above: anchor is either the live
+            // CK_ANCHOR_FRAME or a caller-passed value equal to it, set together with
+            // CK_ANCHOR_TIME_SECONDS at the last PREVIEW/KEY.
+            if (typeof CK_ANCHOR_TIME_SECONDS === 'number') liveEntry.timeSeconds = CK_ANCHOR_TIME_SECONDS;
+            framesList.push(liveEntry);
         }
     }
     if (framesList.length > 0) {
@@ -3817,6 +3849,7 @@ function doKey(auto) {
                 try { const meta = JSON.parse(fs.readFileSync(path.join(sess, 'meta.json'), 'utf8')); CK_SRC_W = meta.width; CK_SRC_H = meta.height; } catch (_) {}
                 if (window.CK_ZONE && typeof window.ckZoneRenderOverlay === 'function') window.ckZoneRenderOverlay();
                 CK_ANCHOR_FRAME = info.sourceFrame;
+                CK_ANCHOR_TIME_SECONDS = (typeof info.sourceTimeSeconds === 'number') ? info.sourceTimeSeconds : null;
 
                 // SAM (separate process) only when SAM is on and points exist.
                 const samPayload = (typeof ckSamPayload === 'function') ? ckSamPayload(info.sourceFrame) : null;
@@ -4096,6 +4129,7 @@ function autoKeyAsync() {
                 try { const meta = JSON.parse(fs.readFileSync(path.join(sess, 'meta.json'), 'utf8')); CK_SRC_W = meta.width; CK_SRC_H = meta.height; } catch (_) {}
                 if (window.CK_ZONE && typeof window.ckZoneRenderOverlay === 'function') window.ckZoneRenderOverlay();
                 CK_ANCHOR_FRAME = info.sourceFrame;
+                CK_ANCHOR_TIME_SECONDS = (typeof info.sourceTimeSeconds === 'number') ? info.sourceTimeSeconds : null;
                 const prev = path.join(sess, 'preview.png');
                 const ppParams = writeParamsFile(settings);
                 ckStatus('Compositing...');
