@@ -1,6 +1,6 @@
 /**
  * CorridorKey — Host Script (ExtendScript)
- * Last modified: 2026-07-26 | Change: bake the target frame rate into the preset copy before newSequence.
+ * Last modified: 2026-07-26 | Change: conform auxiliary frame rates before overwriteClip, not after.
  *
  * WHAT IT DOES: Reads timeline state from After Effects / Premiere Pro and returns it
  *   to the CEP panel as a JSON string. Imports the PNG(s) Python produced back onto the
@@ -1436,6 +1436,44 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
             // TOP). Berto 2026-07-19: the matte must sit ABOVE the clip it cuts —
             // Premiere's Track Matte Key only offers HIGHER tracks in its Matte
             // dropdown, so GARBAGE MASK rides top where CK MASTER (V2) can reach it.
+            //
+            // DANGER ZONE HIGH: this conform MUST stay ABOVE the overwriteClip calls below.
+            // overwriteClip bakes a placed clip's duration from the projectItem's footage
+            // interpretation AT CALL TIME; conform afterward and the auxiliary duration is
+            // PERMANENTLY WRONG (a 205-frame 119.88fps clip landed V1 at 1.627s and both aux
+            // at 8.166s).
+            // breaks: CK MASTER / GARBAGE MASK duration on any non-24fps clip.
+            // depends on: samImported, ckOnlyImported, targetRate and ckBin all being
+            //   resolved earlier in ppro_importSequence, before this point.
+            // Conform aux frame rates + bin placement BEFORE overwriteClip (2026-07-25
+            // fix): overwriteClip bakes the placed trackItem's duration from the
+            // projectItem's CURRENT footage interpretation at call time; setting the
+            // rate afterward does not retroactively rescale a clip already sitting on
+            // the timeline. V1's rate is set at line ~1195, before this whole nest
+            // block runs, so it always places at the source rate. This aux block used
+            // to run AFTER the overwriteClip calls below, so V2/V3 got placed at
+            // Premiere's still-default rate (the sequence fps) and only had their
+            // *projectItem* interpretation corrected too late to affect the already-
+            // placed clip — exactly the reported 205-frame/119.88fps clip landing as
+            // 8.492s (205/24) instead of 1.693s (205/119.88) on both aux tracks. See
+            // ALIGNMENT.md #5 ("...applies that exact rate...before placement"); the
+            // flat-fallback path (~1741-1818) and the factory-nest aux-on-main path
+            // (~1589-1691) already conform before their own placement calls — this
+            // branch had fallen out of step with that pattern.
+            if (samImported) {
+                try {
+                    if (typeof samImported.setOverrideFrameRate === "function") { samImported.setOverrideFrameRate(targetRate); }
+                    else { var fiSamP = samImported.getFootageInterpretation(); if (fiSamP) { fiSamP.frameRate = targetRate; samImported.setFootageInterpretation(fiSamP); } }
+                } catch (_) {}
+                try { if (ckBin) samImported.moveBin(ckBin); } catch (_) {}
+            }
+            if (ckOnlyImported) {
+                try {
+                    if (typeof ckOnlyImported.setOverrideFrameRate === "function") { ckOnlyImported.setOverrideFrameRate(targetRate); }
+                    else { var fiCkoP = ckOnlyImported.getFootageInterpretation(); if (fiCkoP) { fiCkoP.frameRate = targetRate; ckOnlyImported.setFootageInterpretation(fiCkoP); } }
+                } catch (_) {}
+                try { if (ckBin) ckOnlyImported.moveBin(ckBin); } catch (_) {}
+            }
             try {
                 nestSeq.videoTracks[0].overwriteClip(imported, 0);
                 if (ckOnlyImported) { nestSeq.videoTracks[1].overwriteClip(ckOnlyImported, 0); ckOnlyPlaced = true; }
@@ -1457,21 +1495,6 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
                 }
                 _nestGeom = "preset-stacked";
             } catch (ePrePlace) { nestErr = nestErr || String(ePrePlace); }
-            // Conform aux frame rates + bin placement (same as the other path).
-            if (samImported) {
-                try {
-                    if (typeof samImported.setOverrideFrameRate === "function") { samImported.setOverrideFrameRate(targetRate); }
-                    else { var fiSamP = samImported.getFootageInterpretation(); if (fiSamP) { fiSamP.frameRate = targetRate; samImported.setFootageInterpretation(fiSamP); } }
-                } catch (_) {}
-                try { if (ckBin) samImported.moveBin(ckBin); } catch (_) {}
-            }
-            if (ckOnlyImported) {
-                try {
-                    if (typeof ckOnlyImported.setOverrideFrameRate === "function") { ckOnlyImported.setOverrideFrameRate(targetRate); }
-                    else { var fiCkoP = ckOnlyImported.getFootageInterpretation(); if (fiCkoP) { fiCkoP.frameRate = targetRate; ckOnlyImported.setFootageInterpretation(fiCkoP); } }
-                } catch (_) {}
-                try { if (ckBin) ckOnlyImported.moveBin(ckBin); } catch (_) {}
-            }
 
             // Place the preset-born sequence itself on the user's timeline.
             // The old code performed this step only in the non-preset branch,
