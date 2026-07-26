@@ -1,6 +1,6 @@
 /**
  * CorridorKey — Host Script (ExtendScript)
- * Last modified: 2026-07-19 | Change: use the bundled preset path supplied by the CEP panel.
+ * Last modified: 2026-07-26 | Change: bake the target frame rate into the preset copy before newSequence.
  *
  * WHAT IT DOES: Reads timeline state from After Effects / Premiere Pro and returns it
  *   to the CEP panel as a JSON string. Imports the PNG(s) Python produced back onto the
@@ -1297,6 +1297,44 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
                 if (File(_presetCandidates[ppI]).exists) { _presetPath = _presetCandidates[ppI]; break; }
             }
             _presetTried = _presetPath || ("missing: " + _presetCandidates[0]);
+            // DANGER ZONE HIGH: Premiere bakes a sequence's frame rate at creation and
+            // ignores setSettings afterward, so a wrong preset rate makes non-24fps nested
+            // output UNREACHABLE - the geometry gate below correctly refuses the nest and
+            // the aux layers silently degrade to the main timeline.
+            // breaks: nested output for every clip that is not 24fps.
+            // depends on: the 254016000000 ticks/sec timebase, and the shipped preset
+            //   staying read-only (the patched copy must go to Folder.temp, never the install).
+            // FPS BAKE (2026-07-23): Premiere ignores sequence frame-rate
+            // setSettings after creation, so the 24fps-authored preset could
+            // never serve a non-24fps clip — the geometry verification below
+            // correctly refused the nest (first hit: 119.88fps Nikon Z8 corpus
+            // clip). Bake targetRate into a temp COPY of the preset BEFORE
+            // newSequence; the shipped preset file is never written. 24fps
+            // clips produce the same ticks (10584000000), byte-identical
+            // behavior. Any failure falls back to the original preset path.
+            if (_presetPath) {
+                try {
+                    var _rateTicks = Math.round(254016000000 / targetRate);
+                    if (_rateTicks > 0) {
+                        var _seedF = new File(_presetPath);
+                        var _seedXml = null;
+                        if (_seedF.open("r")) { _seedXml = _seedF.read(); _seedF.close(); }
+                        if (_seedXml && _seedXml.match(/<VideoFrameRate>\d+<\/VideoFrameRate>/)) {
+                            _seedXml = _seedXml.replace(/<VideoFrameRate>\d+<\/VideoFrameRate>/,
+                                "<VideoFrameRate>" + _rateTicks + "</VideoFrameRate>");
+                            var _patchF = new File(Folder.temp.fsName + "/CK_3TRACK_" + _rateTicks + ".sqpreset");
+                            if (_patchF.open("w")) {
+                                var _patchOk = _patchF.write(_seedXml);
+                                _patchF.close();
+                                if (_patchOk) {
+                                    _presetPath = _patchF.fsName;
+                                    _presetTried += " [fps-patched:" + _rateTicks + "]";
+                                }
+                            }
+                        }
+                    }
+                } catch (eBake) { /* original preset path remains — today's behavior */ }
+            }
             if (_presetPath && typeof app.project.newSequence === "function") {
                 var _seqIdsBefore = {};
                 for (var sbI = 0; sbI < app.project.sequences.numSequences; sbI++) {
