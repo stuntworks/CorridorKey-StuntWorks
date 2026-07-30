@@ -1,6 +1,6 @@
 /**
  * CorridorKey — Host Script (ExtendScript)
- * Last modified: 2026-07-26 | Change: conform auxiliary frame rates before overwriteClip, not after.
+ * Last modified: 2026-07-27 | Change: Premiere parity — import the raw SAM_JUNK pass to the project bin.
  *
  * WHAT IT DOES: Reads timeline state from After Effects / Premiere Pro and returns it
  *   to the CEP panel as a JSON string. Imports the PNG(s) Python produced back onto the
@@ -1076,7 +1076,7 @@ function ppro_importFrame(outputPath, playheadSeconds, fps) {
 //   from the first rendered PNG. presetPath comes from the CEP panel directory;
 //   the active sequence is the guarded geometry fallback.
 // AFFECTS: Project panel (bin + imported item), timeline, and nested-sequence geometry.
-function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate, samFirstFramePath, ckOnlyFirstFramePath, durationSeconds, sourceWidth, sourceHeight, presetPath, srcVideoPath) {
+function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate, samFirstFramePath, ckOnlyFirstFramePath, durationSeconds, sourceWidth, sourceHeight, presetPath, srcVideoPath, tightSamFirstFramePath) {
     try {
         var seq = app.project.activeSequence;
         if (!seq) return JSON.stringify({ ok: false, error: "No active sequence" });
@@ -1183,6 +1183,49 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
             }
         }
 
+        // RAW SAM (SAM_JUNK) sidecar — AE/Premiere PARITY FIX, Berto 2026-07-27.
+        // AE already receives this pass (ae_createSAMPrecomp's tightSamPath arg);
+        // Premiere's import dropped it and delivered only the processed
+        // GARBAGE_MATTE, so the operator had no un-dilated SAM to pull as a luma
+        // matte. Same snapshot-diff import pattern as the two sidecars above.
+        //
+        // BIN ONLY — deliberately NOT placed on a track. The nest runs off the
+        // shipped 3-track CK_3TRACK.sqpreset and host.jsx fails the nest below if
+        // the preset yields fewer than 3 tracks; a fourth layer would need a new
+        // binary preset authored by hand. Importing to the bin closes the parity
+        // gap with zero risk to the existing three-track placement — the operator
+        // drags it onto whatever track they want.
+        var tightSamImported = null;
+        var tightSamError = "";
+        if (tightSamFirstFramePath) {
+            try {
+                var tsFile = new File(String(tightSamFirstFramePath));
+                if (!tsFile.exists) { tightSamError = "raw SAM first frame not found: " + String(tightSamFirstFramePath); }
+                if (tsFile.exists) {
+                    var beforeIdsTs = {};
+                    for (var iTs = 0; iTs < root.children.numItems; iTs++) {
+                        var chTs = root.children[iTs];
+                        beforeIdsTs[chTs.nodeId || String(iTs) + "-" + chTs.name] = true;
+                    }
+                    var okTs = app.project.importFiles([String(tightSamFirstFramePath)], true, root, true);
+                    if (okTs) {
+                        for (var jTs = 0; jTs < root.children.numItems; jTs++) {
+                            var cTs = root.children[jTs];
+                            var idTs = cTs.nodeId || String(jTs) + "-" + cTs.name;
+                            if (!beforeIdsTs[idTs]) { tightSamImported = cTs; break; }
+                        }
+                        if (!tightSamImported) { tightSamError = "importFiles reported success but no new project item appeared"; }
+                    } else {
+                        tightSamError = "importFiles returned false for " + String(tightSamFirstFramePath);
+                    }
+                }
+            } catch (eTsImport) {
+                // Non-fatal for CK/garbage/CK_ONLY, but NOT silent — the operator is
+                // told, because a missing raw SAM is invisible in a bin-only import.
+                tightSamError = "exception: " + (eTsImport && eTsImport.message ? eTsImport.message : String(eTsImport));
+            }
+        }
+
         // Force the imported PNG sequence's footage frame rate to match V1's. Without
         // this, Premiere applies its default (usually the project fps) and V2 drifts
         // relative to V1 whenever the source's native fps differs. Try both APIs —
@@ -1232,6 +1275,32 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
         }
         if (!ckBin) { try { ckBin = root.createBin("CorridorKey"); } catch (_) {} }
         if (ckBin) { try { imported.moveBin(ckBin); } catch (_) {} }
+
+        // RAW SAM: conform + bin, in the COMMON path (parity fix 2026-07-27).
+        // DANGER ZONE FRAGILE: must stay OUTSIDE the nested-sequence branch below /
+        // breaks: raw SAM lands at the sequence fps instead of the source fps, so it
+        // drifts against the keyed clip / depends on: targetRate and ckBin resolved
+        // above. The aux conform for GARBAGE MASK and CK MASTER lives inside the nest
+        // branch because those two get placed on tracks there; raw SAM is bin-only and
+        // never placed, so a conform inside that branch would be skipped entirely
+        // whenever the nest falls back to flat placement. Same rate math as that aux
+        // block and as ALIGNMENT.md #5 — set the interpretation, never rely on the
+        // sequence default.
+        if (tightSamImported) {
+            try {
+                if (typeof tightSamImported.setOverrideFrameRate === "function") {
+                    tightSamImported.setOverrideFrameRate(targetRate);
+                } else {
+                    var fiTs = tightSamImported.getFootageInterpretation();
+                    if (fiTs) { fiTs.frameRate = targetRate; tightSamImported.setFootageInterpretation(fiTs); }
+                }
+            } catch (eTsRate) {
+                tightSamError = "frame-rate conform failed: " + (eTsRate && eTsRate.message ? eTsRate.message : String(eTsRate));
+            }
+            try { if (ckBin) tightSamImported.moveBin(ckBin); } catch (eTsBin) {
+                tightSamError = "moveBin failed: " + (eTsBin && eTsBin.message ? eTsBin.message : String(eTsBin));
+            }
+        }
 
         // Nested-sequence placement — AE-precomp parity. Build one nested sequence
         // containing CK + SAM + CK MASTER stacked (aux disabled), then place that
@@ -1888,6 +1957,9 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
         // the main-clip rename above).
         try { if (samImported) samImported.name = "GARBAGE MASK"; } catch (_) {}
         try { if (ckOnlyImported) ckOnlyImported.name = "CK MASTER"; } catch (_) {}
+        // Same name AE gives this pass (see ae_createSAMPrecomp, "SAM JUNK MASK") so
+        // the two hosts read identically in the project panel.
+        try { if (tightSamImported) tightSamImported.name = "SAM JUNK MASK"; } catch (_) {}
 
         // Placed-clip read-back: what is ACTUALLY sitting on the nest's V2/V3 —
         // duration + media path of the placed trackItems, not just the imported
@@ -1941,6 +2013,16 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
             diag.ckoName = ckOnlyImported.name;
             diag.ckoPath = (function () { try { return ckOnlyImported.getMediaPath(); } catch (_) { return ""; } })();
         }
+        // Raw SAM lands in the bin only, so the read-back line is the one way to
+        // confirm it arrived without hunting the project panel (parity fix 2026-07-27).
+        if (tightSamImported) {
+            diag.tightSamName = tightSamImported.name;
+            diag.tightSamPath = (function () { try { return tightSamImported.getMediaPath(); } catch (_) { return ""; } })();
+        }
+        // Never silent: if raw SAM was asked for and did not arrive, say why. A
+        // bin-only import leaves no timeline evidence, so this is the only signal.
+        if (tightSamError) { diag.tightSamError = tightSamError; }
+        else if (tightSamFirstFramePath && !tightSamImported) { diag.tightSamError = "raw SAM requested but not imported (reason unknown)"; }
 
         return JSON.stringify({
             ok: true, placed: true, binName: imported.name, appliedRate: appliedRate,

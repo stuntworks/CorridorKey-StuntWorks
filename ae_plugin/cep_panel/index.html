@@ -4408,20 +4408,62 @@ function doCommit() {
             const samJunkFirst = path.join(_samJunkDir, 'SAM_JUNK_00000.png');
             const samJunkSidecar = fs.existsSync(samJunkFirst) ? samJunkFirst
                 : (() => { try { const _ff = fs.readdirSync(_samJunkDir).filter(n => n.startsWith('SAM_JUNK_') && n.endsWith('.png')).sort(); return _ff.length ? path.join(_samJunkDir, _ff[0]) : null; } catch(_) { return null; } })();
+            // PREMIERE CONTRACT PARITY (Berto 2026-07-27). This call site used to hand
+            // Premiere `null, null, 0` and no sidecars at all, so the host received no
+            // garbage matte, no CK MASTER and no raw SAM — while the AE branch two lines
+            // down received all of them. It also passed 10 args to an 11-arg function, so
+            // srcVideoPath arrived undefined. Mirrored from doSAMCommit's proven contract.
+            //
+            // SAM slot takes the PROCESSED GARBAGE_MATTE, falling back to raw SAM_JUNK
+            // when the clean engine did not write one — identical resolution to
+            // doSAMCommit. CK MASTER slot takes CK_ONLY. CK_ALPHA is deliberately NOT
+            // used here: it is the CK matte, a different output, and feeding it to the
+            // CK MASTER slot would put the wrong pass on that track.
+            const _firstPngIn = (dir, prefix) => { try { const _ff = fs.readdirSync(dir).filter(n => n.startsWith(prefix) && n.endsWith('.png')).sort(); return _ff.length ? path.join(dir, _ff[0]) : null; } catch(_) { return null; } };
+            const _gmDirC = path.join(outDir, 'GARBAGE_MATTE');
+            const _gmAnchorC = path.join(_gmDirC, 'GARBAGE_MATTE_00000.png');
+            const samMattePathC =
+                (fs.existsSync(_gmAnchorC) ? _gmAnchorC : _firstPngIn(_gmDirC, 'GARBAGE_MATTE_'))
+                || samJunkSidecar;
+            const _ckOnlyDirC = path.join(outDir, 'CK_ONLY');
+            const _ckOnlyAnchorC = path.join(_ckOnlyDirC, 'CK_ONLY_00000.png');
+            const ckOnlyPathC = (fs.existsSync(_ckOnlyAnchorC) ? _ckOnlyAnchorC : _firstPngIn(_ckOnlyDirC, 'CK_ONLY_')) || null;
+            const _durationC = (Number(info.endSeconds) - Number(info.startSeconds)) || 0;
             const importFn = HOST_APP === 'ppro' ? 'ppro_importSequence' : 'ae_importSequence';
             const renderDimensions = ckReadPngDimensions(firstFrame);
             const renderPresetPath = path.join(PANEL_DIR, 'presets', 'CK_3TRACK.sqpreset');
             const importArgs = HOST_APP === 'ppro'
                 ? [firstFrame, info.inPointSeconds, info.fps, info.sourceFrameRate || info.fps,
-                   null, null, 0, renderDimensions.width, renderDimensions.height, renderPresetPath]
+                   samMattePathC, ckOnlyPathC, _durationC,
+                   renderDimensions.width, renderDimensions.height, renderPresetPath, info.sourceFile,
+                   samJunkSidecar]
                 : [firstFrame, info.fps, info.compStartTime, true, ckLockJson, ckMatteSidecar, info.sourceFile, samJunkSidecar];   // merged clip + CK matte + SAM junk mask
             ckStatus('Placing on timeline...');
             jsxCall(importFn, importArgs, (imp) => {
                 if (!imp || !imp.ok) return finish('Import failed: ' + (imp && imp.error ? imp.error : 'unknown'), true);
                 if (imp.via) ckLog('commit: import target resolved via ' + imp.via);   // LAYER LOCK diagnostic
                 const extras = [];
-                if (imp.ckMatteImported) extras.push('CK matte');
-                if (imp.samJunkImported) extras.push('SAM junk mask');
+                if (HOST_APP === 'ppro') {
+                    // Premiere returns a DIFFERENT result shape than AE. ppro_importSequence
+                    // reports through `diag` (samName / ckoName / tightSamName) plus samPlaced,
+                    // and never sets ckMatteImported or samJunkImported. Reading the AE field
+                    // names here meant a Premiere import could drop every sidecar and still
+                    // report a clean "Done" (Berto 2026-07-27).
+                    const _d = imp.diag || {};
+                    if (_d.samName) extras.push('GARBAGE MASK');
+                    if (_d.ckoName) extras.push('CK MASTER');
+                    if (_d.tightSamName) extras.push('SAM JUNK MASK');
+                    if (_d.tightSamError) {
+                        ckLog('commit WARNING: raw SAM (SAM JUNK MASK) NOT imported — ' + _d.tightSamError, true);
+                    } else if (samJunkSidecar && !_d.tightSamName) {
+                        ckLog('commit WARNING: raw SAM requested but host returned no result for it', true);
+                    }
+                    if (imp.nestFallback) ckLog('commit: NESTED placement failed, used flat fallback — ' + imp.nestFallback, true);
+                    try { if (imp.diag) ckLog('ppro import diag: ' + JSON.stringify(imp.diag)); } catch (_) {}
+                } else {
+                    if (imp.ckMatteImported) extras.push('CK matte');
+                    if (imp.samJunkImported) extras.push('SAM junk mask');
+                }
                 finish('Done. Keyed clip on your timeline' + (extras.length ? ' (+ ' + extras.join(' + ') + ')' : '') +
                        '.' + (_samGuardHeld > 0 ? ' ' + _samGuardHeld + ' frame(s) auto-held by SAM guard — check log.' : ''));
             });
@@ -4606,10 +4648,15 @@ function doSAMCommit(advanced) {
             if (HOST_APP === 'ppro') {
                 const renderDimensions = ckReadPngDimensions(firstFrame);
                 const renderPresetPath = path.join(PANEL_DIR, 'presets', 'CK_3TRACK.sqpreset');
+                // tightSamPath (12th arg) — AE/Premiere PARITY FIX, Berto 2026-07-27.
+                // AE gets this raw SAM_JUNK pass via ae_createSAMPrecomp below; Premiere
+                // was computing it four lines up and then dropping it. host.jsx imports it
+                // to the project bin only, no track placement (3-track preset).
                 jsxCall('ppro_importSequence', [
                     firstFrame, info.inPointSeconds, info.fps, info.sourceFrameRate || info.fps, samMattePath, ckOnlyPath,
                     (Number(info.endSeconds) - Number(info.startSeconds)) || 0,
-                    renderDimensions.width, renderDimensions.height, renderPresetPath, info.sourceFile
+                    renderDimensions.width, renderDimensions.height, renderPresetPath, info.sourceFile,
+                    tightSamPath
                 ], (imp) => {
                     if (!imp || !imp.ok) return finish('Import failed: ' + (imp && imp.error ? imp.error : 'unknown'), true);
                     if (imp.via) ckLog('samCommit: import target resolved via ' + imp.via);
@@ -4617,6 +4664,17 @@ function doSAMCommit(advanced) {
                     // actually landed — an invisible clip on the timeline is diagnosable
                     // from this line instead of guesswork.
                     try { if (imp.diag) ckLog('ppro import diag: ' + JSON.stringify(imp.diag)); } catch (_) {}
+                    // Raw SAM is imported to the bin with no timeline presence, so a
+                    // failure is otherwise invisible. Surface both outcomes explicitly.
+                    try {
+                        if (imp.diag && imp.diag.tightSamError) {
+                            ckLog('samCommit WARNING: raw SAM (SAM JUNK MASK) NOT imported — ' + imp.diag.tightSamError, true);
+                        } else if (imp.diag && imp.diag.tightSamName) {
+                            ckLog('samCommit: raw SAM in CorridorKey bin as "' + imp.diag.tightSamName + '"');
+                        } else if (tightSamPath) {
+                            ckLog('samCommit WARNING: raw SAM requested but host returned no result for it', true);
+                        }
+                    } catch (_) {}
                     if (imp.nestFallback) ckLog('ppro import: NESTED placement failed, used flat fallback — ' + imp.nestFallback, true);
                     finish('Done. ' + (imp.diag && imp.diag.mode === 'nested' ? 'Nested CK clip on your timeline (aux layers inside, off by default).'
                            : 'Keyed clip on your timeline' + (samMattePath ? ' (+ SAM matte)' : '') + '.') +
