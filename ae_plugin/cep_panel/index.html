@@ -1744,8 +1744,9 @@
                   <button class="clear-btn" id="clearSam" type="button">Clear</button>
                   <button class="clear-btn" id="zoneModeBtn" type="button" aria-pressed="false" title="ZONE: click to ARM, then drag an ellipse on the picture around a body part that leaves the green (feet, hands). SAM cuts tight only inside it. (Restored 2026-06-16.)">Zone</button>
                   <button class="clear-btn" id="addFrameBtn" type="button" title="ADD FRAME: stamp the current dots onto THIS frame, then scrub to another frame (PREVIEW it), dot again, and stamp again. Multiple stamped frames re-pin the AI mid-clip so fast motion can't lose the body. Render uses every stamped frame.">ADD FRAME</button>
-                  <button class="clear-btn" id="fusionV2Main" type="button" aria-pressed="false" title="FUSION V2: new keying engine — CK untouched on green, SAM kills junk, zoned hair/feet room. Click to switch engines.">Fusion V2</button>
-                  <button class="clear-btn" id="unifiedBandMain" type="button" aria-pressed="false" title="EDGE V2: unified distance-field edge merge — one monotonic boundary, no detached rims. Mutually exclusive with Fusion V2. Click to switch engines.">Edge V2</button>
+                  <!-- BAKED IN 2026-07-22: Edge V2 is THE engine (forced in ckGetSettings), Fusion V2 retired. Header chips hidden, one release of rollback headroom. -->
+                  <button class="clear-btn" id="fusionV2Main" type="button" style="display:none" aria-pressed="false" title="FUSION V2: new keying engine — CK untouched on green, SAM kills junk, zoned hair/feet room. Click to switch engines.">Fusion V2</button>
+                  <button class="clear-btn" id="unifiedBandMain" type="button" style="display:none" aria-pressed="false" title="EDGE V2: unified distance-field edge merge — one monotonic boundary, no detached rims. Mutually exclusive with Fusion V2. Click to switch engines.">Edge V2</button>
                 </div>
               </div>
               <div class="ww">
@@ -1815,7 +1816,9 @@
               </div>
             </div>
 
-            <div class="cell">
+            <!-- BAKED IN 2026-07-22: Edge V2 is the engine, Fusion V2 retired.
+                 Cells hidden, not deleted — one release of rollback headroom. -->
+            <div class="cell" style="display:none">
               <div class="cell-top">
                 <span class="cell-title">Fusion V2</span>
                 <div class="cell-control">
@@ -1830,7 +1833,7 @@
               </div>
             </div>
 
-            <div class="cell">
+            <div class="cell" style="display:none">
               <div class="cell-top">
                 <span class="cell-title">Edge V2</span>
                 <div class="cell-control">
@@ -2369,9 +2372,12 @@
   function refreshCounts() {
     const incl = samPoints.filter(p => p.label === 1).length;
     const excl = samPoints.length - incl;
-    samCount.textContent = points;
-    bvCount.textContent = points + (points === 1 ? ' point' : ' points');
-    if (stageCount) stageCount.textContent = points + (points === 1 ? ' point' : ' points');
+    // EXCLUDES ANNOUNCE THEMSELVES (2026-07-22): a hidden exclude dot carved a
+    // render — never show a bare total when excludes exist.
+    const _lbl = excl > 0 ? (incl + ' + ' + excl + ' EXCLUDE') : (points + (points === 1 ? ' point' : ' points'));
+    samCount.textContent = excl > 0 ? (incl + '+' + excl + 'X') : points;
+    bvCount.textContent = _lbl;
+    if (stageCount) stageCount.textContent = _lbl;
     // include/exclude breakdown beside the total (item 4)
     if (stageBreak) stageBreak.textContent = incl + ' incl . ' + excl + ' excl';
     ckUpdateSamDependentFaders();
@@ -2418,6 +2424,9 @@
     host.appendChild(pt);
     // record CONTAIN-corrected normalized coords + label for the backend (SAM2 convention)
     samPoints.push({ x: nx, y: ny, label: label });
+    // DOT TRACER (2026-07-22): a phantom EXCLUDE dot reached a render Berto never
+    // placed — log every birth with its trigger so the next one self-documents.
+    try { ckLog('dot placed: ' + (label === 0 ? 'EXCLUDE' : 'include') + ' via ' + (e && e.type ? e.type : '?') + ' mode=' + pointMode + ' at ' + nx.toFixed(3) + ',' + ny.toFixed(3)); } catch (_) {}
     points++;
     refreshCounts();
   }
@@ -2692,7 +2701,8 @@
     vwZoom.appendChild(pt);
     samPoints.push({ x: nx, y: ny, label: label });
     points++; refreshCounts();
-    ckLog('point placed: ' + (label ? 'incl' : 'excl') + ' total=' + samPoints.length);
+    // DOT TRACER (2026-07-22): include the trigger event — phantom-exclude hunt.
+    ckLog('point placed: ' + (label ? 'incl' : 'EXCL') + ' via ' + (e && e.type ? e.type : '?') + ' total=' + samPoints.length + ' at ' + nx.toFixed(3) + ',' + ny.toFixed(3));
   }
   function redrawDots() {
     const r = vwZoom.getBoundingClientRect();
@@ -3369,10 +3379,12 @@ function ckGetSettings() {
     const zoneEdgeEl = document.getElementById('zoneEdge');
     const _zeParsed = zoneEdgeEl ? parseInt(zoneEdgeEl.value, 10) : NaN;
     const zone_erode_px = isNaN(_zeParsed) ? 1 : _zeParsed;
-    const fusionV2El = document.getElementById('fusionV2');
-    const fusion_v2 = fusionV2El ? (fusionV2El.getAttribute('aria-pressed') === 'true') : false;
-    const unifiedBandEl = document.getElementById('unifiedBandV2');
-    const unified_band = unifiedBandEl ? (unifiedBandEl.getAttribute('aria-pressed') === 'true') : false;
+    // BAKED IN (Berto 2026-07-22): Edge V2 is THE engine — every confirmed render
+    // since 07-10 ran it, dot-law fill was proven on it, test phase over. The old
+    // toggles are hidden in the UI and forced here; the engine still honors an
+    // explicit params-json override for headless A/B work.
+    const fusion_v2 = false;
+    const unified_band = true;
     const greenKillEl = document.getElementById('greenKill');
     const green_kill = greenKillEl ? (greenKillEl.getAttribute('aria-pressed') === 'true') : false;
     const samTemporalGuardEl = document.getElementById('samTemporalGuard');
@@ -3905,6 +3917,12 @@ function doKey(auto) {
                     // worse gate (helmet hair, face bites) that lies about the render.
                     samPayload.sourceVideo = info.sourceFile;
                     samPayload.sourceFrame = info.sourceFrame;
+                    // sourceFrame above is round(sourceTimeSeconds * HOST-TIMELINE-fps)
+                    // (ppro_getFrameInfo/ae_getFrameInfo) — wrong when the source clip's
+                    // fps differs from the Premiere sequence / AE comp fps. Also send the
+                    // already-correct sourceTimeSeconds so cmd_sam_apply can recompute the
+                    // seek target from the SOURCE's own fps, same as cmd_extract already
+                    // does — otherwise SAM keys a different frame than the CK preview.
                     samPayload.sourceTimeSeconds = info.sourceTimeSeconds;
                     ckLog('KEY: running SAM (' + samPayload.sam_positive.length + ' incl / ' + samPayload.sam_negative.length + ' excl)');
                     try { fs.writeFileSync(path.join(sess, 'live_params.json'), JSON.stringify(samPayload)); } catch (_) {}

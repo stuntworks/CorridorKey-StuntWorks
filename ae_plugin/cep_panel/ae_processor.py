@@ -1324,7 +1324,8 @@ def apply_shirt_rescue(alpha, sam_soft, src_rgb, settings):
 
 
 def apply_matte_postproc(fg_rgb, alpha_raw, settings, sam_soft=None, source_rgb=None,
-                         screen_type="green", return_garbage=False, frame_idx=None):
+                         screen_type="green", return_garbage=False, frame_idx=None,
+                         sam_fill=None):
     """Canonical CK post-proc shared by single / batch / postproc.
     Returns (fg_rgb, alpha) or (fg_rgb, alpha, green_garbage) when return_garbage=True.
 
@@ -1365,7 +1366,10 @@ def apply_matte_postproc(fg_rgb, alpha_raw, settings, sam_soft=None, source_rgb=
         alpha = _merge_simple(alpha, _sam_r)
         # fill_body_holes available but defaults OFF in simple mode (Resolve does not fill).
         if settings.get('fill_body_holes', False) and _sam_r is not None:
-            alpha = _fill_body_holes(alpha, _sam_r, src_rgb=src, screen_type=screen_type)
+            alpha = _reconnect_split_body(alpha, (sam_fill if sam_fill is not None else _sam_r),
+                                          alpha_raw, src_rgb=src, screen_type=screen_type)
+            alpha = _fill_body_holes(alpha, (sam_fill if sam_fill is not None else _sam_r),
+                                     src_rgb=src, screen_type=screen_type, fg_rgb=fg_rgb)
     else:
         # Legacy garbage-matte path (simple_combine=False or no SAM active).
         alpha, _green_garbage = sam_garbage_merge(alpha, sam_soft, src, settings, screen_type,
@@ -1379,11 +1383,14 @@ def apply_matte_postproc(fg_rgb, alpha_raw, settings, sam_soft=None, source_rgb=
         # fill_body_holes stays OFF: A/B 2026-07-03 (Berto verdict) — ON refills junk
         # inside the arm on motion-blur frames (patches REAL see-through gaps, not just
         # NN dropouts). Same reason as the silent 07-01 flip. Do not re-enable.
-        # 2026-07-19 DOT LAW update: dots now enable it (see sam_active in cmd_batch);
-        # the screen-color exception inside _fill_body_holes keeps real see-through
-        # gaps open, which retires the 07-03 objection at the pixel level.
+        # 2026-07-19 DOT LAW update: dots now enable it (see sam_active in cmd_batch).
+        # 2026-07-22: skip-screen-colored exception replaced by in-place green-cast
+        # repair (see _fill_body_holes docstring) — fill everything, ship no cast.
         if settings.get('fill_body_holes', False) and _sam_r is not None:
-            alpha = _fill_body_holes(alpha, _sam_r, src_rgb=src, screen_type=screen_type)
+            alpha = _reconnect_split_body(alpha, _sam_r, alpha_raw,
+                                          src_rgb=src, screen_type=screen_type)
+            alpha = _fill_body_holes(alpha, (sam_fill if sam_fill is not None else _sam_r),
+                                     src_rgb=src, screen_type=screen_type, fg_rgb=fg_rgb)
         # adaptive_green_kill CALL DISABLED (06-12 restore): function remains defined
         # in corridorkey_sam_merge; call disabled per 06-12 parity (did not exist then).
         # if settings.get('green_kill', False):
@@ -1633,6 +1640,10 @@ def apply_matte_postproc(fg_rgb, alpha_raw, settings, sam_soft=None, source_rgb=
             log.warning(f"edge_decon skipped: {_dc_exc}")
     # ── end edge color decontamination ─────────────────────────
 
+    # LAST LINE OF DEFENSE (2026-07-22): nothing screen-dominant ships on the
+    # subject — see _terminal_screen_cast_clamp. Runs dead last on this path.
+    _terminal_screen_cast_clamp(fg_rgb, alpha, screen_type=screen_type)
+
     if return_garbage:
         return fg_rgb, alpha, _green_garbage
     return fg_rgb, alpha
@@ -1761,20 +1772,179 @@ def _zone_cut_from_sam(sam_bin, settings, w, h, scale, auto_offset=None):
     return np.clip(1.0 - zone_f + zone_f * tight_f, 0.0, 1.0)
 
 
-def _fill_body_holes(alpha, sam_soft, src_rgb=None, screen_type="green"):
+def _terminal_screen_cast_clamp(fg, alpha_2d, screen_type="green"):
+    """LAST LINE OF DEFENSE (Berto 2026-07-22): no screen-dominant color ships on
+    the subject, period. Every shipped pixel (alpha > 0.05) whose screen channel
+    exceeds max of the other two gets that channel clamped to it. Everything the
+    render ships IS subject — background is transparent — so this cannot touch
+    anything legitimate on a green-screen key. (A genuinely green costume would
+    need a bypass toggle; none exists on this production.) Runs after despill and
+    every fill/recolor pass, so no upstream path can leak a green rim past it.
+    Clamp only — never brightens. In place."""
+    try:
+        import numpy as _np_tc
+        if fg is None or fg.ndim != 3 or fg.shape[:2] != alpha_2d.shape[:2]:
+            return
+        _ch = 2 if str(screen_type).lower() == "blue" else 1
+        _o1, _o2 = ((0, 1) if _ch == 2 else (0, 2))
+        _m = alpha_2d > 0.05
+        if not _m.any():
+            return
+        _cast = fg[..., _ch]
+        _cap = _np_tc.maximum(fg[..., _o1], fg[..., _o2])
+        _hit = _m & (_cast > _cap)
+        if _hit.any():
+            _cast[_hit] = _cap[_hit]
+    except Exception as _tc_e:
+        log.warning(f"terminal cast clamp skipped: {_tc_e}")
+
+
+def _reconnect_split_body(alpha, sam_soft, ck_raw, src_rgb=None, screen_type="green"):
+    """DECODE-AGNOSTIC WAIST RECONNECT (Berto 2026-07-22). The existing collapse
+    fallback only catches a WHOLE-frame SAM collapse. During a fast kick SAM does
+    a PARTIAL collapse — it drops the beige vest and splits the body into two
+    large pieces (torso above, legs below) with the waist killed between them.
+    That slips under the full-collapse threshold, so the render severs the person.
+
+    Fix, using the KEYER as the authority DaVinci-style: when SAM's body binarizes
+    into 2+ large components, morphologically bridge the vertical corridor between
+    them, and restore alpha there ONLY where the raw CK keyer is solid (the vest IS
+    there) and the source is not screen-colored. The corridor sits between torso and
+    legs, so the floor/junk (which attaches at the feet, outside the corridor) is
+    never resurrected — unlike a ones-mask fallback. No split -> exact no-op.
+    """
+    try:
+        import numpy as _np_rc
+        import cv2 as _cv2_rc
+        from scipy import ndimage as _ndi_rc
+        a = _np_rc.asarray(alpha, dtype=_np_rc.float32)
+        if a.ndim == 3:
+            a = a[..., 0]
+        h, w = a.shape
+        sam = _np_rc.asarray(sam_soft, dtype=_np_rc.float32)
+        if sam.ndim == 3:
+            sam = sam[..., 0]
+        if sam.shape[:2] != (h, w):
+            sam = _cv2_rc.resize(sam, (w, h), interpolation=_cv2_rc.INTER_LINEAR)
+        ck = _np_rc.asarray(ck_raw, dtype=_np_rc.float32)
+        if ck.ndim == 3:
+            ck = ck[..., 0]
+        if ck.shape[:2] != (h, w):
+            ck = _cv2_rc.resize(ck, (w, h), interpolation=_cv2_rc.INTER_LINEAR)
+
+        solid = sam > 0.5
+        _min_area = (0.02 * h) * (0.02 * w)  # a real body piece, res-relative
+        lbl, n = _ndi_rc.label(solid)
+        if n < 2:
+            return alpha
+        _sizes = _ndi_rc.sum(_np_rc.ones_like(lbl), lbl, range(1, n + 1))
+        _large = [i + 1 for i in range(n) if _sizes[i] >= _min_area]
+        if len(_large) < 2:
+            return alpha
+
+        # Bridge vertically: close the SAM body with a tall, moderate-width kernel.
+        # Height spans a plausible waist gap; width keeps it from ballooning sideways.
+        _kh = max(31, int(round(0.18 * h)) | 1)
+        _kw = max(15, int(round(0.06 * w)) | 1)
+        _kern = _cv2_rc.getStructuringElement(_cv2_rc.MORPH_RECT, (_kw, _kh))
+        _bridged = _cv2_rc.morphologyEx(solid.astype(_np_rc.uint8), _cv2_rc.MORPH_CLOSE, _kern) > 0
+        _corridor = _bridged & (~solid)
+        if not _corridor.any():
+            return alpha
+        # The corridor is the WAIST between two SAM body pieces — it is body by
+        # construction. Fill it wherever the source is not screen-colored (the
+        # motion-blurred vest's raw CK alpha dips to near-zero in spots, so a
+        # hard ck>0.5 gate left pinholes). The anti-screen gate below keeps a
+        # genuine see-through gap open; the spatial corridor keeps the floor out.
+        _restore = _corridor.copy()
+        if _restore.any() and src_rgb is not None:
+            _src_u8 = (src_rgb if src_rgb.dtype == _np_rc.uint8
+                       else (_np_rc.clip(src_rgb, 0, 1) * 255).astype(_np_rc.uint8))
+            if _src_u8.shape[:2] != (h, w):
+                _src_u8 = _cv2_rc.resize(_src_u8, (w, h), interpolation=_cv2_rc.INTER_LINEAR)
+            _hsv = _cv2_rc.cvtColor(_src_u8, _cv2_rc.COLOR_RGB2HSV)
+            if str(screen_type).lower() == "blue":
+                _lo, _hi = (100, 50, 50), (130, 255, 255)
+            else:
+                _lo, _hi = (35, 50, 50), (85, 255, 255)
+            _restore = _restore & (_cv2_rc.inRange(_hsv, _lo, _hi) == 0)
+        if _restore.any():
+            a = a.copy()
+            # Corridor is interior body — set solid (max with ck keeps any already-
+            # higher edge feather; the raw-CK dip must not leave a pinhole here).
+            a[_restore] = _np_rc.maximum(a[_restore], 1.0)
+            log.info(f"waist reconnect: bridged {int(_restore.sum())}px across SAM body split")
+            return a
+        return alpha
+    except Exception as _rc_e:
+        log.warning(f"waist reconnect skipped: {_rc_e}")
+        return alpha
+
+
+def _fill_recolor_from_body(fg, alpha_2d, mask):
+    """Recolor fg[mask] IN PLACE from the nearest solid-body pixels (alpha>=0.95,
+    largest component), then soften the pulled colors inside the mask so the
+    patch reads as motion-blurred fabric, not Voronoi tiles. Same nearest-seed
+    distance-transform mechanism as the CK_EDGE_DECON block (Berto 2026-07-11),
+    without the reach cap — hole interiors are far from the rim by definition.
+    No-ops silently if there is no solid body to pull from."""
+    try:
+        import numpy as _np_rc
+        import cv2 as _cv2_rc
+        h, w = alpha_2d.shape[:2]
+        if fg is None or fg.ndim != 3 or fg.shape[:2] != (h, w) or not mask.any():
+            return
+        _solid = (alpha_2d >= 0.95).astype(_np_rc.uint8)
+        _solid[mask] = 0  # freshly filled px are alpha 1.0 — never their own seed
+        _n, _lbl, _stats, _ = _cv2_rc.connectedComponentsWithStats(_solid, connectivity=8)
+        if _n <= 1:
+            return
+        _best = int(_np_rc.argmax(_stats[1:, _cv2_rc.CC_STAT_AREA])) + 1
+        _body = (_lbl == _best).astype(_np_rc.uint8)
+        # CLEAN SEEDS ONLY (2026-07-22 iter 2): spill-tinted body pixels (hair
+        # edges, shadowed shoulders) painted the patch olive — a green-dominant
+        # pixel may not serve as a color source. Fall back to the full body only
+        # if the clean-seed set is empty.
+        _g_dom = fg[..., 1] > _np_rc.maximum(fg[..., 0], fg[..., 2])
+        _clean = _body.copy()
+        _clean[_g_dom] = 0
+        if _clean.any():
+            _body = _clean
+        _dist, _nn = _cv2_rc.distanceTransformWithLabels(
+            (1 - _body).astype(_np_rc.uint8), _cv2_rc.DIST_L2, 5,
+            labelType=_cv2_rc.DIST_LABEL_PIXEL)
+        _bys, _bxs = _np_rc.where(_body > 0)
+        if not len(_bys):
+            return
+        _idx = _np_rc.clip(_nn[mask] - 1, 0, len(_bys) - 1)
+        fg[mask] = fg[_bys[_idx], _bxs[_idx]]
+        # soften only inside the mask: blur a copy, paste masked region back
+        _blur = _cv2_rc.GaussianBlur(fg, (0, 0), sigmaX=9)
+        fg[mask] = _blur[mask]
+        # final polish: whatever green the blur re-mixed in, clamp it out of the
+        # patch (g -> min(g, max(r,b)) — clamp only, never brightens)
+        _gg = fg[..., 1]
+        _cap = _np_rc.maximum(fg[..., 0], fg[..., 2])
+        _gg[mask] = _np_rc.minimum(_gg[mask], _cap[mask])
+    except Exception as _rc_e:
+        log.warning(f"fill recolor skipped: {_rc_e}")
+
+
+def _fill_body_holes(alpha, sam_soft, src_rgb=None, screen_type="green", fg_rgb=None):
     """Fill enclosed interior holes in CK matte that fall inside the solid SAM body.
     Enclosed holes = pixels binary_fill_holes closes on (alpha>0.5) that were not
     already opaque AND lie inside solidify_sam_silhouette. Only those pixels go to 1.0.
     Soft outer edge is untouched — hair survives.
 
-    SCREEN-COLOR EXCEPTION (Berto 2026-07-19, the AE "junk cleaner" rule made
-    automatic): when src_rgb is given, hole pixels whose source color matches the
-    screen (same HSV window as the merge classifiers: green hue 35-85 / blue
-    100-130, S>=50, V>=50) are NOT filled — real screen showing through a gap
-    (arm/hair wedge) stays transparent, exactly what the AE track-matte rescue
-    produced by hand. Fabric/hair dropouts (beige vest, whip blur) are not
-    screen-colored, so they still fill solid. src_rgb=None keeps the old
-    fill-everything behavior byte-identical.
+    SCREEN-GAP LAW (Berto 2026-07-23, regression corpus — restores the 07-19
+    skip-screen-colored exception, retiring the 07-22 fill+recolor): a hole pixel
+    that still shows screen color in the source is a SEE-THROUGH gap, not body —
+    it stays OPEN. The 07-22 fill-everything variant painted a blurred body copy
+    over 124k px of open green on SBV_0727 (rig wire + edge junk form thin loops
+    that enclose real screen, and solidify's fill-holes adopts the loop interior
+    as body). Non-screen-colored hole pixels still fill solid. Screen cast on
+    kept body pixels is handled downstream by _terminal_screen_cast_clamp.
+    src_rgb=None keeps plain fill-everything behavior.
     """
     try:
         import numpy as _np_fh
@@ -1791,21 +1961,29 @@ def _fill_body_holes(alpha, sam_soft, src_rgb=None, screen_type="green"):
         a_bin = a > 0.5
         enclosed_holes = _snd.binary_fill_holes(a_bin) & ~a_bin
         fix_mask = enclosed_holes & (solid > 0)
-        if fix_mask.any() and src_rgb is not None:
-            src_u8 = (src_rgb if src_rgb.dtype == _np_fh.uint8
-                      else (_np_fh.clip(src_rgb, 0, 1) * 255).astype(_np_fh.uint8))
-            if src_u8.shape[:2] != (h, w):
-                src_u8 = _cv2_fh.resize(src_u8, (w, h), interpolation=_cv2_fh.INTER_LINEAR)
-            hsv = _cv2_fh.cvtColor(src_u8, _cv2_fh.COLOR_RGB2HSV)
-            if str(screen_type).lower() == "blue":
-                _lo, _hi = (100, 50, 50), (130, 255, 255)
-            else:
-                _lo, _hi = (35, 50, 50), (85, 255, 255)
-            on_screen = _cv2_fh.inRange(hsv, _lo, _hi) > 0
-            fix_mask = fix_mask & ~on_screen
         if fix_mask.any():
+            # SCREEN-GAP LAW (Berto 2026-07-23): screen-colored hole pixels are
+            # see-through gaps — never filled, never repainted. Only holes whose
+            # source pixels are NOT screen-colored fill to 1.0 (true NN dropouts,
+            # bounce-lit fabric stays a judgment call for the corpus renders).
             a = a.copy()
-            a[fix_mask] = 1.0
+            fill_ok = fix_mask
+            if src_rgb is not None:
+                src_u8 = (src_rgb if src_rgb.dtype == _np_fh.uint8
+                          else (_np_fh.clip(src_rgb, 0, 1) * 255).astype(_np_fh.uint8))
+                if src_u8.shape[:2] != (h, w):
+                    src_u8 = _cv2_fh.resize(src_u8, (w, h), interpolation=_cv2_fh.INTER_LINEAR)
+                hsv = _cv2_fh.cvtColor(src_u8, _cv2_fh.COLOR_RGB2HSV)
+                if str(screen_type).lower() == "blue":
+                    _lo, _hi = (100, 50, 50), (130, 255, 255)
+                else:
+                    _lo, _hi = (35, 50, 50), (85, 255, 255)
+                on_screen = _cv2_fh.inRange(hsv, _lo, _hi) > 0
+                skipped = fix_mask & on_screen
+                fill_ok = fix_mask & ~on_screen
+                if skipped.any():
+                    log.info(f"body-hole fill: left {int(skipped.sum())}px screen-colored gap OPEN, filled {int(fill_ok.sum())}px of {int(fix_mask.sum())}px")
+            a[fill_ok] = 1.0
         return a
     except Exception as _bhf_e:
         log.warning(f"body-hole fill skipped: {_bhf_e}")
@@ -2506,20 +2684,166 @@ def cmd_batch(source_video, output_folder, settings,
 
                 _pts_np, _lbl_np = _build_sam_pts_labels(sam_pos, sam_neg)
                 log.info(f"SAM2 video: anchor at range frame {sam_anchor_rel} (absolute {sam_anchor_abs})")
+
+                # MASK-SEED (Berto 2026-07-22): the vest/waist drop is a SAM
+                # dot-position lottery — five points on the anchor are too sparse
+                # to keep a beige garment attached through a fast kick. CK's OWN
+                # keyer reliably sees the whole person every frame. Seed SAM with
+                # that full-person silhouette (Meta's recommended fix for garment
+                # dropout, arxiv 2408.00714) instead of trusting dots alone. The
+                # keyer runs on the exact padded-square anchor image SAM will
+                # track, so the mask lands in SAM's own coordinate space with no
+                # scale/pad bookkeeping. Operator dots still register AFTER as
+                # refinement (negatives carve, positives reinforce). Gated:
+                # default ON when dots exist; params 'sam_mask_seed' False = old
+                # points-only path, byte-identical.
+                # MASK-SEED — parked 2026-07-22: fixed severance but rode the dark
+                # floor mat into SAM's object (no floor problem on DaVinci). Superseded
+                # by the ported DaVinci SAM post-pass below (interior-collapse -> NN
+                # fallback + backward pass). Default OFF; kept for A/B.
+                _mask_seed = None
+                if settings.get('sam_mask_seed', False):
+                    try:
+                        _anchor_png = sam_tmp_dir / f"{sam_anchor_rel:06d}.png"
+                        _anchor_bgr = cv2.imread(str(_anchor_png), cv2.IMREAD_COLOR)
+                        if _anchor_bgr is not None:
+                            _anchor_rgb = cv2.cvtColor(_anchor_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+                            # Key the REAL image content only. The anchor PNG is a
+                            # padded SQUARE (black letterbox bars); the keyer reads
+                            # black as subject, which blew the seed to 64% of frame.
+                            # Unpad -> key -> re-pad the alpha to SAM's square space.
+                            _sq_shape = _anchor_rgb.shape[:2]
+                            if _pad_box is not None:
+                                _anchor_content = _unpad_from_square(_anchor_rgb, _pad_box)
+                            else:
+                                _anchor_content = _anchor_rgb
+                            _seed_hint = generate_chroma_hint(_anchor_content, settings["screenType"])
+                            _seed_res = processor.process_frame(_anchor_content, _seed_hint, ps)
+                            _seed_a = _seed_res["alpha"] if isinstance(_seed_res, dict) else _seed_res
+                            if _seed_a is not None:
+                                _seed_a = np.asarray(_seed_a, dtype=np.float32)
+                                if _seed_a.ndim == 3:
+                                    _seed_a = _seed_a[..., 0]
+                                if _pad_box is not None:
+                                    _t, _b, _l, _r = _pad_box
+                                    _seed_full = np.zeros(_sq_shape, dtype=np.float32)
+                                    _seed_full[_t:_t + _seed_a.shape[0], _l:_l + _seed_a.shape[1]] = _seed_a
+                                    _seed_a = _seed_full
+                                _seed_bin = _seed_a > 0.5
+                                # keep the largest solid blob (the person), fill
+                                # interior holes, dilate slightly so a thin garment
+                                # edge isn't clipped from the prompt.
+                                from scipy import ndimage as _ndi_seed
+                                _bfh_seed = _ndi_seed.binary_fill_holes
+                                _lbl_seed = _ndi_seed.label
+                                _dil_seed = _ndi_seed.binary_dilation
+                                _ero_seed = _ndi_seed.binary_erosion
+                                # The keyer treats non-green set pieces (dark floor
+                                # mat, crash pads) as foreground, so the raw seed can
+                                # bridge the person to the floor through the shoes.
+                                # ERODE to snap thin bridges, keep only blob(s) that
+                                # contain an operator POSITIVE dot (person, never the
+                                # floor — no dot lands there), then DILATE back.
+                                _ero_px = 16
+                                _seed_core = _ero_seed(_seed_bin, iterations=_ero_px)
+                                _lm, _ln = _lbl_seed(_seed_core)
+                                if _ln > 0:
+                                    _keep = np.zeros(_ln + 1, dtype=bool)
+                                    if _pts_np is not None and _lbl_np is not None:
+                                        for _pi in range(len(_pts_np)):
+                                            if int(_lbl_np[_pi]) != 1:
+                                                continue  # positive dots only
+                                            _px = int(round(float(_pts_np[_pi][0])))
+                                            _py = int(round(float(_pts_np[_pi][1])))
+                                            if 0 <= _py < _lm.shape[0] and 0 <= _px < _lm.shape[1]:
+                                                _plb = _lm[_py, _px]
+                                                if _plb > 0:
+                                                    _keep[_plb] = True
+                                    if not _keep.any():
+                                        # no dot landed on a core blob — fall back to
+                                        # the largest core component (still the person)
+                                        _sz = _ndi_seed.sum(np.ones_like(_lm), _lm, range(1, _ln + 1))
+                                        _keep[int(np.argmax(_sz)) + 1] = True
+                                    _seed_bin = _keep[_lm]
+                                _seed_bin = _dil_seed(_seed_bin, iterations=_ero_px + 3)
+                                _seed_bin = _bfh_seed(_seed_bin)
+                                # FLOOR-SLAB CUT: the keyer pulls dark set pieces
+                                # (floor mat, crash pads) into the seed, riding in at
+                                # the feet. A person is a NARROW vertical figure; a
+                                # floor mat is a WIDE horizontal slab. Zero any seed
+                                # row whose width is a large multiple of the body's
+                                # own typical row width, then keep the dot-blob again
+                                # so the now-detached floor drops.
+                                _rowsum = _seed_bin.sum(axis=1).astype(np.float32)
+                                _occ = _rowsum[_rowsum > 0]
+                                if _occ.size > 10:
+                                    _typ = float(np.median(_occ))
+                                    _floor_rows = _rowsum > (3.0 * _typ)
+                                    if _floor_rows.any():
+                                        _seed_bin[_floor_rows, :] = False
+                                        _lm2, _ln2 = _lbl_seed(_seed_bin)
+                                        if _ln2 > 0:
+                                            _keep2 = np.zeros(_ln2 + 1, dtype=bool)
+                                            if _pts_np is not None and _lbl_np is not None:
+                                                for _pi in range(len(_pts_np)):
+                                                    if int(_lbl_np[_pi]) != 1:
+                                                        continue
+                                                    _px = int(round(float(_pts_np[_pi][0])))
+                                                    _py = int(round(float(_pts_np[_pi][1])))
+                                                    if 0 <= _py < _lm2.shape[0] and 0 <= _px < _lm2.shape[1]:
+                                                        _pl2 = _lm2[_py, _px]
+                                                        if _pl2 > 0:
+                                                            _keep2[_pl2] = True
+                                            if not _keep2.any():
+                                                _s2 = _ndi_seed.sum(np.ones_like(_lm2), _lm2, range(1, _ln2 + 1))
+                                                _keep2[int(np.argmax(_s2)) + 1] = True
+                                            _seed_bin = _keep2[_lm2]
+                                            _seed_bin = _bfh_seed(_seed_bin)
+                                _cover = float(_seed_bin.mean())
+                                # sanity: a real person mask is a few-to-30% of frame.
+                                # reject a blown-out (whole frame) or empty seed.
+                                if 0.01 < _cover < 0.60:
+                                    _mask_seed = _seed_bin.astype(np.bool_)
+                                    log.info(f"SAM2 mask-seed: keyer person silhouette ready (cover={_cover:.3f})")
+                                else:
+                                    log.info(f"SAM2 mask-seed: rejected keyer seed (cover={_cover:.3f}) — points-only")
+                    except Exception as _seedex:
+                        log.warning(f"SAM2 mask-seed: skipped ({_seedex}) — points-only")
+
                 with sam_torch.inference_mode():
                     _state = _video_predictor.init_state(
                         video_path=str(sam_tmp_dir),
                         offload_video_to_cpu=True,
                         async_loading_frames=False,
                     )
-                    _video_predictor.add_new_points_or_box(
-                        inference_state=_state,
-                        frame_idx=sam_anchor_rel,
-                        obj_id=1,
-                        points=_pts_np,
-                        labels=_lbl_np,
-                        clear_old_points=True,
-                    )
+                    if _mask_seed is not None:
+                        _video_predictor.add_new_mask(
+                            inference_state=_state,
+                            frame_idx=sam_anchor_rel,
+                            obj_id=1,
+                            mask=_mask_seed,
+                        )
+                        # Operator dots refine on top of the mask (negatives carve
+                        # real gaps, positives reinforce). clear_old_points=False so
+                        # the mask prompt survives.
+                        if _pts_np is not None:
+                            _video_predictor.add_new_points_or_box(
+                                inference_state=_state,
+                                frame_idx=sam_anchor_rel,
+                                obj_id=1,
+                                points=_pts_np,
+                                labels=_lbl_np,
+                                clear_old_points=False,
+                            )
+                    else:
+                        _video_predictor.add_new_points_or_box(
+                            inference_state=_state,
+                            frame_idx=sam_anchor_rel,
+                            obj_id=1,
+                            points=_pts_np,
+                            labels=_lbl_np,
+                            clear_old_points=True,
+                        )
                     # Multi-frame SAM prompting: register additional anchor frames.
                     # clear_old_points=False is critical — True would wipe prior frames' prompts.
                     if sam_frames_raw:
@@ -2833,6 +3157,26 @@ def cmd_batch(source_video, output_folder, settings,
                 # (later) the CK_ALPHA sidecar both need the un-choked matte.
                 alpha_raw = alpha.copy()
                 _sam_frame = sam_video_masks.get(seq_num)
+                # SAM BLINK BRIDGE (Berto 2026-07-22): SAM's video tracker strobes —
+                # drops a body region for single frames (f28 bad / f29 fine / f30 bad
+                # on the baseline clip) and the body-hole fill then refuses to fill
+                # there, punching one-frame holes. For the FILL ONLY, union the frame's
+                # SAM with what its neighbors AGREE on (min of ±1, min of ±2): a region
+                # both neighbors call body cannot blink out. Junk-kill/merge still use
+                # the raw per-frame SAM — this never widens the kill zone.
+                _sam_fill_frame = _sam_frame
+                try:
+                    if _sam_frame is not None and sam_video_masks:
+                        _sbb_cand = [_sam_frame]
+                        for _sbb_r in (1, 2):
+                            _sbb_a = sam_video_masks.get(seq_num - _sbb_r)
+                            _sbb_b = sam_video_masks.get(seq_num + _sbb_r)
+                            if _sbb_a is not None and _sbb_b is not None and _sbb_a.shape == _sam_frame.shape == _sbb_b.shape:
+                                _sbb_cand.append(np.minimum(_sbb_a, _sbb_b))
+                        if len(_sbb_cand) > 1:
+                            _sam_fill_frame = np.maximum.reduce(_sbb_cand)
+                except Exception:
+                    _sam_fill_frame = _sam_frame
                 # _garbage_gate is only produced by the experimental_recipe path;
                 # the GARBAGE sidecar write below guards on it. Default None or the
                 # fusion_v2/default paths crash every frame at the sidecar step
@@ -2852,7 +3196,7 @@ def cmd_batch(source_video, output_folder, settings,
                     fg, alpha, _green_garbage = apply_matte_postproc(
                         fg, alpha_raw, settings, sam_soft=_sam_frame, source_rgb=img_rgb,
                         screen_type=settings["screenType"], return_garbage=True,
-                        frame_idx=seq_num)
+                        frame_idx=seq_num, sam_fill=_sam_fill_frame)
                 elif settings.get('experimental_recipe'):
                     alpha, _garbage_gate = apply_recipe_composite(
                         alpha_raw, _sam_frame, alpha.shape[1], settings)
@@ -2863,8 +3207,8 @@ def cmd_batch(source_video, output_folder, settings,
                     # apply_matte_postproc; the non-default branches must run the same
                     # sequence here to stay byte-identical to the pre-unification render.
                     if settings.get('fill_body_holes', False) and _sam_frame is not None:
-                        alpha = _fill_body_holes(alpha, _sam_frame, src_rgb=img_rgb,
-                                                 screen_type=settings["screenType"])
+                        alpha = _fill_body_holes(alpha, _sam_fill_frame, src_rgb=img_rgb,
+                                                 screen_type=settings["screenType"], fg_rgb=fg)
                     # adaptive_green_kill CALL DISABLED (06-12 restore)
                     # if settings.get('green_kill', False):
                     #     from corridorkey_sam_merge import adaptive_green_kill
@@ -2917,8 +3261,8 @@ def cmd_batch(source_video, output_folder, settings,
                             alpha = np.clip(alpha * _zone_mask, 0.0, 1.0)
                         log.info(f'fusion_v2 batch frame {frame_idx}: hybrid solve done')
                         if settings.get('fill_body_holes', False) and _sam_frame is not None:
-                            alpha = _fill_body_holes(alpha, _sam_frame, src_rgb=img_rgb,
-                                                     screen_type=settings["screenType"])
+                            alpha = _fill_body_holes(alpha, _sam_fill_frame, src_rgb=img_rgb,
+                                                     screen_type=settings["screenType"], fg_rgb=fg)
                         # adaptive_green_kill CALL DISABLED (06-12 restore)
                         # if settings.get('green_kill', False):
                         #     from corridorkey_sam_merge import adaptive_green_kill
@@ -2931,7 +3275,7 @@ def cmd_batch(source_video, output_folder, settings,
                         fg, alpha, _green_garbage = apply_matte_postproc(
                             fg, alpha_raw, settings, sam_soft=_sam_frame, source_rgb=img_rgb,
                             screen_type=settings["screenType"], return_garbage=True,
-                            frame_idx=seq_num)
+                            frame_idx=seq_num, sam_fill=_sam_fill_frame)
                 # TWO-STREAM BRAW COLOR (2026-07-18): alpha above was keyed on the
                 # Rec709 decode (saturated -> keyable); the SHIPPED color is the
                 # camera-native decode of the same frame, so the render matches the
@@ -2944,6 +3288,16 @@ def cmd_batch(source_video, output_folder, settings,
                     if _native_bgr is None:
                         raise RuntimeError(f"CK_ERROR: native-color frame {frame_idx} missing from two-stream decode")
                     fg = cv2.cvtColor(_native_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+                    # FILL RECOLOR carry-over (2026-07-22): the fill marked screen-
+                    # colored filled pixels; recolor them from THIS shipped native
+                    # buffer's own body pixels (the rec709 recolor above got replaced
+                    # by this swap). Clear the record — strictly per-frame.
+                    _frl = globals().pop('_FILL_RECOLOR_LAST', None)
+                    if _frl is not None and _frl.shape == fg.shape[:2]:
+                        _fill_recolor_from_body(fg, alpha, _frl)
+                    # LAST LINE OF DEFENSE on the SHIPPED (native) buffer too —
+                    # the postproc-end clamp ran on the pre-swap rec709 fg.
+                    _terminal_screen_cast_clamp(fg, alpha, screen_type=settings.get("screenType", "green"))
                 fg_uint16 = (np.clip(fg, 0, 1) * 65535).astype(np.uint16)
                 alpha_uint16 = (np.clip(alpha, 0, 1) * 65535).astype(np.uint16)
                 fg_bgr = cv2.cvtColor(fg_uint16, cv2.COLOR_RGB2BGR)
@@ -3716,12 +4070,21 @@ def cmd_postproc(session_dir, output_path, settings, background="checker", v1_pa
             view = alpha
         elif sam_soft is not None:
             try:
-                from corridorkey_sam_merge import solidify_sam_silhouette
-                view = solidify_sam_silhouette(
-                    sam_soft, carve_points=settings.get("sam_negative") or None
-                ).astype(np.float32)
+                # ONE TRUTH (Berto 2026-07-24): show the ACTIVE engine's actual SAM
+                # input. unified_band consumes binarize_sam_silhouette RAW (bites and
+                # all — dispatch call site ~line 1206); only the legacy garbage path
+                # consumes the healed solidify hull. Solidify's close+fill was hiding
+                # real gate bites (strap-carved arm) that shipped in the render.
+                if settings.get("unified_band"):
+                    from corridorkey_sam_merge import binarize_sam_silhouette
+                    view = binarize_sam_silhouette(sam_soft).astype(np.float32)
+                else:
+                    from corridorkey_sam_merge import solidify_sam_silhouette
+                    view = solidify_sam_silhouette(
+                        sam_soft, carve_points=settings.get("sam_negative") or None
+                    ).astype(np.float32)
             except Exception as _sv_e:
-                log.warning(f"SAM view solidify failed, showing raw gate: {_sv_e}")
+                log.warning(f"SAM view failed, showing raw gate: {_sv_e}")
                 view = sam_soft
         else:
             view = np.zeros_like(alpha)
@@ -3960,17 +4323,31 @@ def cmd_sam_apply(session_dir, settings):
             from corridorkey_sam_merge import patch_sam2_loader_for_png as _patch_pr
             _patch_pr()
             _pr_cap = cv2.VideoCapture(str(_sv_path), cv2.CAP_FFMPEG)
-            # Resolve the pre-roll seek index from the SOURCE's own fps when the panel
-            # sent sourceTimeSeconds — mirrors cmd_batch's time-range resolution above.
-            # The raw sourceFrame the panel computed can be derived from the SEQUENCE
-            # fps (Premiere) rather than this clip's native fps, which drifts CK's
-            # keyed frame away from the frame SAM actually segments.
-            _sf_time = settings.get("sourceTimeSeconds")
-            if _sf_time is not None:
+            # DANGER ZONE FRAGILE: _sf_idx above comes from settings["sourceFrame"],
+            # which the panel computes as round(sourceTimeSeconds * HOST-TIMELINE-fps)
+            # (Premiere: ppro_getFrameInfo, host.jsx:863; AE: ae_getFrameInfo,
+            # host.jsx:188) -- the PREMIERE SEQUENCE's or AE COMP's frame rate, not
+            # the source clip's own rate. When they differ (e.g. a 119.88fps source
+            # cut into a 24fps sequence) that number seeks the wrong frame, while
+            # cmd_extract (~line 1078-1084) -- which is what actually wrote the
+            # fg.png/plate.png CK keyed -- seeks by sourceTimeSeconds, fps-independent.
+            # Recompute _sf_idx here from sourceTimeSeconds (when the panel sent it)
+            # using THIS capture's own probed fps, so SAM anchors on the identical
+            # source frame CK just extracted instead of trusting the host-timeline
+            # frame number handed in. Falls back to the raw _sf_idx above when
+            # sourceTimeSeconds is absent (older callers).
+            # breaks: SAM keys a different frame than the CK preview whenever the
+            #   source clip's fps differs from the host sequence/comp fps.
+            # depends on: settings["sourceTimeSeconds"] (host.jsx sourceTimeSec /
+            #   sourceTime, already fps-independent) and this capture's own
+            #   CAP_PROP_FPS probe.
+            _src_time_sec = settings.get("sourceTimeSeconds")
+            if _src_time_sec is not None:
                 try:
-                    _src_fps = _pr_cap.get(cv2.CAP_PROP_FPS)
-                    if _src_fps and _src_fps > 0:
-                        _sf_idx = round(float(_sf_time) * _src_fps)
+                    _src_time_sec = float(_src_time_sec)
+                    _src_fps = _pr_cap.get(cv2.CAP_PROP_FPS) or 0.0
+                    if _src_fps > 0:
+                        _sf_idx = int(round(_src_time_sec * _src_fps))
                 except (TypeError, ValueError):
                     pass
             _pr_preroll = _sf_idx - 1
