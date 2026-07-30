@@ -1,4 +1,4 @@
-<!-- Last modified: 2026-07-19 | Change: pass the bundled three-track preset path into Premiere | Full history: git log -->
+<!-- Last modified: 2026-07-26 | Change: add EDGE SHADOW fader (contact-shadow rim removal, default 0 = off) | Full history: git log -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1887,6 +1887,32 @@
             </div>
           </div>
 
+          <!-- EDGE SHADOW (Berto 2026-07-26) — removes the dark contact-shadow rim
+               a limb casts on the screen just outside its own silhouette (the
+               outline around the forearm and fist on SBV_0727). DEFAULT 0 = OFF,
+               so every previously keyed shot renders byte-identical (verified).
+               50 reproduces the engine's long-standing darkness threshold; higher
+               reaches further but starts thinning soft edges where the subject is
+               dark against a dark background. Solid alpha is never removed at any
+               setting — that guard lives in the engine, not on this slider. -->
+          <div class="matte-fader" id="faderEdgeShadow" style="margin-top:12px">
+            <div class="fader-head">
+              <span class="cell-title">EDGE SHADOW</span>
+              <span class="fader-value" id="edgeShadowVal">0</span>
+            </div>
+            <div class="fader-row">
+              <div class="fader-track">
+                <div class="fader-slot"></div>
+                <div class="fader-fill" id="edgeShadowFill" style="width:0%"></div>
+                <div class="fader-ticks" id="edgeShadowTicks"></div>
+                <input type="range" class="fader" id="edgeShadow" min="0" max="100" step="5" value="0"
+                       aria-label="Edge shadow, contact-shadow rim removal, 0 to 100, 0 is off" />
+                <div class="fader-cap-lines" id="edgeShadowCap" style="left:0%"></div>
+              </div>
+              <div class="fader-scale"><span>0</span><span>25</span><span>50</span><span>75</span><span>100</span></div>
+            </div>
+          </div>
+
         </div>
       </div>
     </div>
@@ -2207,6 +2233,18 @@
     }
   }
 
+  // EDGE SHADOW (Berto 2026-07-26): restore the saved value, same pattern as
+  // SAM MATTE TIGHTEN above. An unset or out-of-range value leaves the input's
+  // HTML default of 0, which is OFF and matches the engine's absent-key default.
+  const edgeShadowEl = document.getElementById('edgeShadow');
+  if (edgeShadowEl) {
+    const _esSaved = localStorage.getItem('ck_global_edge_shadow');
+    const _esParsed = _esSaved !== null ? parseFloat(_esSaved) : NaN;
+    if (!isNaN(_esParsed) && _esParsed >= 0 && _esParsed <= 100) {
+      edgeShadowEl.value = _esParsed;
+    }
+  }
+
   // ---- Advanced = EXPAND TO COCKPIT (not an accordion) ----
   const unit = document.querySelector('.unit');
   const adv = document.getElementById('adv');
@@ -2255,13 +2293,16 @@
   wireFader('zoneEdge');
   wireFader('fusionExpand');
   wireFader('samMatteTighten');
+  wireFader('edgeShadow');
   (function () {
-    ['despill', 'zoneEdge', 'fusionExpand', 'samMatteTighten'].forEach(function (id) {
+    ['despill', 'zoneEdge', 'fusionExpand', 'samMatteTighten', 'edgeShadow'].forEach(function (id) {
       const el = document.getElementById(id);
       if (el) el.addEventListener('change', function () {
         // SAM MATTE TIGHTEN (Berto 2026-07-12): persist alongside the repreview
         // trigger the other faders already share — same ck_global_* convention.
         if (id === 'samMatteTighten') localStorage.setItem('ck_global_sam_matte_tighten', el.value);
+        // EDGE SHADOW (Berto 2026-07-26): same convention. Restored below on load.
+        if (id === 'edgeShadow') localStorage.setItem('ck_global_edge_shadow', el.value);
         if (typeof ckScheduleRepreview === 'function') ckScheduleRepreview();
       });
     });
@@ -3399,6 +3440,11 @@ function ckGetSettings() {
     // string — corridorkey_sam_merge's validator rejects non-numeric values.
     const samMatteTightenEl = document.getElementById('samMatteTighten');
     const sam_matte_tighten_px = samMatteTightenEl ? parseFloat(samMatteTightenEl.value) : 3;
+    // EDGE SHADOW (Berto 2026-07-26): contact-shadow rim removal, 0 = OFF and is
+    // the default. Number, not string — the engine's _resolve_edge_shadow_amount
+    // rejects non-numeric values and falls back to 0 (off).
+    const edgeShadowSliderEl = document.getElementById('edgeShadow');
+    const edge_shadow = edgeShadowSliderEl ? parseFloat(edgeShadowSliderEl.value) : 0;
     const settings = {
         screenType: screenType,
         despill: despill,
@@ -3417,7 +3463,8 @@ function ckGetSettings() {
         sam2_temporal_guard_enabled: sam2_temporal_guard_enabled,
         unified_band: unified_band,
         ck_authority: ck_authority,
-        sam_matte_tighten_px: sam_matte_tighten_px
+        sam_matte_tighten_px: sam_matte_tighten_px,
+        edge_shadow: edge_shadow
     };
     ckLog('fusion_v2: ' + (fusion_v2 ? 'on' : 'off') + ' at settings build');
     ckLog('unified_band: ' + (unified_band ? 'on' : 'off') + ' at settings build');
@@ -4695,7 +4742,8 @@ function ckOpenURL(url) {
     // Move faders to pod body as full-style slider row (ABOVE the button row)
     var podBody = document.getElementById('workPodBody');
     if (podBody) {
-        ['faderDespill', 'faderZoneEdge', 'faderFusionExpand', 'faderSamMatteTighten'].forEach(function (id) {
+        ['faderDespill', 'faderZoneEdge', 'faderFusionExpand', 'faderSamMatteTighten',
+         'faderEdgeShadow'].forEach(function (id) {
             var f = document.getElementById(id);
             if (!f) return;
             var _savedDisplay = f.style.display;  // preserve fusion hide state across cssText wipe
@@ -5007,7 +5055,8 @@ function ckResizePanel(w, h) {
         // Faders aren't chrome buttons, so they missed the hover explainer the buttons get.
         // Wire the same #ckBtnTip popup onto the DESPILL + ZONE EDGE faders (Berto 2026-06-26).
         [['faderDespill', 'DESPILL: pulls green/blue screen color spill (the color cast) off the subject — edges, hair, semi-transparent areas. Higher = more spill removed.'],
-         ['faderZoneEdge', 'ZONE EDGE: feather or tighten the matte edge inside the ZONE region you drew.']].forEach(function (_fp) {
+         ['faderZoneEdge', 'ZONE EDGE: feather or tighten the matte edge inside the ZONE region you drew.'],
+         ['faderEdgeShadow', 'EDGE SHADOW: removes the dark rim a limb casts on the screen just outside its own outline. 0 = off (nothing changes). Higher reaches further, but can thin soft edges where the subject is dark against a dark background. Solid areas are never removed.']].forEach(function (_fp) {
             var _fe = document.getElementById(_fp[0]); if (!_fe) return;
             _fe.addEventListener('mouseenter', function () { tip.textContent = _fp[1]; tip.style.display = 'block'; });
             _fe.addEventListener('mouseleave', function () { tip.style.display = 'none'; });

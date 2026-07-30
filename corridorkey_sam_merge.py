@@ -1,4 +1,4 @@
-# Last modified: 2026-07-19 | Change: restore large enclosed dark holes when CK identifies solid subject | Full history: git log
+# Last modified: 2026-07-26 | Change: add EDGE SHADOW panel slider (contact-shadow rim killer, default off) | Full history: git log
 """v1.0 two-mask SAM matte processing.
 
 CK matte and SAM matte are independent in v1.0. The plugin no longer
@@ -2180,6 +2180,54 @@ def _resolve_sam_matte_tighten_px(settings):
     if not np.isfinite(_v):
         return _default
     return float(min(SAM_MATTE_TIGHTEN_PX_MAX, max(0.0, _v)))
+
+
+# EDGE SHADOW slider ceiling and tuning anchors (Berto 2026-07-26). The midpoint
+# is deliberate: at slider 50 the darkness test reproduces UNIFIED_BAND_SHADOW_KILL_VAL
+# exactly, so the slider reads as "less / same / more" against the number the engine
+# has always used rather than as an arbitrary scale.
+EDGE_SHADOW_SLIDER_MAX = 100.0
+EDGE_SHADOW_SLIDER_MIDPOINT = 50.0
+EDGE_SHADOW_GREEN_REACH_PX_BASE = 8.0   # how near green must sit, measured at 1920 width
+EDGE_SHADOW_SOLID_ALPHA_GUARD = 0.90    # alpha at or above this is NEVER removed, at ANY slider value
+
+# EDGE SHADOW protect band — how close to the silhouette the halo cut is allowed to
+# come, measured at 1920 width and scaled up. Pixels nearer than this are genuine
+# edge blend (motion blur, soft edge) and are NEVER eligible at any slider value.
+# Measured on SBV_0727 frame 139: of 100,231 soft survivors outside the silhouette,
+# 15,604 sit within 3px (real edge) while 41,099 sit 8-20px out — that outer band is
+# leftover screen with partial alpha, which is the outline Berto photographed.
+EDGE_SHADOW_PROTECT_PX_MAX = 16.0   # slider just above 0 — timid, only far halo cut
+EDGE_SHADOW_PROTECT_PX_MIN = 3.0    # slider 100 — cuts close, still never inside the blend
+
+
+def _resolve_edge_shadow_amount(settings):
+    """
+    # WHAT IT DOES: Validates and clamps settings['edge_shadow'], the 0-100 panel
+    #               slider that removes the dark contact-shadow rim a limb casts on
+    #               the screen just outside its own silhouette. Returns 0.0 for an
+    #               absent key or any garbage value, and 0.0 means "feature off".
+    # DEPENDS ON:   the settings dict, which arrives as unfiltered JSON via
+    #               ae_processor.load_settings (`settings.update(json.load(f))`).
+    # AFFECTS:      the EDGE SHADOW block at the end of merge_ck_unified_band.
+    #               Returning 0.0 skips that block entirely, so DaVinci, ComfyUI and
+    #               every saved AE session that never sends this key keep rendering
+    #               BYTE-IDENTICAL to pre-feature code.
+
+    bool is rejected explicitly: `isinstance(True, int)` is True in Python, so a
+    hand-edited `true` in the params JSON would otherwise arrive as 1.0. Same
+    reasoning as _resolve_sam_matte_tighten_px above.
+    """
+    _off = 0.0
+    if not isinstance(settings, dict) or "edge_shadow" not in settings:
+        return _off
+    _v = settings.get("edge_shadow")
+    if isinstance(_v, bool) or not isinstance(_v, (int, float)):
+        return _off
+    _v = float(_v)
+    if not np.isfinite(_v):
+        return _off
+    return float(min(EDGE_SHADOW_SLIDER_MAX, max(0.0, _v)))
 UNIFIED_BAND_FEET_TIGHT_PX_BASE = 1.0  # feet-zone width TAPER TARGET — deliberately
                                         # NOT the general tight_px (5.5). The old
                                         # feet-ring-kill hugs a near-eroded silhouette
@@ -3672,6 +3720,16 @@ def merge_ck_unified_band(
         -1,
     )[None, :]
     downward_zone = (_bottom_of_col >= 0) & (_rows > _bottom_of_col)
+    # FEET-SCOPE (Berto 2026-07-24, 4-agent attribution): applied globally, this
+    # rule was the #1 killer of CK-solid flesh wherever SAM under-covers a limb
+    # (66% of the SBV_0727 forearm carve — a column through a half-missed arm is
+    # not "floor below feet"). The floor leak it guards is a FEET phenomenon:
+    # scope it to the same feet zone the taper uses; waist-crop shots
+    # (_body_exits_bottom) skip feet-only rules, degenerate feet_start<=0 too.
+    if _body_exits_bottom or feet_start <= 0:
+        downward_zone &= False
+    else:
+        downward_zone &= (_rows >= feet_start)
     W = np.where(downward_zone, 0.0, W)
 
     # Feather field — starts flat at _feather_px, then gets TIGHTENED (not just W)
@@ -3840,6 +3898,77 @@ def merge_ck_unified_band(
             * (1.0 - support)
         )
         final = np.clip(final * (1.0 - shadow_kill), 0.0, 1.0).astype(np.float32)
+
+    # --- EDGE SHADOW (Berto 2026-07-26, panel slider, DEFAULT OFF) ------------
+    # WHAT IT DOES: removes the dark rim a limb casts on the screen just outside
+    #               its own silhouette — the outline Berto photographed around the
+    #               forearm and fist on SBV_0727 frame 139. Those pixels are too
+    #               dark to read as green, so CK keeps them and they survive as a
+    #               drawn-on contour. The shadow_kill above cannot reach them: it
+    #               is multiplied by (1 - support), which switches it off near the
+    #               body to protect creases.
+    # DEPENDS ON:   on_green_hsv and val (both built from source_rgb earlier in
+    #               this function), sam, _scale, _resolve_edge_shadow_amount.
+    # AFFECTS:      nothing when the slider is 0, which is the default and what
+    #               every pre-existing caller sends. Above 0 it only ever REMOVES
+    #               alpha, and only outside the SAM silhouette.
+    #
+    # Why this is NOT the rejected green barrier: that validated a run of strong
+    # green per pixel ALONG the band and cost 3.6x render time. This is one dilate
+    # of a mask the engine already computed plus a boolean test. It never walks
+    # the band pixel by pixel.
+    #
+    # The green-within-reach clause is the entire discriminator: contact shadow
+    # sits ON the screen, so green is immediately beside it, while a crease or
+    # fold on the subject has no green next to it and is never eligible.
+    _edge_shadow_amount = _resolve_edge_shadow_amount(settings)
+    if _edge_shadow_amount > 0.0 and on_green_hsv is not None and val is not None:
+        _edge_shadow_darkness = UNIFIED_BAND_SHADOW_KILL_VAL * (
+            _edge_shadow_amount / EDGE_SHADOW_SLIDER_MIDPOINT)
+        _edge_shadow_reach_px = max(1, int(round(EDGE_SHADOW_GREEN_REACH_PX_BASE * _scale)))
+        _edge_shadow_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (_edge_shadow_reach_px * 2 + 1, _edge_shadow_reach_px * 2 + 1))
+        _is_on_green = on_green_hsv > 0.5
+        _has_green_within_reach = cv2.dilate(
+            _is_on_green.astype(np.uint8), _edge_shadow_kernel) > 0
+
+        # Distance out from the silhouette. The protect band shrinks as the slider
+        # rises, so the operator decides how close to their own edge the cut dares
+        # come — never closer than EDGE_SHADOW_PROTECT_PX_MIN.
+        _outside_silhouette = (np.asarray(sam) <= 0.5)
+        _distance_from_silhouette = cv2.distanceTransform(
+            _outside_silhouette.astype(np.uint8), cv2.DIST_L2, 5)
+        _protect_px = (EDGE_SHADOW_PROTECT_PX_MAX
+                       - (EDGE_SHADOW_PROTECT_PX_MAX - EDGE_SHADOW_PROTECT_PX_MIN)
+                       * (_edge_shadow_amount / EDGE_SHADOW_SLIDER_MAX)) * _scale
+        _beyond_protect_band = _distance_from_silhouette > _protect_px
+
+        # DANGER ZONE HIGH: the solid-alpha guard and the protect band / breaks:
+        # subject edges tear off (fingers, knuckles) or the soft motion-blurred edge
+        # turns into a hard mat line — the exact defect FEET-SCOPE exists to avoid /
+        # depends on: EDGE_SHADOW_SOLID_ALPHA_GUARD, EDGE_SHADOW_PROTECT_PX_MIN.
+        # Measured 2026-07-26 without the guard: 3,134 of 8,653 killed pixels were
+        # fully solid and the watch hand came back ragged. Soft edge alpha only, and
+        # only beyond the protect band.
+        #
+        # Two things get cut, both background the keyer failed to finish:
+        #   1. leftover SCREEN with partial alpha (reads as green, 48,707 px on the
+        #      measured frame) — the halo that draws the outline;
+        #   2. dark CONTACT SHADOW cast on the screen, which is not green itself but
+        #      has green beside it.
+        _edge_shadow_kill = (
+            (final > 0.02)
+            & (final < EDGE_SHADOW_SOLID_ALPHA_GUARD)
+            & _outside_silhouette
+            & _beyond_protect_band
+            & (
+                _is_on_green
+                | ((val < _edge_shadow_darkness) & _has_green_within_reach)
+            )
+        )
+        final = np.clip(
+            final * (1.0 - _edge_shadow_kill.astype(np.float32)), 0.0, 1.0).astype(np.float32)
 
     # --- FEET-ZONE OFF-GREEN ALPHA-RING HARDENING (P4, 2026-07-11) — see the
     # UNIFIED_BAND_FEET_RING_HARD_* constants above for the full forensic why.
