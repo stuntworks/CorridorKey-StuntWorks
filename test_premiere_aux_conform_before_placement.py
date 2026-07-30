@@ -42,34 +42,61 @@ def _preset_stacked_branch(host):
 # AFFECTS:      Fails when aux layers would be placed at the nest's default rate,
 #               landing at the wrong duration on a non-24fps clip.
 def test_both_aux_items_conform_before_placement():
+    # 2026-07-28 (matte picker): the two hardcoded aux conforms became one loop over
+    # the selected mattes, so the fragments below locate the loop instead of the two
+    # named variables. The invariant under test is IDENTICAL — every matte is
+    # conformed before the first overwriteClip — and it is now enforced for up to
+    # four mattes rather than exactly two.
     branch = _preset_stacked_branch(_host())
 
     placements = []
-    for track in (0, 1, 2):
-        frag = "nestSeq.videoTracks[%d].overwriteClip" % track
-        assert frag in branch, f"missing placement for videoTracks[{track}]"
+    for frag in (
+        "nestSeq.videoTracks[0].overwriteClip",
+        "videoTracks[_trkIdx].overwriteClip(_matteSlots[_msP].item",
+    ):
+        assert frag in branch, f"missing placement fragment: {frag!r}"
         placements.append(branch.index(frag))
     first_placement = min(placements)
 
-    for item in AUX_ITEMS:
-        frag = "%s.setOverrideFrameRate(targetRate)" % item
-        assert frag in branch, f"{item} is never rate-conformed in this branch"
-        conform = branch.index(frag)
-        assert conform < first_placement, (
-            f"{item} is conformed AFTER the first overwriteClip; its placed "
-            f"duration is baked from the pre-conform interpretation"
-        )
+    conform_frag = "_msItem.setOverrideFrameRate(targetRate)"
+    assert conform_frag in branch, "selected mattes are never rate-conformed in this branch"
+    assert branch.index(conform_frag) < first_placement, (
+        "mattes are conformed AFTER the first overwriteClip; their placed "
+        "duration is baked from the pre-conform interpretation"
+    )
+
+    # The conform loop must cover EVERY selected matte, not just the first one.
+    assert "for (var _msC = 0; _msC < _matteSlots.length; _msC++)" in branch, (
+        "the conform step is no longer a loop over all selected mattes"
+    )
 
 
 # WHAT IT DOES: Verifies the branch still places all three layers on the right tracks.
 # DEPENDS ON:   V1 main, V2 CK MASTER, V3 GARBAGE MASK track assignment.
 # AFFECTS:      Fails when the ordering test could pass on a gutted branch.
 def test_all_three_layers_are_still_placed():
-    branch = _preset_stacked_branch(_host())
-    expected = ((0, "imported"), (1, "ckOnlyImported"), (2, "samImported"))
-    for track, item in expected:
-        frag = "nestSeq.videoTracks[%d].overwriteClip(%s" % (track, item)
-        assert frag in branch, f"videoTracks[{track}] no longer receives {item}"
+    # 2026-07-28 (matte picker): V2/V3 are no longer hardcoded — they come from the
+    # selected-matte plan. What must NOT change is the default: with no plan (an older
+    # panel) or the shipped defaults, V1 is the keyed output, V2 is CK MASTER and V3 is
+    # GARBAGE MASK above it, because Premiere's Track Matte Key only offers HIGHER
+    # tracks in its Matte dropdown. This test now pins that default ordering at its
+    # source — the legacy fallback — plus the V1 placement that never moved.
+    host = _host()
+    branch = _preset_stacked_branch(host)
+
+    assert "nestSeq.videoTracks[0].overwriteClip(imported" in branch, (
+        "V1 no longer receives the keyed output"
+    )
+    assert "videoTracks[_trkIdx].overwriteClip(_matteSlots[_msP].item" in branch, (
+        "selected mattes are no longer placed on the tracks above V1"
+    )
+
+    cko = host.index('_matteSlots.push({ key: "CK MASTER", item: ckOnlyImported })')
+    gm = host.index('_matteSlots.push({ key: "GARBAGE MASK", item: samImported })')
+    assert cko < gm, (
+        "legacy fallback order changed: CK MASTER must take V2 and GARBAGE MASK V3, "
+        "so the garbage matte sits ABOVE the clip it cuts"
+    )
 
 
 # WHAT IT DOES: Verifies the other two import paths also conform before placing.

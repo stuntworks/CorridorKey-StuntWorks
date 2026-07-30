@@ -306,6 +306,15 @@ DEFAULT_SETTINGS = {
     "despeckle": True,
     "despeckleSize": 400,
     "choke": 0,
+    # Matte-deliverable selection gates (2026-07-28): four independent booleans
+    # deciding which sidecar matte folders get WRITTEN. Unchecked = the folder is
+    # never created and no PNG is encoded for it. CK_ONLY/GARBAGE_MATTE default ON
+    # (matches the pre-gate always-on behavior); SAM_JUNK/CK_ALPHA default OFF
+    # (these two are opt-in extras, not part of the standard deliverable set).
+    "matte_ck_master": True,   # gates the CK_ONLY/ write block in cmd_batch
+    "matte_garbage": True,     # gates the GARBAGE_MATTE/ write block in cmd_batch
+    "matte_sam_junk": False,   # gates the SAM_JUNK/ write in _write_fusion_sidecars
+    "matte_ck_alpha": False,   # gates the CK_ALPHA/ write in _write_fusion_sidecars
 }
 
 
@@ -2192,14 +2201,21 @@ def _write_fusion_sidecars(ck_alpha, sam_union,
 
     try:
         # 1. CK_ALPHA — RAW CK neural-net alpha (un-merged, un-choked). 16-bit 3-channel.
-        if ck_alpha is not None:
+        #    GATED on matte_ck_alpha (default OFF, 2026-07-28): unchecked means this
+        #    folder is never created and no PNG is encoded — an opt-in extra, not part
+        #    of the standard deliverable set. .get(..., False) tolerates a settings
+        #    dict from before this flag existed (falls back to the shipped default)
+        #    and a non-bool value (bool(...) coerces without raising).
+        if ck_alpha is not None and bool(settings.get("matte_ck_alpha", False)):
             m = ck_alpha[:, :, 0] if ck_alpha.ndim == 3 else ck_alpha
             m16 = (np.clip(m, 0.0, 1.0) * 65535.0).astype(np.uint16)
             _write("CK_ALPHA", "CK_ALPHA", cv2.merge([m16, m16, m16]))
 
         # 2. SAM_JUNK — inverted SAM mask (uint8 0/255, white=junk to discard, black=body).
         #    AE layer named 'SAM JUNK MASK' with Simple Choker buffer — see host.jsx.
-        if sam_union is not None:
+        #    GATED on matte_sam_junk (default OFF, 2026-07-28): same reasoning as
+        #    matte_ck_alpha above — opt-in extra, unchecked writes nothing.
+        if sam_union is not None and bool(settings.get("matte_sam_junk", False)):
             s_2d = sam_union[:, :, 0] if sam_union.ndim == 3 else sam_union
             junk_u8 = ((1.0 - np.clip(s_2d, 0.0, 1.0)) * 255.0).astype(np.uint8)
             _write("SAM_JUNK", "SAM_JUNK", cv2.merge([junk_u8, junk_u8, junk_u8]))
@@ -3308,24 +3324,35 @@ def cmd_batch(source_video, output_folder, settings,
                 # matte-boxes the head from THIS clip and lays it back over the merged
                 # key to restore the eaten hair. Despilled fg + RAW CK alpha (pre-fusion,
                 # un-choked), so it carries every wisp the merged output loses.
-                _ck_a = alpha_raw[:, :, 0] if alpha_raw.ndim == 3 else alpha_raw
-                # adaptive_green_kill CALL DISABLED (06-12 restore)
-                # if settings.get('green_kill', False):
-                #     from corridorkey_sam_merge import adaptive_green_kill
-                #     _ck_a = adaptive_green_kill(_ck_a, _sam_frame, img_rgb)
-                _ck_a16 = (np.clip(_ck_a, 0, 1) * 65535).astype(np.uint16)
-                _ck_only_bgra = cv2.merge([fg_bgr[:, :, 0], fg_bgr[:, :, 1], fg_bgr[:, :, 2], _ck_a16])
-                _ck_only_dir = out_dir / "CK_ONLY"
-                _ck_only_dir.mkdir(parents=True, exist_ok=True)
-                _atomic_imwrite(_ck_only_dir / f"CK_ONLY_{seq_num:05d}.png", _ck_only_bgra)
-                if processed == 0:
-                    _atomic_imwrite(_ck_only_dir / "CK_ONLY_00000.png", _ck_only_bgra)
+                # GATED on matte_ck_master (default ON, 2026-07-28): unchecked means this
+                # whole block — including creating CK_ONLY/ — never runs, so the folder
+                # is never created and no PNG is encoded. .get(..., True) tolerates a
+                # settings dict from before this flag existed (falls back to today's
+                # always-on behavior) and a non-bool value (bool(...) coerces safely).
+                if bool(settings.get("matte_ck_master", True)):
+                    _ck_a = alpha_raw[:, :, 0] if alpha_raw.ndim == 3 else alpha_raw
+                    # adaptive_green_kill CALL DISABLED (06-12 restore)
+                    # if settings.get('green_kill', False):
+                    #     from corridorkey_sam_merge import adaptive_green_kill
+                    #     _ck_a = adaptive_green_kill(_ck_a, _sam_frame, img_rgb)
+                    _ck_a16 = (np.clip(_ck_a, 0, 1) * 65535).astype(np.uint16)
+                    _ck_only_bgra = cv2.merge([fg_bgr[:, :, 0], fg_bgr[:, :, 1], fg_bgr[:, :, 2], _ck_a16])
+                    _ck_only_dir = out_dir / "CK_ONLY"
+                    _ck_only_dir.mkdir(parents=True, exist_ok=True)
+                    _atomic_imwrite(_ck_only_dir / f"CK_ONLY_{seq_num:05d}.png", _ck_only_bgra)
+                    if processed == 0:
+                        _atomic_imwrite(_ck_only_dir / "CK_ONLY_00000.png", _ck_only_bgra)
                 # GARBAGE_MATTE (Berto 2026-06-14): the clean engine's green-aware keep-gate,
                 # surfaced as a STABLE knock-out matte — better than raw inverted-SAM (SAM_JUNK),
                 # which wobbles per-frame. Written SAME polarity as SAM_JUNK (white=junk) so it
                 # is a drop-in luma-inverted matte in the precomp. None on the fusion path, so
                 # the precomp falls back to SAM_JUNK there.
-                if _green_garbage is not None:
+                # GATED on matte_garbage (default ON, 2026-07-28), ADDED alongside the
+                # pre-existing _green_garbage is not None check (not replacing it) —
+                # unchecked means the folder is never created even when the clean engine
+                # did produce a garbage matte. .get(..., True) tolerates a settings dict
+                # from before this flag existed and a non-bool value.
+                if _green_garbage is not None and bool(settings.get("matte_garbage", True)):
                     _gg = _green_garbage[:, :, 0] if _green_garbage.ndim == 3 else _green_garbage
                     if _gg.shape[:2] != alpha_raw.shape[:2]:
                         _gg = cv2.resize(_gg.astype(np.float32),

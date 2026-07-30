@@ -1296,6 +1296,46 @@
     background: transparent !important; box-shadow: none !important; padding: 0 !important; margin: 0 !important;
   }
   .work-pod-body .ww { display: none; }   /* no explainer paragraphs in the pod */
+  /* MATTES row (Berto 2026-07-29): four checkboxes on one line, directly above
+     PREVIEW / RENDER. Deliberately NOT the .cell chrome — inside the pod it is a
+     pick-list for the render about to fire, so it stays flat and one line high.
+     The .work-pod-body .cell rule already strips background/padding; these rules
+     apply wherever the row lives, pod or not. */
+  .mattes-row {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    /* Centered on the PREVIEW / RENDER buttons below it, not left-hugging the
+       faders (Berto 2026-07-29). The top margin clears the fader scale numbers,
+       which the row was overlapping. */
+    justify-content: center; width: 100%;
+    margin: 16px 0 0; padding: 0;
+    background: transparent !important; box-shadow: none !important;
+  }
+  .mattes-row .mattes-label {
+    font-size: 9px; letter-spacing: .14em; color: var(--ink-faint);
+    text-transform: uppercase; flex: 0 0 auto;
+  }
+  .mchk {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 10px; letter-spacing: .08em; text-transform: uppercase;
+    color: var(--ink); cursor: pointer; user-select: none; flex: 0 0 auto;
+  }
+  .mchk input[type="checkbox"] {
+    -webkit-appearance: none; appearance: none; margin: 0;
+    width: 13px; height: 13px; border-radius: 3px; cursor: pointer;
+    background: linear-gradient(180deg, #202327, #15171a);
+    box-shadow: 0 0 0 1px rgba(0,0,0,.6), 0 1px 0 rgba(255,255,255,.05) inset;
+    position: relative; flex: 0 0 auto;
+  }
+  .mchk input[type="checkbox"]:checked {
+    background: linear-gradient(180deg, #1f7f83, #0d5c60);
+    box-shadow: 0 0 0 1px rgba(0,0,0,.6), 0 0 6px rgba(40,220,228,.45);
+  }
+  .mchk input[type="checkbox"]:checked::after {
+    content: ''; position: absolute; left: 4px; top: 1px;
+    width: 3px; height: 7px; border: solid #d8feff;
+    border-width: 0 2px 2px 0; transform: rotate(45deg);
+  }
+  .mchk input[type="checkbox"]:focus-visible { outline: 1px solid var(--cyan); outline-offset: 2px; }
   .work-pod-foot { display: flex; align-items: center; gap: 10px; margin-top: 12px; }
   .work-pod-masks { display: flex; align-items: center; gap: 6px; margin-top: 8px; }
   .work-pod-masks select#maskMode {
@@ -1913,6 +1953,44 @@
             </div>
           </div>
 
+          <!-- MATTES (Berto 2026-07-28): four independent toggles choosing which
+               matte deliverables a render actually writes to disk. Checked means
+               that pass is rendered, imported, and placed on its own timeline
+               track; unchecked means it is never written at all: no PNGs, no
+               track, nothing to clean up later. None of these four cost any
+               extra keying or SAM compute; the only cost is PNG encode + disk
+               (measured at 3840x2160 on real frames, see each toggle's Why
+               line). Defaults reproduce the timeline Berto has today: CK MASTER
+               and GARBAGE MASK on, SAM JUNK MASK and CK ALPHA off. -->
+          <!-- Berto 2026-07-29: real checkboxes in one row, sitting directly above
+               PREVIEW / RENDER. The pswitch version read as a settings toggle; these
+               are a pick-list for the render you are about to fire, so they belong
+               next to the button that fires it. Tooltips carry the What/Why so the
+               row stays one line high. -->
+          <div class="cell mattes-row" id="cellMattes">
+            <span class="mattes-label">MATTES</span>
+            <label class="mchk" for="matteCkMaster"
+                   title="CK MASTER - CK's own key alone, full hair, no SAM cut. Costs no extra keying or SAM: 416 ms and 28.8 MB per frame at 3840x2160. On by default; this is the CK matte track on your timeline today.">
+              <input type="checkbox" id="matteCkMaster" checked />
+              <span>CK MASTER</span>
+            </label>
+            <label class="mchk" for="matteGarbage"
+                   title="GARBAGE MASK - CK's green-aware holdout matte. Costs no extra keying or SAM: 32 ms and 0.4 MB per frame. On by default; this is the garbage matte track on your timeline today.">
+              <input type="checkbox" id="matteGarbage" checked />
+              <span>GARBAGE MASK</span>
+            </label>
+            <label class="mchk" for="matteSamJunk"
+                   title="SAM JUNK MASK - raw inverted SAM, white is junk, no green-aware dilation. Costs nothing beyond the SAM pass you already ran: 34 ms and 0.5 MB per frame. Off by default.">
+              <input type="checkbox" id="matteSamJunk" />
+              <span>SAM JUNK MASK</span>
+            </label>
+            <label class="mchk" for="matteCkAlpha"
+                   title="CK ALPHA - CK's own matte pass. Costs no extra keying or SAM: 116 ms and 3.5 MB per frame. Off by default.">
+              <input type="checkbox" id="matteCkAlpha" />
+              <span>CK ALPHA</span>
+            </label>
+          </div>
+
         </div>
       </div>
     </div>
@@ -2216,6 +2294,30 @@
       ckLog('ck_authority toggle: ' + (aOn ? 'off' : 'on'));
     });
   }
+
+  // MATTES (Berto 2026-07-29): four render-deliverable CHECKBOXES sitting directly
+  // above PREVIEW / RENDER. They were pswitch toggles until Berto asked for
+  // checkboxes in a row: this is a pick-list for the render you are about to fire,
+  // not a settings switch. CK MASTER and GARBAGE MASK default ON (they reproduce
+  // the timeline he has today); SAM JUNK MASK and CK ALPHA default OFF. The HTML
+  // checked attribute carries each default, so an ABSENT localStorage key must
+  // never read as off for the two that default on -- only an explicit saved value
+  // overrides the HTML default, in either direction.
+  [['matteCkMaster', 'ck_global_matte_ck_master', 'matte_ck_master', true],
+   ['matteGarbage', 'ck_global_matte_garbage', 'matte_garbage', true],
+   ['matteSamJunk', 'ck_global_matte_sam_junk', 'matte_sam_junk', false],
+   ['matteCkAlpha', 'ck_global_matte_ck_alpha', 'matte_ck_alpha', false]
+  ].forEach(function (spec) {
+    const el = document.getElementById(spec[0]);
+    if (!el) return;
+    const saved = localStorage.getItem(spec[1]);
+    if (saved === 'true') el.checked = true;
+    else if (saved === 'false') el.checked = false;
+    el.addEventListener('change', function () {
+      localStorage.setItem(spec[1], el.checked ? 'true' : 'false');
+      ckLog(spec[2] + ' toggle: ' + (el.checked ? 'on' : 'off'));
+    });
+  });
 
   // SAM MATTE TIGHTEN (Berto 2026-07-12) — global persisted state, same
   // ck_global_* convention as CK Authority above. Restore BEFORE wireFader()
@@ -3445,6 +3547,36 @@ function ckGetSettings() {
     // rejects non-numeric values and falls back to 0 (off).
     const edgeShadowSliderEl = document.getElementById('edgeShadow');
     const edge_shadow = edgeShadowSliderEl ? parseFloat(edgeShadowSliderEl.value) : 0;
+    // MATTES (Berto 2026-07-28): which matte deliverables this render should
+    // write and place, one bool per toggle. Same aria-pressed idiom as every
+    // other pswitch read above. The el ? ... : default fallback covers the
+    // button being absent from the DOM entirely (mid-edit panel); it is not
+    // the localStorage-restore path, that already ran on load and is baked
+    // into aria-pressed by the time this function runs.
+    // Real checkboxes since 2026-07-29, so these read .checked rather than the
+    // aria-pressed idiom the pswitch controls use. The el ? ... : default fallback
+    // covers the input being absent from the DOM entirely, and each fallback repeats
+    // that control's shipped default.
+    const matteCkMasterEl = document.getElementById('matteCkMaster');
+    const matte_ck_master = matteCkMasterEl ? !!matteCkMasterEl.checked : true;
+    const matteGarbageEl = document.getElementById('matteGarbage');
+    const matte_garbage = matteGarbageEl ? !!matteGarbageEl.checked : true;
+    const matteSamJunkEl = document.getElementById('matteSamJunk');
+    const matte_sam_junk = matteSamJunkEl ? !!matteSamJunkEl.checked : false;
+    const matteCkAlphaEl = document.getElementById('matteCkAlpha');
+    const matte_ck_alpha = matteCkAlphaEl ? !!matteCkAlphaEl.checked : false;
+    // HOST-SPECIFIC: the picker is a PREMIERE feature. It decides which mattes get their
+    // own Premiere track, and its two unticked defaults exist so the Premiere timeline
+    // stays exactly as it is today. AE is a different delivery: ae_createSAMPrecomp
+    // consumes CK_ALPHA (its CK MATTE) and SAM_JUNK (its GARBAGE MASK) on every render,
+    // so letting the Premiere defaults gate the writes would silently strip two layers
+    // out of an AE precomp nobody asked us to change. In AE all four passes are written,
+    // which is today's behavior, unchanged.
+    const _isPpro = (HOST_APP === 'ppro');
+    const matte_ck_master_eff = _isPpro ? matte_ck_master : true;
+    const matte_garbage_eff = _isPpro ? matte_garbage : true;
+    const matte_sam_junk_eff = _isPpro ? matte_sam_junk : true;
+    const matte_ck_alpha_eff = _isPpro ? matte_ck_alpha : true;
     const settings = {
         screenType: screenType,
         despill: despill,
@@ -3464,7 +3596,11 @@ function ckGetSettings() {
         unified_band: unified_band,
         ck_authority: ck_authority,
         sam_matte_tighten_px: sam_matte_tighten_px,
-        edge_shadow: edge_shadow
+        edge_shadow: edge_shadow,
+        matte_ck_master: matte_ck_master_eff,
+        matte_garbage: matte_garbage_eff,
+        matte_sam_junk: matte_sam_junk_eff,
+        matte_ck_alpha: matte_ck_alpha_eff
     };
     ckLog('fusion_v2: ' + (fusion_v2 ? 'on' : 'off') + ' at settings build');
     ckLog('unified_band: ' + (unified_band ? 'on' : 'off') + ' at settings build');
@@ -4268,6 +4404,23 @@ function autoPreCache(info) {
         }
     );
 }
+// MATTES plan (Berto 2026-07-28): turns the four matte toggles plus the
+// disk-probe results doCommit/doSAMCommit already computed into the ordered
+// array Premiere places on V2, V3, V4... An entry is included ONLY when BOTH
+// its toggle is on AND the probe actually found that sidecar's first frame:
+// unchecked means the pass was never rendered, so there is nothing to place;
+// and a checked toggle can't summon a file the render didn't write. Fixed
+// priority order: CK MASTER, GARBAGE MASK, SAM JUNK MASK, CK ALPHA. Returns a
+// JSON string, ready to hand straight to jsxCall as the 13th argument.
+function ckBuildMattePlan(settings, ckMasterPath, garbageMattePath, samJunkPath, ckAlphaPath) {
+    const plan = [];
+    if (settings.matte_ck_master && ckMasterPath) plan.push({ key: 'CK MASTER', path: ckMasterPath });
+    if (settings.matte_garbage && garbageMattePath) plan.push({ key: 'GARBAGE MASK', path: garbageMattePath });
+    if (settings.matte_sam_junk && samJunkPath) plan.push({ key: 'SAM JUNK MASK', path: samJunkPath });
+    if (settings.matte_ck_alpha && ckAlphaPath) plan.push({ key: 'CK ALPHA', path: ckAlphaPath });
+    return JSON.stringify(plan);
+}
+
 // KEY = COMMIT. Key the WHOLE clip (work area) and drop it on the timeline. The
 // perfect-key path: see the auto-keyed sample, hit KEY, boom -- it's on your
 // timeline. Runs async (UI never freezes) and shows live n/m progress on the
@@ -4422,9 +4575,13 @@ function doCommit() {
             const _firstPngIn = (dir, prefix) => { try { const _ff = fs.readdirSync(dir).filter(n => n.startsWith(prefix) && n.endsWith('.png')).sort(); return _ff.length ? path.join(dir, _ff[0]) : null; } catch(_) { return null; } };
             const _gmDirC = path.join(outDir, 'GARBAGE_MATTE');
             const _gmAnchorC = path.join(_gmDirC, 'GARBAGE_MATTE_00000.png');
-            const samMattePathC =
-                (fs.existsSync(_gmAnchorC) ? _gmAnchorC : _firstPngIn(_gmDirC, 'GARBAGE_MATTE_'))
-                || samJunkSidecar;
+            // MATTES (Berto 2026-07-28): the GARBAGE_MATTE-only resolution, split out
+            // of samMattePathC below so the matte plan can offer "GARBAGE MASK" as its
+            // own entry instead of the SAM_JUNK-fallback value samMattePathC carries
+            // for the legacy args-5/args-6 slots. samMattePathC's own value is
+            // unchanged by this split.
+            const _garbageMatteOnlyC = (fs.existsSync(_gmAnchorC) ? _gmAnchorC : _firstPngIn(_gmDirC, 'GARBAGE_MATTE_'));
+            const samMattePathC = _garbageMatteOnlyC || samJunkSidecar;
             const _ckOnlyDirC = path.join(outDir, 'CK_ONLY');
             const _ckOnlyAnchorC = path.join(_ckOnlyDirC, 'CK_ONLY_00000.png');
             const ckOnlyPathC = (fs.existsSync(_ckOnlyAnchorC) ? _ckOnlyAnchorC : _firstPngIn(_ckOnlyDirC, 'CK_ONLY_')) || null;
@@ -4432,11 +4589,18 @@ function doCommit() {
             const importFn = HOST_APP === 'ppro' ? 'ppro_importSequence' : 'ae_importSequence';
             const renderDimensions = ckReadPngDimensions(firstFrame);
             const renderPresetPath = path.join(PANEL_DIR, 'presets', 'CK_3TRACK.sqpreset');
+            // MATTES (Berto 2026-07-28): 13th arg, additive only, args 1-12 above are
+            // untouched. Ordered plan of which sidecars to place on V2/V3/V4..., built
+            // from the four toggles in settings crossed with the disk probes already
+            // resolved above (ckOnlyPathC, _garbageMatteOnlyC, samJunkSidecar,
+            // ckMatteSidecar). A toggle that's off never contributes an entry, so
+            // nothing from that pass reaches the timeline.
+            const mattePlanJsonC = ckBuildMattePlan(settings, ckOnlyPathC, _garbageMatteOnlyC, samJunkSidecar, ckMatteSidecar);
             const importArgs = HOST_APP === 'ppro'
                 ? [firstFrame, info.inPointSeconds, info.fps, info.sourceFrameRate || info.fps,
                    samMattePathC, ckOnlyPathC, _durationC,
                    renderDimensions.width, renderDimensions.height, renderPresetPath, info.sourceFile,
-                   samJunkSidecar]
+                   samJunkSidecar, mattePlanJsonC]
                 : [firstFrame, info.fps, info.compStartTime, true, ckLockJson, ckMatteSidecar, info.sourceFile, samJunkSidecar];   // merged clip + CK matte + SAM junk mask
             ckStatus('Placing on timeline...');
             jsxCall(importFn, importArgs, (imp) => {
@@ -4631,8 +4795,14 @@ function doSAMCommit(advanced) {
             const _gmAnchor = path.join(_gmDir, 'GARBAGE_MATTE_00000.png');
             const _samJunkDir = path.join(outDir, 'SAM_JUNK');
             const _sjAnchor = path.join(_samJunkDir, 'SAM_JUNK_00000.png');
+            // MATTES (Berto 2026-07-28): the GARBAGE_MATTE-only resolution, split out
+            // of samMattePath below so the matte plan can offer "GARBAGE MASK" as its
+            // own entry instead of the SAM_JUNK-fallback value samMattePath carries
+            // for the legacy args-5/args-6 slots. samMattePath's own value is
+            // unchanged by this split.
+            const _garbageMatteOnly = (fs.existsSync(_gmAnchor) ? _gmAnchor : _firstPng(_gmDir, 'GARBAGE_MATTE_'));
             const samMattePath =
-                (fs.existsSync(_gmAnchor) ? _gmAnchor : _firstPng(_gmDir, 'GARBAGE_MATTE_'))
+                _garbageMatteOnly
                 || (fs.existsSync(_sjAnchor) ? _sjAnchor : _firstPng(_samJunkDir, 'SAM_JUNK_'));
             // Tight SAM matte: raw inverted-SAM from SAM_JUNK/ only — no green-aware fallback.
             // Secondary holdout layer for off-green shots. host.jsx skips it if identical to wide.
@@ -4652,11 +4822,16 @@ function doSAMCommit(advanced) {
                 // AE gets this raw SAM_JUNK pass via ae_createSAMPrecomp below; Premiere
                 // was computing it four lines up and then dropping it. host.jsx imports it
                 // to the project bin only, no track placement (3-track preset).
+                // mattePlanJson (13th arg, Berto 2026-07-28): additive only, args 1-12
+                // above are untouched. Same plan builder as doCommit, fed from the same
+                // four toggles crossed with the sidecars already resolved above
+                // (ckOnlyPath, _garbageMatteOnly, tightSamPath, ckMattePath).
+                const mattePlanJson = ckBuildMattePlan(settings, ckOnlyPath, _garbageMatteOnly, tightSamPath, ckMattePath);
                 jsxCall('ppro_importSequence', [
                     firstFrame, info.inPointSeconds, info.fps, info.sourceFrameRate || info.fps, samMattePath, ckOnlyPath,
                     (Number(info.endSeconds) - Number(info.startSeconds)) || 0,
                     renderDimensions.width, renderDimensions.height, renderPresetPath, info.sourceFile,
-                    tightSamPath
+                    tightSamPath, mattePlanJson
                 ], (imp) => {
                     if (!imp || !imp.ok) return finish('Import failed: ' + (imp && imp.error ? imp.error : 'unknown'), true);
                     if (imp.via) ckLog('samCommit: import target resolved via ' + imp.via);
@@ -4818,6 +4993,25 @@ function ckOpenURL(url) {
             if (valEl && headEl && valEl.parentNode !== headEl) headEl.appendChild(valEl);
             podBody.appendChild(f);
         });
+
+        // MATTES must be relocated too (Berto 2026-07-29). It lives in #approveGate
+        // beside the faders, and working mode hides that whole section
+        // (.unit.working .approve-gate { display: none !important }). Anything left
+        // behind there is unreachable: the gate run where SAM JUNK MASK was ticked
+        // rendered as if it never happened, because the switch was not on screen to
+        // click. The faders above survive precisely because they get moved here.
+        //
+        // It goes BETWEEN the pod body and the pod foot, so the row sits directly
+        // above PREVIEW / RENDER: you pick the mattes, then you press the button that
+        // renders them. Berto's placement call.
+        var _mattesCell = document.getElementById('cellMattes');
+        var _podFoot = document.querySelector('#workPod .work-pod-foot');
+        if (_mattesCell && _podFoot && _podFoot.parentNode) {
+            _mattesCell.style.cssText = 'margin-top:0;';
+            _podFoot.parentNode.insertBefore(_mattesCell, _podFoot);
+        } else if (_mattesCell) {
+            podBody.appendChild(_mattesCell);   // fallback: still reachable
+        }
     }
 
     // 2) pod KEY = PREVIEW this frame (+ SAM mask); COMMIT = render whole clip; Done = exit

@@ -1076,8 +1076,37 @@ function ppro_importFrame(outputPath, playheadSeconds, fps) {
 //   from the first rendered PNG. presetPath comes from the CEP panel directory;
 //   the active sequence is the guarded geometry fallback.
 // AFFECTS: Project panel (bin + imported item), timeline, and nested-sequence geometry.
-function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate, samFirstFramePath, ckOnlyFirstFramePath, durationSeconds, sourceWidth, sourceHeight, presetPath, srcVideoPath, tightSamFirstFramePath) {
+function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate, samFirstFramePath, ckOnlyFirstFramePath, durationSeconds, sourceWidth, sourceHeight, presetPath, srcVideoPath, tightSamFirstFramePath, mattePlanJson) {
     try {
+        // MATTE PICKER (Berto 2026-07-28): arg 13 is an ordered JSON array of the mattes the
+        // operator ticked in the panel — [{key, path}, ...] — to be placed on V2, V3, V4...
+        // in that order. Absent or unparseable means an older panel is driving this host, so
+        // we fall back to the legacy pair (CK MASTER on V2, GARBAGE MASK on V3) and behave
+        // exactly as before. Never throw on a bad plan: a malformed picker must not cost the
+        // operator the whole key.
+        // CEP hands a JS null across evalScript as the literal STRING "null", so a
+        // plain truthiness check treats an absent sidecar as a real path, opens a file
+        // called "null", fails, and reports a scary "raw SAM NOT imported" warning on
+        // every render where that matte simply was not selected. Normalize once, here.
+        function _ckPathArg(v) {
+            if (v === null || typeof v === "undefined") return "";
+            var s = String(v);
+            if (s === "null" || s === "undefined" || s === "") return "";
+            return s;
+        }
+        tightSamFirstFramePath = _ckPathArg(tightSamFirstFramePath);
+        samFirstFramePath = _ckPathArg(samFirstFramePath);
+        ckOnlyFirstFramePath = _ckPathArg(ckOnlyFirstFramePath);
+
+        var _mattePlan = null;
+        var _mattePlanErr = "";
+        if (typeof mattePlanJson !== "undefined" && mattePlanJson) {
+            try {
+                var _mp = (typeof mattePlanJson === "string") ? JSON.parse(String(mattePlanJson)) : mattePlanJson;
+                if (_mp && _mp.length !== undefined) { _mattePlan = _mp; }
+                else { _mattePlanErr = "matte plan was not an array"; }
+            } catch (eMP) { _mattePlanErr = "matte plan JSON parse failed: " + eMP; }
+        }
         var seq = app.project.activeSequence;
         if (!seq) return JSON.stringify({ ok: false, error: "No active sequence" });
 
@@ -1189,12 +1218,12 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
         // GARBAGE_MATTE, so the operator had no un-dilated SAM to pull as a luma
         // matte. Same snapshot-diff import pattern as the two sidecars above.
         //
-        // BIN ONLY — deliberately NOT placed on a track. The nest runs off the
-        // shipped 3-track CK_3TRACK.sqpreset and host.jsx fails the nest below if
-        // the preset yields fewer than 3 tracks; a fourth layer would need a new
-        // binary preset authored by hand. Importing to the bin closes the parity
-        // gap with zero risk to the existing three-track placement — the operator
-        // drags it onto whatever track they want.
+        // Imported here, PLACED only if the operator ticked SAM JUNK MASK in the matte
+        // picker (see the plan resolution below). It was bin-only until 2026-07-28 because
+        // the preset was assumed to be a hand-authored binary stuck at three tracks; it is
+        // not — the count is a plain XML tag, patched at runtime like the frame rate, and a
+        // 5-track patch was spike-proven in Premiere 25.x. Default is unticked, so the
+        // out-of-the-box timeline is unchanged.
         var tightSamImported = null;
         var tightSamError = "";
         if (tightSamFirstFramePath) {
@@ -1225,6 +1254,76 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
                 tightSamError = "exception: " + (eTsImport && eTsImport.message ? eTsImport.message : String(eTsImport));
             }
         }
+
+        // CK_ALPHA sidecar — Premiere has never imported this pass; only AE received it.
+        // It becomes reachable when the operator ticks CK ALPHA in the matte picker, so the
+        // import is driven off the plan rather than a fixed argument. Same snapshot-diff
+        // pattern as the three sidecars above.
+        var ckAlphaImported = null;
+        var ckAlphaError = "";
+        var _ckAlphaPath = null;
+        if (_mattePlan) {
+            for (var _mpA = 0; _mpA < _mattePlan.length; _mpA++) {
+                var _entA = _mattePlan[_mpA];
+                if (_entA && String(_entA.key) === "CK ALPHA" && _entA.path) { _ckAlphaPath = String(_entA.path); break; }
+            }
+        }
+        if (_ckAlphaPath) {
+            try {
+                var caFile = new File(_ckAlphaPath);
+                if (!caFile.exists) { ckAlphaError = "CK ALPHA first frame not found: " + _ckAlphaPath; }
+                if (caFile.exists) {
+                    var beforeIdsCa = {};
+                    for (var iCa = 0; iCa < root.children.numItems; iCa++) {
+                        var chCa = root.children[iCa];
+                        beforeIdsCa[chCa.nodeId || String(iCa) + "-" + chCa.name] = true;
+                    }
+                    var okCa = app.project.importFiles([_ckAlphaPath], true, root, true);
+                    if (okCa) {
+                        for (var jCa = 0; jCa < root.children.numItems; jCa++) {
+                            var cCa = root.children[jCa];
+                            var idCa = cCa.nodeId || String(jCa) + "-" + cCa.name;
+                            if (!beforeIdsCa[idCa]) { ckAlphaImported = cCa; break; }
+                        }
+                        if (!ckAlphaImported) { ckAlphaError = "importFiles reported success but no new project item appeared"; }
+                    } else {
+                        ckAlphaError = "importFiles returned false for " + _ckAlphaPath;
+                    }
+                }
+            } catch (eCaImport) {
+                ckAlphaError = "exception: " + (eCaImport && eCaImport.message ? eCaImport.message : String(eCaImport));
+            }
+        }
+
+        // Resolve the plan into the ORDER mattes will occupy V2, V3, V4... Each entry maps a
+        // panel key onto an item this function already imported. An entry whose sidecar never
+        // made it to disk simply drops out — the same degrade-quietly rule the sidecars have
+        // always followed. With no plan (older panel), rebuild the legacy pair so the timeline
+        // is bit-for-bit what it is today: CK MASTER on V2, GARBAGE MASK on V3 above it.
+        var _matteSlots = [];
+        if (_mattePlan) {
+            for (var _mpI = 0; _mpI < _mattePlan.length; _mpI++) {
+                var _ent = _mattePlan[_mpI];
+                if (!_ent || !_ent.key) continue;
+                var _k = String(_ent.key), _item = null;
+                if (_k === "CK MASTER") { _item = ckOnlyImported; }
+                else if (_k === "GARBAGE MASK") { _item = samImported; }
+                else if (_k === "SAM JUNK MASK") { _item = tightSamImported; }
+                else if (_k === "CK ALPHA") { _item = ckAlphaImported; }
+                if (_item) { _matteSlots.push({ key: _k, item: _item }); }
+            }
+        } else {
+            if (ckOnlyImported) { _matteSlots.push({ key: "CK MASTER", item: ckOnlyImported }); }
+            if (samImported) { _matteSlots.push({ key: "GARBAGE MASK", item: samImported }); }
+        }
+        // V1 always carries the keyed output; the mattes take the tracks above it, one each.
+        // The count follows the plan exactly: two mattes is 3 tracks (today), four is 5, and
+        // NO mattes is 1. An earlier version floored this at 3, which quietly contradicted the
+        // picker — unticking everything still built two empty tracks, so "off" did not look
+        // off. The floor is 1 because V1 must exist; the gate below still refuses the nest if
+        // Premiere hands back fewer tracks than the plan needs.
+        var _tracksNeeded = 1 + _matteSlots.length;
+        if (_tracksNeeded < 1) { _tracksNeeded = 1; }
 
         // Force the imported PNG sequence's footage frame rate to match V1's. Without
         // this, Premiere applies its default (usually the project fps) and V2 drifts
@@ -1351,6 +1450,7 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
         // candidate paths below.
         var _presetSeq = null;
         var _presetTried = "";
+        var _trackShortfall = "";   // set only when Premiere made fewer tracks than the plan needs
         var _nestGeomSource = ""; // 'preset' when the shipped .sqpreset built the nest
         try {
             // DANGER ZONE HIGH: $.fileName can resolve against Premiere.exe when CEP
@@ -1391,13 +1491,26 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
                         if (_seedXml && _seedXml.match(/<VideoFrameRate>\d+<\/VideoFrameRate>/)) {
                             _seedXml = _seedXml.replace(/<VideoFrameRate>\d+<\/VideoFrameRate>/,
                                 "<VideoFrameRate>" + _rateTicks + "</VideoFrameRate>");
-                            var _patchF = new File(Folder.temp.fsName + "/CK_3TRACK_" + _rateTicks + ".sqpreset");
+                            // TRACK COUNT (matte picker, 2026-07-28): the seed ships 3 native
+                            // tracks; one more matte means one more track. It is the same
+                            // text-patch trick as the rate above — the count is a plain XML
+                            // tag, NOT the hand-authored binary the old comment claimed.
+                            // SPIKE-PROVEN: a seed patched to 5 produced 5 real factory tracks
+                            // in Premiere 25.x, twice, with no QE DOM anywhere. At the default
+                            // two mattes this writes 3 and the file is what it has always been.
+                            // breaks: nothing at 3; at >3, a Premiere that ignored the tag would
+                            //   fail the numTracks gate below and fall back, never place blind.
+                            if (_seedXml.match(/<InitialNumberOfVideoTracks>\d+<\/InitialNumberOfVideoTracks>/)) {
+                                _seedXml = _seedXml.replace(/<InitialNumberOfVideoTracks>\d+<\/InitialNumberOfVideoTracks>/,
+                                    "<InitialNumberOfVideoTracks>" + _tracksNeeded + "</InitialNumberOfVideoTracks>");
+                            }
+                            var _patchF = new File(Folder.temp.fsName + "/CK_" + _tracksNeeded + "TRACK_" + _rateTicks + ".sqpreset");
                             if (_patchF.open("w")) {
                                 var _patchOk = _patchF.write(_seedXml);
                                 _patchF.close();
                                 if (_patchOk) {
                                     _presetPath = _patchF.fsName;
-                                    _presetTried += " [fps-patched:" + _rateTicks + "]";
+                                    _presetTried += " [fps-patched:" + _rateTicks + " tracks:" + _tracksNeeded + "]";
                                 }
                             }
                         }
@@ -1417,8 +1530,17 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
                         if (!_seqIdsBefore[String(_saSeq.sequenceID)]) { _presetSeq = _saSeq; break; }
                     }
                 }
-                if (_presetSeq && _presetSeq.videoTracks.numTracks < 3) {
-                    nestErr = "preset created only " + _presetSeq.videoTracks.numTracks + " video tracks";
+                // Gate on what THIS render actually needs, not a hardcoded 3. If Premiere
+                // ignored the patched track count we refuse the nest here and degrade, rather
+                // than placing mattes onto tracks that do not exist.
+                if (_presetSeq && _presetSeq.videoTracks.numTracks < _tracksNeeded) {
+                    nestErr = "preset created only " + _presetSeq.videoTracks.numTracks
+                            + " video tracks, needed " + _tracksNeeded;
+                    // Keep the shortfall in its OWN variable: the fallback branch below
+                    // reassigns nestErr, so without this the one fact that explains the
+                    // failure ("Premiere ignored the patched track count") disappears from
+                    // the log and the operator sees only a generic nest error.
+                    _trackShortfall = nestErr;
                     _presetSeq = null;
                 }
                 if (_presetSeq) {
@@ -1529,27 +1651,58 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
             // flat-fallback path (~1741-1818) and the factory-nest aux-on-main path
             // (~1589-1691) already conform before their own placement calls — this
             // branch had fallen out of step with that pattern.
-            if (samImported) {
+            // One conform per selected matte, in plan order, ALL of them before any
+            // overwriteClip below. Same rule as before, just no longer hardcoded to the
+            // two legacy sidecars — a picker can put four mattes through here.
+            for (var _msC = 0; _msC < _matteSlots.length; _msC++) {
+                var _msItem = _matteSlots[_msC].item;
                 try {
-                    if (typeof samImported.setOverrideFrameRate === "function") { samImported.setOverrideFrameRate(targetRate); }
-                    else { var fiSamP = samImported.getFootageInterpretation(); if (fiSamP) { fiSamP.frameRate = targetRate; samImported.setFootageInterpretation(fiSamP); } }
+                    if (typeof _msItem.setOverrideFrameRate === "function") { _msItem.setOverrideFrameRate(targetRate); }
+                    else { var _fiMs = _msItem.getFootageInterpretation(); if (_fiMs) { _fiMs.frameRate = targetRate; _msItem.setFootageInterpretation(_fiMs); } }
                 } catch (_) {}
-                try { if (ckBin) samImported.moveBin(ckBin); } catch (_) {}
-            }
-            if (ckOnlyImported) {
-                try {
-                    if (typeof ckOnlyImported.setOverrideFrameRate === "function") { ckOnlyImported.setOverrideFrameRate(targetRate); }
-                    else { var fiCkoP = ckOnlyImported.getFootageInterpretation(); if (fiCkoP) { fiCkoP.frameRate = targetRate; ckOnlyImported.setFootageInterpretation(fiCkoP); } }
-                } catch (_) {}
-                try { if (ckBin) ckOnlyImported.moveBin(ckBin); } catch (_) {}
+                try { if (ckBin) _msItem.moveBin(ckBin); } catch (_) {}
             }
             try {
                 nestSeq.videoTracks[0].overwriteClip(imported, 0);
-                if (ckOnlyImported) { nestSeq.videoTracks[1].overwriteClip(ckOnlyImported, 0); ckOnlyPlaced = true; }
-                if (samImported) { nestSeq.videoTracks[2].overwriteClip(samImported, 0); samPlaced = true; }
-                for (var prT = 0; prT < 3 && prT < nestSeq.videoTracks.numTracks; prT++) {
+                // V2 upward, in the order the panel listed them. With the default pair that
+                // is CK MASTER on V2 and GARBAGE MASK on V3 — unchanged from today, including
+                // GARBAGE MASK riding above CK MASTER so it is reachable as that clip's matte.
+                for (var _msP = 0; _msP < _matteSlots.length; _msP++) {
+                    var _trkIdx = _msP + 1;
+                    if (_trkIdx >= nestSeq.videoTracks.numTracks) {
+                        nestErr = nestErr || ("no track V" + (_trkIdx + 1) + " for " + _matteSlots[_msP].key);
+                        break;
+                    }
+                    nestSeq.videoTracks[_trkIdx].overwriteClip(_matteSlots[_msP].item, 0);
+                    _matteSlots[_msP].placed = true;
+                    // Instructions ON the matte itself, mirroring AE, where every matte layer
+                    // carries its own marker. Premiere has no writable comment on a timeline
+                    // TrackItem, but footage projectItems DO carry markers, and those show on
+                    // the clip. Guarded: an unavailable marker API must never cost the
+                    // placement, and the sequence-level marker below is the backstop.
+                    try {
+                        var _mkItem = _matteSlots[_msP].item;
+                        if (_mkItem && typeof _mkItem.getMarkers === "function") {
+                            var _mkColl = _mkItem.getMarkers();
+                            if (_mkColl && typeof _mkColl.createMarker === "function") {
+                                var _cmk = _mkColl.createMarker(0);
+                                try { _cmk.name = _matteSlots[_msP].key + " - matte, track output OFF"; } catch (_) {}
+                                try {
+                                    _cmk.comments = _matteSlots[_msP].key + " on V" + (_trkIdx + 1)
+                                        + ". Turn this track's output on, select the clip you want cut, "
+                                        + "add Effects > Keying > Track Matte Key, set Matte to V" + (_trkIdx + 1)
+                                        + ", Composite Using = Matte Luma, and tick Reverse.";
+                                } catch (_) {}
+                                _matteSlots[_msP].markerOk = true;
+                            }
+                        }
+                    } catch (_) { /* marker is a convenience, never a gate */ }
+                    if (_matteSlots[_msP].key === "CK MASTER") { ckOnlyPlaced = true; }
+                    if (_matteSlots[_msP].key === "GARBAGE MASK") { samPlaced = true; }
+                }
+                for (var prT = 0; prT < nestSeq.videoTracks.numTracks; prT++) {
                     var _prTrk = nestSeq.videoTracks[prT];
-                    // AE-parity default state: clips stay ENABLED; V2/V3 hide via
+                    // AE-parity default state: clips stay ENABLED; matte tracks hide via
                     // track output (the timeline eyeball), so toggling the eyeball
                     // reveals them — same gesture as the AE precomp layer eyeball.
                     try { if (typeof _prTrk.setMute === "function") _prTrk.setMute(prT === 0 ? 0 : 1); } catch (_) {}
@@ -1557,11 +1710,33 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
                         if (_prTrk.clips.numItems > 0) {
                             var _prClip = _prTrk.clips[0];
                             // Rename the TIMELINE instances (not the source items).
-                            try { _prClip.name = (prT === 0) ? "CK + SAM AI OUTPUT" : (prT === 1 ? "CK MASTER" : "GARBAGE MASK"); } catch (_) {}
+                            var _prName = (prT === 0) ? "CK + SAM AI OUTPUT"
+                                        : (_matteSlots[prT - 1] ? _matteSlots[prT - 1].key : null);
+                            if (_prName) { try { _prClip.name = _prName; } catch (_) {} }
                             try { _prClip.disabled = false; } catch (_) {}
                         }
                     } catch (_) {}
                 }
+                // Instructions ride on a sequence marker, mirroring AE's rule that notes
+                // belong ON the work, not in a separate text layer (Berto 2026-06-21).
+                // Premiere gets a marker rather than an applied effect on purpose: CEP has
+                // no safe way to apply Track Matte Key, so the operator is TOLD the steps
+                // instead of being handed a half-wired effect.
+                try {
+                    if (_matteSlots.length && nestSeq.markers && typeof nestSeq.markers.createMarker === "function") {
+                        var _mkTxt = "CorridorKey mattes: ";
+                        for (var _mkI = 0; _mkI < _matteSlots.length; _mkI++) {
+                            _mkTxt += "V" + (_mkI + 2) + " = " + _matteSlots[_mkI].key
+                                   + (_mkI < _matteSlots.length - 1 ? ", " : ". ");
+                        }
+                        _mkTxt += "Each matte track is output-OFF. To use one: turn its eyeball on, "
+                               + "select the clip you want cut, add Effects > Keying > Track Matte Key, "
+                               + "set Matte to that track, Composite Using = Matte Luma, and tick Reverse.";
+                        var _mk = nestSeq.markers.createMarker(0);
+                        try { _mk.name = "CorridorKey — how to use these mattes"; } catch (_) {}
+                        try { _mk.comments = _mkTxt; } catch (_) {}
+                    }
+                } catch (_) { /* a missing marker must never cost the placement */ }
                 _nestGeom = "preset-stacked";
             } catch (ePrePlace) { nestErr = nestErr || String(ePrePlace); }
 
@@ -1837,8 +2012,13 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
         // createNewSequenceFromClips is unavailable, the nest's project item
         // couldn't be located, or placing the nest on the main timeline failed.
         if (mode !== "nested" && (samImported || ckOnlyImported)) {
+            // The track shortfall, when it happened, is the ONE fact that explains this
+            // failure — and nestErr has already been reassigned by the fallback branch by
+            // now, so it has to be carried in explicitly or the operator is told nothing
+            // useful about why their mattes did not land.
             return JSON.stringify({ ok: false,
-                error: "Could not place the three-layer CK nested sequence: " + (nestErr || "unknown placement error") });
+                error: "Could not place the three-layer CK nested sequence: " + (nestErr || "unknown placement error")
+                     + (_trackShortfall ? " [" + _trackShortfall + "]" : "") });
         }
         if (mode !== "nested") {
             samPlaced = false;
@@ -1974,6 +2154,9 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
                         placedInfo.push({
                             track: "V" + (pv + 1),
                             name: (function () { try { return pClip.name; } catch (_) { return "?"; } })(),
+                            // startSec matters as much as duration: two clips of equal length
+                            // starting a frame apart are still misaligned.
+                            startSec: (function () { try { return Math.round(pClip.start.seconds * 1000) / 1000; } catch (_) { return -1; } })(),
                             durSec: (function () { try { return Math.round((pClip.end.seconds - pClip.start.seconds) * 1000) / 1000; } catch (_) { return -1; } })(),
                             media: (function () { try { return pClip.projectItem.getMediaPath(); } catch (_) { return ""; } })()
                         });
@@ -2023,6 +2206,88 @@ function ppro_importSequence(firstFramePath, startSeconds, fps, sourceFrameRate,
         // bin-only import leaves no timeline evidence, so this is the only signal.
         if (tightSamError) { diag.tightSamError = tightSamError; }
         else if (tightSamFirstFramePath && !tightSamImported) { diag.tightSamError = "raw SAM requested but not imported (reason unknown)"; }
+
+        // MATTE PICKER read-back. The whole point of the picker is that the operator gets the
+        // mattes they ticked, on tracks — so the log has to say what was asked for, how many
+        // tracks that needed, how many Premiere actually made, and which ones landed. Anything
+        // requested but missing shows up here rather than as a quietly shorter timeline.
+        diag.matteTracksNeeded = _tracksNeeded;
+        if (_trackShortfall) { diag.matteTrackShortfall = _trackShortfall; }
+        diag.matteTracksCreated = (nestSeq && nestSeq.videoTracks) ? nestSeq.videoTracks.numTracks : -1;
+        diag.mattePlanSource = _mattePlan ? "panel" : "legacy default (no plan arg)";
+        if (_mattePlanErr) { diag.mattePlanError = _mattePlanErr; }
+        var _msDiag = [];
+        for (var _mdI = 0; _mdI < _matteSlots.length; _mdI++) {
+            _msDiag.push({
+                track: "V" + (_mdI + 2),
+                key: _matteSlots[_mdI].key,
+                placed: !!_matteSlots[_mdI].placed,
+                // Whether the per-clip instruction marker actually took. If this reads false
+                // across the board, Premiere refused the projectItem marker API and the
+                // sequence marker is the only guidance the operator got.
+                clipMarker: !!_matteSlots[_mdI].markerOk,
+                // PROVENANCE: the bin accumulates identically-named items across renders, so
+                // a name proves nothing about which batch a matte came from. Every render
+                // writes to its own ck_batch_<hash> folder, so the media path is the only
+                // reliable evidence. plannedMedia is what the panel ASKED for; trackMedia is
+                // read back off the clip ACTUALLY sitting on that track
+                // (TrackItem.projectItem.getMediaPath, via placedInfo). Echoing the input
+                // would prove nothing — a wrong or stale item on the track would still report
+                // the path we intended. They must match.
+                plannedMedia: (function (it) { try { return it.getMediaPath(); } catch (_) { return ""; } })(_matteSlots[_mdI].item),
+                trackMedia: (function (trk) {
+                    for (var _pi = 0; _pi < placedInfo.length; _pi++) {
+                        if (placedInfo[_pi].track === trk) { return placedInfo[_pi].media; }
+                    }
+                    return "";
+                })("V" + (_mdI + 2))
+            });
+        }
+        diag.matteSlots = _msDiag;
+
+        // BATCH PROVENANCE VERDICT, computed from what is ON THE TRACKS. Every render writes
+        // to its own ck_batch_<hash> folder, and the bin accumulates identically-named items
+        // across renders, so "CK MASTER" on V2 could be last week's. Extract the hash from
+        // each placed clip's real media path and say plainly whether the timeline is built
+        // from one render or several. Alignment is meaningless across mixed batches.
+        try {
+            var _hashes = [], _noHash = [];
+            for (var _bpI = 0; _bpI < placedInfo.length; _bpI++) {
+                var _bm = String(placedInfo[_bpI].media || "").match(/ck_batch_([0-9a-f]+)/);
+                if (_bm) {
+                    var _seenH = false;
+                    for (var _hI = 0; _hI < _hashes.length; _hI++) { if (_hashes[_hI] === _bm[1]) { _seenH = true; break; } }
+                    if (!_seenH) { _hashes.push(_bm[1]); }
+                } else if (placedInfo[_bpI].media) {
+                    _noHash.push(placedInfo[_bpI].track);
+                }
+            }
+            diag.batchHashes = _hashes.join(", ");
+            diag.singleBatch = (_hashes.length === 1);
+            if (_noHash.length) { diag.tracksWithoutBatchHash = _noHash.join(", "); }
+            if (_hashes.length > 1) {
+                diag.batchWarning = "MIXED BATCHES on the timeline: " + _hashes.join(" + ")
+                                  + " - these clips are from different renders";
+            }
+        } catch (_) {}
+        if (_mattePlan) {
+            var _missing = [];
+            for (var _mqI = 0; _mqI < _mattePlan.length; _mqI++) {
+                var _q = _mattePlan[_mqI];
+                if (!_q || !_q.key) continue;
+                var _seen = false;
+                for (var _mrI = 0; _mrI < _matteSlots.length; _mrI++) {
+                    if (_matteSlots[_mrI].key === String(_q.key)) { _seen = true; break; }
+                }
+                if (!_seen) { _missing.push(String(_q.key)); }
+            }
+            if (_missing.length) { diag.matteRequestedButMissing = _missing.join(", "); }
+        }
+        if (ckAlphaError) { diag.ckAlphaError = ckAlphaError; }
+        if (ckAlphaImported) {
+            diag.ckAlphaName = ckAlphaImported.name;
+            diag.ckAlphaPath = (function () { try { return ckAlphaImported.getMediaPath(); } catch (_) { return ""; } })();
+        }
 
         return JSON.stringify({
             ok: true, placed: true, binName: imported.name, appliedRate: appliedRate,

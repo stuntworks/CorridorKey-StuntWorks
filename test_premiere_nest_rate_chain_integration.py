@@ -27,15 +27,25 @@ ROOT = Path(__file__).resolve().parent
 HOST_PATH = ROOT / "ae_plugin" / "cep_panel" / "jsx" / "host.jsx"
 
 # (label, distinctive source fragment) in required execution order.
+#
+# 2026-07-28 (matte picker): the two hardcoded aux conforms and the three hardcoded
+# overwriteClip calls became one conform loop and one placement loop, because the
+# operator can now select up to four mattes instead of always exactly two. The chain
+# and its ORDER are unchanged — every selected matte is still conformed before
+# anything is placed. Only the fragments that locate each link were updated. The
+# per-matte behavior (V2 upward in plan order, missing sidecars dropped, refusal when
+# Premiere makes too few tracks) is covered behaviorally in
+# D:\CLAUDE_JUNK\ck_mattepicker_20260728\test_host_matte_plan.js, which runs the real
+# ppro_importSequence against a mocked Premiere.
 CHAIN = (
-    ("bake rate into preset copy", "_presetPath = _patchF.fsName"),
+    ("bake rate into preset copy", "\"<VideoFrameRate>\" + _rateTicks"),
+    ("bake track count into preset copy", "\"<InitialNumberOfVideoTracks>\" + _tracksNeeded"),
+    ("adopt the patched preset copy", "_presetPath = _patchF.fsName"),
     ("newSequence from preset", "app.project.newSequence(_nestName"),
     ("geometry verification", "preset geometry verification failed"),
-    ("conform GARBAGE MASK", "samImported.setOverrideFrameRate(targetRate)"),
-    ("conform CK MASTER", "ckOnlyImported.setOverrideFrameRate(targetRate)"),
+    ("conform every selected matte", "_msItem.setOverrideFrameRate(targetRate)"),
     ("place V1", "nestSeq.videoTracks[0].overwriteClip"),
-    ("place V2", "nestSeq.videoTracks[1].overwriteClip"),
-    ("place V3", "nestSeq.videoTracks[2].overwriteClip"),
+    ("place selected mattes from V2 up", "videoTracks[_trkIdx].overwriteClip(_matteSlots[_msP].item"),
 )
 
 
