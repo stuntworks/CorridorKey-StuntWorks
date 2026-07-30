@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# Last modified: 2026-07-04 | Change: SAM2 temporal consistency guard (cmd_batch + cmd_batch_scrub), opt-in via sam2_temporal_guard_enabled, default OFF; batch_result.txt gains a 4th held-count field. | Full history: git log
+# Last modified: 2026-07-29 | Change: _reconnect_split_body bridges each detached SAM piece across its own measured gap instead of closing the whole silhouette with a fixed 0.06w x 0.18h kernel, which was resurrecting the crotch-to-floor wedge; pinned by test_reconnect_gap_bound.py. | Full history: git log
 # ============================================================================
 # LIVE FILE — THIS is the canonical CorridorKey AE/Premiere processor (1180 lines,
 # full SAM2 batch). The CEP panel runs THIS copy via a Windows junction:
@@ -1815,12 +1815,26 @@ def _reconnect_split_body(alpha, sam_soft, ck_raw, src_rgb=None, screen_type="gr
     large pieces (torso above, legs below) with the waist killed between them.
     That slips under the full-collapse threshold, so the render severs the person.
 
-    Fix, using the KEYER as the authority DaVinci-style: when SAM's body binarizes
-    into 2+ large components, morphologically bridge the vertical corridor between
-    them, and restore alpha there ONLY where the raw CK keyer is solid (the vest IS
-    there) and the source is not screen-colored. The corridor sits between torso and
-    legs, so the floor/junk (which attaches at the feet, outside the corridor) is
-    never resurrected — unlike a ones-mask fallback. No split -> exact no-op.
+    Fix: when SAM's body binarizes into 2+ large components, bridge each detached
+    piece to the main body across ITS OWN measured gap, and restore alpha there where
+    the source is not screen-colored. Pieces farther apart than the reach cap are left
+    alone. No split -> exact no-op.
+
+    GEOMETRY IS THE WHOLE FIX (2026-07-29). This used to close the silhouette with a
+    fixed 0.06w x 0.18h kernel and describe the result as "the corridor between torso
+    and legs". It was not: at 4K that kernel is 231 x 389 px against a 29 px split, so
+    it filled every concavity in the body, including the wedge between the legs down
+    onto the floor. Measured on ck_batch_fdd2e28de847: 105,890 px forced to alpha 1.0
+    on frame 53 (73.7% of it in the bottom third), leaking on 33 of the 37 frames that
+    trigger. Pinned by test_reconnect_gap_bound.py.
+
+    ck_raw is accepted and currently unused. The docstring used to promise a raw-CK
+    solidity gate; that gate was removed earlier because motion blur left pinholes in
+    the vest, and it would not help here anyway — on the frame-53 restore footprint CK
+    alpha is >= 0.5 on 99.8% of pixels (89.6% exactly 1.0), because CK's matte in that
+    region answers the same "is it green" question the HSV gate below already asks, so
+    it cannot tell beige vest from dark floor mats. Removing the argument is a separate
+    cleanup, deliberately not folded into this fix.
     """
     try:
         import numpy as _np_rc
@@ -1851,13 +1865,40 @@ def _reconnect_split_body(alpha, sam_soft, ck_raw, src_rgb=None, screen_type="gr
         if len(_large) < 2:
             return alpha
 
-        # Bridge vertically: close the SAM body with a tall, moderate-width kernel.
-        # Height spans a plausible waist gap; width keeps it from ballooning sideways.
-        _kh = max(31, int(round(0.18 * h)) | 1)
-        _kw = max(15, int(round(0.06 * w)) | 1)
-        _kern = _cv2_rc.getStructuringElement(_cv2_rc.MORPH_RECT, (_kw, _kh))
-        _bridged = _cv2_rc.morphologyEx(solid.astype(_np_rc.uint8), _cv2_rc.MORPH_CLOSE, _kern) > 0
-        _corridor = _bridged & (~solid)
+        # GAP-BOUNDED BRIDGE (2026-07-29). The previous kernel was a fixed
+        # 0.06w x 0.18h rect -- 231 x 389 px at 4K -- while a real body split is
+        # tens of pixels wide (29 px on ck_batch_fdd2e28de847 frame 53). A close
+        # that large does not bridge a waist, it fills every concavity in the
+        # silhouette: 105,890 px forced solid on that frame, 73.7% of it the wedge
+        # between the legs and the floor mats below, on 33 of the 37 frames in the
+        # batch that trigger at all. Each detached piece now gets its own kernel,
+        # sized to that pair's measured gap, and only pixels within reach of BOTH
+        # pieces are kept -- so the bridge can land between the two pieces and
+        # nowhere else.
+        # DANGER ZONE HIGH: reason: severs or welds the actor / breaks: waist
+        #   reconnect on a real split, or resurrects floor junk / depends on:
+        #   scipy label output above, _sizes, and the res-relative _max_gap cap.
+        _largest = max(_large, key=lambda _c_pick: _sizes[_c_pick - 1])
+        _main = lbl == _largest
+        _d_main = _cv2_rc.distanceTransform((~_main).astype(_np_rc.uint8), _cv2_rc.DIST_L2, 5)
+        # Reach cap matches the old kernel's horizontal half-width, so this can
+        # never bridge farther than the shipped behaviour already did.
+        _max_gap = max(15.0, 0.03 * w)
+        _corridor = _np_rc.zeros_like(_main)
+        for _c in _large:
+            if _c == _largest:
+                continue
+            _piece = lbl == _c
+            _gap = float(_d_main[_piece].min())
+            if _gap > _max_gap:
+                continue  # too far to be one body: floor junk, crew, a second actor
+            _reach = max(_gap, 8.0)
+            _k = int(2 * _np_rc.ceil(_reach) + 1)
+            _kern = _cv2_rc.getStructuringElement(_cv2_rc.MORPH_RECT, (_k, _k))
+            _pair = (_main | _piece).astype(_np_rc.uint8)
+            _closed = _cv2_rc.morphologyEx(_pair, _cv2_rc.MORPH_CLOSE, _kern) > 0
+            _d_piece = _cv2_rc.distanceTransform((~_piece).astype(_np_rc.uint8), _cv2_rc.DIST_L2, 5)
+            _corridor |= _closed & (~solid) & (_d_main <= _reach) & (_d_piece <= _reach)
         if not _corridor.any():
             return alpha
         # The corridor is the WAIST between two SAM body pieces — it is body by
