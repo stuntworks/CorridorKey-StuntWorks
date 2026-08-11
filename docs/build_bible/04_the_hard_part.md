@@ -26,10 +26,13 @@ The obvious approaches for all three fail the same way: they assume the host env
 ## What the naive approach breaks
 
 Calling anything that triggers `cuInit` from inside the CEP panel's own Python child process crashes it every time with `0xC0000005`, even after stripping every mitigation flag `CreateProcess` exposes and using `CREATE_BREAKAWAY_FROM_JOB` (the `ck_launch.py` attempt); the mitigations are inherited at a level a child process cannot undo on itself.
+Tag: FAILED APPROACH. Evidence: KNOWLEDGE_LOG_ARCHIVE:3833-3837, as cited by the graveyard entry for this same crash later in this part. Last verified: 2026-06-16. Recheck when: Adobe changes CEP's process-creation model, or Windows changes how process mitigations are inherited.
 
 Scripting Premiere's QE `addTracks` path produces tracks that accept clips in the UI but render completely blank, with zero error and effectively zero documentation of why.
+Tag: FAILED APPROACH. Evidence: session-handoff-2026-07-18-ck-premiere-parity-marathon.md, the same source cited by the VERIFIED sequence-preset entry later in this part. Last verified: 2026-07-18. Recheck when: Adobe ships a documented, supported track-creation API for CEP.
 
 Feeding `cv2.imread` or `PyAV` a `.braw` file returns silent failures (`None`, or an identical "Load failed" message) in both host apps, because neither links the proprietary Blackmagic codec. And even once a raw decode exists, feeding its flat, log-space output straight to the keyer starves the chroma key (saturation around 0.23 on real green), so "can we read the file" and "is the color right to key" turn out to be two separate problems.
+Tag: FAILED APPROACH. Evidence: reference-corridorkey-cannot-read-braw.md; session-handoff-2026-07-18-ck-premiere-parity-marathon.md, the same sources cited by the VERIFIED braw-decode entry later in this part. Last verified: 2026-07-18. Recheck when: cv2 or PyAV add Blackmagic RAW support, or the bundled SDK version changes.
 
 ---
 
