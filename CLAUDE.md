@@ -2,6 +2,10 @@
 
 Entry point for any AI (or human) editing this repository.
 
+## PROJECT BIBLE — read before investigating any bug or proposing any change
+
+`docs\build_bible\00_INDEX.md` is the router into this project's knowledge base: protected list, known failed approaches, solved gotchas, open issues. Before forming theories about a bug that smells familiar, or proposing a design change, consult the bible per its routing rule. It exists because this project's failures were expensive; do not repeat one that is already documented.
+
 ## AE CEP folder is a Windows JUNCTION (read this before editing AE files)
 
 The Adobe CEP install path:
