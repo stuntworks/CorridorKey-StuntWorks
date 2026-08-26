@@ -26,3 +26,10 @@ CorridorKeyModule/checkpoints/
 *.pt
 *.mov
 *.mp4
+
+# --- scratch and debug material (2026-08-25) ---
+# WORK/ is THE place for screenshots, debug renders, one-off test output and
+# anything else that is worth keeping on disk but is not part of the product.
+# It is never committed. Put scratch here instead of at a drive root or in the
+# home folder, and the filing sweep will leave it alone.
+WORK/
