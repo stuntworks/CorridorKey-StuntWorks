@@ -33,3 +33,10 @@ CorridorKeyModule/checkpoints/
 # It is never committed. Put scratch here instead of at a drive root or in the
 # home folder, and the filing sweep will leave it alone.
 WORK/
+
+# --- build bible: private engineering notes, NOT for the public repo (2026-08-30) ---
+# The bible is 100% StuntWorks engineering — no upstream Corridor material — and it
+# documents the SAM merge reasoning, failed approaches and open issues. It lives in the
+# PRIVATE repo stuntworks/build-bible under bibles/corridorkey/. Files stay on disk here;
+# git just stops publishing them.
+docs/build_bible/
